@@ -1,0 +1,8 @@
+{
+	"name": "nwslapp-proxy",
+	"main": "src/index.ts",
+	"compatibility_date": "2025-06-01",
+	"observability": {
+		"enabled": true,
+	},
+}
