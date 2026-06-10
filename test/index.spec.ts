@@ -55,7 +55,7 @@ describe("chooseSummaryTTL", () => {
 		expect(chooseSummaryTTL(summaryWithState("in"))).toBe(30);
 	});
 
-	it("caches future matches until the next 3am ET (pre -> dynamic, <=24h, >=60s)", () => {
+	it("caches future matches until the next daily refresh, 07:00 UTC (pre -> dynamic, <=24h, >=60s)", () => {
 		const ttl = chooseSummaryTTL(summaryWithState("pre"));
 		expect(ttl).toBeGreaterThanOrEqual(60);
 		expect(ttl).toBeLessThanOrEqual(86400);
