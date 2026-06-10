@@ -181,7 +181,7 @@ export function chooseSummaryTTL(body: ArrayBuffer): number {
 			case "in":
 				return LIVE_TTL;
 			case "pre":
-				return secondsUntil3amET();
+				return secondsUntilDailyRefresh();
 			default:
 				return SUMMARY_DEFAULT_TTL;
 		}
@@ -191,22 +191,25 @@ export function chooseSummaryTTL(body: ArrayBuffer): number {
 }
 
 /**
- * Seconds until the next 03:00 America/New_York. Future-match preview data
- * (both teams' season averages) only shifts once the day's other matches are
- * final — a west-coast 7pm PT kickoff ends ~1am ET, so all results settle by
- * ~1am ET. Expiring every cache at 3am ET converges them on one daily refresh
- * right after the last possible game wraps.
+ * Seconds until the next daily cache refresh — 07:00 UTC. Future-match preview
+ * data (both teams' season averages) only shifts once the day's other matches are
+ * final; a west-coast 7pm PT kickoff ends ~1am ET (~05:00 UTC), so 07:00 UTC sits
+ * just after the last possible game wraps and converges every future-match cache
+ * on one daily refresh.
  *
- * etNow/target are both built from the same ET-wall-clock string, so their
- * delta is the correct duration. The lone edge is a DST-transition day, where
- * the offset shifts mid-window and the result is off by ≤1hr — harmless for a
- * once-daily cache. 60s floor avoids a near-zero TTL hammering ESPN right at 3am.
+ * 07:00 UTC is 03:00 US Eastern during the NWSL season (EDT, UTC−4, in effect
+ * Mar–Nov) — so this keeps the original "3am ET, after the games settle" intent,
+ * but as plain UTC arithmetic with no timezone string-reparse or DST math. The lone
+ * edge is a late-season EST date, where 07:00 UTC is 02:00 ET — still early morning,
+ * still after games settle, harmless for a once-daily cache. 60s floor avoids a
+ * near-zero TTL right at the boundary.
  */
-function secondsUntil3amET(): number {
-	const now = new Date();
-	const etNow = new Date(now.toLocaleString("en-US", { timeZone: "America/New_York" }));
-	const target = new Date(etNow);
-	target.setHours(3, 0, 0, 0);
-	if (target <= etNow) target.setDate(target.getDate() + 1);
-	return Math.max(Math.floor((target.getTime() - etNow.getTime()) / 1000), 60);
+const REFRESH_HOUR_UTC = 7;
+
+function secondsUntilDailyRefresh(): number {
+	const now = Date.now();
+	const target = new Date(now);
+	target.setUTCHours(REFRESH_HOUR_UTC, 0, 0, 0);
+	if (target.getTime() <= now) target.setUTCDate(target.getUTCDate() + 1);
+	return Math.max(Math.floor((target.getTime() - now) / 1000), 60);
 }
