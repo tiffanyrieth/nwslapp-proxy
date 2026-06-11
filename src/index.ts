@@ -27,12 +27,54 @@ const LIVE_TTL = 30; // a match is in progress — keep scores/lineups fresh
 const SCOREBOARD_DEFAULT_TTL = 300; // fixture list barely changes between matches
 const SUMMARY_DEFAULT_TTL = 3600; // 1hr — safe fallback when summary state can't be read
 const IMMUTABLE_TTL = 31536000; // 1yr — a finished match's data is final, cache ~forever
+const TEAM_VIDEOS_TTL = 3600; // 1hr — a club's recent uploads change at most a few times/day
+
+const YT_API = "https://www.googleapis.com/youtube/v3";
+const UPLOADS_PER_TEAM = 5; // recent uploads to pull per club (the app filters/caps)
+
+// One verified video id per club, used only to RESOLVE the club's YouTube channel
+// at runtime: videos.list(part=snippet) → snippet.channelId → uploads playlist
+// ("UU" + channelId without its "UC" prefix). Reusing ids the app's seed already
+// verified means no separate channel-id research, and the whole response is cached
+// ~1h so this resolution is cheap. (If a seed video is deleted, that club silently
+// yields no live cards until re-seeded — graceful, not fatal. A future tidy could
+// bake in the resolved channel ids to drop this call.)
+const TEAM_SEED_VIDEO: Record<string, string> = {
+	LA: "bs3r9AbiAxk", BAY: "FCt8ZY3xocY", BOS: "fnwgebaTb9k", CHI: "dLiMB5XM8U4",
+	DEN: "p0cvf5-1h3Y", GFC: "xx8slc-q3s0", HOU: "khgdvraSRkY", KC: "cJMSF_oajX0",
+	NC: "j5NcGy3_WQc", ORL: "gxFfPHB0hxU", POR: "_37ruj00IQw", LOU: "h_upJQCPFDU",
+	SD: "qI3vFXoOEQk", SEA: "1JwgDxClwPA", UTA: "CzlPKyGe1eI", WAS: "IdSPrFaTxco",
+};
+
+// Per-club article URLs from each club's OWN site, surfaced on Home as NEWS cards
+// (diversifies Home beyond YouTube). Each URL is fetched and its Open Graph
+// metadata (og:title / og:description / og:image / article:published_time) is
+// scraped into a `newsArticle` ContentCard — the iMessage/Slack link-preview
+// model. `source` is the club display name on the card (→ crest).
+//
+// TEMP curated list, OG-fetched LIVE so titles/images stay real. Auto-discovery
+// is a later step and easy here: club sites mostly run WordPress, so `/feed/`
+// (RSS) and `/wp-json/wp/v2/posts` are open + keyless (verified on
+// washingtonspirit.com). Only WAS for now.
+const TEAM_ARTICLES: Record<string, Array<{ url: string; source: string }>> = {
+	WAS: [
+		{
+			url: "https://washingtonspirit.com/blog/2026/06/09/washington-spirit-star-trinity-rodman-and-owner-michele-kang-named-to-inaugural-time100-sports-list/",
+			source: "Washington Spirit",
+		},
+	],
+};
+
+// A desktop-browser UA so article fetches get the full SSR'd HTML (with OG tags)
+// rather than a stripped bot page.
+const BROWSER_UA =
+	"Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36";
 
 export default {
-	async fetch(request: Request, _env: Env, ctx: ExecutionContext): Promise<Response> {
+	async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
 		const url = new URL(request.url);
 
-		// Both routes are GET-only; reject early so the 405 is shared.
+		// All routes are GET-only; reject early so the 405 is shared.
 		if (request.method !== "GET") {
 			return new Response("Method not allowed. Use GET.", {
 				status: 405,
@@ -40,8 +82,9 @@ export default {
 			});
 		}
 
-		// Route by path. Each route differs only in its upstream base + TTL rule;
-		// the fetch/cache/serve-stale flow is shared in proxyAndCache.
+		// The two ESPN routes are transparent caching pass-throughs (shared
+		// proxyAndCache). /team-videos is different: it *builds* a response by
+		// calling the YouTube Data API and normalizing to ContentCard JSON.
 		if (url.pathname === "/scoreboard") {
 			return proxyAndCache(url, ESPN_SCOREBOARD, chooseScoreboardTTL, ctx);
 		}
@@ -51,9 +94,12 @@ export default {
 			// `dates`/`limit`.
 			return proxyAndCache(url, ESPN_SUMMARY, chooseSummaryTTL, ctx);
 		}
+		if (url.pathname === "/team-videos") {
+			return handleTeamVideos(url, env, ctx);
+		}
 
 		return new Response(
-			"Not found. This proxy serves GET /scoreboard and GET /summary.",
+			"Not found. This proxy serves GET /scoreboard, /summary, and /team-videos.",
 			{ status: 404 },
 		);
 	},
@@ -212,4 +258,305 @@ function secondsUntilDailyRefresh(): number {
 	target.setUTCHours(REFRESH_HOUR_UTC, 0, 0, 0);
 	if (target.getTime() <= now) target.setUTCDate(target.getUTCDate() + 1);
 	return Math.max(Math.floor((target.getTime() - now) / 1000), 60);
+}
+
+// ---------------------------------------------------------------------------
+// /team-videos — Home Module 1 "From your teams" (the first ALIVE pipeline).
+//
+// `GET /team-videos?teams=WAS,POR,…` returns each followed club's recent YouTube
+// uploads as `ContentCard` JSON (the app decodes it directly — see the iOS
+// `ContentCard` model + `ContentService`). Unlike the ESPN routes this NORMALIZES:
+// it resolves each club's uploads playlist, pulls recent videos via the YouTube
+// Data API, and maps them to the card shape. The whole response is edge-cached ~1h
+// (keyed by the normalized, sorted team list), so one build serves every caller and
+// quota use stays trivial.
+// ---------------------------------------------------------------------------
+
+/** Minimal shapes for the YouTube Data API responses we read. */
+interface YTSnippet {
+	title?: string;
+	publishedAt?: string;
+	channelId?: string;
+	resourceId?: { videoId?: string };
+}
+interface YTItem {
+	id?: string;
+	snippet?: YTSnippet;
+	contentDetails?: { duration?: string };
+}
+
+async function handleTeamVideos(
+	url: URL,
+	env: Env,
+	ctx: ExecutionContext,
+): Promise<Response> {
+	// Normalize the team list (upper-case, de-duped, SORTED) so different follow
+	// orderings share one cache entry.
+	const teams = [
+		...new Set(
+			(url.searchParams.get("teams") ?? "")
+				.split(",")
+				.map((t) => t.trim().toUpperCase())
+				.filter(Boolean),
+		),
+	].sort();
+
+	const cache = caches.default;
+	const cacheUrl = new URL(url);
+	cacheUrl.searchParams.set("teams", teams.join(","));
+	const cacheKey = new Request(cacheUrl.toString(), { method: "GET" });
+
+	const hit = await cache.match(cacheKey);
+	if (hit) return withCacheStatus(hit, "HIT");
+
+	if (!env.YOUTUBE_API_KEY) {
+		// Misconfiguration (secret not set) — 503 so the app falls back to its seed.
+		return new Response("team-videos unavailable: YOUTUBE_API_KEY not set.", {
+			status: 503,
+		});
+	}
+
+	let cards: unknown[];
+	try {
+		// YouTube uploads + league news (nwslsoccer.com OG), merged newest-first.
+		// Articles are best-effort (buildArticleCards never throws); only a YouTube
+		// outage trips the stale/502 fallback below.
+		const [videos, articles] = await Promise.all([
+			buildTeamCards(teams, env.YOUTUBE_API_KEY),
+			buildArticleCards(teams),
+		]);
+		cards = [...videos, ...articles].sort((a, b) =>
+			((a as Card).timestamp ?? "") < ((b as Card).timestamp ?? "") ? 1 : -1,
+		);
+	} catch {
+		// A YouTube outage serves a stale copy if we have one, else 502 (the app
+		// falls back to its seed on any non-2xx).
+		return (await serveStale(cache, cacheKey)) ?? upstreamError();
+	}
+
+	const headers = new Headers();
+	headers.set("Content-Type", "application/json");
+	headers.set("Cache-Control", `public, max-age=${TEAM_VIDEOS_TTL}`);
+
+	const toCache = new Response(JSON.stringify(cards), { status: 200, headers });
+	ctx.waitUntil(cache.put(cacheKey, toCache.clone()));
+	return withCacheStatus(toCache, "MISS");
+}
+
+/** Build the `ContentCard` array for the requested clubs (newest first). */
+async function buildTeamCards(teams: string[], apiKey: string): Promise<unknown[]> {
+	// Only clubs we have a seed video for can be resolved.
+	const known = teams.filter((t) => TEAM_SEED_VIDEO[t]);
+	if (known.length === 0) return [];
+
+	// 1. Resolve each club's channel → uploads playlist (one batched call).
+	const seedSnippets = await ytVideos(known.map((t) => TEAM_SEED_VIDEO[t]), "snippet", apiKey);
+	const channelByVideo = new Map<string, string>();
+	for (const v of seedSnippets) {
+		if (v.id && v.snippet?.channelId) channelByVideo.set(v.id, v.snippet.channelId);
+	}
+	const uploadsByTeam = new Map<string, string>();
+	for (const abbr of known) {
+		const channelId = channelByVideo.get(TEAM_SEED_VIDEO[abbr]);
+		// A channel's uploads playlist id is its channel id with "UC" → "UU".
+		if (channelId && channelId.startsWith("UC")) {
+			uploadsByTeam.set(abbr, "UU" + channelId.slice(2));
+		}
+	}
+
+	// 2. Recent uploads per club, in parallel (one playlistItems call each). A
+	//    single club failing drops only its own cards.
+	const perTeam = await Promise.all(
+		[...uploadsByTeam.entries()].map(async ([abbr, playlist]) => {
+			try {
+				const items = await ytPlaylistItems(playlist, UPLOADS_PER_TEAM, apiKey);
+				return items
+					.filter((it) => it.snippet?.resourceId?.videoId)
+					.map((it) => ({ abbr, snippet: it.snippet as YTSnippet }));
+			} catch {
+				return [];
+			}
+		}),
+	);
+	const uploads = perTeam.flat();
+	if (uploads.length === 0) return [];
+
+	// 3. Durations (one batched call; optional — a failure just omits them).
+	const durationById = new Map<string, string>();
+	try {
+		const details = await ytVideos(
+			uploads.map((u) => u.snippet.resourceId!.videoId!),
+			"contentDetails",
+			apiKey,
+		);
+		for (const v of details) {
+			const formatted = formatDuration(v.contentDetails?.duration);
+			if (v.id && formatted) durationById.set(v.id, formatted);
+		}
+	} catch {
+		/* durations are optional */
+	}
+
+	// 4. Map to ContentCard JSON. `undefined` fields are dropped by JSON.stringify,
+	//    which the Swift decoder reads as nil. Newest first.
+	return uploads
+		.map((u) => {
+			const vid = u.snippet.resourceId!.videoId!;
+			return {
+				id: `yt-${vid}`,
+				layout: "youtube",
+				platform: "youtube",
+				placement: "home",
+				teamAbbreviation: u.abbr,
+				isLeague: false,
+				title: u.snippet.title,
+				thumbnailURL: `https://img.youtube.com/vi/${vid}/hqdefault.jpg`,
+				duration: durationById.get(vid),
+				igFallback: false,
+				timestamp: u.snippet.publishedAt,
+				url: `https://www.youtube.com/watch?v=${vid}`,
+				ctaLabel: "Watch on YouTube",
+			};
+		})
+		.sort((a, b) => (a.timestamp ?? "") < (b.timestamp ?? "") ? 1 : -1);
+}
+
+/** Just the field the merged-sort needs off a built card. */
+type Card = { timestamp?: string };
+
+/**
+ * League-news cards for the requested clubs: fetch each curated nwslsoccer.com
+ * article and scrape its Open Graph tags into a `newsArticle` ContentCard.
+ * Best-effort — a fetch or a missing title drops only that one card (never
+ * throws), so a news hiccup can't take down the YouTube cards it's merged with.
+ */
+async function buildArticleCards(teams: string[]): Promise<unknown[]> {
+	const jobs: Array<{ abbr: string; url: string; source: string }> = [];
+	for (const abbr of teams) {
+		for (const a of TEAM_ARTICLES[abbr] ?? []) jobs.push({ abbr, url: a.url, source: a.source });
+	}
+	if (jobs.length === 0) return [];
+
+	const built = await Promise.all(
+		jobs.map(async ({ abbr, url, source }) => {
+			try {
+				const og = await fetchOG(url);
+				// `timestamp` is required app-side; skip a card we can't date rather
+				// than fake a time (would mis-sort it to "now").
+				const published = isoNoFraction(og.published);
+				if (!og.title || !published) return null;
+				return {
+					id: `nws-${url.split("/").filter(Boolean).pop()}`, // slug = stable id
+					layout: "newsArticle",
+					platform: "article",
+					placement: "home",
+					teamAbbreviation: abbr,
+					isLeague: false,
+					headline: og.title,
+					blurb: og.description, // undefined → nil (e.g. generic site default)
+					sourceName: source,
+					thumbnailURL: og.image,
+					igFallback: false,
+					timestamp: published,
+					url,
+					ctaLabel: "Read more",
+				};
+			} catch {
+				return null;
+			}
+		}),
+	);
+	return built.filter(Boolean);
+}
+
+/** Normalize any ISO-ish date to "YYYY-MM-DDTHH:MM:SSZ" — no fractional seconds,
+ *  no numeric offset — the one shape the app's strict `.iso8601` JSON decoder
+ *  accepts (sources vary: YouTube emits "…Z", nwslsoccer ".337Z", WordPress
+ *  "+00:00"). Returns undefined for an unparseable input. */
+function isoNoFraction(s?: string): string | undefined {
+	if (!s) return undefined;
+	const t = Date.parse(s);
+	if (Number.isNaN(t)) return undefined;
+	return new Date(t).toISOString().replace(/\.\d{3}Z$/, "Z");
+}
+
+/** Scrape an article page's Open Graph metadata (title/description/image) + the
+ *  `article:published_time`. */
+async function fetchOG(
+	url: string,
+): Promise<{ title?: string; description?: string; image?: string; published?: string }> {
+	const r = await fetch(url, { headers: { "User-Agent": BROWSER_UA, Accept: "text/html" } });
+	if (!r.ok) throw new Error(`og fetch ${r.status}`);
+	const html = await r.text();
+
+	const meta = (prop: string): string | undefined => {
+		const m = new RegExp(`<meta property="${prop}" content="([^"]*)"`, "i").exec(html);
+		return m ? decodeEntities(m[1]) : undefined;
+	};
+
+	return {
+		title: meta("og:title")?.trim(),
+		description: meta("og:description"),
+		image: meta("og:image"),
+		published: meta("article:published_time"),
+	};
+}
+
+/** Decode the handful of HTML entities OG `content` attrs carry (e.g. `&#x27;`). */
+function decodeEntities(s: string): string {
+	return s
+		.replace(/&#x([0-9a-f]+);/gi, (_, h) => String.fromCodePoint(parseInt(h, 16)))
+		.replace(/&#(\d+);/g, (_, d) => String.fromCodePoint(parseInt(d, 10)))
+		.replace(/&amp;/g, "&")
+		.replace(/&quot;/g, '"')
+		.replace(/&#39;/g, "'")
+		.replace(/&lt;/g, "<")
+		.replace(/&gt;/g, ">");
+}
+
+/** videos.list for the given ids + part, chunked at the API's 50-id limit. */
+async function ytVideos(ids: string[], part: string, apiKey: string): Promise<YTItem[]> {
+	const out: YTItem[] = [];
+	for (let i = 0; i < ids.length; i += 50) {
+		const chunk = ids.slice(i, i + 50);
+		const u = new URL(`${YT_API}/videos`);
+		u.searchParams.set("part", part);
+		u.searchParams.set("id", chunk.join(","));
+		u.searchParams.set("maxResults", "50");
+		u.searchParams.set("key", apiKey);
+		const r = await fetch(u.toString());
+		if (!r.ok) throw new Error(`videos.list ${r.status}`);
+		const json = (await r.json()) as { items?: YTItem[] };
+		out.push(...(json.items ?? []));
+	}
+	return out;
+}
+
+/** playlistItems.list for one uploads playlist, newest first. */
+async function ytPlaylistItems(
+	playlistId: string,
+	maxResults: number,
+	apiKey: string,
+): Promise<YTItem[]> {
+	const u = new URL(`${YT_API}/playlistItems`);
+	u.searchParams.set("part", "snippet");
+	u.searchParams.set("playlistId", playlistId);
+	u.searchParams.set("maxResults", String(maxResults));
+	u.searchParams.set("key", apiKey);
+	const r = await fetch(u.toString());
+	if (!r.ok) throw new Error(`playlistItems.list ${r.status}`);
+	const json = (await r.json()) as { items?: YTItem[] };
+	return json.items ?? [];
+}
+
+/** ISO-8601 duration ("PT4M12S") → a display label ("4:12" / "1:02:03"). */
+function formatDuration(iso?: string): string | undefined {
+	if (!iso) return undefined;
+	const m = /^PT(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?$/.exec(iso);
+	if (!m) return undefined;
+	const h = Number(m[1] ?? 0);
+	const min = Number(m[2] ?? 0);
+	const s = Number(m[3] ?? 0);
+	const pad = (n: number) => String(n).padStart(2, "0");
+	return h > 0 ? `${h}:${pad(min)}:${pad(s)}` : `${min}:${pad(s)}`;
 }

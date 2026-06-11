@@ -37,6 +37,14 @@ describe("nwslapp-proxy route guards", () => {
 		expect(response.status).toBe(405);
 		expect(response.headers.get("Allow")).toBe("GET");
 	});
+
+	it("405s non-GET requests to /team-videos", async () => {
+		const response = await SELF.fetch("https://proxy.test/team-videos?teams=WAS", {
+			method: "POST",
+		});
+		expect(response.status).toBe(405);
+		expect(response.headers.get("Allow")).toBe("GET");
+	});
 });
 
 // chooseSummaryTTL is pure: ArrayBuffer in, TTL out. Drives the cache lifetime
