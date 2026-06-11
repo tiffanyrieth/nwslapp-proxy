@@ -46,6 +46,30 @@ const TEAM_SEED_VIDEO: Record<string, string> = {
 	SD: "qI3vFXoOEQk", SEA: "1JwgDxClwPA", UTA: "CzlPKyGe1eI", WAS: "IdSPrFaTxco",
 };
 
+// Per-club article URLs from each club's OWN site, surfaced on Home as NEWS cards
+// (diversifies Home beyond YouTube). Each URL is fetched and its Open Graph
+// metadata (og:title / og:description / og:image / article:published_time) is
+// scraped into a `newsArticle` ContentCard — the iMessage/Slack link-preview
+// model. `source` is the club display name on the card (→ crest).
+//
+// TEMP curated list, OG-fetched LIVE so titles/images stay real. Auto-discovery
+// is a later step and easy here: club sites mostly run WordPress, so `/feed/`
+// (RSS) and `/wp-json/wp/v2/posts` are open + keyless (verified on
+// washingtonspirit.com). Only WAS for now.
+const TEAM_ARTICLES: Record<string, Array<{ url: string; source: string }>> = {
+	WAS: [
+		{
+			url: "https://washingtonspirit.com/blog/2026/06/09/washington-spirit-star-trinity-rodman-and-owner-michele-kang-named-to-inaugural-time100-sports-list/",
+			source: "Washington Spirit",
+		},
+	],
+};
+
+// A desktop-browser UA so article fetches get the full SSR'd HTML (with OG tags)
+// rather than a stripped bot page.
+const BROWSER_UA =
+	"Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36";
+
 export default {
 	async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
 		const url = new URL(request.url);
@@ -294,7 +318,16 @@ async function handleTeamVideos(
 
 	let cards: unknown[];
 	try {
-		cards = await buildTeamCards(teams, env.YOUTUBE_API_KEY);
+		// YouTube uploads + league news (nwslsoccer.com OG), merged newest-first.
+		// Articles are best-effort (buildArticleCards never throws); only a YouTube
+		// outage trips the stale/502 fallback below.
+		const [videos, articles] = await Promise.all([
+			buildTeamCards(teams, env.YOUTUBE_API_KEY),
+			buildArticleCards(teams),
+		]);
+		cards = [...videos, ...articles].sort((a, b) =>
+			((a as Card).timestamp ?? "") < ((b as Card).timestamp ?? "") ? 1 : -1,
+		);
 	} catch {
 		// A YouTube outage serves a stale copy if we have one, else 502 (the app
 		// falls back to its seed on any non-2xx).
@@ -386,6 +419,99 @@ async function buildTeamCards(teams: string[], apiKey: string): Promise<unknown[
 			};
 		})
 		.sort((a, b) => (a.timestamp ?? "") < (b.timestamp ?? "") ? 1 : -1);
+}
+
+/** Just the field the merged-sort needs off a built card. */
+type Card = { timestamp?: string };
+
+/**
+ * League-news cards for the requested clubs: fetch each curated nwslsoccer.com
+ * article and scrape its Open Graph tags into a `newsArticle` ContentCard.
+ * Best-effort — a fetch or a missing title drops only that one card (never
+ * throws), so a news hiccup can't take down the YouTube cards it's merged with.
+ */
+async function buildArticleCards(teams: string[]): Promise<unknown[]> {
+	const jobs: Array<{ abbr: string; url: string; source: string }> = [];
+	for (const abbr of teams) {
+		for (const a of TEAM_ARTICLES[abbr] ?? []) jobs.push({ abbr, url: a.url, source: a.source });
+	}
+	if (jobs.length === 0) return [];
+
+	const built = await Promise.all(
+		jobs.map(async ({ abbr, url, source }) => {
+			try {
+				const og = await fetchOG(url);
+				// `timestamp` is required app-side; skip a card we can't date rather
+				// than fake a time (would mis-sort it to "now").
+				const published = isoNoFraction(og.published);
+				if (!og.title || !published) return null;
+				return {
+					id: `nws-${url.split("/").filter(Boolean).pop()}`, // slug = stable id
+					layout: "newsArticle",
+					platform: "article",
+					placement: "home",
+					teamAbbreviation: abbr,
+					isLeague: false,
+					headline: og.title,
+					blurb: og.description, // undefined → nil (e.g. generic site default)
+					sourceName: source,
+					thumbnailURL: og.image,
+					igFallback: false,
+					timestamp: published,
+					url,
+					ctaLabel: "Read more",
+				};
+			} catch {
+				return null;
+			}
+		}),
+	);
+	return built.filter(Boolean);
+}
+
+/** Normalize any ISO-ish date to "YYYY-MM-DDTHH:MM:SSZ" — no fractional seconds,
+ *  no numeric offset — the one shape the app's strict `.iso8601` JSON decoder
+ *  accepts (sources vary: YouTube emits "…Z", nwslsoccer ".337Z", WordPress
+ *  "+00:00"). Returns undefined for an unparseable input. */
+function isoNoFraction(s?: string): string | undefined {
+	if (!s) return undefined;
+	const t = Date.parse(s);
+	if (Number.isNaN(t)) return undefined;
+	return new Date(t).toISOString().replace(/\.\d{3}Z$/, "Z");
+}
+
+/** Scrape an article page's Open Graph metadata (title/description/image) + the
+ *  `article:published_time`. */
+async function fetchOG(
+	url: string,
+): Promise<{ title?: string; description?: string; image?: string; published?: string }> {
+	const r = await fetch(url, { headers: { "User-Agent": BROWSER_UA, Accept: "text/html" } });
+	if (!r.ok) throw new Error(`og fetch ${r.status}`);
+	const html = await r.text();
+
+	const meta = (prop: string): string | undefined => {
+		const m = new RegExp(`<meta property="${prop}" content="([^"]*)"`, "i").exec(html);
+		return m ? decodeEntities(m[1]) : undefined;
+	};
+
+	return {
+		title: meta("og:title")?.trim(),
+		description: meta("og:description"),
+		image: meta("og:image"),
+		published: meta("article:published_time"),
+	};
+}
+
+/** Decode the handful of HTML entities OG `content` attrs carry (e.g. `&#x27;`). */
+function decodeEntities(s: string): string {
+	return s
+		.replace(/&#x([0-9a-f]+);/gi, (_, h) => String.fromCodePoint(parseInt(h, 16)))
+		.replace(/&#(\d+);/g, (_, d) => String.fromCodePoint(parseInt(d, 10)))
+		.replace(/&amp;/g, "&")
+		.replace(/&quot;/g, '"')
+		.replace(/&#39;/g, "'")
+		.replace(/&lt;/g, "<")
+		.replace(/&gt;/g, ">");
 }
 
 /** videos.list for the given ids + part, chunked at the API's 50-id limit. */
