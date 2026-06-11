@@ -5,4 +5,13 @@ interface Env {
 	// Secret, set via `wrangler secret put YOUTUBE_API_KEY`. Backs GET /team-videos:
 	// resolves each club's YouTube uploads + recent videos via the YouTube Data API.
 	YOUTUBE_API_KEY: string;
+
+	// Secret, set via `wrangler secret put ANTHROPIC_API_KEY`. Backs the Feed's
+	// per-post Claude Haiku relevance/no-hot-takes filter (Step 2). When unset, the
+	// filter fails open for curated Bluesky handles (the Feed serves unfiltered).
+	ANTHROPIC_API_KEY?: string;
+
+	// KV namespace caching one Haiku verdict per post id (bsky:{uri}), ~7d TTL —
+	// a post is tagged ONCE, ever; only never-seen posts hit Haiku on a cache miss.
+	FEED_TAGS: KVNamespace;
 }
