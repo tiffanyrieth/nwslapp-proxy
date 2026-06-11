@@ -410,7 +410,7 @@ async function handleTeamVideos(
 			buildArticleCards(teams),
 			buildTeamBlueskyCards(teams),
 		]);
-		cards = [...videos, ...articles, ...teamPosts].sort(byTimestampDesc);
+		cards = dedupeByContent([...videos, ...articles, ...teamPosts].sort(byTimestampDesc));
 	} catch {
 		// A YouTube outage serves a stale copy if we have one, else 502 (the app
 		// falls back to its seed on any non-2xx).
@@ -666,6 +666,31 @@ function byTimestampDesc(a: unknown, b: unknown): number {
 	return ((a as Card).timestamp ?? "") < ((b as Card).timestamp ?? "") ? 1 : -1;
 }
 
+/**
+ * Collapse cards with identical visible TEXT — content-level dedup, not just by id.
+ * A post-id check misses the real case: a bot (e.g. the nwslstat xG account)
+ * publishing the same recap twice (morning + afternoon) — two distinct posts, two
+ * ids, byte-identical text. Keeps the FIRST occurrence; callers pass cards
+ * newest-first, so that's the freshest copy. The key is the card's primary text
+ * (bodyText / title / headline), lower-cased + whitespace-collapsed. A card with no
+ * text key (shouldn't happen) passes through.
+ */
+export function dedupeByContent(cards: unknown[]): unknown[] {
+	const seen = new Set<string>();
+	return (cards as Array<{ bodyText?: string; title?: string; headline?: string }>).filter(
+		(c) => {
+			const key = (c.bodyText ?? c.title ?? c.headline ?? "")
+				.toLowerCase()
+				.replace(/\s+/g, " ")
+				.trim();
+			if (!key) return true;
+			if (seen.has(key)) return false;
+			seen.add(key);
+			return true;
+		},
+	);
+}
+
 // ---------------------------------------------------------------------------
 // /feed — the Feed tab's live source (A2: Bluesky). `GET /feed?teams=WAS,POR,…`
 // returns reporter + league + followed-team Bluesky posts as ContentCard JSON.
@@ -702,6 +727,9 @@ async function handleFeed(url: URL, env: Env, ctx: ExecutionContext): Promise<Re
 		// league outlets + club accounts are NWSL-dedicated and pass untouched.
 		const reporters = await filterReporterRelevance(rawReporters, env, ctx);
 		cards = [...reporters, ...leagueCards, ...teamCards].sort(byTimestampDesc);
+		// Collapse identical-text duplicates (bot double-posts) BEFORE the cap, so a
+		// dup never costs a cap slot and we keep the freshest copy.
+		cards = dedupeByContent(cards);
 		// Free anti-flood cap (no API): no single account may dominate the feed.
 		cards = capPerHandle(cards, MAX_PER_HANDLE);
 	} catch {

@@ -5,7 +5,7 @@ import {
 	SELF,
 } from "cloudflare:test";
 import { describe, it, expect } from "vitest";
-import worker, { chooseSummaryTTL } from "../src/index";
+import worker, { chooseSummaryTTL, dedupeByContent } from "../src/index";
 
 // A correctly-typed `Request` to pass to `worker.fetch()`.
 const IncomingRequest = Request<unknown, IncomingRequestCfProperties>;
@@ -75,5 +75,49 @@ describe("chooseSummaryTTL", () => {
 
 	it("falls back to 1hr on unparseable bytes", () => {
 		expect(chooseSummaryTTL(new TextEncoder().encode("not json").buffer)).toBe(3600);
+	});
+});
+
+// dedupeByContent collapses identical-TEXT cards — the real nwslstat bug, where a
+// bot double-posts the same recap under two different post ids.
+describe("dedupeByContent", () => {
+	it("collapses two cards with identical text but different ids, keeping the first", () => {
+		const cards = [
+			{ id: "bsky-newer", bodyText: "North Carolina Courage: 4 (2.08 xG)\nvs\nChicago Stars FC: 0 (0.64 xG)" },
+			{ id: "bsky-older", bodyText: "North Carolina Courage: 4 (2.08 xG)\nvs\nChicago Stars FC: 0 (0.64 xG)" },
+		];
+		const out = dedupeByContent(cards) as Array<{ id: string }>;
+		expect(out).toHaveLength(1);
+		expect(out[0].id).toBe("bsky-newer"); // first occurrence (callers pass newest-first)
+	});
+
+	it("treats whitespace/case differences as the same content", () => {
+		const out = dedupeByContent([
+			{ id: "a", bodyText: "Match Day!  GO TEAM" },
+			{ id: "b", bodyText: "match day! go team" },
+		]);
+		expect(out).toHaveLength(1);
+	});
+
+	it("keeps genuinely distinct posts", () => {
+		const out = dedupeByContent([
+			{ id: "a", bodyText: "NC Courage win 4-0" },
+			{ id: "b", bodyText: "Gotham draw 1-1" },
+		]);
+		expect(out).toHaveLength(2);
+	});
+
+	it("keys off title/headline when there is no bodyText (YouTube / news cards)", () => {
+		const out = dedupeByContent([
+			{ id: "yt1", title: "Match Highlights" },
+			{ id: "yt2", title: "Match Highlights" },
+			{ id: "news1", headline: "Spirit sign new keeper" },
+		]);
+		expect(out).toHaveLength(2);
+	});
+
+	it("passes through cards with no text key untouched", () => {
+		const out = dedupeByContent([{ id: "a" }, { id: "b" }]);
+		expect(out).toHaveLength(2);
 	});
 });
