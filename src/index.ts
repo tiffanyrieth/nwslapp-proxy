@@ -70,6 +70,55 @@ const TEAM_ARTICLES: Record<string, Array<{ url: string; source: string }>> = {
 const BROWSER_UA =
 	"Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36";
 
+// Bluesky AT Protocol PUBLIC API (keyless, no auth) — backs the Feed's
+// reporter/league/team posts (and the team voices merged onto Home).
+const BSKY_PUBLIC = "https://public.api.bsky.app/xrpc";
+const BSKY_UA = "nwslapp-proxy/0.3 (+https://nwslapp-proxy.tiffany-rieth.workers.dev)";
+const FEED_TTL = 900; // 15min — the Feed is conversational, fresher than Home's 1h
+const POSTS_PER_HANDLE = 12; // recent posts pulled per account (app applies staleness)
+
+// Curated, API-VERIFIED Bluesky handles for the Feed (and the team voices merged
+// onto Home). Every handle was confirmed to currently return posts from the keyless
+// public AT-Proto API; dead/dormant candidates were dropped (GFC + BAY have no
+// active club account, DEN's is off-season-dormant — so 13 of 16 clubs). `kind`
+// drives layout + placement:
+//   reporter|league → blueskyReporter, placement "feed", isLeague true
+//   team            → blueskyTeam{Media,Text}, placement "both" (Home + Feed),
+//                     tagged with `abbr` (the app's club join key)
+interface FeedHandle {
+	handle: string;
+	kind: "reporter" | "league" | "team";
+	abbr?: string;
+}
+const FEED_HANDLES: FeedHandle[] = [
+	// Reporters / journalists (league-wide)
+	{ handle: "meglinehan.com", kind: "reporter" },
+	{ handle: "jeffkassouf.bsky.social", kind: "reporter" },
+	{ handle: "sandraherrera.bsky.social", kind: "reporter" },
+	{ handle: "pcattry.bsky.social", kind: "reporter" },
+	{ handle: "katiewhyatt.bsky.social", kind: "reporter" },
+	// League / official outlets
+	{ handle: "nwslsoccer.com", kind: "league" },
+	{ handle: "equalizersoccer.bsky.social", kind: "league" },
+	{ handle: "nwslthisweek.bsky.social", kind: "league" },
+	{ handle: "nwslstat.bsky.social", kind: "league" },
+	{ handle: "allforxi.bsky.social", kind: "league" },
+	// Official club accounts (13 of 16 verified active)
+	{ handle: "angelcity.com", kind: "team", abbr: "LA" },
+	{ handle: "bostonlegacyfc.com", kind: "team", abbr: "BOS" },
+	{ handle: "chicagostars.com", kind: "team", abbr: "CHI" },
+	{ handle: "houstondash.com", kind: "team", abbr: "HOU" },
+	{ handle: "thekccurrent.bsky.social", kind: "team", abbr: "KC" },
+	{ handle: "racingloufc.com", kind: "team", abbr: "LOU" },
+	{ handle: "nccourage.com", kind: "team", abbr: "NC" },
+	{ handle: "orlpride.com", kind: "team", abbr: "ORL" },
+	{ handle: "thornsfc.com", kind: "team", abbr: "POR" },
+	{ handle: "sandiegowavefc.com", kind: "team", abbr: "SD" },
+	{ handle: "reignfc.com", kind: "team", abbr: "SEA" },
+	{ handle: "utahroyalsfc.com", kind: "team", abbr: "UTA" },
+	{ handle: "washingtonspirit.com", kind: "team", abbr: "WAS" },
+];
+
 export default {
 	async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
 		const url = new URL(request.url);
@@ -97,9 +146,12 @@ export default {
 		if (url.pathname === "/team-videos") {
 			return handleTeamVideos(url, env, ctx);
 		}
+		if (url.pathname === "/feed") {
+			return handleFeed(url, ctx);
+		}
 
 		return new Response(
-			"Not found. This proxy serves GET /scoreboard, /summary, and /team-videos.",
+			"Not found. This proxy serves GET /scoreboard, /summary, /team-videos, and /feed.",
 			{ status: 404 },
 		);
 	},
@@ -290,16 +342,7 @@ async function handleTeamVideos(
 	env: Env,
 	ctx: ExecutionContext,
 ): Promise<Response> {
-	// Normalize the team list (upper-case, de-duped, SORTED) so different follow
-	// orderings share one cache entry.
-	const teams = [
-		...new Set(
-			(url.searchParams.get("teams") ?? "")
-				.split(",")
-				.map((t) => t.trim().toUpperCase())
-				.filter(Boolean),
-		),
-	].sort();
+	const teams = normalizeTeams(url.searchParams.get("teams"));
 
 	const cache = caches.default;
 	const cacheUrl = new URL(url);
@@ -318,16 +361,16 @@ async function handleTeamVideos(
 
 	let cards: unknown[];
 	try {
-		// YouTube uploads + league news (nwslsoccer.com OG), merged newest-first.
-		// Articles are best-effort (buildArticleCards never throws); only a YouTube
-		// outage trips the stale/502 fallback below.
-		const [videos, articles] = await Promise.all([
+		// YouTube uploads + club-site news (OG) + the club's own Bluesky posts
+		// (placement "both" → also shown in the Feed), merged newest-first. Articles
+		// and Bluesky are best-effort (neither builder throws); only a YouTube outage
+		// trips the stale/502 fallback below.
+		const [videos, articles, teamPosts] = await Promise.all([
 			buildTeamCards(teams, env.YOUTUBE_API_KEY),
 			buildArticleCards(teams),
+			buildTeamBlueskyCards(teams),
 		]);
-		cards = [...videos, ...articles].sort((a, b) =>
-			((a as Card).timestamp ?? "") < ((b as Card).timestamp ?? "") ? 1 : -1,
-		);
+		cards = [...videos, ...articles, ...teamPosts].sort(byTimestampDesc);
 	} catch {
 		// A YouTube outage serves a stale copy if we have one, else 502 (the app
 		// falls back to its seed on any non-2xx).
@@ -559,4 +602,189 @@ function formatDuration(iso?: string): string | undefined {
 	const s = Number(m[3] ?? 0);
 	const pad = (n: number) => String(n).padStart(2, "0");
 	return h > 0 ? `${h}:${pad(min)}:${pad(s)}` : `${min}:${pad(s)}`;
+}
+
+// ---------------------------------------------------------------------------
+// Shared content helpers (used by both /team-videos and /feed).
+// ---------------------------------------------------------------------------
+
+/** Normalize a `teams` query value → upper-cased, de-duped, SORTED abbreviations,
+ *  so different follow orderings share one cache entry. */
+function normalizeTeams(raw: string | null): string[] {
+	return [
+		...new Set(
+			(raw ?? "")
+				.split(",")
+				.map((t) => t.trim().toUpperCase())
+				.filter(Boolean),
+		),
+	].sort();
+}
+
+/** Sort built ContentCards newest-first by their ISO `timestamp` string. */
+function byTimestampDesc(a: unknown, b: unknown): number {
+	return ((a as Card).timestamp ?? "") < ((b as Card).timestamp ?? "") ? 1 : -1;
+}
+
+// ---------------------------------------------------------------------------
+// /feed — the Feed tab's live source (A2: Bluesky). `GET /feed?teams=WAS,POR,…`
+// returns reporter + league + followed-team Bluesky posts as ContentCard JSON.
+// Reporter/league cards are league-wide (always returned); team cards are scoped
+// to the requested clubs and carry placement "both" so they ALSO surface on Home.
+// (Reddit + news RSS extend this same route in later steps.) Edge-cached 15min,
+// keyed by the normalized, sorted team list — like /team-videos.
+// ---------------------------------------------------------------------------
+async function handleFeed(url: URL, ctx: ExecutionContext): Promise<Response> {
+	const teams = normalizeTeams(url.searchParams.get("teams"));
+
+	const cache = caches.default;
+	const cacheUrl = new URL(url);
+	cacheUrl.searchParams.set("teams", teams.join(","));
+	const cacheKey = new Request(cacheUrl.toString(), { method: "GET" });
+
+	const hit = await cache.match(cacheKey);
+	if (hit) return withCacheStatus(hit, "HIT");
+
+	let cards: unknown[];
+	try {
+		// Reporter/league (always) + the requested clubs' own posts, newest-first.
+		// Both builders isolate per-handle failures, so a single dead account can't
+		// trip the stale/502 fallback — that's reserved for a total Bluesky outage.
+		const [reporters, teamPosts] = await Promise.all([
+			buildReporterLeagueCards(),
+			buildTeamBlueskyCards(teams),
+		]);
+		cards = [...reporters, ...teamPosts].sort(byTimestampDesc);
+	} catch {
+		return (await serveStale(cache, cacheKey)) ?? upstreamError();
+	}
+
+	const headers = new Headers();
+	headers.set("Content-Type", "application/json");
+	headers.set("Cache-Control", `public, max-age=${FEED_TTL}`);
+
+	const toCache = new Response(JSON.stringify(cards), { status: 200, headers });
+	ctx.waitUntil(cache.put(cacheKey, toCache.clone()));
+	return withCacheStatus(toCache, "MISS");
+}
+
+/** Reporter + league Bluesky posts (always league-wide; blueskyReporter layout). */
+async function buildReporterLeagueCards(): Promise<unknown[]> {
+	const handles = FEED_HANDLES.filter((h) => h.kind === "reporter" || h.kind === "league");
+	const per = await Promise.all(handles.map((h) => blueskyCardsFor(h)));
+	return per.flat();
+}
+
+/** A followed club's own Bluesky posts (placement "both" → Home + Feed). Empty
+ *  when no teams are requested or none of them have a curated handle. */
+async function buildTeamBlueskyCards(teams: string[]): Promise<unknown[]> {
+	if (teams.length === 0) return [];
+	const wanted = new Set(teams);
+	const handles = FEED_HANDLES.filter((h) => h.kind === "team" && h.abbr && wanted.has(h.abbr));
+	const per = await Promise.all(handles.map((h) => blueskyCardsFor(h)));
+	return per.flat();
+}
+
+/** Fetch one account's recent OWN posts (reposts dropped) and map them to
+ *  ContentCards. A single handle failing yields [] — isolated like /team-videos'
+ *  per-team try/catch — so one dead account never sinks the whole response. */
+async function blueskyCardsFor(h: FeedHandle): Promise<unknown[]> {
+	try {
+		const feed = await bskyAuthorFeed(h.handle, POSTS_PER_HANDLE);
+		return feed
+			// A repost carries a `reason`; drop it so we don't attribute someone
+			// else's post to this account. Also require post text.
+			.filter((it) => !it.reason && it.post?.record?.text)
+			.map((it) => mapBskyPost(it.post as BskyPost, h))
+			.filter(Boolean);
+	} catch {
+		return [];
+	}
+}
+
+/** Minimal shapes for the AT-Proto getAuthorFeed response we read. */
+interface BskyItem {
+	reason?: unknown;
+	post?: BskyPost;
+}
+interface BskyPost {
+	uri?: string;
+	author?: { handle?: string; displayName?: string };
+	record?: { text?: string; createdAt?: string };
+	embed?: { $type?: string; [k: string]: unknown };
+	likeCount?: number;
+	repostCount?: number;
+}
+
+/** getAuthorFeed for one actor, recent own-and-repost posts (we filter reposts). */
+async function bskyAuthorFeed(actor: string, limit: number): Promise<BskyItem[]> {
+	const u = new URL(`${BSKY_PUBLIC}/app.bsky.feed.getAuthorFeed`);
+	u.searchParams.set("actor", actor);
+	u.searchParams.set("limit", String(limit));
+	u.searchParams.set("filter", "posts_no_replies");
+	const r = await fetch(u.toString(), {
+		headers: { "User-Agent": BSKY_UA, Accept: "application/json" },
+	});
+	if (!r.ok) throw new Error(`bsky getAuthorFeed ${r.status}`);
+	const json = (await r.json()) as { feed?: BskyItem[] };
+	return json.feed ?? [];
+}
+
+/** One Bluesky post → ContentCard JSON. Returns null for a post we can't key or
+ *  date (skip rather than emit a card that would mis-sort to "now"). `undefined`
+ *  fields are dropped by JSON.stringify, which the Swift decoder reads as nil. */
+function mapBskyPost(post: BskyPost, h: FeedHandle): unknown | null {
+	const uri = post.uri;
+	const handle = post.author?.handle;
+	// Bluesky emits fractional-second ISO ("…653Z"); the app's strict .iso8601
+	// decoder rejects that, so normalize to "…Z" (the exact bug that silently
+	// drops a whole batch to seed — see live-feed-plan "Finding").
+	const created = isoNoFraction(post.record?.createdAt);
+	if (!uri || !handle || !created) return null;
+
+	const rkey = uri.split("/").pop();
+	const image = extractBskyImage(post.embed);
+	const isTeam = h.kind === "team";
+	const layout = isTeam ? (image ? "blueskyTeamMedia" : "blueskyTeamText") : "blueskyReporter";
+
+	return {
+		id: `bsky-${rkey}`,
+		layout,
+		platform: "bluesky",
+		placement: isTeam ? "both" : "feed",
+		teamAbbreviation: isTeam ? h.abbr : undefined,
+		isLeague: !isTeam, // reporters + league outlets are league-wide
+		authorName: post.author?.displayName || handle,
+		handle: `@${handle}`,
+		bodyText: post.record?.text,
+		thumbnailURL: image,
+		igFallback: false,
+		likes: post.likeCount,
+		reposts: post.repostCount,
+		timestamp: created,
+		url: `https://bsky.app/profile/${handle}/post/${rkey}`,
+		ctaLabel: "View on Bluesky",
+	};
+}
+
+/** Best preview image off a post embed (images → video thumb → external link
+ *  card → recordWithMedia's media). Undefined when there's nothing visual. */
+function extractBskyImage(embed?: { $type?: string; [k: string]: unknown }): string | undefined {
+	if (!embed) return undefined;
+	switch (embed.$type) {
+		case "app.bsky.embed.images#view": {
+			const imgs = embed.images as Array<{ thumb?: string }> | undefined;
+			return imgs?.[0]?.thumb;
+		}
+		case "app.bsky.embed.video#view":
+			return embed.thumbnail as string | undefined;
+		case "app.bsky.embed.external#view": {
+			const ext = embed.external as { thumb?: string } | undefined;
+			return ext?.thumb;
+		}
+		case "app.bsky.embed.recordWithMedia#view":
+			return extractBskyImage(embed.media as { $type?: string } | undefined);
+		default:
+			return undefined;
+	}
 }
