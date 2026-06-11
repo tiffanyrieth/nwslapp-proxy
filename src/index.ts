@@ -77,6 +77,46 @@ const BSKY_UA = "nwslapp-proxy/0.3 (+https://nwslapp-proxy.tiffany-rieth.workers
 const FEED_TTL = 900; // 15min — the Feed is conversational, fresher than Home's 1h
 const POSTS_PER_HANDLE = 12; // recent posts pulled per account (app applies staleness)
 
+// Claude Haiku relevance filter (Step 2). Runs on REPORTER posts only — they're
+// journalists who also post about other sports, their personal life, etc., so we
+// keep just the NWSL/women's-soccer ones. League outlets + club accounts are
+// NWSL-dedicated and never touch the API. Each reporter post is tagged ONCE
+// (verdict cached in KV by post id, ~7d); only never-seen posts hit Haiku on a
+// miss. Fails OPEN — no key or a Haiku outage degrades to the un-gated feed.
+const ANTHROPIC_API = "https://api.anthropic.com/v1/messages";
+const HAIKU_MODEL = "claude-haiku-4-5";
+const HAIKU_BATCH = 20; // posts per Haiku call (one numbered list → array of verdicts)
+const TAG_TTL = 7 * 24 * 3600; // a post's verdict is stable; cache it a week
+const MAX_PER_HANDLE = 3; // free anti-flood cap: keep at most N posts per account
+
+const FEED_POLICY = `You are a relevance filter for an NWSL (US National Women's Soccer League) fan-app feed. These posts come from soccer JOURNALISTS who also post about unrelated topics. For each post decide isNWSL:
+- true: about NWSL or women's soccer — its clubs, players, matches, transfers, results, or reporting/analysis/commentary on them.
+- false: off-topic — other sports, the author's personal life, or unrelated news.
+Keep normal soccer opinion and match reactions (those are true). When unsure, prefer true.`;
+
+// Forced structured output (output_config.format) — Haiku 4.5 returns the first
+// text block as JSON matching this schema. No min/max constraints (unsupported);
+// additionalProperties:false is required on every object.
+const VERDICT_SCHEMA = {
+	type: "object",
+	additionalProperties: false,
+	properties: {
+		verdicts: {
+			type: "array",
+			items: {
+				type: "object",
+				additionalProperties: false,
+				properties: {
+					id: { type: "string" },
+					isNWSL: { type: "boolean" },
+				},
+				required: ["id", "isNWSL"],
+			},
+		},
+	},
+	required: ["verdicts"],
+};
+
 // Curated, API-VERIFIED Bluesky handles for the Feed (and the team voices merged
 // onto Home). Every handle was confirmed to currently return posts from the keyless
 // public AT-Proto API; dead/dormant candidates were dropped (GFC + BAY have no
@@ -147,7 +187,7 @@ export default {
 			return handleTeamVideos(url, env, ctx);
 		}
 		if (url.pathname === "/feed") {
-			return handleFeed(url, ctx);
+			return handleFeed(url, env, ctx);
 		}
 
 		return new Response(
@@ -634,7 +674,7 @@ function byTimestampDesc(a: unknown, b: unknown): number {
 // (Reddit + news RSS extend this same route in later steps.) Edge-cached 15min,
 // keyed by the normalized, sorted team list — like /team-videos.
 // ---------------------------------------------------------------------------
-async function handleFeed(url: URL, ctx: ExecutionContext): Promise<Response> {
+async function handleFeed(url: URL, env: Env, ctx: ExecutionContext): Promise<Response> {
 	const teams = normalizeTeams(url.searchParams.get("teams"));
 
 	const cache = caches.default;
@@ -647,14 +687,23 @@ async function handleFeed(url: URL, ctx: ExecutionContext): Promise<Response> {
 
 	let cards: unknown[];
 	try {
-		// Reporter/league (always) + the requested clubs' own posts, newest-first.
-		// Both builders isolate per-handle failures, so a single dead account can't
-		// trip the stale/502 fallback — that's reserved for a total Bluesky outage.
-		const [reporters, teamPosts] = await Promise.all([
-			buildReporterLeagueCards(),
+		// Three sources: reporters + league outlets (always) + the requested clubs'
+		// own posts. Per-handle failures are isolated inside blueskyCardsFor, so a
+		// single dead account can't trip the stale/502 fallback — that's reserved for
+		// a total Bluesky outage.
+		const reporterHandles = FEED_HANDLES.filter((h) => h.kind === "reporter");
+		const leagueHandles = FEED_HANDLES.filter((h) => h.kind === "league");
+		const [rawReporters, leagueCards, teamCards] = await Promise.all([
+			buildBlueskyCards(reporterHandles),
+			buildBlueskyCards(leagueHandles),
 			buildTeamBlueskyCards(teams),
 		]);
-		cards = [...reporters, ...teamPosts].sort(byTimestampDesc);
+		// Only reporters get the Haiku relevance pass (they post off-topic too);
+		// league outlets + club accounts are NWSL-dedicated and pass untouched.
+		const reporters = await filterReporterRelevance(rawReporters, env, ctx);
+		cards = [...reporters, ...leagueCards, ...teamCards].sort(byTimestampDesc);
+		// Free anti-flood cap (no API): no single account may dominate the feed.
+		cards = capPerHandle(cards, MAX_PER_HANDLE);
 	} catch {
 		return (await serveStale(cache, cacheKey)) ?? upstreamError();
 	}
@@ -668,9 +717,8 @@ async function handleFeed(url: URL, ctx: ExecutionContext): Promise<Response> {
 	return withCacheStatus(toCache, "MISS");
 }
 
-/** Reporter + league Bluesky posts (always league-wide; blueskyReporter layout). */
-async function buildReporterLeagueCards(): Promise<unknown[]> {
-	const handles = FEED_HANDLES.filter((h) => h.kind === "reporter" || h.kind === "league");
+/** Build cards for a set of Bluesky handles (per-handle failures isolated). */
+async function buildBlueskyCards(handles: FeedHandle[]): Promise<unknown[]> {
 	const per = await Promise.all(handles.map((h) => blueskyCardsFor(h)));
 	return per.flat();
 }
@@ -787,4 +835,120 @@ function extractBskyImage(embed?: { $type?: string; [k: string]: unknown }): str
 		default:
 			return undefined;
 	}
+}
+
+// ---------------------------------------------------------------------------
+// Haiku relevance / no-hot-takes filter (Step 2).
+// ---------------------------------------------------------------------------
+
+interface Verdict {
+	id: string;
+	isNWSL: boolean;
+}
+type FeedCard = { id?: string; handle?: string; bodyText?: string };
+
+/** Keep at most `max` posts per author handle (cards arrive newest-first, so this
+ *  keeps the freshest few) — a free cap so one prolific account can't flood the
+ *  feed. Cards without a handle pass through. */
+function capPerHandle(cards: unknown[], max: number): unknown[] {
+	const counts = new Map<string, number>();
+	return (cards as FeedCard[]).filter((c) => {
+		if (!c.handle) return true;
+		const n = (counts.get(c.handle) ?? 0) + 1;
+		counts.set(c.handle, n);
+		return n <= max;
+	});
+}
+
+/**
+ * Drop reporter posts that aren't about NWSL/women's soccer. Each card's verdict
+ * is cached in KV by its stable post id (tagged once, ever); only never-seen cards
+ * are batched to Haiku on a cache miss. Fail-OPEN: a card with no verdict (KV miss
+ * + Haiku error or no key) is KEPT, so an outage degrades to the un-gated reporter
+ * feed. KV writes are deferred via ctx.waitUntil so tagging never blocks the
+ * response longer than the one Haiku round-trip.
+ */
+async function filterReporterRelevance(
+	cards: unknown[],
+	env: Env,
+	ctx: ExecutionContext,
+): Promise<unknown[]> {
+	const typed = cards as FeedCard[];
+	const verdicts = new Map<string, Verdict>();
+
+	// 1. Load cached verdicts (one KV read per card; misses return null).
+	const cached = await Promise.all(
+		typed.map((c) => (c.id ? env.FEED_TAGS.get(c.id, "json") : Promise.resolve(null))),
+	);
+	const uncached: FeedCard[] = [];
+	typed.forEach((c, i) => {
+		const v = cached[i] as Verdict | null;
+		if (v) verdicts.set(c.id!, v);
+		else if (c.id) uncached.push(c);
+	});
+
+	// 2. Tag the misses via Haiku, batched. No key → skip (everything fails open).
+	if (uncached.length > 0 && env.ANTHROPIC_API_KEY) {
+		for (let i = 0; i < uncached.length; i += HAIKU_BATCH) {
+			const batch = uncached.slice(i, i + HAIKU_BATCH);
+			let out: Verdict[] | null;
+			try {
+				out = await haikuTagBatch(batch, env.ANTHROPIC_API_KEY);
+			} catch {
+				out = null; // fail open: leave this batch unjudged → kept below
+			}
+			if (out) {
+				for (const v of out) {
+					if (!v?.id) continue;
+					verdicts.set(v.id, v);
+					ctx.waitUntil(
+						env.FEED_TAGS.put(v.id, JSON.stringify(v), { expirationTtl: TAG_TTL }),
+					);
+				}
+			}
+		}
+	}
+
+	// 3. Keep a card unless it was JUDGED off-topic (unjudged = keep, fail-open).
+	return typed.filter((c) => {
+		const v = c.id ? verdicts.get(c.id) : undefined;
+		return v ? v.isNWSL : true;
+	});
+}
+
+/** Tag one batch of cards via a single Haiku call (forced JSON via output_config). */
+async function haikuTagBatch(cards: FeedCard[], apiKey: string): Promise<Verdict[]> {
+	const list = cards
+		.map((c) => {
+			const handle = (c.handle ?? "").replace(/^@/, "");
+			const text = (c.bodyText ?? "").replace(/\s+/g, " ").slice(0, 400);
+			return `[${c.id}] @${handle}: ${text}`;
+		})
+		.join("\n\n");
+
+	const r = await fetch(ANTHROPIC_API, {
+		method: "POST",
+		headers: {
+			"Content-Type": "application/json",
+			"x-api-key": apiKey,
+			"anthropic-version": "2023-06-01",
+		},
+		body: JSON.stringify({
+			model: HAIKU_MODEL,
+			max_tokens: 2048,
+			messages: [
+				{
+					role: "user",
+					content: `${FEED_POLICY}\n\nClassify each post. Echo its id exactly.\n\n${list}`,
+				},
+			],
+			output_config: { format: { type: "json_schema", schema: VERDICT_SCHEMA } },
+		}),
+	});
+	if (!r.ok) throw new Error(`haiku ${r.status}`);
+
+	const json = (await r.json()) as { content?: Array<{ type?: string; text?: string }> };
+	const text = json.content?.find((b) => b.type === "text")?.text;
+	if (!text) throw new Error("haiku: no text block");
+	return (JSON.parse(text) as { verdicts?: Verdict[] }).verdicts ?? [];
 }

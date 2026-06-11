@@ -5,4 +5,12 @@
 	"observability": {
 		"enabled": true,
 	},
+	// Caches one Claude Haiku verdict per Feed post (bsky:{uri}), ~7d TTL — backs the
+	// relevance/no-hot-takes filter so a post is tagged once, ever (Step 2).
+	"kv_namespaces": [
+		{
+			"binding": "FEED_TAGS",
+			"id": "3c1372c0f8174cdcb3e2e52ca5de14ad",
+		},
+	],
 }
