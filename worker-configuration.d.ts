@@ -13,5 +13,13 @@ interface Env {
 
 	// KV namespace caching one Haiku verdict per post id (bsky:{uri}), ~7d TTL —
 	// a post is tagged ONCE, ever; only never-seen posts hit Haiku on a cache miss.
+	// Also holds the B3b social-cards snapshot (SOCIAL_CACHE_KEY), refreshed by cron.
 	FEED_TAGS: KVNamespace;
+
+	// Secret, set via `wrangler secret put APIFY_TOKEN`. Backs the B3b IG/TikTok
+	// social pipe: the daily cron calls Apify's low-cost IG + TikTok scrapers for
+	// curated club + player handles and caches the resulting cards in KV. When unset,
+	// the social builder yields [] (Home/Feed fall back to seed for those cards) —
+	// every other source is unaffected.
+	APIFY_TOKEN?: string;
 }

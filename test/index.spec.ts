@@ -12,6 +12,8 @@ import worker, {
 	appearedPlayers,
 	pickWeekly,
 	seasonFormLabel,
+	mapApifyInstagram,
+	mapApifyTikTok,
 } from "../src/index";
 
 // A correctly-typed `Request` to pass to `worker.fetch()`.
@@ -228,5 +230,134 @@ describe("spotlight helpers", () => {
 	it("formats the season form label with correct pluralization", () => {
 		expect(seasonFormLabel({ goals: 1, assists: 0, apps: 5 })).toBe("1 goal · 0 assists");
 		expect(seasonFormLabel({ goals: 3, assists: 2, apps: 12 })).toBe("3 goals · 2 assists");
+	});
+});
+
+// B3b — Apify IG/TikTok → ContentCard mappers. Pure (one scraped item + its
+// handle in → one socialVideo card out); the field-name defensiveness + routing
+// is the risky part, so it's the part we unit-test. Live shape is verified by curl
+// against the deployed Worker (the cron populates KV).
+describe("mapApifyInstagram", () => {
+	const club = {
+		handle: "washingtonspirit",
+		platform: "instagram",
+		kind: "team",
+		abbr: "WAS",
+		name: "Washington Spirit",
+	};
+	const player = {
+		handle: "trinity_rodman",
+		platform: "instagram",
+		kind: "player",
+		abbr: "WAS",
+		name: "Trinity Rodman",
+	};
+
+	it("maps a club IG post to socialVideo, placement home, fractional seconds stripped", () => {
+		const card = mapApifyInstagram(
+			{
+				shortCode: "ABC123",
+				url: "https://www.instagram.com/p/ABC123/",
+				timestamp: "2026-06-10T15:00:00.000Z",
+				displayUrl: "https://img.example/ig.jpg",
+				caption: "Matchday!",
+				likesCount: 1200,
+				ownerUsername: "washingtonspirit",
+			},
+			club,
+		) as Record<string, unknown>;
+		expect(card.layout).toBe("socialVideo");
+		expect(card.platform).toBe("instagram");
+		expect(card.placement).toBe("home");
+		expect(card.teamAbbreviation).toBe("WAS");
+		expect(card.id).toBe("ig-ABC123");
+		expect(card.thumbnailURL).toBe("https://img.example/ig.jpg");
+		expect(card.bodyText).toBe("Matchday!");
+		expect(card.likes).toBe(1200);
+		expect(card.timestamp).toBe("2026-06-10T15:00:00Z");
+		expect(card.authorName).toBe("Washington Spirit");
+		expect(card.ctaLabel).toBe("Open in Instagram");
+	});
+
+	it("routes a player post to placement feed", () => {
+		const card = mapApifyInstagram(
+			{ shortCode: "Z", url: "https://www.instagram.com/p/Z/", timestamp: "2026-06-10T15:00:00Z" },
+			player,
+		) as Record<string, unknown>;
+		expect(card.placement).toBe("feed");
+		expect(card.authorName).toBe("Trinity Rodman");
+	});
+
+	it("handles a unix-seconds timestamp, nested caption, and derives the url from the shortcode", () => {
+		const card = mapApifyInstagram(
+			{ code: "S1", taken_at: 1749567600, caption: { text: "hi" }, image_url: "https://img/x.jpg" },
+			club,
+		) as Record<string, unknown>;
+		expect(card.url).toBe("https://www.instagram.com/p/S1/");
+		expect(card.bodyText).toBe("hi");
+		expect(card.thumbnailURL).toBe("https://img/x.jpg");
+		expect(String(card.timestamp).endsWith("Z")).toBe(true);
+	});
+
+	it("maps the REAL sones lowcost output shape (code, taken_at unix, caption.text, image_url, post_url, like_count)", () => {
+		const card = mapApifyInstagram(
+			{
+				code: "DZd8lRsSC3b",
+				post_url: "https://www.instagram.com/p/DZd8lRsSC3b/",
+				taken_at: 1781301094,
+				caption: { text: "Happy World Cup! ⚽️" },
+				image_url: "https://instagram.fna.fbcdn.net/x.jpg",
+				like_count: 1234,
+				scraped_username: "washingtonspirit",
+			},
+			club,
+		) as Record<string, unknown>;
+		expect(card.id).toBe("ig-DZd8lRsSC3b");
+		expect(card.url).toBe("https://www.instagram.com/p/DZd8lRsSC3b/");
+		expect(card.thumbnailURL).toBe("https://instagram.fna.fbcdn.net/x.jpg");
+		expect(card.bodyText).toBe("Happy World Cup! ⚽️");
+		expect(card.likes).toBe(1234);
+		expect(String(card.timestamp).endsWith("Z")).toBe(true);
+	});
+
+	it("returns null when the post can't be dated (won't mis-sort to now)", () => {
+		expect(mapApifyInstagram({ url: "https://www.instagram.com/p/X/" }, club)).toBeNull();
+	});
+});
+
+describe("mapApifyTikTok", () => {
+	const club = {
+		handle: "washspirit",
+		platform: "tiktok",
+		kind: "team",
+		abbr: "WAS",
+		name: "Washington Spirit",
+	};
+
+	it("maps a TikTok video to socialVideo with cover, likes, and id from the video url", () => {
+		const card = mapApifyTikTok(
+			{
+				text: "goal!",
+				webVideoUrl: "https://www.tiktok.com/@washspirit/video/7490000000000000000",
+				videoMeta: { coverUrl: "https://img/cover.jpg" },
+				createTimeISO: "2026-06-09T12:00:00.000Z",
+				diggCount: 500,
+				authorMeta: { name: "washspirit" },
+			},
+			club,
+		) as Record<string, unknown>;
+		expect(card.layout).toBe("socialVideo");
+		expect(card.platform).toBe("tiktok");
+		expect(card.placement).toBe("home");
+		expect(card.id).toBe("tt-7490000000000000000");
+		expect(card.thumbnailURL).toBe("https://img/cover.jpg");
+		expect(card.bodyText).toBe("goal!");
+		expect(card.likes).toBe(500);
+		expect(card.timestamp).toBe("2026-06-09T12:00:00Z");
+		expect(card.ctaLabel).toBe("Open in TikTok");
+	});
+
+	it("returns null without a video url", () => {
+		expect(mapApifyTikTok({ createTimeISO: "2026-06-09T12:00:00Z" }, club)).toBeNull();
 	});
 });

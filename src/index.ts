@@ -89,6 +89,30 @@ const HAIKU_BATCH = 20; // posts per Haiku call (one numbered list → array of 
 const TAG_TTL = 7 * 24 * 3600; // a post's verdict is stable; cache it a week
 const MAX_PER_HANDLE = 3; // free anti-flood cap: keep at most N posts per account
 
+// B3b — Instagram social pipe (via Apify). Low-cost, pay-per-result, NO-rental actor
+// (owner chose the cheap path to stay inside Apify's free $5/mo credit):
+//   IG = sones/instagram-posts-scraper-lowcost  ($0.30/1k, HTTP-only)
+// TikTok (clockworks/tiktok-scraper, $1.70/1k, no rental) is DEFERRED for now but its
+// id + mapper are kept ready. Apify API path uses "~" for the actor "/".
+// We DON'T scrape on the user request path (a 50-account sync run is too slow and would
+// risk a Worker timeout). Instead a CRON refreshes the card snapshot into KV
+// (SOCIAL_CACHE_KEY); /feed and /team-videos just READ that snapshot — pinning Apify to
+// ~1 run/cron regardless of app traffic. IG ~600 items/run × every-other-day ≈ $2.7/mo,
+// well under $5. Unset APIFY_TOKEN → the builder no-ops → seed fallback.
+const APIFY_API = "https://api.apify.com/v2/acts";
+const APIFY_IG_ACTOR = "sones~instagram-posts-scraper-lowcost";
+const APIFY_TIKTOK_ACTOR = "clockworks~tiktok-scraper"; // deferred; kept ready for re-enable
+// Per-account post cap we ASK for. The cheap IG actor does NOT honor postsPerProfile
+// (or newerThan) — it returns ~12/profile of mixed-age posts regardless — so IG volume
+// (~600/run) is controlled by cron CADENCE (every other day, see wrangler.jsonc), not
+// per-post limits. The app's staleness filter (Home 72h / Feed 7d) drops the old posts
+// client-side, so a mixed-age KV snapshot is fine to display; we just can't avoid
+// paying to scrape them. (TikTok's clockworks actor DOES honor it via resultsPerPage,
+// relevant when TikTok is re-enabled.)
+const SOCIAL_POSTS_PER_PROFILE = 4;
+const SOCIAL_CACHE_KEY = "social-cards-v1"; // KV key for the cron-built card snapshot
+const SOCIAL_CACHE_TTL = 3 * 24 * 3600; // 3d KV safety net — the daily cron refreshes well within it
+
 const FEED_POLICY = `You are a relevance filter for an NWSL (US National Women's Soccer League) fan-app feed. These posts come from soccer JOURNALISTS who also post about unrelated topics. For each post decide isNWSL:
 - true: about NWSL or women's soccer — its clubs, players, matches, transfers, results, or reporting/analysis/commentary on them.
 - false: off-topic — other sports, the author's personal life, or unrelated news.
@@ -229,6 +253,100 @@ const FEED_HANDLES: FeedHandle[] = [
 	{ handle: "washingtonspirit.com", kind: "team", abbr: "WAS" },
 ];
 
+// ---------------------------------------------------------------------------
+// B3b — IG social handles (the Apify scrape targets).
+//
+// Handles were web-VERIFIED, not inferred from names (they're routinely
+// non-obvious — Rodman is `trinity_rodman`, Lavelle `lavellerose`, LaBonta
+// `lomomma`; 7 clubs differ between IG and TikTok). Full provenance +
+// confidence notes: app repo `Reference/Feed update/B3b candidate social
+// handles.md`. The first live cron scrape is the final verification pass — a
+// handle that returns zero/garbage gets pulled before it ever reaches a card.
+//
+// IG ONLY for now — TikTok is deferred (owner decision). Clubs' IG → placement
+// "home" (the club's own voice); players' IG → placement "feed". `abbr` is the app's
+// club join key; a player's abbr is her current NWSL club, which routes her posts to
+// that club's followers with no Haiku (the player IS the team link). CLUB_SOCIAL still
+// carries each club's TikTok handle as ready reference for when TikTok is re-enabled.
+// ---------------------------------------------------------------------------
+interface SocialHandle {
+	handle: string; // username, no @; matched case-insensitively to scrape output
+	platform: "instagram" | "tiktok";
+	kind: "team" | "player";
+	abbr: string; // routing key — club abbr (a player → her current NWSL club)
+	name: string; // card author display ("Washington Spirit" / "Trinity Rodman")
+}
+
+// Club official accounts. `tiktok` omitted only if a club truly has none.
+const CLUB_SOCIAL: Record<string, { name: string; ig: string; tiktok?: string }> = {
+	LA:  { name: "Angel City FC",        ig: "weareangelcity",     tiktok: "weareangelcity" },
+	BAY: { name: "Bay FC",               ig: "wearebayfc",         tiktok: "wearebayfc" },
+	BOS: { name: "Boston Legacy FC",     ig: "bostonlegacyfc",     tiktok: "bostonlegacyfc" }, // 2026 expansion — re-check near launch
+	CHI: { name: "Chicago Stars",        ig: "thechicagostars",    tiktok: "thechicagostars" }, // NOT legacy chicagoredstars
+	DEN: { name: "Denver Summit FC",     ig: "denversummit_fc",    tiktok: "denversummitfc" },  // ⚠️ IG has underscore, TikTok doesn't
+	GFC: { name: "Gotham FC",            ig: "gothamfc",           tiktok: "gothamfc" },
+	HOU: { name: "Houston Dash",         ig: "houstondash",        tiktok: "houston.dash" },     // ⚠️ TikTok has a dot
+	KC:  { name: "Kansas City Current",  ig: "kccurrent",          tiktok: "thekccurrent" },     // ⚠️ TikTok adds "the"
+	LOU: { name: "Racing Louisville",    ig: "racinglouisvillefc", tiktok: "racingloufc" },      // ⚠️ IG spelled out, TikTok abbreviated
+	NC:  { name: "NC Courage",           ig: "thenccourage",       tiktok: "thenccourage" },
+	ORL: { name: "Orlando Pride",        ig: "orlpride",           tiktok: "orlandopride" },     // ⚠️ IG abbreviated, TikTok full
+	POR: { name: "Portland Thorns",      ig: "thornsfc",           tiktok: "thornsfc" },
+	SD:  { name: "San Diego Wave",       ig: "sandiegowavefc",     tiktok: "sandiegowavefc" },
+	SEA: { name: "Seattle Reign",        ig: "reignfc",            tiktok: "reignfc" },
+	UTA: { name: "Utah Royals",          ig: "utahroyalsfc",       tiktok: "utahroyalsofficial" }, // ⚠️ different TikTok
+	WAS: { name: "Washington Spirit",    ig: "washingtonspirit",   tiktok: "washspirit" },        // ⚠️ TikTok abbreviated
+};
+
+// USWNT-pool + marquee-international players → IG only, routed to current NWSL club.
+// Europe-based (Fox/Girma/A.Thompson) included per owner, tagged to last NWSL club.
+const PLAYER_SOCIAL: Array<{ name: string; abbr: string; ig: string }> = [
+	{ name: "Trinity Rodman",   abbr: "WAS", ig: "trinity_rodman" },
+	{ name: "Mallory Swanson",  abbr: "CHI", ig: "malpugh" },
+	{ name: "Sophia Wilson",    abbr: "POR", ig: "sophiawilson" },
+	{ name: "Jaedyn Shaw",      abbr: "GFC", ig: "jaedynshaw11" },
+	{ name: "Reilyn Turner",    abbr: "POR", ig: "reilynturner" },
+	{ name: "Olivia Moultrie",  abbr: "POR", ig: "olivia_moultrie" },
+	{ name: "Rose Lavelle",     abbr: "GFC", ig: "lavellerose" },
+	{ name: "Croix Bethune",    abbr: "KC",  ig: "croixbethune" },   // traded WAS→KC Feb 2026
+	{ name: "Hal Hershfelt",    abbr: "WAS", ig: "halhershh" },
+	{ name: "Jaelin Howell",    abbr: "GFC", ig: "jaehowell" },      // traded to Gotham
+	{ name: "Lo'eau LaBonta",   abbr: "KC",  ig: "lomomma" },
+	{ name: "Ashley Sanchez",   abbr: "NC",  ig: "ashley.sanchez" }, // NC Courage, not WAS
+	{ name: "Maddie Dahlien",   abbr: "SEA", ig: "maddie.dahlien" },
+	{ name: "Jordyn Bugg",      abbr: "SEA", ig: "jordyn.bugg" },
+	{ name: "Riley Jackson",    abbr: "NC",  ig: "riley.jackson8" }, // NC Courage, not WAS
+	{ name: "Sally Menti",      abbr: "SEA", ig: "sallymenti" },
+	{ name: "Claudia Dickey",   abbr: "SEA", ig: "claudiadickey_" },
+	{ name: "Mandy McGlynn",    abbr: "UTA", ig: "mandy_mcglynn" },
+	{ name: "Jane Campbell",    abbr: "HOU", ig: "janecampbell_" },
+	{ name: "Jordan Silkowitz", abbr: "BAY", ig: "jordansilkowitz" },
+	{ name: "Tierna Davidson",  abbr: "GFC", ig: "tierna_davidson" },
+	{ name: "Emily Sonnett",    abbr: "GFC", ig: "emilysonnett" },
+	{ name: "Lilly Reale",      abbr: "GFC", ig: "lillyreale" },
+	{ name: "Tara Rudd",        abbr: "WAS", ig: "taraaamckeown" },  // plays as Rudd; IG keeps maiden name
+	{ name: "Gisele Thompson",  abbr: "LA",  ig: "giselethomp" },
+	{ name: "Avery Patterson",  abbr: "HOU", ig: "averypatterson9" },
+	{ name: "Kennedy Wesley",   abbr: "SD",  ig: "kennedywesleyy" },
+	{ name: "Barbra Banda",     abbr: "ORL", ig: "barbrabandaofficial" }, // intl star (owner-approved)
+	{ name: "Temwa Chawinga",   abbr: "KC",  ig: "temwa556" },            // intl star
+	{ name: "Marta",            abbr: "ORL", ig: "martavsilva10" },       // intl star; real acct (many imposters)
+	{ name: "Catarina Macario", abbr: "SD",  ig: "catarina_macario" },    // signed SD Wave Mar 2026
+	{ name: "Emily Fox",        abbr: "NC",  ig: "___emilyfox" },         // Europe (Arsenal); tag last NWSL = NC
+	{ name: "Naomi Girma",      abbr: "SD",  ig: "naomi_girma" },         // Europe (Chelsea); tag last NWSL = SD
+	{ name: "Alyssa Thompson",  abbr: "LA",  ig: "alyssthomp" },          // Europe (Chelsea); last NWSL = LA
+];
+
+// IG-only for now (TikTok deferred — owner decision). CLUB_SOCIAL.tiktok handles are
+// kept above as ready reference for when TikTok is re-enabled (see buildSocialCards).
+const SOCIAL_HANDLES: SocialHandle[] = [
+	...Object.entries(CLUB_SOCIAL).map(
+		([abbr, c]): SocialHandle => ({ handle: c.ig, platform: "instagram", kind: "team", abbr, name: c.name }),
+	),
+	...PLAYER_SOCIAL.map(
+		(p): SocialHandle => ({ handle: p.ig, platform: "instagram", kind: "player", abbr: p.abbr, name: p.name }),
+	),
+];
+
 export default {
 	async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
 		const url = new URL(request.url);
@@ -267,6 +385,19 @@ export default {
 			"Not found. This proxy serves GET /scoreboard, /summary, /team-videos, /feed, and /spotlight.",
 			{ status: 404 },
 		);
+	},
+
+	// B3b — once-daily cron: scrape IG via Apify and refresh the social-card
+	// snapshot in KV. Decoupled from user requests so a slow ~50-account scrape never
+	// blocks the app and Apify spend is pinned to ~1 run/day (see wrangler.jsonc crons).
+	// Await (not waitUntil) — a cron should keep its invocation alive until the work is
+	// done; best-effort, a failed refresh leaves the last good snapshot in place.
+	async scheduled(_controller, env, _ctx): Promise<void> {
+		try {
+			await refreshSocialCache(env);
+		} catch {
+			/* swallow — next run retries; the stale snapshot stays serving */
+		}
 	},
 } satisfies ExportedHandler<Env>;
 
@@ -474,16 +605,19 @@ async function handleTeamVideos(
 
 	let cards: unknown[];
 	try {
-		// YouTube uploads + club-site news (OG) + the club's own Bluesky posts
-		// (placement "both" → also shown in the Feed), merged newest-first. Articles
-		// and Bluesky are best-effort (neither builder throws); only a YouTube outage
-		// trips the stale/502 fallback below.
-		const [videos, articles, teamPosts] = await Promise.all([
+		// YouTube uploads + club-site news (OG) + the club's own IG (B3b, read
+		// from the cron-built KV snapshot, placement "home"), merged newest-first.
+		// Articles + social are best-effort (neither throws); only a YouTube outage
+		// trips the stale/502 fallback below. Club Bluesky moved OFF Home into the Feed
+		// in B3b — IG is the club's Home voice now.
+		const [videos, articles, social] = await Promise.all([
 			buildTeamCards(teams, env.YOUTUBE_API_KEY),
 			buildArticleCards(teams),
-			buildTeamBlueskyCards(teams),
+			readSocialCards(env),
 		]);
-		cards = dedupeByContent([...videos, ...articles, ...teamPosts].sort(byTimestampDesc));
+		cards = dedupeByContent(
+			[...videos, ...articles, ...socialFor(social, teams, new Set(["home"]))].sort(byTimestampDesc),
+		);
 	} catch {
 		// A YouTube outage serves a stale copy if we have one, else 502 (the app
 		// falls back to its seed on any non-2xx).
@@ -942,12 +1076,12 @@ export function dedupeByContent(cards: unknown[]): unknown[] {
 }
 
 // ---------------------------------------------------------------------------
-// /feed — the Feed tab's live source (A2: Bluesky). `GET /feed?teams=WAS,POR,…`
-// returns reporter + league + followed-team Bluesky posts as ContentCard JSON.
-// Reporter/league cards are league-wide (always returned); team cards are scoped
-// to the requested clubs and carry placement "both" so they ALSO surface on Home.
-// (Reddit + news RSS extend this same route in later steps.) Edge-cached 15min,
-// keyed by the normalized, sorted team list — like /team-videos.
+// /feed — the Feed tab's live source. `GET /feed?teams=WAS,POR,…` returns the
+// "wider conversation" as ContentCard JSON: reporter + league + followed-club
+// Bluesky (A2) + news articles (B1) + player IG clips (B3b). Reporter/league/
+// news are league-wide; club Bluesky + player social are scoped to the requested
+// clubs. All carry placement "feed" (B3b moved club Bluesky off Home). Edge-cached
+// 15min, keyed by the normalized, sorted team list — like /team-videos.
 // ---------------------------------------------------------------------------
 async function handleFeed(url: URL, env: Env, ctx: ExecutionContext): Promise<Response> {
 	const teams = normalizeTeams(url.searchParams.get("teams"));
@@ -968,19 +1102,26 @@ async function handleFeed(url: URL, env: Env, ctx: ExecutionContext): Promise<Re
 		// a total Bluesky outage.
 		const reporterHandles = FEED_HANDLES.filter((h) => h.kind === "reporter");
 		const leagueHandles = FEED_HANDLES.filter((h) => h.kind === "league");
-		const [rawReporters, leagueCards, teamCards, newsCards] = await Promise.all([
+		const [rawReporters, leagueCards, teamCards, newsCards, social] = await Promise.all([
 			buildBlueskyCards(reporterHandles),
 			buildBlueskyCards(leagueHandles),
 			buildTeamBlueskyCards(teams),
 			// News (B1): per-outlet RSS → Haiku NWSL-gate + team-tag → OG-enrich →
 			// newsArticle cards (placement "feed"). Self-isolating; failures yield [].
 			buildNewsCards(env, ctx),
+			// Social (B3b): the cron-built IG snapshot; here we take the player
+			// clips (placement "feed") routed to the followed teams. Club Bluesky is
+			// already in teamCards (now placement "feed" too).
+			readSocialCards(env),
 		]);
 		// Only reporters get the Haiku relevance pass (they post off-topic too);
 		// league outlets + club accounts are NWSL-dedicated and pass untouched.
 		// News cards are already Haiku-tagged inside buildNewsCards.
 		const reporters = await filterReporterRelevance(rawReporters, env, ctx);
-		cards = [...reporters, ...leagueCards, ...teamCards, ...newsCards].sort(byTimestampDesc);
+		const playerSocial = socialFor(social, teams, new Set(["feed"]));
+		cards = [...reporters, ...leagueCards, ...teamCards, ...newsCards, ...playerSocial].sort(
+			byTimestampDesc,
+		);
 		// Collapse identical-text duplicates (bot double-posts) BEFORE the cap, so a
 		// dup never costs a cap slot and we keep the freshest copy.
 		cards = dedupeByContent(cards);
@@ -1005,8 +1146,8 @@ async function buildBlueskyCards(handles: FeedHandle[]): Promise<unknown[]> {
 	return per.flat();
 }
 
-/** A followed club's own Bluesky posts (placement "both" → Home + Feed). Empty
- *  when no teams are requested or none of them have a curated handle. */
+/** A followed club's own Bluesky posts (placement "feed" — Feed "Social" only, as
+ *  of B3b). Empty when no teams are requested or none have a curated handle. */
 async function buildTeamBlueskyCards(teams: string[]): Promise<unknown[]> {
 	if (teams.length === 0) return [];
 	const wanted = new Set(teams);
@@ -1081,7 +1222,10 @@ function mapBskyPost(post: BskyPost, h: FeedHandle): unknown | null {
 		id: `bsky-${rkey}`,
 		layout,
 		platform: "bluesky",
-		placement: isTeam ? "both" : "feed",
+		// B3b: ALL Bluesky now lives in the Feed only (was "both" for team posts). The
+		// club's Home voice is its IG now; club Bluesky is its real-time/social
+		// voice → Feed "Social". teamAbbreviation still scopes a team post to followers.
+		placement: "feed",
 		teamAbbreviation: isTeam ? h.abbr : undefined,
 		isLeague: !isTeam, // reporters + league outlets are league-wide
 		authorName: post.author?.displayName || handle,
@@ -1140,6 +1284,206 @@ function capPerHandle(cards: unknown[], max: number): unknown[] {
 		counts.set(c.handle, n);
 		return n <= max;
 	});
+}
+
+// ---------------------------------------------------------------------------
+// B3b — Social cards (IG via Apify).
+//
+// The CRON builds the full snapshot (every club + player, both platforms) and
+// stores it in KV (SOCIAL_CACHE_KEY); /feed and /team-videos only READ + filter
+// it. We never scrape on a user request — a ~50-account sync run is far too slow
+// for the request path and would risk a Worker timeout; the cron has a generous
+// budget and pins Apify to ~1 run/day. The two actors + the handle map are the
+// SOCIAL_* constants / SOCIAL_HANDLES above. Mappers are exported for unit tests.
+// ---------------------------------------------------------------------------
+
+/** Normalize an ISO string OR a unix timestamp (seconds or ms) to the app's
+ *  strict "…Z" ISO8601 (no fractional seconds). Undefined when unparseable —
+ *  IG actors vary (ISO string vs unix), and a card with no timestamp is
+ *  dropped rather than mis-sorted to "now". */
+function isoFromAny(v: unknown): string | undefined {
+	if (typeof v === "number" && Number.isFinite(v)) {
+		const ms = v > 1e12 ? v : v * 1000; // a value below ~1e12 is seconds, not ms
+		return new Date(ms).toISOString().replace(/\.\d{3}Z$/, "Z");
+	}
+	if (typeof v === "string") return isoNoFraction(v);
+	return undefined;
+}
+
+/** A finite number, else undefined (so a missing count drops to nil app-side). */
+function numOrUndef(v: unknown): number | undefined {
+	return typeof v === "number" && Number.isFinite(v) ? v : undefined;
+}
+
+/** Run an Apify actor synchronously and return its dataset items (cron-only —
+ *  a sync run is slow). Throws on non-2xx so the caller can isolate one platform's
+ *  failure from the other. */
+async function apifyRunSync(actor: string, input: unknown, token: string): Promise<unknown[]> {
+	const r = await fetch(`${APIFY_API}/${actor}/run-sync-get-dataset-items?token=${token}`, {
+		method: "POST",
+		headers: { "Content-Type": "application/json" },
+		body: JSON.stringify(input),
+	});
+	if (!r.ok) {
+		const body = await r.text().catch(() => "");
+		throw new Error(`apify ${actor} ${r.status} ${body.slice(0, 300)}`);
+	}
+	const json = await r.json();
+	return Array.isArray(json) ? json : [];
+}
+
+/** One Apify Instagram post → a `socialVideo` ContentCard, or null if unusable.
+ *  Field names are the sones/instagram-posts-scraper-lowcost output (snake_case,
+ *  verified live): `code` (shortcode), `taken_at` (unix s), `caption.text`,
+ *  `image_url`, `post_url`, `like_count`. Fallbacks kept for the apify-standard
+ *  names in case the actor is ever swapped. `placement` routes the card
+ *  (club → Home, player → Feed). */
+export function mapApifyInstagram(raw: unknown, h: SocialHandle): unknown | null {
+	const item = raw as Record<string, unknown>;
+	const code = (item.code ?? item.shortCode ?? item.shortcode) as string | undefined;
+	const url =
+		(item.post_url as string | undefined) ??
+		(item.url as string | undefined) ??
+		(code ? `https://www.instagram.com/p/${code}/` : undefined);
+	const ts = isoFromAny(item.taken_at ?? item.timestamp ?? item.takenAtTimestamp);
+	if (!url || !ts) return null;
+
+	const image =
+		(item.image_url as string | undefined) ??
+		(item.displayUrl as string | undefined) ??
+		(item.thumbnailUrl as string | undefined);
+	const rawCaption = item.caption;
+	const caption =
+		typeof rawCaption === "string"
+			? rawCaption
+			: ((rawCaption as { text?: string } | undefined)?.text ?? (item.text as string | undefined));
+
+	return {
+		id: `ig-${code ?? hashId(url)}`,
+		layout: "socialVideo",
+		platform: "instagram",
+		placement: h.kind === "team" ? "home" : "feed",
+		teamAbbreviation: h.abbr,
+		isLeague: false,
+		authorName: h.name,
+		handle: `@${h.handle}`, // only used by capPerHandle; footer shows authorName
+		bodyText: caption || undefined,
+		thumbnailURL: typeof image === "string" ? image : undefined,
+		igFallback: false,
+		likes: numOrUndef(item.like_count ?? item.likesCount ?? item.likeCount),
+		timestamp: ts,
+		url,
+		ctaLabel: "Open in Instagram",
+	};
+}
+
+/** One Apify TikTok video → a `socialVideo` ContentCard, or null if unusable.
+ *  Output shape is the clockworks/tiktok-scraper documented fields. */
+export function mapApifyTikTok(raw: unknown, h: SocialHandle): unknown | null {
+	const item = raw as Record<string, unknown>;
+	const url = (item.webVideoUrl as string | undefined) ?? (item.url as string | undefined);
+	const ts = isoFromAny(item.createTimeISO ?? item.createTime);
+	if (!url || !ts) return null;
+
+	const vid = url.split("/").filter(Boolean).pop();
+	const videoMeta = item.videoMeta as { coverUrl?: string } | undefined;
+	const cover = videoMeta?.coverUrl ?? (item.cover as string | undefined);
+	const text = item.text;
+
+	return {
+		id: `tt-${vid ?? hashId(url)}`,
+		layout: "socialVideo",
+		platform: "tiktok",
+		placement: h.kind === "team" ? "home" : "feed",
+		teamAbbreviation: h.abbr,
+		isLeague: false,
+		authorName: h.name,
+		handle: `@${h.handle}`,
+		bodyText: typeof text === "string" ? text || undefined : undefined,
+		thumbnailURL: typeof cover === "string" ? cover : undefined,
+		igFallback: false,
+		likes: numOrUndef(item.diggCount),
+		timestamp: ts,
+		url,
+		ctaLabel: "Open in TikTok",
+	};
+}
+
+/** Build the social cards, split by platform so the caller can preserve one
+ *  platform's last-good snapshot if the other came back empty. Cron-only.
+ *
+ *  TikTok is DEFERRED (owner: IG-only for now), so only Instagram is scraped — which
+ *  also means a single actor runs, sidestepping the Apify FREE plan's 8192MB TOTAL
+ *  concurrent-actor cap (running two at once trips `actor-memory-limit-exceeded`/402).
+ *  To re-enable TikTok: add a SEQUENTIAL second pass (after IG, to stay under that cap)
+ *  scraping APIFY_TIKTOK_ACTOR over the CLUB_SOCIAL.tiktok handles → mapApifyTikTok.
+ *  IG empty (or no APIFY_TOKEN) → caller keeps the last good snapshot (→ seed fallback). */
+async function buildSocialCards(env: Env): Promise<{ instagram: unknown[]; tiktok: unknown[] }> {
+	const token = env.APIFY_TOKEN;
+	if (!token) return { instagram: [], tiktok: [] };
+
+	const igHandles = SOCIAL_HANDLES.filter((h) => h.platform === "instagram");
+	const igByUser = new Map(igHandles.map((h) => [h.handle.toLowerCase(), h]));
+
+	let instagram: unknown[] = [];
+	try {
+		const items = await apifyRunSync(
+			APIFY_IG_ACTOR,
+			{ usernames: igHandles.map((h) => h.handle), postsPerProfile: SOCIAL_POSTS_PER_PROFILE },
+			token,
+		);
+		instagram = items
+			.map((it) => {
+				// sones output keys the scraped account on `scraped_username`.
+				const rec = it as { scraped_username?: string; ownerUsername?: string; user?: { username?: string } };
+				const user = String(rec.scraped_username ?? rec.user?.username ?? rec.ownerUsername ?? "").toLowerCase();
+				const h = igByUser.get(user);
+				return h ? mapApifyInstagram(it, h) : null;
+			})
+			.filter(Boolean) as unknown[];
+	} catch {
+		/* IG failed this run — caller keeps the last good IG snapshot */
+	}
+
+	return { instagram, tiktok: [] };
+}
+
+/** Cron entry: rebuild the social snapshot → KV. IG-only (TikTok deferred): writes the
+ *  fresh IG cards, but if THIS run got nothing (intermittent Apify outage) it keeps the
+ *  last-good IG snapshot rather than blanking the social slot. Writing IG-only also
+ *  PURGES any stale TikTok cards a past run may have left in KV. When TikTok is
+ *  re-enabled, restore a per-platform merge (fresh-or-last-good for each platform). */
+async function refreshSocialCache(env: Env): Promise<void> {
+	const { instagram } = await buildSocialCards(env);
+	const cards = instagram.length
+		? instagram
+		: (await readSocialCards(env)).filter(
+				(c) => (c as { platform?: string }).platform === "instagram",
+			);
+	if (cards.length === 0) return; // nothing now, nothing before — keep KV as-is
+	await env.FEED_TAGS.put(SOCIAL_CACHE_KEY, JSON.stringify(cards), {
+		expirationTtl: SOCIAL_CACHE_TTL,
+	});
+}
+
+/** Read the cron-built social snapshot (all placements), or [] if none yet. */
+async function readSocialCards(env: Env): Promise<unknown[]> {
+	const snapshot = (await env.FEED_TAGS.get(SOCIAL_CACHE_KEY, "json")) as unknown[] | null;
+	return snapshot ?? [];
+}
+
+/** Filter the social snapshot to the requested teams + the allowed placements
+ *  (Home wants "home", Feed wants "feed"). */
+function socialFor(cards: unknown[], teams: string[], placements: Set<string>): unknown[] {
+	if (teams.length === 0) return [];
+	const wanted = new Set(teams);
+	return (cards as Array<{ teamAbbreviation?: string; placement?: string }>).filter(
+		(c) =>
+			!!c.placement &&
+			placements.has(c.placement) &&
+			!!c.teamAbbreviation &&
+			wanted.has(c.teamAbbreviation),
+	);
 }
 
 /**
