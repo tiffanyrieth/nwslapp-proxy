@@ -6,11 +6,20 @@
 		"enabled": true,
 	},
 	// Caches one Claude Haiku verdict per Feed post (bsky:{uri}), ~7d TTL — backs the
-	// relevance/no-hot-takes filter so a post is tagged once, ever (Step 2).
+	// relevance/no-hot-takes filter so a post is tagged once, ever (Step 2). Also holds
+	// the B3b social-card snapshot (key "social-cards-v1"), refreshed by the cron below.
 	"kv_namespaces": [
 		{
 			"binding": "FEED_TAGS",
 			"id": "3c1372c0f8174cdcb3e2e52ca5de14ad",
 		},
 	],
+	// B3b — Instagram scrape (Apify) → KV social snapshot, EVERY OTHER DAY at 12:00 UTC
+	// (~7am ET). Decoupled from user requests. The cheap IG actor ignores per-post limits
+	// (~600 items/run), so daily would run ~$5.4/mo (over the free $5); every other day
+	// keeps it ≈$2.7/mo, safely free, fair across all accounts. Flip to daily
+	// ("0 12 * * *") if you want max freshness and accept seed-fallback near month-end.
+	"triggers": {
+		"crons": ["0 12 */2 * *"],
+	},
 }
