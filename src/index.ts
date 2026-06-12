@@ -117,6 +117,76 @@ const VERDICT_SCHEMA = {
 	required: ["verdicts"],
 };
 
+// ---------------------------------------------------------------------------
+// Per-outlet RSS → Feed "News" chip (B1). A keyless, free pipe: pull each curated
+// women's-soccer outlet's OWN RSS (real publisher URLs + description + image),
+// Haiku-gate to drop non-NWSL items, tag the keepers to NWSL team(s), and OG-scrape
+// the real URL to fill any missing image/blurb. (We moved off Google News: it hides
+// the real article URL behind an encrypted redirect, so its links can't be
+// OG-scraped for a thumbnail/summary.) Distinct from the club-site OG news on Home
+// (buildArticleCards) — that's placement "home"; these are placement "feed".
+// ---------------------------------------------------------------------------
+
+// Owner-curated per-outlet RSS feeds (replaces the old Google-News-aggregator
+// approach: Google hides the real article URL behind an encrypted redirect, so we
+// couldn't OG-scrape a blurb/image off it. These feeds carry REAL publisher URLs
+// + a description, some with an image — so cards get a summary + thumbnail and a
+// tap-out straight to the source). The feed list IS the allowlist now. Adjust
+// freely. (Quality bar: dedicated women's-soccer desks. Some feeds — JWS, the
+// Guardian — also carry non-NWSL women's sport / WSL / men's content, so every
+// item still runs the Haiku isNWSL gate below to drop off-topic pieces.)
+interface NewsFeed {
+	url: string;
+	source: string; // display name on the card
+}
+const NEWS_FEEDS: NewsFeed[] = [
+	{ url: "https://equalizersoccer.com/feed/", source: "The Equalizer" },
+	{ url: "https://justwomenssports.com/feed/", source: "Just Women's Sports" },
+	{ url: "https://www.allforxi.com/rss/index.xml", source: "All For XI" }, // Atom (SB Nation)
+	{ url: "https://www.theguardian.com/football/womensfootball/rss", source: "The Guardian" },
+];
+
+// The 16 app club abbreviations — Haiku tags each article to a subset of these
+// (or none → league-wide). Must match the app's club join keys exactly.
+const NEWS_TEAM_ABBRS = [
+	"LA", "BAY", "BOS", "CHI", "DEN", "GFC", "HOU", "KC",
+	"NC", "ORL", "POR", "LOU", "SD", "SEA", "UTA", "WAS",
+];
+const NEWS_TEAM_ABBR_SET = new Set(NEWS_TEAM_ABBRS);
+
+const NEWS_POLICY = `You are filtering and tagging news articles for an NWSL (US National Women's Soccer League) fan app. The articles come from women's-soccer outlets whose feeds also carry non-NWSL items (other women's sports like the PWHL/WNBA, the English WSL or other foreign leagues, men's soccer, general news).
+
+For each article (headline + outlet) decide two things:
+1. "isNWSL": true ONLY if the article is primarily about the NWSL — an NWSL club, an NWSL match/standing/award, a player at an NWSL club, a transfer INTO or OUT OF an NWSL club, or the US women's national team (USWNT). false for everything else, INCLUDING women's soccer that isn't NWSL: a foreign league (England's WSL, Spain's Liga F, the UEFA Women's Champions League, etc.), players moving between two non-NWSL clubs, other sports (PWHL, WNBA), and men's soccer. When the headline centers a foreign league or a non-NWSL transfer, isNWSL is false even though it's women's soccer.
+2. "teams": if isNWSL, the NWSL club abbreviation(s) it is primarily about; [] for league-wide/general NWSL or USWNT news. If isNWSL is false, return [].
+
+The 16 NWSL teams and their abbreviations:
+LA = Angel City FC, BAY = Bay FC, BOS = Boston, CHI = Chicago Stars, DEN = Denver, GFC = Gotham FC, HOU = Houston Dash, KC = Kansas City Current, NC = North Carolina Courage, ORL = Orlando Pride, POR = Portland Thorns, LOU = Racing Louisville, SD = San Diego Wave, SEA = Seattle Reign, UTA = Utah Royals, WAS = Washington Spirit.
+
+Rules: a single-team article → exactly that one abbreviation; a multi-team article (match naming two clubs, a transfer between clubs) → all clubs named; league-wide NWSL news → []. Only use the 16 abbreviations above. Echo each article's id exactly.`;
+
+// Forced structured output — carries the NWSL relevance gate + the tagged teams.
+const NEWS_SCHEMA = {
+	type: "object",
+	additionalProperties: false,
+	properties: {
+		verdicts: {
+			type: "array",
+			items: {
+				type: "object",
+				additionalProperties: false,
+				properties: {
+					id: { type: "string" },
+					isNWSL: { type: "boolean" },
+					teams: { type: "array", items: { type: "string" } },
+				},
+				required: ["id", "isNWSL", "teams"],
+			},
+		},
+	},
+	required: ["verdicts"],
+};
+
 // Curated, API-VERIFIED Bluesky handles for the Feed (and the team voices merged
 // onto Home). Every handle was confirmed to currently return posts from the keyless
 // public AT-Proto API; dead/dormant candidates were dropped (GFC + BAY have no
@@ -597,6 +667,183 @@ function decodeEntities(s: string): string {
 		.replace(/&gt;/g, ">");
 }
 
+// ---------------------------------------------------------------------------
+// Google News RSS → newsArticle cards (Feed "News" chip, B1).
+// ---------------------------------------------------------------------------
+
+/** A Google News RSS <item>, parsed to the fields we use. The Google `<link>` is a
+ *  news.google.com redirect (resolves to the publisher in a browser); the real
+ *  publisher domain is on `<source url="…">`. */
+export interface NewsItem {
+	title: string;
+	link: string; // REAL publisher article URL (tap-out target)
+	pubDate?: string;
+	description?: string; // plain-text blurb (HTML stripped)
+	image?: string; // best in-feed image, if the feed carries one
+}
+
+/** Parse a feed (RSS 2.0 *or* Atom) → items carrying the REAL article link, a
+ *  plain-text description, and an in-feed image when present. Outlets differ:
+ *  WordPress/Guardian emit RSS 2.0 (<item>, <link>URL</link>, <pubDate>); SB Nation
+ *  (AllForXI) emits Atom (<entry>, <link href="…"/>, <published>, <content>).
+ *  Regex-based (no XML lib), same posture as fetchOG's meta scraping. */
+export function parseOutletRSS(xml: string): NewsItem[] {
+	const items: NewsItem[] = [];
+	const blocks = xml.match(/<(?:item|entry)[\s>][\s\S]*?<\/(?:item|entry)>/g) ?? [];
+	for (const block of blocks) {
+		const tag = (name: string): string | undefined => {
+			const m = new RegExp(`<${name}(?:\\s[^>]*)?>([\\s\\S]*?)</${name}>`, "i").exec(block);
+			if (!m) return undefined;
+			const inner = m[1].replace(/^\s*<!\[CDATA\[/, "").replace(/\]\]>\s*$/, "").trim();
+			return inner || undefined;
+		};
+		const title = tag("title");
+		// RSS: <link>URL</link>. Atom: <link rel="alternate" href="URL"/> (or first href).
+		let link = tag("link");
+		if (!link) {
+			const m =
+				/<link[^>]*\brel="alternate"[^>]*\bhref="([^"]+)"/i.exec(block) ??
+				/<link[^>]*\bhref="([^"]+)"/i.exec(block);
+			link = m ? m[1] : undefined;
+		}
+		if (!title || !link) continue;
+		const descRaw =
+			tag("description") ?? tag("content:encoded") ?? tag("content") ?? tag("summary");
+		items.push({
+			title: decodeEntities(title).trim(),
+			link: decodeEntities(link).trim(),
+			pubDate: tag("pubDate") ?? tag("dc:date") ?? tag("published") ?? tag("updated"),
+			description: descRaw ? stripHtml(descRaw).slice(0, 240) : undefined,
+			image: firstImageFromRSS(block),
+		});
+	}
+	return items;
+}
+
+/** Best in-feed image for an RSS <item>: media:content/thumbnail → image enclosure
+ *  → first <img> inside the (CDATA) description/content. Undefined if none. */
+function firstImageFromRSS(block: string): string | undefined {
+	let m = /<media:(?:content|thumbnail)[^>]*\burl="([^"]+)"/i.exec(block);
+	if (m) return decodeEntities(m[1]);
+	m = /<enclosure[^>]*\burl="([^"]+)"[^>]*\btype="image\//i.exec(block)
+		?? /<enclosure[^>]*\btype="image\/[^"]*"[^>]*\burl="([^"]+)"/i.exec(block);
+	if (m) return decodeEntities(m[1]);
+	m = /<img[^>]*\bsrc="([^"]+)"/i.exec(block);
+	if (m) return decodeEntities(m[1]);
+	return undefined;
+}
+
+/** Strip tags + CDATA from an HTML snippet → collapsed plain text. Decode entities
+ *  FIRST so entity-encoded tags (e.g. the Guardian's `&lt;p&gt;`) become real tags
+ *  and get stripped in the same pass; otherwise they'd survive as visible `<p>`. */
+function stripHtml(s: string): string {
+	const decoded = decodeEntities(s.replace(/<!\[CDATA\[/g, "").replace(/\]\]>/g, ""));
+	return decoded
+		.replace(/<[^>]+>/g, " ")
+		.replace(/\s+/g, " ")
+		.trim();
+}
+
+/** Tiny stable string hash → short base36 id (stable id / KV key off the article URL). */
+function hashId(s: string): string {
+	let h = 5381;
+	for (let i = 0; i < s.length; i++) h = ((h << 5) + h + s.charCodeAt(i)) | 0;
+	return (h >>> 0).toString(36);
+}
+
+/** A built news card (the fields the news pipeline reads/mutates; the rest pass
+ *  through to JSON via the index signature). */
+type NewsCard = {
+	id: string;
+	teamAbbreviation?: string;
+	isLeague: boolean;
+	headline?: string;
+	sourceName?: string;
+	url?: string;
+	blurb?: string;
+	thumbnailURL?: string;
+	[k: string]: unknown;
+};
+
+/** Build Feed "News" cards from the curated per-outlet RSS feeds: real publisher
+ *  URL + description + image. Haiku then drops non-NWSL items and tags the rest;
+ *  survivors missing an image/blurb are OG-scraped (the club-news plumbing, now on
+ *  real article URLs). Per-feed failures are isolated (a dead feed → []), so one
+ *  outlet down never trips the feed's stale fallback. */
+async function buildNewsCards(env: Env, ctx: ExecutionContext): Promise<unknown[]> {
+	const perFeed = await Promise.all(
+		NEWS_FEEDS.map(async (feed) => {
+			try {
+				const r = await fetch(feed.url, {
+					headers: {
+						"User-Agent": BROWSER_UA,
+						Accept: "application/rss+xml, application/xml, text/xml",
+					},
+				});
+				if (!r.ok) return [] as NewsCard[];
+				const cards: NewsCard[] = [];
+				for (const it of parseOutletRSS(await r.text())) {
+					// `timestamp` is required app-side; skip an undatable item rather
+					// than fake a time (would mis-sort it to "now").
+					const timestamp = isoNoFraction(it.pubDate);
+					if (!timestamp) continue;
+					cards.push({
+						id: `news-${hashId(it.link)}`,
+						layout: "newsArticle",
+						platform: "article",
+						placement: "feed",
+						teamAbbreviation: undefined, // set by tagNewsTeams (single-team)
+						isLeague: true, // default; tagNewsTeams narrows when single-team
+						headline: it.title,
+						blurb: it.description,
+						sourceName: feed.source,
+						thumbnailURL: it.image,
+						igFallback: false,
+						timestamp,
+						url: it.link,
+						ctaLabel: "Read article",
+					});
+				}
+				return cards;
+			} catch {
+				return [] as NewsCard[];
+			}
+		}),
+	);
+
+	// Haiku FIRST (drop non-NWSL + route), so we only spend OG scrapes on keepers.
+	const kept = await tagNewsTeams(perFeed.flat(), env, ctx);
+	return enrichNewsOG(kept, env, ctx);
+}
+
+/** Fill a missing thumbnail/blurb by Open-Graph-scraping the REAL article URL —
+ *  the same fetchOG plumbing the club-news cards use. Cached in KV by card id
+ *  (`ogn-<id>`, ~7d) so each article is scraped once; cards that already have both
+ *  skip it. Best-effort: a scrape failure leaves the card as-is (headline still shows). */
+async function enrichNewsOG(cards: NewsCard[], env: Env, ctx: ExecutionContext): Promise<NewsCard[]> {
+	await Promise.all(
+		cards.map(async (c) => {
+			if ((c.thumbnailURL && c.blurb) || !c.url) return;
+			const key = `ogn-${c.id}`;
+			let og = (await env.FEED_TAGS.get(key, "json")) as
+				| { image?: string; description?: string }
+				| null;
+			if (!og) {
+				try {
+					const scraped = await fetchOG(c.url);
+					og = { image: scraped.image, description: scraped.description };
+					ctx.waitUntil(env.FEED_TAGS.put(key, JSON.stringify(og), { expirationTtl: TAG_TTL }));
+				} catch {
+					og = {};
+				}
+			}
+			if (!c.thumbnailURL && og.image) c.thumbnailURL = og.image;
+			if (!c.blurb && og.description) c.blurb = stripHtml(og.description).slice(0, 240);
+		}),
+	);
+	return cards;
+}
+
 /** videos.list for the given ids + part, chunked at the API's 50-id limit. */
 async function ytVideos(ids: string[], part: string, apiKey: string): Promise<YTItem[]> {
 	const out: YTItem[] = [];
@@ -718,15 +965,19 @@ async function handleFeed(url: URL, env: Env, ctx: ExecutionContext): Promise<Re
 		// a total Bluesky outage.
 		const reporterHandles = FEED_HANDLES.filter((h) => h.kind === "reporter");
 		const leagueHandles = FEED_HANDLES.filter((h) => h.kind === "league");
-		const [rawReporters, leagueCards, teamCards] = await Promise.all([
+		const [rawReporters, leagueCards, teamCards, newsCards] = await Promise.all([
 			buildBlueskyCards(reporterHandles),
 			buildBlueskyCards(leagueHandles),
 			buildTeamBlueskyCards(teams),
+			// News (B1): per-outlet RSS → Haiku NWSL-gate + team-tag → OG-enrich →
+			// newsArticle cards (placement "feed"). Self-isolating; failures yield [].
+			buildNewsCards(env, ctx),
 		]);
 		// Only reporters get the Haiku relevance pass (they post off-topic too);
 		// league outlets + club accounts are NWSL-dedicated and pass untouched.
+		// News cards are already Haiku-tagged inside buildNewsCards.
 		const reporters = await filterReporterRelevance(rawReporters, env, ctx);
-		cards = [...reporters, ...leagueCards, ...teamCards].sort(byTimestampDesc);
+		cards = [...reporters, ...leagueCards, ...teamCards, ...newsCards].sort(byTimestampDesc);
 		// Collapse identical-text duplicates (bot double-posts) BEFORE the cap, so a
 		// dup never costs a cap slot and we keep the freshest copy.
 		cards = dedupeByContent(cards);
@@ -979,4 +1230,123 @@ async function haikuTagBatch(cards: FeedCard[], apiKey: string): Promise<Verdict
 	const text = json.content?.find((b) => b.type === "text")?.text;
 	if (!text) throw new Error("haiku: no text block");
 	return (JSON.parse(text) as { verdicts?: Verdict[] }).verdicts ?? [];
+}
+
+// ---------------------------------------------------------------------------
+// Haiku relevance gate + team-tagging for News cards (B1). Same KV-cache + batch
+// mechanics as filterReporterRelevance; the verdict both gates on NWSL relevance
+// (the per-outlet feeds carry non-NWSL items — PWHL, WSL, men's soccer) and tags
+// the keepers to team(s).
+// ---------------------------------------------------------------------------
+
+interface NewsVerdict {
+	id: string;
+	isNWSL: boolean;
+	teams: string[];
+}
+
+/**
+ * Gate each news card on NWSL relevance and tag the keepers to team(s) (verdict
+ * KV-cached by card id, ~7d). A card JUDGED `isNWSL: false` is DROPPED (the feeds
+ * carry non-NWSL items). For a keeper, exactly ONE team sets `teamAbbreviation` +
+ * clears `isLeague` (routes to that club's followers); zero or multiple teams stay
+ * `isLeague: true` (shown to all NWSL followers — the single-`teamAbbreviation`
+ * model can't carry a set). Fail-OPEN: no key / Haiku error leaves a card unjudged
+ * and KEPT as league-wide, so an outage degrades to the un-gated feed rather than
+ * an empty chip. Unknown abbreviations are ignored.
+ */
+async function tagNewsTeams(
+	cards: NewsCard[],
+	env: Env,
+	ctx: ExecutionContext,
+): Promise<NewsCard[]> {
+	if (cards.length === 0) return cards;
+	const verdicts = new Map<string, NewsVerdict>();
+
+	// 1. Load cached verdicts (one KV read per card; misses return null). The key is
+	//    versioned (`nv1-`) so tightening the policy/schema can be rolled by bumping
+	//    the version rather than waiting out every cached verdict's TTL.
+	const vkey = (id: string) => `nv1-${id}`;
+	const cached = await Promise.all(cards.map((c) => env.FEED_TAGS.get(vkey(c.id), "json")));
+	const uncached: NewsCard[] = [];
+	cards.forEach((c, i) => {
+		const v = cached[i] as NewsVerdict | null;
+		if (v) verdicts.set(c.id, v);
+		else uncached.push(c);
+	});
+
+	// 2. Tag the misses via Haiku, batched. No key → skip (everything fails open).
+	if (uncached.length > 0 && env.ANTHROPIC_API_KEY) {
+		for (let i = 0; i < uncached.length; i += HAIKU_BATCH) {
+			const batch = uncached.slice(i, i + HAIKU_BATCH);
+			let out: NewsVerdict[] | null;
+			try {
+				out = await haikuTagNewsBatch(batch, env.ANTHROPIC_API_KEY);
+			} catch {
+				out = null; // fail open: batch unjudged → kept league-wide below
+			}
+			if (out) {
+				for (const v of out) {
+					if (!v?.id) continue;
+					const teams = (v.teams ?? []).filter((t) => NEWS_TEAM_ABBR_SET.has(t));
+					const clean: NewsVerdict = { id: v.id, isNWSL: v.isNWSL !== false, teams };
+					verdicts.set(v.id, clean);
+					ctx.waitUntil(
+						env.FEED_TAGS.put(vkey(v.id), JSON.stringify(clean), { expirationTtl: TAG_TTL }),
+					);
+				}
+			}
+		}
+	}
+
+	// 3. Drop judged-off-topic cards; route the keepers. Unjudged (fail-open) → kept.
+	const keepers: NewsCard[] = [];
+	for (const c of cards) {
+		const v = verdicts.get(c.id);
+		if (v && v.isNWSL === false) continue; // judged non-NWSL → drop
+		if (v && v.teams.length === 1) {
+			c.teamAbbreviation = v.teams[0];
+			c.isLeague = false;
+		}
+		keepers.push(c);
+	}
+	return keepers;
+}
+
+/** Tag one batch of news cards to team(s) via a single Haiku call (forced JSON). */
+async function haikuTagNewsBatch(cards: NewsCard[], apiKey: string): Promise<NewsVerdict[]> {
+	const list = cards
+		.map((c) => {
+			const src = c.sourceName ?? "";
+			const headline = (c.headline ?? "").replace(/\s+/g, " ").slice(0, 200);
+			const blurb = (c.blurb ?? "").replace(/\s+/g, " ").slice(0, 200);
+			return `[${c.id}] (${src}) ${headline}${blurb ? ` — ${blurb}` : ""}`;
+		})
+		.join("\n\n");
+
+	const r = await fetch(ANTHROPIC_API, {
+		method: "POST",
+		headers: {
+			"Content-Type": "application/json",
+			"x-api-key": apiKey,
+			"anthropic-version": "2023-06-01",
+		},
+		body: JSON.stringify({
+			model: HAIKU_MODEL,
+			max_tokens: 2048,
+			messages: [
+				{
+					role: "user",
+					content: `${NEWS_POLICY}\n\nTag each article. Echo its id exactly.\n\n${list}`,
+				},
+			],
+			output_config: { format: { type: "json_schema", schema: NEWS_SCHEMA } },
+		}),
+	});
+	if (!r.ok) throw new Error(`haiku news ${r.status}`);
+
+	const json = (await r.json()) as { content?: Array<{ type?: string; text?: string }> };
+	const text = json.content?.find((b) => b.type === "text")?.text;
+	if (!text) throw new Error("haiku news: no text block");
+	return (JSON.parse(text) as { verdicts?: NewsVerdict[] }).verdicts ?? [];
 }
