@@ -5,7 +5,11 @@ import {
 	SELF,
 } from "cloudflare:test";
 import { describe, it, expect } from "vitest";
-import worker, { chooseSummaryTTL, dedupeByContent } from "../src/index";
+import worker, {
+	chooseSummaryTTL,
+	dedupeByContent,
+	parseOutletRSS,
+} from "../src/index";
 
 // A correctly-typed `Request` to pass to `worker.fetch()`.
 const IncomingRequest = Request<unknown, IncomingRequestCfProperties>;
@@ -119,5 +123,64 @@ describe("dedupeByContent", () => {
 	it("passes through cards with no text key untouched", () => {
 		const out = dedupeByContent([{ id: "a" }, { id: "b" }]);
 		expect(out).toHaveLength(2);
+	});
+});
+
+// parseOutletRSS is pure: a standard RSS 2.0 string → items with the REAL article
+// link, a plain-text (HTML-stripped) description, and an in-feed image when present.
+// The allowlist/feed-list + Haiku relevance gate are exercised live via curl.
+describe("parseOutletRSS", () => {
+	const rss = `<?xml version="1.0"?><rss version="2.0" xmlns:media="http://search.yahoo.com/mrss/" xmlns:content="http://purl.org/rss/1.0/modules/content/"><channel>
+		<item>
+			<title><![CDATA[Spirit edge Thorns 2-1 in late thriller]]></title>
+			<link>https://equalizersoccer.com/2026/06/11/spirit-thorns/</link>
+			<pubDate>Wed, 11 Jun 2026 18:30:00 GMT</pubDate>
+			<description><![CDATA[<p>Washington&#8217;s late winner sealed it. <a href="x">Read on</a></p>]]></description>
+			<media:content url="https://equalizersoccer.com/img/spirit.jpg" medium="image" />
+		</item>
+		<item>
+			<title>Women&#8217;s football roundup</title>
+			<link>https://www.theguardian.com/football/2026/jun/11/roundup</link>
+			<pubDate>Tue, 10 Jun 2026 09:00:00 GMT</pubDate>
+			<description>Plain summary text with no markup.</description>
+			<content:encoded><![CDATA[<img src="https://i.guim.co.uk/lead.jpg"/><p>Body…</p>]]></content:encoded>
+		</item>
+	</channel></rss>`;
+
+	it("parses the REAL link, strips HTML from the description, reads media:content image", () => {
+		const items = parseOutletRSS(rss);
+		expect(items).toHaveLength(2);
+		expect(items[0].title).toBe("Spirit edge Thorns 2-1 in late thriller");
+		expect(items[0].link).toBe("https://equalizersoccer.com/2026/06/11/spirit-thorns/");
+		expect(items[0].description).toBe("Washington’s late winner sealed it. Read on");
+		expect(items[0].image).toBe("https://equalizersoccer.com/img/spirit.jpg");
+	});
+
+	it("decodes entities and falls back to an <img> inside content:encoded", () => {
+		const items = parseOutletRSS(rss);
+		expect(items[1].title).toBe("Women’s football roundup");
+		expect(items[1].description).toBe("Plain summary text with no markup.");
+		expect(items[1].image).toBe("https://i.guim.co.uk/lead.jpg");
+	});
+
+	it("returns [] for input with no items", () => {
+		expect(parseOutletRSS("<rss><channel></channel></rss>")).toEqual([]);
+	});
+
+	it("parses Atom feeds too (SB Nation / AllForXI: <entry>, link href, <published>)", () => {
+		const atom = `<feed xmlns="http://www.w3.org/2005/Atom">
+			<entry>
+				<title type="html"><![CDATA[San Diego Wave star Dudinha announces ACL injury]]></title>
+				<link rel="alternate" type="text/html" href="https://www.allforxi.com/nwsl/15385/dudinha-acl" />
+				<published>2026-06-10T19:41:20-04:00</published>
+				<summary type="html"><![CDATA[<p>The forward will miss the rest of the season.</p>]]></summary>
+			</entry>
+		</feed>`;
+		const items = parseOutletRSS(atom);
+		expect(items).toHaveLength(1);
+		expect(items[0].title).toBe("San Diego Wave star Dudinha announces ACL injury");
+		expect(items[0].link).toBe("https://www.allforxi.com/nwsl/15385/dudinha-acl");
+		expect(items[0].pubDate).toBe("2026-06-10T19:41:20-04:00");
+		expect(items[0].description).toBe("The forward will miss the rest of the season.");
 	});
 });
