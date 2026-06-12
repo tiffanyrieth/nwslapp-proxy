@@ -259,9 +259,12 @@ export default {
 		if (url.pathname === "/feed") {
 			return handleFeed(url, env, ctx);
 		}
+		if (url.pathname === "/spotlight") {
+			return handleSpotlight(url, env, ctx);
+		}
 
 		return new Response(
-			"Not found. This proxy serves GET /scoreboard, /summary, /team-videos, and /feed.",
+			"Not found. This proxy serves GET /scoreboard, /summary, /team-videos, /feed, and /spotlight.",
 			{ status: 404 },
 		);
 	},
@@ -1349,4 +1352,354 @@ async function haikuTagNewsBatch(cards: NewsCard[], apiKey: string): Promise<New
 	const text = json.content?.find((b) => b.type === "text")?.text;
 	if (!text) throw new Error("haiku news: no text block");
 	return (JSON.parse(text) as { verdicts?: NewsVerdict[] }).verdicts ?? [];
+}
+
+// ---------------------------------------------------------------------------
+// /spotlight — Home Module 2 "Get to know your players" (B2). For each followed
+// club, pick a real player from that team's MOST RECENT matchday squad (players
+// who actually appeared — starters + subs used), attach real ESPN season stats,
+// and generate a short "why watch" blurb via Claude Haiku. Returns PlayerSpotlight
+// JSON the app decodes directly (its seed is the offline-first fallback). One pick
+// per team per week (deterministic), edge-cached; the blurb is KV-cached weekly.
+//
+// ⚠️ CONTENT GUARDRAIL (non-negotiable): the blurb is ALWAYS about the player's
+// soccer career — NEVER her family, relationships, parents, or "the legacy of
+// someone else" (a systemic way women athletes get framed that men never are;
+// Trinity Rodman has publicly asked media to stop invoking her father). Enforcement
+// is structural: the Haiku prompt receives ONLY soccer fields (name, position,
+// team, age, season stats, recent appearance) — never any biographical/family data
+// — AND the prompt explicitly forbids it. Review generated blurbs before shipping.
+// ---------------------------------------------------------------------------
+
+const ESPN_CORE = "https://sports.core.api.espn.com/v2/sports/soccer/leagues/usa.nwsl";
+const SPOTLIGHT_TTL = 6 * 3600; // 6h edge cache; the weekly pick is stable, stats refresh a few times/day
+const SPOTLIGHT_NARRATIVE_TTL = 7 * 24 * 3600; // the blurb is regenerated at most weekly
+
+// App join-key abbreviation → full club name (for the blurb prompt + seasonForm).
+const TEAM_NAMES: Record<string, string> = {
+	LA: "Angel City FC", BAY: "Bay FC", BOS: "Boston Legacy FC", CHI: "Chicago Stars FC",
+	DEN: "Denver Summit FC", GFC: "Gotham FC", HOU: "Houston Dash", KC: "Kansas City Current",
+	NC: "North Carolina Courage", ORL: "Orlando Pride", POR: "Portland Thorns FC",
+	LOU: "Racing Louisville FC", SD: "San Diego Wave FC", SEA: "Seattle Reign FC",
+	UTA: "Utah Royals FC", WAS: "Washington Spirit",
+};
+
+const SPOTLIGHT_POLICY = `You are writing a short player profile (2-3 sentences) for a women's soccer fan app's weekly "get to know your players" spotlight. The tone is warm and fan-to-fan, like an Olympics broadcast introducing an athlete before her event.
+
+Write about ONLY:
+- Her playing style and what she brings to this team (infer reasonably from her position and stats)
+- How her current season is going, grounded in the stats provided
+- What a fan watching the team's next match should look for from her
+
+Hard rules (non-negotiable):
+- Focus ONLY on the player's soccer career, skills, position, and current form.
+- NEVER mention family members, parents, siblings, partners, or relationships.
+- NEVER frame her as related to, or the legacy of, any other person.
+- NEVER reference anything outside of soccer.
+- Do NOT invent specific facts (former clubs, trophies, nationality, biographical details, named matches, or calendar years/dates) beyond what is given — speak only to playing style and the season stats provided.
+- Length: exactly 2-3 sentences. Output ONLY the profile text, no preamble or quotation marks.`;
+
+interface SummaryRosterPlayer {
+	starter?: boolean;
+	subbedIn?: boolean;
+	jersey?: string;
+	position?: { abbreviation?: string; name?: string };
+	athlete?: { id?: string; displayName?: string };
+}
+interface SummaryRoster {
+	team?: { abbreviation?: string };
+	roster?: SummaryRosterPlayer[];
+}
+interface SpotlightStats {
+	goals: number;
+	assists: number;
+	apps: number;
+}
+
+async function handleSpotlight(url: URL, env: Env, ctx: ExecutionContext): Promise<Response> {
+	const teams = normalizeTeams(url.searchParams.get("teams"));
+
+	const cache = caches.default;
+	const cacheUrl = new URL(url);
+	cacheUrl.searchParams.set("teams", teams.join(","));
+	const cacheKey = new Request(cacheUrl.toString(), { method: "GET" });
+
+	const hit = await cache.match(cacheKey);
+	if (hit) return withCacheStatus(hit, "HIT");
+
+	// No follows → no spotlights (the app shows the module only for followed teams).
+	let cards: unknown[] = [];
+	if (teams.length > 0) {
+		try {
+			cards = await buildSpotlightCards(teams, env, ctx);
+		} catch {
+			// A total scoreboard outage serves a stale copy if we have one, else 502
+			// (the app falls back to its seed on any non-2xx). Per-team failures are
+			// isolated inside buildSpotlightCards and never reach here.
+			return (await serveStale(cache, cacheKey)) ?? upstreamError();
+		}
+	}
+
+	const headers = new Headers();
+	headers.set("Content-Type", "application/json");
+	headers.set("Cache-Control", `public, max-age=${SPOTLIGHT_TTL}`);
+	const toCache = new Response(JSON.stringify(cards), { status: 200, headers });
+	ctx.waitUntil(cache.put(cacheKey, toCache.clone()));
+	return withCacheStatus(toCache, "MISS");
+}
+
+/** Build one spotlight per requested team (newest matchday squad → weekly pick →
+ *  real stats + bio → Haiku blurb). Per-team failures drop only that team. */
+async function buildSpotlightCards(teams: string[], env: Env, ctx: ExecutionContext): Promise<unknown[]> {
+	// 1. One scoreboard fetch → each team's most recent FINISHED event.
+	const year = new Date().getUTCFullYear();
+	const recentEvent = await recentEventByTeam(year, new Set(teams));
+
+	// 2. Per team (parallel, isolated). Summary fetches are de-duped per event id (two
+	//    followed teams that played each other share one summary).
+	const summaryCache = new Map<string, Promise<SummaryRoster[]>>();
+	const weekNum = Math.floor(Date.now() / (7 * 24 * 3600 * 1000));
+
+	const built = await Promise.all(
+		teams.map(async (abbr) => {
+			try {
+				const eventId = recentEvent.get(abbr);
+				if (!eventId) return null;
+
+				let rostersP = summaryCache.get(eventId);
+				if (!rostersP) {
+					rostersP = fetchSummaryRosters(eventId);
+					summaryCache.set(eventId, rostersP);
+				}
+				const rosters = await rostersP;
+				const pool = appearedPlayers(rosters.find((r) => r.team?.abbreviation === abbr));
+				if (pool.length === 0) return null;
+
+				const player = pickWeekly(pool, abbr, weekNum);
+				const athleteId = player.athlete!.id!;
+				const teamName = TEAM_NAMES[abbr] ?? abbr;
+
+				const [stats, bio] = await Promise.all([
+					fetchAthleteSeasonStats(athleteId, year),
+					fetchAthleteBio(athleteId),
+				]);
+
+				// The match-day roster labels bench players "Substitute"; prefer the
+				// athlete record's real position in that case (else keep the richer
+				// match position, e.g. "Attacking Midfielder Right").
+				const matchPos = player.position?.name;
+				const position = matchPos && matchPos !== "Substitute" ? matchPos : bio.position ?? "Player";
+				const playerName = (player.athlete!.displayName ?? "Unknown").trim();
+
+				const blurb = await whyWatchBlurb(
+					{ name: playerName, position, teamName, age: bio.age, stats },
+					abbr,
+					athleteId,
+					weekNum,
+					env,
+					ctx,
+				);
+
+				return {
+					id: `spot-${abbr}-${athleteId}`,
+					teamAbbreviation: abbr,
+					playerName,
+					jerseyNumber: parseInt(player.jersey ?? "0", 10) || 0,
+					position,
+					bioBlurb: blurb,
+					nationality: bio.nationality,
+					age: bio.age,
+					careerHighlights: [],
+					funFacts: [],
+					seasonForm: stats ? seasonFormLabel(stats) : undefined,
+					espnAthleteId: athleteId,
+					seasonStatLine: stats ?? undefined,
+				};
+			} catch {
+				return null;
+			}
+		}),
+	);
+	return built.filter(Boolean);
+}
+
+/** Most recent FINISHED (state "post") event id for each wanted team, from one
+ *  scoreboard fetch. Scans both competitors of every event; keeps the latest by date. */
+async function recentEventByTeam(year: number, wanted: Set<string>): Promise<Map<string, string>> {
+	const r = await fetch(`${ESPN_SCOREBOARD}?dates=${year}0101-${year}1231&limit=500`, {
+		headers: { Accept: "application/json" },
+	});
+	if (!r.ok) throw new Error(`scoreboard ${r.status}`);
+	const json = (await r.json()) as {
+		events?: Array<{
+			id?: string;
+			date?: string;
+			status?: { type?: { state?: string } };
+			competitions?: Array<{ competitors?: Array<{ team?: { abbreviation?: string } }> }>;
+		}>;
+	};
+	const best = new Map<string, { id: string; date: string }>();
+	for (const ev of json.events ?? []) {
+		if (ev.status?.type?.state !== "post" || !ev.id || !ev.date) continue;
+		for (const c of ev.competitions?.[0]?.competitors ?? []) {
+			const abbr = c.team?.abbreviation;
+			if (!abbr || !wanted.has(abbr)) continue;
+			const cur = best.get(abbr);
+			if (!cur || cur.date < ev.date) best.set(abbr, { id: ev.id, date: ev.date });
+		}
+	}
+	const out = new Map<string, string>();
+	for (const [abbr, v] of best) out.set(abbr, v.id);
+	return out;
+}
+
+/** One match's two team rosters from the summary endpoint. */
+async function fetchSummaryRosters(eventId: string): Promise<SummaryRoster[]> {
+	const r = await fetch(`${ESPN_SUMMARY}?event=${eventId}`, { headers: { Accept: "application/json" } });
+	if (!r.ok) throw new Error(`summary ${r.status}`);
+	const json = (await r.json()) as { rosters?: SummaryRoster[] };
+	return json.rosters ?? [];
+}
+
+/** Players who actually APPEARED (starters + subs who came on), sorted by athlete id
+ *  so the deterministic weekly pick is stable regardless of JSON ordering. */
+export function appearedPlayers(roster?: SummaryRoster): SummaryRosterPlayer[] {
+	return (roster?.roster ?? [])
+		.filter(
+			(p) => (p.starter === true || p.subbedIn === true) && p.athlete?.id && p.athlete?.displayName,
+		)
+		.sort((a, b) => (a.athlete!.id! < b.athlete!.id! ? -1 : 1));
+}
+
+/** Deterministic weekly pick: stable for a given (team, week), so the spotlight
+ *  changes once a week and the narrative KV key stays put for that week. */
+export function pickWeekly(pool: SummaryRosterPlayer[], abbr: string, weekNum: number): SummaryRosterPlayer {
+	const key = `${abbr}-${weekNum}`;
+	let seed = 7;
+	for (let i = 0; i < key.length; i++) seed = (seed * 31 + key.charCodeAt(i)) >>> 0;
+	return pool[seed % pool.length];
+}
+
+/** One athlete's season stat line — goals (offensive.totalGoals), assists
+ *  (offensive.goalAssists), apps (general.appearances). Best-effort → null. */
+async function fetchAthleteSeasonStats(id: string, year: number): Promise<SpotlightStats | null> {
+	try {
+		const r = await fetch(`${ESPN_CORE}/seasons/${year}/types/1/athletes/${id}/statistics`, {
+			headers: { Accept: "application/json" },
+		});
+		if (!r.ok) return null;
+		const json = (await r.json()) as {
+			splits?: { categories?: Array<{ name?: string; stats?: Array<{ name?: string; value?: number }> }> };
+		};
+		const cats = json.splits?.categories ?? [];
+		const stat = (cat: string, name: string): number => {
+			const s = cats.find((x) => x.name === cat)?.stats?.find((x) => x.name === name);
+			return Math.round(s?.value ?? 0);
+		};
+		return {
+			goals: stat("offensive", "totalGoals"),
+			assists: stat("offensive", "goalAssists"),
+			apps: stat("general", "appearances"),
+		};
+	} catch {
+		return null;
+	}
+}
+
+/** Athlete age, nationality + real position from the Core API athlete record. The
+ *  position backs up the match-day roster, whose `position.name` is "Substitute"
+ *  for anyone who came off the bench. Best-effort → {}. */
+async function fetchAthleteBio(id: string): Promise<{ age?: number; nationality?: string; position?: string }> {
+	try {
+		const r = await fetch(`${ESPN_CORE}/athletes/${id}`, { headers: { Accept: "application/json" } });
+		if (!r.ok) return {};
+		const json = (await r.json()) as { age?: number; citizenship?: string; position?: { name?: string } };
+		return {
+			age: typeof json.age === "number" ? json.age : undefined,
+			nationality: json.citizenship || undefined,
+			position: json.position?.name || undefined,
+		};
+	} catch {
+		return {};
+	}
+}
+
+/** "3 goals · 1 assist" — the small form line under the stat strip. */
+export function seasonFormLabel(s: SpotlightStats): string {
+	const g = `${s.goals} goal${s.goals === 1 ? "" : "s"}`;
+	const a = `${s.assists} assist${s.assists === 1 ? "" : "s"}`;
+	return `${g} · ${a}`;
+}
+
+/**
+ * The Haiku "why watch" blurb. Its input is ONLY soccer fields (the guardrail is
+ * structural — no family/biographical data is ever passed) and the prompt forbids
+ * relationship/legacy framing. KV-cached per (team, athlete, week) so it's
+ * generated at most once a week. Fail-OPEN: no key or any Haiku error → a neutral,
+ * soccer-only fallback sentence (bioBlurb is required app-side, never empty).
+ */
+async function whyWatchBlurb(
+	p: { name: string; position: string; teamName: string; age?: number; stats: SpotlightStats | null },
+	abbr: string,
+	athleteId: string,
+	weekNum: number,
+	env: Env,
+	ctx: ExecutionContext,
+): Promise<string> {
+	// Versioned key (`spv2-`) so a prompt/policy change rerolls cached blurbs rather
+	// than waiting out each one's weekly TTL (mirrors the news tagger's `nv1-`).
+	const key = `spv2-${abbr}-${athleteId}-${weekNum}`;
+	const cached = await env.FEED_TAGS.get(key, "text");
+	if (cached) return cached;
+
+	const fallback = fallbackBlurb(p);
+	if (!env.ANTHROPIC_API_KEY) return fallback;
+
+	const statsLine = p.stats
+		? `${p.stats.apps} appearances, ${p.stats.goals} goals, ${p.stats.assists} assists this season`
+		: "limited stats available this season";
+	const facts = [
+		`Player: ${p.name}`,
+		`Position: ${p.position}`,
+		`Team: ${p.teamName}`,
+		p.age ? `Age: ${p.age}` : null,
+		`Season stats: ${statsLine}`,
+		`Recent: appeared in the team's most recent match`,
+	]
+		.filter(Boolean)
+		.join("\n");
+
+	try {
+		const r = await fetch(ANTHROPIC_API, {
+			method: "POST",
+			headers: {
+				"Content-Type": "application/json",
+				"x-api-key": env.ANTHROPIC_API_KEY,
+				"anthropic-version": "2023-06-01",
+			},
+			body: JSON.stringify({
+				model: HAIKU_MODEL,
+				max_tokens: 220,
+				messages: [{ role: "user", content: `${SPOTLIGHT_POLICY}\n\n${facts}` }],
+			}),
+		});
+		if (!r.ok) throw new Error(`haiku spotlight ${r.status}`);
+		const json = (await r.json()) as { content?: Array<{ type?: string; text?: string }> };
+		const text = json.content?.find((b) => b.type === "text")?.text?.trim();
+		if (!text) throw new Error("haiku spotlight: no text block");
+		ctx.waitUntil(env.FEED_TAGS.put(key, text, { expirationTtl: SPOTLIGHT_NARRATIVE_TTL }));
+		return text;
+	} catch {
+		return fallback;
+	}
+}
+
+/** Neutral, soccer-only blurb when Haiku is unavailable (never mentions anything
+ *  outside the player's season). */
+function fallbackBlurb(p: { name: string; position: string; teamName: string; stats: SpotlightStats | null }): string {
+	const role = p.position.toLowerCase();
+	if (p.stats && (p.stats.goals > 0 || p.stats.assists > 0)) {
+		return `${p.name} has been a contributor for ${p.teamName} this season, with ${p.stats.goals} goals and ${p.stats.assists} assists across ${p.stats.apps} appearances. Keep an eye on the ${role} the next time ${p.teamName} take the pitch.`;
+	}
+	return `${p.name} is one to watch for ${p.teamName} — a ${role} who featured in the team's most recent matchday squad. Catch her in action the next time they play.`;
 }
