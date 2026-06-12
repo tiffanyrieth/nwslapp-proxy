@@ -17,6 +17,8 @@
  * ESPN directly from the app.
  */
 
+import { runBracketTick, type BracketEnv } from "./bracket-engine";
+
 const ESPN_SCOREBOARD =
 	"https://site.api.espn.com/apis/site/v2/sports/soccer/usa.nwsl/scoreboard";
 const ESPN_SUMMARY =
@@ -351,7 +353,18 @@ export default {
 	async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
 		const url = new URL(request.url);
 
-		// All routes are GET-only; reject early so the 405 is shared.
+		// Admin-only: run one Bracket engine tick on demand (the hourly cron does this
+		// automatically; this is for verification). Guarded by the BRACKET_ADMIN_KEY secret.
+		if (url.pathname === "/bracket/run") {
+			const key = (env as unknown as { BRACKET_ADMIN_KEY?: string }).BRACKET_ADMIN_KEY;
+			if (request.method !== "POST" || !key || request.headers.get("x-admin-key") !== key) {
+				return new Response("forbidden", { status: 403 });
+			}
+			const msg = await runBracketTick(env as unknown as BracketEnv);
+			return new Response(`${msg}\n`);
+		}
+
+		// All other routes are GET-only; reject early so the 405 is shared.
 		if (request.method !== "GET") {
 			return new Response("Method not allowed. Use GET.", {
 				status: 405,
@@ -392,7 +405,17 @@ export default {
 	// blocks the app and Apify spend is pinned to ~1 run/day (see wrangler.jsonc crons).
 	// Await (not waitUntil) — a cron should keep its invocation alive until the work is
 	// done; best-effort, a failed refresh leaves the last good snapshot in place.
-	async scheduled(_controller, env, _ctx): Promise<void> {
+	async scheduled(controller, env, _ctx): Promise<void> {
+		// The hourly cron drives the Bracket Battle engine (generate / tally + advance /
+		// rotate). The every-other-day cron refreshes the Instagram social cache.
+		if (controller.cron === "0 * * * *") {
+			try {
+				await runBracketTick(env as unknown as BracketEnv);
+			} catch {
+				/* swallow — the next hourly tick retries; the engine is idempotent */
+			}
+			return;
+		}
 		try {
 			await refreshSocialCache(env);
 		} catch {
