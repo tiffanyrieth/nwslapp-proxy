@@ -20,6 +20,8 @@
 	// keeps it ≈$2.7/mo, safely free, fair across all accounts. Flip to daily
 	// ("0 12 * * *") if you want max freshness and accept seed-fallback near month-end.
 	"triggers": {
-		"crons": ["0 12 */2 * *"],
+		// every-other-day at 12:00 UTC → Instagram social cache refresh.
+		// hourly → Bracket Battle engine tick (generate / tally + advance / rotate).
+		"crons": ["0 12 */2 * *", "0 * * * *"],
 	},
 }

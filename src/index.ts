@@ -17,6 +17,8 @@
  * ESPN directly from the app.
  */
 
+import { runBracketTick, forceCloseActiveRound, type BracketEnv } from "./bracket-engine";
+
 const ESPN_SCOREBOARD =
 	"https://site.api.espn.com/apis/site/v2/sports/soccer/usa.nwsl/scoreboard";
 const ESPN_SUMMARY =
@@ -351,7 +353,33 @@ export default {
 	async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
 		const url = new URL(request.url);
 
-		// All routes are GET-only; reject early so the 405 is shared.
+		// Admin-only: run one Bracket engine tick on demand (the hourly cron does this
+		// automatically; this is for verification). Guarded by the BRACKET_ADMIN_KEY secret.
+		if (url.pathname === "/bracket/run") {
+			const key = (env as unknown as { BRACKET_ADMIN_KEY?: string }).BRACKET_ADMIN_KEY;
+			if (request.method !== "POST" || !key || request.headers.get("x-admin-key") !== key) {
+				return new Response("forbidden", { status: 403 });
+			}
+			try {
+				const bEnv = env as unknown as BracketEnv;
+				// ?force=close → close the open round now, so this same tick tallies it
+				// (verification only).
+				const forced = url.searchParams.get("force") === "close"
+					? `${await forceCloseActiveRound(bEnv)}; ` : "";
+				const msg = await runBracketTick(bEnv);
+				return new Response(`${forced}${msg}\n`);
+			} catch (e) {
+				const err = e as Error;
+				// Redact anything secret-shaped so a misconfig can't leak a key.
+				const safe = `${err.message}\n${err.stack ?? ""}`.replace(
+					/sb_secret_[A-Za-z0-9_]+|sb_publishable_[A-Za-z0-9_]+|eyJ[A-Za-z0-9_.\-]+/g,
+					"[redacted]",
+				);
+				return new Response(`bracket tick error: ${safe}\n`, { status: 500 });
+			}
+		}
+
+		// All other routes are GET-only; reject early so the 405 is shared.
 		if (request.method !== "GET") {
 			return new Response("Method not allowed. Use GET.", {
 				status: 405,
@@ -392,7 +420,17 @@ export default {
 	// blocks the app and Apify spend is pinned to ~1 run/day (see wrangler.jsonc crons).
 	// Await (not waitUntil) — a cron should keep its invocation alive until the work is
 	// done; best-effort, a failed refresh leaves the last good snapshot in place.
-	async scheduled(_controller, env, _ctx): Promise<void> {
+	async scheduled(controller, env, _ctx): Promise<void> {
+		// The hourly cron drives the Bracket Battle engine (generate / tally + advance /
+		// rotate). The every-other-day cron refreshes the Instagram social cache.
+		if (controller.cron === "0 * * * *") {
+			try {
+				await runBracketTick(env as unknown as BracketEnv);
+			} catch {
+				/* swallow — the next hourly tick retries; the engine is idempotent */
+			}
+			return;
+		}
 		try {
 			await refreshSocialCache(env);
 		} catch {
