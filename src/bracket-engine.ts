@@ -27,7 +27,6 @@ export interface BracketEnv {
 }
 
 const ESPN_SITE = "https://site.api.espn.com/apis/site/v2/sports/soccer/usa.nwsl";
-const ESPN_CORE = "https://sports.core.api.espn.com/v2/sports/soccer/leagues/usa.nwsl";
 const BREAK_MS = 7 * 24 * 3600 * 1000; // ~1 week between editions
 const POOL_CAP = 64; // never seed more than a 64-bracket for stat editions
 
@@ -105,22 +104,6 @@ async function fetchRoster(teamId: string, abbr: string): Promise<RosterPlayer[]
     }));
 }
 
-async function fetchGoals(athleteId: string, year: number): Promise<number> {
-  try {
-    const r = await fetch(`${ESPN_CORE}/seasons/${year}/types/1/athletes/${athleteId}/statistics`, {
-      headers: { Accept: "application/json" },
-    });
-    if (!r.ok) return 0;
-    const json = (await r.json()) as {
-      splits?: { categories?: { name?: string; stats?: { name?: string; value?: number }[] }[] };
-    };
-    const off = json.splits?.categories?.find((c) => c.name === "offensive");
-    return Math.round(off?.stats?.find((s) => s.name === "totalGoals")?.value ?? 0);
-  } catch {
-    return 0;
-  }
-}
-
 const POSITION_GROUP: Record<string, "F" | "M" | "D" | "G"> = {
   F: "F", CF: "F", ST: "F", S: "F", W: "F", RW: "F", LW: "F", FW: "F",
   M: "M", CM: "M", DM: "M", AM: "M", MF: "M",
@@ -130,18 +113,34 @@ const POSITION_GROUP: Record<string, "F" | "M" | "D" | "G"> = {
 
 // ── Edition generation (stats-seeded; all players of a position, byes) ─────────
 
-/** Build a stats-seeded edition entrant list: every player of `group`, seeded by goals
- *  (the only template wired now — Top Forward). Capped at 64; ties broken by name for
- *  determinism. Real pool, no top-N cut beyond the bracket cap. */
-async function buildStatsPool(group: "F" | "M" | "D" | "G", year: number): Promise<Entrant[]> {
+/** Build a position-edition entrant list: EVERY player of `group` across all 16 teams,
+ *  seeded by ROUND-ROBIN INTERLEAVE across teams (seed 1 = team A's first, seed 2 =
+ *  team B's first, …) so each club's players are spread through the seed range — which
+ *  keeps same-team players out of the early rounds and varies the draw. Within a team,
+ *  ordered by jersey. No per-player API calls (16 roster fetches total) → fits the free
+ *  Workers subrequest budget. (Exact season-stat seeding is a later option — needs more
+ *  subrequests; see the engine notes.) Capped at a 64-bracket. */
+async function buildStatsPool(group: "F" | "M" | "D" | "G"): Promise<Entrant[]> {
   const teams = await fetchTeamAbbrs();
   const rosters = await Promise.all(teams.map((t) => fetchRoster(t.id, t.abbr)));
-  const players = rosters.flat().filter((p) => POSITION_GROUP[p.position] === group);
-  const withGoals = await Promise.all(
-    players.map(async (p) => ({ p, goals: await fetchGoals(p.id, year) })),
+  const byTeam = rosters.map((r) =>
+    r.filter((p) => POSITION_GROUP[p.position] === group)
+      .sort((a, b) => (a.jersey ?? 999) - (b.jersey ?? 999)),
   );
-  withGoals.sort((x, y) => y.goals - x.goals || x.p.name.localeCompare(y.p.name));
-  return withGoals.slice(0, POOL_CAP).map(({ p }, i) => ({
+  const ordered: RosterPlayer[] = [];
+  for (let depth = 0; ordered.length < POOL_CAP; depth++) {
+    let added = false;
+    for (const team of byTeam) {
+      const p = team[depth];
+      if (p) {
+        ordered.push(p);
+        added = true;
+        if (ordered.length >= POOL_CAP) break;
+      }
+    }
+    if (!added) break; // every team exhausted
+  }
+  return ordered.map((p, i) => ({
     id: p.id, name: p.name, jersey: p.jersey, team: p.team, seed: i + 1,
   }));
 }
@@ -177,6 +176,11 @@ interface EditionRow { id: string; current_round: number; round_closes_at: strin
 export async function runBracketTick(env: BracketEnv, now: number = Date.now()): Promise<string> {
   if (!env.SUPABASE_URL || !env.SUPABASE_SERVICE_ROLE_KEY) {
     return "skipped: Supabase secrets not set";
+  }
+  // Guard against a misconfigured/swapped secret WITHOUT echoing its value (a bad
+  // SUPABASE_URL would otherwise leak into thrown URLs/stacks).
+  if (!env.SUPABASE_URL.startsWith("https://") || !env.SUPABASE_URL.includes(".supabase.co")) {
+    return "config error: SUPABASE_URL is not a https://<project>.supabase.co URL — it looks swapped with the service-role key. Re-set both secrets.";
   }
   const active = await sbGet<EditionRow[]>(env, "bracket_editions?is_active=eq.true&select=id,current_round,round_closes_at,is_active&limit=1");
 
@@ -216,8 +220,8 @@ async function generateNext(env: BracketEnv, now: number): Promise<string> {
     return `generated creative edition ${c.id} (${entrants.length} entrants)`;
   }
 
-  // Otherwise a stats edition (Top Forward by goals — the only stat template wired now).
-  const pool = await buildStatsPool("F", year);
+  // Otherwise a position edition (Top Forward — every forward, team-interleave seeded).
+  const pool = await buildStatsPool("F");
   if (pool.length < 8) return "idle: not enough stat data to generate yet";
   const id = `top-forward-${year}-${used}`;
   await writeEdition(env, { id, themeLabel: "TOP FORWARD", title: `Best Forward · ${year}`, type: "statsSeeded" }, pool);

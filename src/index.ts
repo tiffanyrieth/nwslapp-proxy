@@ -360,8 +360,18 @@ export default {
 			if (request.method !== "POST" || !key || request.headers.get("x-admin-key") !== key) {
 				return new Response("forbidden", { status: 403 });
 			}
-			const msg = await runBracketTick(env as unknown as BracketEnv);
-			return new Response(`${msg}\n`);
+			try {
+				const msg = await runBracketTick(env as unknown as BracketEnv);
+				return new Response(`${msg}\n`);
+			} catch (e) {
+				const err = e as Error;
+				// Redact anything secret-shaped so a misconfig can't leak a key.
+				const safe = `${err.message}\n${err.stack ?? ""}`.replace(
+					/sb_secret_[A-Za-z0-9_]+|sb_publishable_[A-Za-z0-9_]+|eyJ[A-Za-z0-9_.\-]+/g,
+					"[redacted]",
+				);
+				return new Response(`bracket tick error: ${safe}\n`, { status: 500 });
+			}
 		}
 
 		// All other routes are GET-only; reject early so the 405 is shared.
