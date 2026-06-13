@@ -408,9 +408,12 @@ export default {
 		if (url.pathname === "/spotlight") {
 			return handleSpotlight(url, env, ctx);
 		}
+		if (url.pathname === "/trivia") {
+			return handleTrivia(url, env, ctx);
+		}
 
 		return new Response(
-			"Not found. This proxy serves GET /scoreboard, /summary, /team-videos, /feed, and /spotlight.",
+			"Not found. This proxy serves GET /scoreboard, /summary, /team-videos, /feed, /spotlight, and /trivia.",
 			{ status: 404 },
 		);
 	},
@@ -1828,6 +1831,50 @@ async function handleSpotlight(url: URL, env: Env, ctx: ExecutionContext): Promi
 	const toCache = new Response(JSON.stringify(cards), { status: 200, headers });
 	ctx.waitUntil(cache.put(cacheKey, toCache.clone()));
 	return withCacheStatus(toCache, "MISS");
+}
+
+const TRIVIA_TTL = 6 * 3600; // 6h edge cache — the question pool changes rarely (owner reloads via scripts/load_trivia.mjs)
+const TRIVIA_POOL_KEY = "trivia-pool-v1"; // KV key for the owner-loaded question pool
+
+/** Daily Trivia's question pool. League-wide (no `teams` param) and read-only:
+ *  returns the owner-loaded `[TriviaQuestion]` array straight from KV (loaded via
+ *  scripts/load_trivia.mjs). Returns `[]` when the pool hasn't been loaded yet —
+ *  the app then falls back to its bundled seed — so the route is safe to deploy
+ *  before the pool exists. (A reload is picked up after the 6h edge cache expires.) */
+async function handleTrivia(url: URL, env: Env, ctx: ExecutionContext): Promise<Response> {
+	const cache = caches.default;
+	// Normalized, versioned cache key: the pool is league-wide, so every request
+	// (with or without a cache-busting query) maps to ONE entry. `cv` is a manual
+	// cache-version lever — bump it to abandon a stale edge entry without waiting
+	// out the TTL.
+	const cacheUrl = new URL(url);
+	cacheUrl.search = "";
+	cacheUrl.searchParams.set("cv", "1");
+	const cacheKey = new Request(cacheUrl.toString(), { method: "GET" });
+
+	const hit = await cache.match(cacheKey);
+	if (hit) return withCacheStatus(hit, "HIT");
+
+	let pool: unknown[] = [];
+	try {
+		pool = ((await env.FEED_TAGS.get(TRIVIA_POOL_KEY, "json")) as unknown[] | null) ?? [];
+	} catch {
+		// A KV read failure serves a stale copy if we have one, else 502 (the app
+		// falls back to its seed on any non-2xx).
+		return (await serveStale(cache, cacheKey)) ?? upstreamError();
+	}
+
+	const headers = new Headers();
+	headers.set("Content-Type", "application/json");
+	headers.set("Cache-Control", `public, max-age=${TRIVIA_TTL}`);
+	const body = new Response(JSON.stringify(pool), { status: 200, headers });
+	// Never cache an EMPTY pool: a request that lands before the pool is loaded
+	// must not pin `[]` at the edge for 6h (that would force the app onto its seed
+	// long after a load). Only a real pool is worth caching.
+	if (pool.length > 0) {
+		ctx.waitUntil(cache.put(cacheKey, body.clone()));
+	}
+	return withCacheStatus(body, "MISS");
 }
 
 /** Build one spotlight per requested team (newest matchday squad → weekly pick →
