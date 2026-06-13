@@ -173,6 +173,17 @@ async function writeEdition(
 
 interface EditionRow { id: string; current_round: number; round_closes_at: string | null; is_active: boolean; }
 
+/** Force the active edition's open round to close NOW (round_closes_at → the past) so
+ *  the next tick tallies it. Verification only (the cron closes rounds on schedule). */
+export async function forceCloseActiveRound(env: BracketEnv): Promise<string> {
+  const active = await sbGet<{ id: string; current_round: number }[]>(
+    env, "bracket_editions?is_active=eq.true&select=id,current_round&limit=1");
+  if (active.length === 0) return "no active edition to close";
+  await sbPatch(env, "bracket_editions", `id=eq.${active[0].id}`,
+    { round_closes_at: new Date(Date.now() - 60_000).toISOString() });
+  return `forced close on ${active[0].id} round ${active[0].current_round}`;
+}
+
 export async function runBracketTick(env: BracketEnv, now: number = Date.now()): Promise<string> {
   if (!env.SUPABASE_URL || !env.SUPABASE_SERVICE_ROLE_KEY) {
     return "skipped: Supabase secrets not set";

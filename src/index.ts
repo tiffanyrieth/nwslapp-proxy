@@ -17,7 +17,7 @@
  * ESPN directly from the app.
  */
 
-import { runBracketTick, type BracketEnv } from "./bracket-engine";
+import { runBracketTick, forceCloseActiveRound, type BracketEnv } from "./bracket-engine";
 
 const ESPN_SCOREBOARD =
 	"https://site.api.espn.com/apis/site/v2/sports/soccer/usa.nwsl/scoreboard";
@@ -361,8 +361,13 @@ export default {
 				return new Response("forbidden", { status: 403 });
 			}
 			try {
-				const msg = await runBracketTick(env as unknown as BracketEnv);
-				return new Response(`${msg}\n`);
+				const bEnv = env as unknown as BracketEnv;
+				// ?force=close → close the open round now, so this same tick tallies it
+				// (verification only).
+				const forced = url.searchParams.get("force") === "close"
+					? `${await forceCloseActiveRound(bEnv)}; ` : "";
+				const msg = await runBracketTick(bEnv);
+				return new Response(`${forced}${msg}\n`);
 			} catch (e) {
 				const err = e as Error;
 				// Redact anything secret-shaped so a misconfig can't leak a key.
