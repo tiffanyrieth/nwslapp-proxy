@@ -1,0 +1,535 @@
+[
+  {
+    "question": "Which club won the very first NWSL Championship in 2013?",
+    "options": [
+      "Portland Thorns FC",
+      "Western New York Flash",
+      "Seattle Reign FC",
+      "North Carolina Courage"
+    ],
+    "correctIndex": 0,
+    "category": "leagueHistory",
+    "difficulty": "easy",
+    "id": "q001"
+  },
+  {
+    "question": "The NWSL Shield is awarded to which team each season?",
+    "options": [
+      "The winner of the NWSL Championship playoff",
+      "The team with the best regular-season record",
+      "The highest-scoring team in the regular season",
+      "The team with the fewest goals allowed in the regular season"
+    ],
+    "correctIndex": 1,
+    "category": "leagueHistory",
+    "difficulty": "easy",
+    "id": "q002"
+  },
+  {
+    "question": "How many clubs competed in the NWSL's inaugural 2013 season?",
+    "options": [
+      "8",
+      "9",
+      "10",
+      "12"
+    ],
+    "correctIndex": 0,
+    "category": "leagueHistory",
+    "difficulty": "medium",
+    "id": "q003"
+  },
+  {
+    "question": "The North Carolina Courage won back-to-back NWSL Championships in which two consecutive years?",
+    "options": [
+      "2015 and 2016",
+      "2017 and 2018",
+      "2018 and 2019",
+      "2019 and 2020"
+    ],
+    "correctIndex": 2,
+    "category": "leagueHistory",
+    "difficulty": "medium",
+    "id": "q004"
+  },
+  {
+    "question": "Washington Spirit won their first NWSL Championship in which year?",
+    "options": [
+      "2019",
+      "2020",
+      "2021",
+      "2022"
+    ],
+    "correctIndex": 2,
+    "category": "leagueHistory",
+    "difficulty": "medium",
+    "id": "q005"
+  },
+  {
+    "question": "Portland Thorns FC defeated which team to win the 2022 NWSL Championship?",
+    "options": [
+      "NJ/NY Gotham FC",
+      "Washington Spirit",
+      "North Carolina Courage",
+      "Kansas City Current"
+    ],
+    "correctIndex": 3,
+    "category": "leagueHistory",
+    "difficulty": "hard",
+    "id": "q006"
+  },
+  {
+    "question": "Which two clubs joined the NWSL as expansion teams for the 2026 season, bringing the league to 16 clubs?",
+    "options": [
+      "San Diego Wave FC and Angel City FC",
+      "Bay FC and Orlando Pride",
+      "Denver Summit FC and Boston Legacy FC",
+      "Racing Louisville FC and Chicago Stars FC"
+    ],
+    "correctIndex": 2,
+    "category": "leagueHistory",
+    "difficulty": "easy",
+    "id": "q007"
+  },
+  {
+    "question": "The Chicago Stars FC were previously known by what name before their 2024 rebrand?",
+    "options": [
+      "Chicago Red Stars",
+      "Chicago Fire FC",
+      "Chicago Blaze",
+      "Chicago Winds"
+    ],
+    "correctIndex": 0,
+    "category": "teamHistory",
+    "difficulty": "easy",
+    "id": "q008"
+  },
+  {
+    "question": "Which NWSL club was founded in 2021 as an expansion team and plays its home games in Kansas City, Missouri?",
+    "options": [
+      "Utah Royals FC",
+      "Racing Louisville FC",
+      "Kansas City Current",
+      "San Diego Wave FC"
+    ],
+    "correctIndex": 2,
+    "category": "teamHistory",
+    "difficulty": "easy",
+    "id": "q009"
+  },
+  {
+    "question": "Angel City FC, which joined the NWSL in 2022, is headquartered in which California city?",
+    "options": [
+      "San Francisco",
+      "Los Angeles",
+      "San Diego",
+      "Sacramento"
+    ],
+    "correctIndex": 1,
+    "category": "teamHistory",
+    "difficulty": "easy",
+    "id": "q010"
+  },
+  {
+    "question": "Before becoming the Seattle Reign FC in 2024, the club operated under which name?",
+    "options": [
+      "Seattle Sounders Women",
+      "OL Reign FC",
+      "Seattle Stars FC",
+      "Pacific FC"
+    ],
+    "correctIndex": 1,
+    "category": "teamHistory",
+    "difficulty": "medium",
+    "id": "q011"
+  },
+  {
+    "question": "The Utah Royals FC originally joined the NWSL in 2018 but briefly ceased operations before which season, before ultimately returning to the league?",
+    "options": [
+      "2019 season",
+      "2020 season",
+      "2021 season",
+      "2022 season"
+    ],
+    "correctIndex": 2,
+    "category": "teamHistory",
+    "difficulty": "medium",
+    "id": "q012"
+  },
+  {
+    "question": "The NJ/NY Gotham FC were previously known by which name before their 2021 rebrand?",
+    "options": [
+      "New York Flash",
+      "Sky Blue FC",
+      "New York Red Bulls Women",
+      "New Jersey Dash"
+    ],
+    "correctIndex": 1,
+    "category": "teamHistory",
+    "difficulty": "medium",
+    "id": "q013"
+  },
+  {
+    "question": "Which stadium is the home of the Kansas City Current, widely recognized as the first purpose-built stadium for a professional women's soccer team in the United States?",
+    "options": [
+      "Audi Field",
+      "CPKC Stadium",
+      "Shell Energy Stadium",
+      "Snapdragon Stadium"
+    ],
+    "correctIndex": 1,
+    "category": "venues",
+    "difficulty": "easy",
+    "id": "q014"
+  },
+  {
+    "question": "Providence Park, a historic multi-use stadium dating back to 1926, serves as the home ground for which NWSL club?",
+    "options": [
+      "Seattle Reign FC",
+      "North Carolina Courage",
+      "Portland Thorns FC",
+      "Racing Louisville FC"
+    ],
+    "correctIndex": 2,
+    "category": "venues",
+    "difficulty": "easy",
+    "id": "q015"
+  },
+  {
+    "question": "Which NWSL club plays its home matches at Audi Field in Washington, D.C.?",
+    "options": [
+      "NJ/NY Gotham FC",
+      "Washington Spirit",
+      "North Carolina Courage",
+      "Racing Louisville FC"
+    ],
+    "correctIndex": 1,
+    "category": "venues",
+    "difficulty": "easy",
+    "id": "q016"
+  },
+  {
+    "question": "San Diego Wave FC plays at Snapdragon Stadium, which it shares with which other professional sports tenant?",
+    "options": [
+      "San Diego FC (MLS)",
+      "San Diego Padres (MLB)",
+      "San Diego Gulls (AHL)",
+      "San Diego Legion (MLR)"
+    ],
+    "correctIndex": 0,
+    "category": "venues",
+    "difficulty": "medium",
+    "id": "q017"
+  },
+  {
+    "question": "Shell Energy Stadium is the home venue for which NWSL club?",
+    "options": [
+      "Bay FC",
+      "Angel City FC",
+      "Houston Dash",
+      "Orlando Pride"
+    ],
+    "correctIndex": 2,
+    "category": "venues",
+    "difficulty": "easy",
+    "id": "q018"
+  },
+  {
+    "question": "CPKC Stadium in Kansas City opened in 2024. What does the \"CPKC\" in its naming-rights title stand for?",
+    "options": [
+      "City Park and Kansas City",
+      "Canadian Pacific Kansas City (a railway company)",
+      "Central Park and Kansas City",
+      "Commerce Park Kansas City"
+    ],
+    "correctIndex": 1,
+    "category": "venues",
+    "difficulty": "medium",
+    "id": "q019"
+  },
+  {
+    "question": "Angel City FC plays its home matches at BMO Stadium in Los Angeles. Which MLS club also uses BMO Stadium as its primary home ground?",
+    "options": [
+      "LA Galaxy",
+      "Los Angeles FC",
+      "San Jose Earthquakes",
+      "Real Salt Lake"
+    ],
+    "correctIndex": 1,
+    "category": "venues",
+    "difficulty": "medium",
+    "id": "q020"
+  },
+  {
+    "question": "Lynn Family Stadium in Louisville, Kentucky is the home venue for which NWSL club?",
+    "options": [
+      "Utah Royals FC",
+      "Chicago Stars FC",
+      "Racing Louisville FC",
+      "NJ/NY Gotham FC"
+    ],
+    "correctIndex": 2,
+    "category": "venues",
+    "difficulty": "hard",
+    "id": "q021"
+  },
+  {
+    "question": "Brazilian legend Marta spent the majority of her NWSL career with which club?",
+    "options": [
+      "Portland Thorns FC",
+      "North Carolina Courage",
+      "Orlando Pride",
+      "Washington Spirit"
+    ],
+    "correctIndex": 2,
+    "category": "playerFacts",
+    "difficulty": "easy",
+    "id": "q022"
+  },
+  {
+    "question": "Trinity Rodman, daughter of NBA Hall of Famer Dennis Rodman, plays her club soccer for which NWSL side?",
+    "options": [
+      "Angel City FC",
+      "Washington Spirit",
+      "Kansas City Current",
+      "Chicago Stars FC"
+    ],
+    "correctIndex": 1,
+    "category": "playerFacts",
+    "difficulty": "easy",
+    "id": "q023"
+  },
+  {
+    "question": "Mallory Swanson (née Pugh) is a forward for which NWSL club?",
+    "options": [
+      "Seattle Reign FC",
+      "Houston Dash",
+      "Chicago Stars FC",
+      "Portland Thorns FC"
+    ],
+    "correctIndex": 2,
+    "category": "playerFacts",
+    "difficulty": "easy",
+    "id": "q024"
+  },
+  {
+    "question": "Asisat Oshoala, one of the most decorated African women's footballers, plays for which NWSL expansion side that began play in 2024?",
+    "options": [
+      "Denver Summit FC",
+      "Bay FC",
+      "Boston Legacy FC",
+      "Racing Louisville FC"
+    ],
+    "correctIndex": 1,
+    "category": "playerFacts",
+    "difficulty": "medium",
+    "id": "q025"
+  },
+  {
+    "question": "Barbra Banda, the prolific striker known for her powerful shooting, represents which national team?",
+    "options": [
+      "Nigeria",
+      "Tanzania",
+      "Zambia",
+      "Cameroon"
+    ],
+    "correctIndex": 2,
+    "category": "playerFacts",
+    "difficulty": "medium",
+    "id": "q026"
+  },
+  {
+    "question": "Temwa Chawinga, who set NWSL single-season scoring records, holds nationality for which country?",
+    "options": [
+      "Zimbabwe",
+      "Malawi",
+      "Mozambique",
+      "Kenya"
+    ],
+    "correctIndex": 1,
+    "category": "playerFacts",
+    "difficulty": "medium",
+    "id": "q027"
+  },
+  {
+    "question": "Esther González, a prolific goal scorer in the NWSL, holds which nationality?",
+    "options": [
+      "Mexican",
+      "Argentine",
+      "Spanish",
+      "Colombian"
+    ],
+    "correctIndex": 2,
+    "category": "playerFacts",
+    "difficulty": "medium",
+    "id": "q028"
+  },
+  {
+    "question": "Sam Kerr's record-breaking 2019 NWSL season of 18 goals was achieved while playing for which club?",
+    "options": [
+      "Portland Thorns FC",
+      "Houston Dash",
+      "Chicago Red Stars",
+      "North Carolina Courage"
+    ],
+    "correctIndex": 2,
+    "category": "records",
+    "difficulty": "hard",
+    "id": "q029"
+  },
+  {
+    "question": "Temwa Chawinga set the NWSL single-season goals record with 20 in 2024 while playing for which club?",
+    "options": [
+      "Houston Dash",
+      "Orlando Pride",
+      "Kansas City Current",
+      "NJ/NY Gotham FC"
+    ],
+    "correctIndex": 2,
+    "category": "records",
+    "difficulty": "medium",
+    "id": "q030"
+  },
+  {
+    "question": "Racheal Kundananji's transfer to Bay FC in 2024 was reported as a world-record fee for women's football. Which country does Kundananji represent internationally?",
+    "options": [
+      "Nigeria",
+      "Ghana",
+      "Cameroon",
+      "Zambia"
+    ],
+    "correctIndex": 3,
+    "category": "records",
+    "difficulty": "medium",
+    "id": "q031"
+  },
+  {
+    "question": "Which player won the NWSL Golden Boot in 2024 and became the first to reach 20 league goals in a single season?",
+    "options": [
+      "Sophia Smith",
+      "Barbra Banda",
+      "Temwa Chawinga",
+      "Lynn Williams"
+    ],
+    "correctIndex": 2,
+    "category": "records",
+    "difficulty": "easy",
+    "id": "q032"
+  },
+  {
+    "question": "The Portland Thorns FC hold the record for the most NWSL Championship titles. How many championships had they won through the 2024 season?",
+    "options": [
+      "Two",
+      "Three",
+      "Four",
+      "Five"
+    ],
+    "correctIndex": 1,
+    "category": "records",
+    "difficulty": "medium",
+    "id": "q033"
+  },
+  {
+    "question": "Before Temwa Chawinga broke the record in 2024, the NWSL single-season goals record of 18 had stood since which year?",
+    "options": [
+      "2016",
+      "2017",
+      "2018",
+      "2019"
+    ],
+    "correctIndex": 3,
+    "category": "records",
+    "difficulty": "medium",
+    "id": "q034"
+  },
+  {
+    "question": "How many players does each team field at the start of a soccer match?",
+    "options": [
+      "9",
+      "10",
+      "11",
+      "12"
+    ],
+    "correctIndex": 2,
+    "category": "rules",
+    "difficulty": "easy",
+    "id": "q035"
+  },
+  {
+    "question": "In the NWSL, how many points does a team earn for a win in the regular season?",
+    "options": [
+      "1",
+      "2",
+      "3",
+      "4"
+    ],
+    "correctIndex": 2,
+    "category": "rules",
+    "difficulty": "easy",
+    "id": "q036"
+  },
+  {
+    "question": "What does 'GD' stand for in an NWSL standings table?",
+    "options": [
+      "Goals Deducted",
+      "Goal Difference",
+      "Games Drawn",
+      "Goal Distribution"
+    ],
+    "correctIndex": 1,
+    "category": "rules",
+    "difficulty": "easy",
+    "id": "q037"
+  },
+  {
+    "question": "How long is each half of a standard NWSL regular-season match?",
+    "options": [
+      "30 minutes",
+      "40 minutes",
+      "45 minutes",
+      "50 minutes"
+    ],
+    "correctIndex": 2,
+    "category": "rules",
+    "difficulty": "easy",
+    "id": "q038"
+  },
+  {
+    "question": "Under the Laws of the Game, how many substitutions is each team typically allowed in a standard match (using the five-substitution rule adopted broadly after 2020)?",
+    "options": [
+      "3",
+      "4",
+      "5",
+      "6"
+    ],
+    "correctIndex": 2,
+    "category": "rules",
+    "difficulty": "medium",
+    "id": "q040"
+  },
+  {
+    "question": "Which abbreviation in NWSL standings represents the number of matches a team has drawn (tied)?",
+    "options": [
+      "T",
+      "D",
+      "DR",
+      "X"
+    ],
+    "correctIndex": 1,
+    "category": "rules",
+    "difficulty": "medium",
+    "id": "q041"
+  },
+  {
+    "question": "In the NWSL postseason format, how does the NWSL Championship differ from the NWSL Shield?",
+    "options": [
+      "The Shield is the knockout playoff trophy; the Championship goes to the regular-season leader",
+      "The Championship is won by the playoff bracket winner; the Shield goes to the best regular-season record",
+      "They are two names for the same trophy awarded at season's end",
+      "The Shield is awarded to the top seed; the Championship goes to the runners-up"
+    ],
+    "correctIndex": 1,
+    "category": "leagueHistory",
+    "difficulty": "hard",
+    "id": "q042"
+  }
+]
