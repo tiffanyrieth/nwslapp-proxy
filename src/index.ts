@@ -434,9 +434,12 @@ export default {
 		if (url.pathname === "/headshots") {
 			return handleHeadshots(url, env, ctx);
 		}
+		if (url.pathname === "/crest") {
+			return handleCrest(url, env, ctx);
+		}
 
 		return new Response(
-			"Not found. This proxy serves GET /scoreboard, /summary, /team-videos, /feed, /spotlight, /trivia, and /headshots.",
+			"Not found. This proxy serves GET /scoreboard, /summary, /team-videos, /feed, /spotlight, /trivia, /headshots, and /crest.",
 			{ status: 404 },
 		);
 	},
@@ -1907,6 +1910,44 @@ async function handleTrivia(url: URL, env: Env, ctx: ExecutionContext): Promise<
 	if (pool.length > 0) {
 		ctx.waitUntil(cache.put(cacheKey, body.clone()));
 	}
+	return withCacheStatus(body, "MISS");
+}
+
+const CREST_TTL = 30 * 24 * 3600; // 30d edge cache — team crests effectively never change
+
+/** Serve a team's NWSL crest as a transparent PNG: `GET /crest?team=WAS`. The PNGs are
+ *  rasterized offline from NWSL's vector/raster sources (named-transform-only CDN ⇒ no clean
+ *  client-side transparent PNG) and stored per team in KV (`crest:{ABBR}`) by
+ *  scripts/load_crests.mjs. A team not loaded yet → 404, and the app keeps its existing ESPN
+ *  crest (TeamLogo's fallback). Read-only and keyed by the normalized abbreviation, so every
+ *  request for a team maps to one edge-cache entry. */
+async function handleCrest(url: URL, env: Env, ctx: ExecutionContext): Promise<Response> {
+	const team = (url.searchParams.get("team") ?? "").toUpperCase().replace(/[^A-Z]/g, "");
+	if (!team) return new Response("missing ?team", { status: 400 });
+
+	const cache = caches.default;
+	const cacheUrl = new URL(url);
+	cacheUrl.search = "";
+	cacheUrl.searchParams.set("team", team);
+	cacheUrl.searchParams.set("cv", "3"); // manual cache-version lever (bump to drop stale edge crests)
+	const cacheKey = new Request(cacheUrl.toString(), { method: "GET" });
+
+	const hit = await cache.match(cacheKey);
+	if (hit) return withCacheStatus(hit, "HIT");
+
+	let bytes: ArrayBuffer | null;
+	try {
+		bytes = await env.FEED_TAGS.get(`crest:${team}`, "arrayBuffer");
+	} catch {
+		return new Response("crest unavailable", { status: 502 });
+	}
+	if (!bytes) return new Response("no crest for team", { status: 404 }); // app falls back to ESPN
+
+	const headers = new Headers();
+	headers.set("Content-Type", "image/png");
+	headers.set("Cache-Control", `public, max-age=${CREST_TTL}`);
+	const body = new Response(bytes, { status: 200, headers });
+	ctx.waitUntil(cache.put(cacheKey, body.clone()));
 	return withCacheStatus(body, "MISS");
 }
 
