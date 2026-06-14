@@ -18,6 +18,7 @@
  */
 
 import { runBracketTick, forceCloseActiveRound, type BracketEnv } from "./bracket-engine";
+import { buildHeadshotMap, handleHeadshots } from "./headshots";
 
 const ESPN_SCOREBOARD =
 	"https://site.api.espn.com/apis/site/v2/sports/soccer/usa.nwsl/scoreboard";
@@ -379,6 +380,25 @@ export default {
 			}
 		}
 
+		// Admin-only: rebuild the player-headshot map on demand (the weekly cron does this
+		// automatically; this is for verification + auditing the unmatched list). Guarded by
+		// the same BRACKET_ADMIN_KEY secret as /bracket/run.
+		if (url.pathname === "/headshots/run") {
+			const key = (env as unknown as { BRACKET_ADMIN_KEY?: string }).BRACKET_ADMIN_KEY;
+			if (request.method !== "POST" || !key || request.headers.get("x-admin-key") !== key) {
+				return new Response("forbidden", { status: 403 });
+			}
+			try {
+				const meta = await buildHeadshotMap(env);
+				return new Response(`${JSON.stringify(meta, null, 2)}\n`, {
+					headers: { "Content-Type": "application/json" },
+				});
+			} catch (e) {
+				const err = e as Error;
+				return new Response(`headshots build error: ${err.message}\n${err.stack ?? ""}\n`, { status: 500 });
+			}
+		}
+
 		// All other routes are GET-only; reject early so the 405 is shared.
 		if (request.method !== "GET") {
 			return new Response("Method not allowed. Use GET.", {
@@ -411,9 +431,12 @@ export default {
 		if (url.pathname === "/trivia") {
 			return handleTrivia(url, env, ctx);
 		}
+		if (url.pathname === "/headshots") {
+			return handleHeadshots(url, env, ctx);
+		}
 
 		return new Response(
-			"Not found. This proxy serves GET /scoreboard, /summary, /team-videos, /feed, /spotlight, and /trivia.",
+			"Not found. This proxy serves GET /scoreboard, /summary, /team-videos, /feed, /spotlight, /trivia, and /headshots.",
 			{ status: 404 },
 		);
 	},
@@ -431,6 +454,16 @@ export default {
 				await runBracketTick(env as unknown as BracketEnv);
 			} catch {
 				/* swallow — the next hourly tick retries; the engine is idempotent */
+			}
+			return;
+		}
+		// Weekly → rebuild the NWSL↔ESPN player-headshot map. Idempotent; a failure leaves
+		// the last good map in KV serving, and the next week retries.
+		if (controller.cron === "0 9 * * 1") {
+			try {
+				await buildHeadshotMap(env);
+			} catch {
+				/* swallow — next weekly run retries; the stale map stays serving */
 			}
 			return;
 		}
