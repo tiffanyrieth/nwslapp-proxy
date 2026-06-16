@@ -37,6 +37,7 @@ const SCOREBOARD_LEAGUES = new Set<string>([
 	"fifa.friendly.w",                // Women's international friendlies (global)
 	"concacaf.w.gold",                // Concacaf W Gold Cup (national teams)
 	"concacaf.womens.championship",   // Concacaf W Championship (national teams, pre-2024)
+	"concacaf.w.champions_cup",       // Concacaf W Champions Cup (CLUB: NWSL clubs vs Liga MX)
 ]);
 const scoreboardUpstream = (slug: string) =>
 	`https://site.api.espn.com/apis/site/v2/sports/soccer/${slug}/scoreboard`;
