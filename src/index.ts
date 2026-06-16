@@ -25,6 +25,22 @@ const ESPN_SCOREBOARD =
 const ESPN_SUMMARY =
 	"https://site.api.espn.com/apis/site/v2/sports/soccer/usa.nwsl/summary";
 
+// `/scoreboard?league=<slug>` serves any of these ESPN soccer competitions (women's)
+// through the same cached pass-through. NWSL is the default when `league` is absent
+// (so the existing app build keeps working). The slug is ALLOWLISTED server-side —
+// we never forward an arbitrary `league` into an ESPN URL (SSRF / cache hygiene).
+const SCOREBOARD_LEAGUES = new Set<string>([
+	"usa.nwsl",                       // NWSL (default)
+	"fifa.wwc",                       // FIFA Women's World Cup
+	"fifa.w.olympics",                // Olympics (women)
+	"fifa.shebelieves",               // SheBelieves Cup
+	"fifa.friendly.w",                // Women's international friendlies (global)
+	"concacaf.w.gold",                // Concacaf W Gold Cup (national teams)
+	"concacaf.womens.championship",   // Concacaf W Championship (national teams, pre-2024)
+]);
+const scoreboardUpstream = (slug: string) =>
+	`https://site.api.espn.com/apis/site/v2/sports/soccer/${slug}/scoreboard`;
+
 // Cache TTLs (seconds).
 const LIVE_TTL = 30; // a match is in progress — keep scores/lineups fresh
 const SCOREBOARD_DEFAULT_TTL = 300; // fixture list barely changes between matches
@@ -203,8 +219,8 @@ const NEWS_TEAM_ABBR_SET = new Set(NEWS_TEAM_ABBRS);
 const NEWS_POLICY = `You are filtering and tagging news articles for an NWSL (US National Women's Soccer League) fan app. The articles come from women's-soccer outlets whose feeds also carry non-NWSL items (other women's sports like the PWHL/WNBA, the English WSL or other foreign leagues, men's soccer, general news).
 
 For each article (headline + outlet) decide two things:
-1. "isNWSL": true ONLY if the article is primarily about the NWSL — an NWSL club, an NWSL match/standing/award, a player at an NWSL club, a transfer INTO or OUT OF an NWSL club, or the US women's national team (USWNT). false for everything else, INCLUDING women's soccer that isn't NWSL: a foreign league (England's WSL, Spain's Liga F, the UEFA Women's Champions League, etc.), players moving between two non-NWSL clubs, other sports (PWHL, WNBA), and men's soccer. When the headline centers a foreign league or a non-NWSL transfer, isNWSL is false even though it's women's soccer.
-2. "teams": if isNWSL, the NWSL club abbreviation(s) it is primarily about; [] for league-wide/general NWSL or USWNT news. If isNWSL is false, return [].
+1. "isNWSL": true ONLY if the article is primarily about the NWSL itself — an NWSL club, an NWSL match/standing/award/power-ranking, a player AT an NWSL club in an NWSL context, or a transfer INTO or OUT OF an NWSL club. false for everything else, INCLUDING: national-team soccer (the USWNT or ANY country's national team — international friendlies, tournaments, the World Cup, call-ups, FIFA windows) EVEN WHEN NWSL players take part; women's soccer that isn't NWSL (England's WSL, Spain's Liga F, the UEFA Women's Champions League, other foreign leagues); players moving between two non-NWSL clubs; other sports (PWHL, WNBA); and men's soccer. When the headline centers a national team, an international match/window, a foreign league, or a non-NWSL transfer, isNWSL is false even though it may involve women's soccer or NWSL players. When unsure, return false.
+2. "teams": if isNWSL, the NWSL club abbreviation(s) it is primarily about; [] for genuinely league-wide/general NWSL news. If isNWSL is false, return [].
 
 The 16 NWSL teams and their abbreviations:
 LA = Angel City FC, BAY = Bay FC, BOS = Boston, CHI = Chicago Stars, DEN = Denver, GFC = Gotham FC, HOU = Houston Dash, KC = Kansas City Current, NC = North Carolina Courage, ORL = Orlando Pride, POR = Portland Thorns, LOU = Racing Louisville, SD = San Diego Wave, SEA = Seattle Reign, UTA = Utah Royals, WAS = Washington Spirit.
@@ -430,7 +446,15 @@ export default {
 		// proxyAndCache). /team-videos is different: it *builds* a response by
 		// calling the YouTube Data API and normalizing to ContentCard JSON.
 		if (url.pathname === "/scoreboard") {
-			return proxyAndCache(url, ESPN_SCOREBOARD, chooseScoreboardTTL, ctx);
+			// `?league=<slug>` selects the competition (default NWSL). Allowlisted so an
+			// arbitrary slug can't be forwarded into an ESPN URL. `league` rides the
+			// cache key (independent per competition) but is stripped before ESPN (its
+			// scoreboard doesn't take it — the league lives in the path).
+			const league = url.searchParams.get("league") ?? "usa.nwsl";
+			if (!SCOREBOARD_LEAGUES.has(league)) {
+				return new Response(`Unknown league "${league}".`, { status: 400 });
+			}
+			return proxyAndCache(url, scoreboardUpstream(league), chooseScoreboardTTL, ctx);
 		}
 		if (url.pathname === "/summary") {
 			// Missing `?event=` isn't validated here — forwarded verbatim, letting
@@ -522,6 +546,9 @@ async function proxyAndCache(
 	// MISS — forward to ESPN, preserving the incoming query string verbatim.
 	const upstream = new URL(upstreamBase);
 	upstream.search = url.search;
+	// `league` (scoreboard only) is encoded in `upstreamBase`'s path, not an ESPN
+	// query param — strip it from the forwarded search. No-op for routes without it.
+	upstream.searchParams.delete("league");
 
 	let espnResponse: Response;
 	try {
@@ -1788,9 +1815,10 @@ async function tagNewsTeams(
 	const verdicts = new Map<string, NewsVerdict>();
 
 	// 1. Load cached verdicts (one KV read per card; misses return null). The key is
-	//    versioned (`nv1-`) so tightening the policy/schema can be rolled by bumping
-	//    the version rather than waiting out every cached verdict's TTL.
-	const vkey = (id: string) => `nv1-${id}`;
+	//    versioned (`nv2-`) so tightening the policy/schema can be rolled by bumping
+	//    the version rather than waiting out every cached verdict's TTL. (nv1→nv2:
+	//    dropped the USWNT/national-team relevance allowance.)
+	const vkey = (id: string) => `nv2-${id}`;
 	const cached = await Promise.all(cards.map((c) => env.FEED_TAGS.get(vkey(c.id), "json")));
 	const uncached: NewsCard[] = [];
 	cards.forEach((c, i) => {
