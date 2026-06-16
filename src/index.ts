@@ -80,12 +80,15 @@ const BSKY_UA = "nwslapp-proxy/0.3 (+https://nwslapp-proxy.tiffany-rieth.workers
 const FEED_TTL = 900; // 15min — the Feed is conversational, fresher than Home's 1h
 const POSTS_PER_HANDLE = 12; // recent posts pulled per account (app applies staleness)
 
-// Claude Haiku relevance filter (Step 2). Runs on REPORTER posts only — they're
-// journalists who also post about other sports, their personal life, etc., so we
-// keep just the NWSL/women's-soccer ones. League outlets + club accounts are
-// NWSL-dedicated and never touch the API. Each reporter post is tagged ONCE
-// (verdict cached in KV by post id, ~7d); only never-seen posts hit Haiku on a
-// miss. Fails OPEN — no key or a Haiku outage degrades to the un-gated feed.
+// Claude Haiku relevance + team-tag (Step 2). Runs on the third-party Bluesky
+// bucket — REPORTER and LEAGUE-OUTLET accounts (both post off-topic/non-NWSL and
+// neither carries a team tag of its own). It gates relevance AND tags the team so a
+// post about a followed club gets that club's color/label; off-topic + non-followed
+// posts are dropped (decideFeedItem). Club-official and player accounts are the
+// trusted FAST PATHS — they carry their own abbr and never touch the API. Each post
+// is classified ONCE (verdict cached in KV by post id, ~7d); only never-seen posts
+// hit Haiku on a miss. This bucket fails toward DROP when unjudged (no key / Haiku
+// outage / unsure) — the club + player fast paths keep the feed populated.
 const ANTHROPIC_API = "https://api.anthropic.com/v1/messages";
 const HAIKU_MODEL = "claude-haiku-4-5";
 const HAIKU_BATCH = 20; // posts per Haiku call (one numbered list → array of verdicts)
@@ -116,15 +119,29 @@ const SOCIAL_POSTS_PER_PROFILE = 4;
 const SOCIAL_CACHE_KEY = "social-cards-v1"; // KV key for the cron-built card snapshot
 const SOCIAL_CACHE_TTL = 3 * 24 * 3600; // 3d KV safety net — the daily cron refreshes well within it
 
-const FEED_POLICY = `You are a relevance filter for an NWSL (US National Women's Soccer League) fan-app feed. These posts come from soccer JOURNALISTS who also post about unrelated topics. For each post decide isNWSL:
-- true: about NWSL or women's soccer — its clubs, players, matches, transfers, results, or reporting/analysis/commentary on them.
-- false: off-topic — other sports, the author's personal life, or unrelated news.
-Keep normal soccer opinion and match reactions (those are true). When unsure, prefer true.`;
+// Social (reporter + league-outlet) Bluesky classifier. These accounts post
+// off-topic too, so each post is gated AND team-tagged: isNWSL (strict — false
+// for non-NWSL incl. men's soccer, foreign leagues, personal/off-topic), teams[]
+// (the NWSL clubs it's primarily about; [] for genuinely league-wide), and
+// leagueNews (a HIGH bar — true only for real league-wide NWSL news, not general
+// reporter chatter/opinion). The keep/drop + tag rule lives in decideFeedItem,
+// which fails toward DROP when a post is unjudged (fixes the old fail-open leak).
+const SOCIAL_POLICY = `You are filtering and tagging Bluesky posts for an NWSL (US National Women's Soccer League) fan app. The posts come from soccer reporters/journalists and NWSL media/league accounts, who also post off-topic things (other sports, foreign leagues, men's soccer, personal life, general chatter).
+
+For each post (handle + text) decide three things:
+1. "isNWSL": true ONLY if the post is clearly about the NWSL — an NWSL club, an NWSL match/result/standing/award, a player at an NWSL club, a transfer into or out of an NWSL club, or the US women's national team (USWNT). false for everything else, INCLUDING women's soccer that isn't NWSL (England's WSL, Liga F, the UEFA Women's Champions League, other foreign leagues), other sports (PWHL, WNBA), men's soccer (including the men's World Cup), and the author's personal/off-topic posts. When you are unsure whether a post is about the NWSL, return false.
+2. "teams": if isNWSL, the NWSL club abbreviation(s) the post is primarily about; [] for genuinely league-wide/general NWSL or USWNT posts. If isNWSL is false, return [].
+3. "leagueNews": true ONLY when isNWSL is true AND teams is empty AND the post is genuine league-wide NWSL NEWS — expansion, the schedule/fixtures release, awards/honors, the playoff race, rule/CBA/roster-rule changes, or other league-wide announcements. false for general opinion, hot takes, predictions, banter, or chatter not tied to hard news. If isNWSL is false or teams is non-empty, return false.
+
+The 16 NWSL teams and their abbreviations:
+LA = Angel City FC, BAY = Bay FC, BOS = Boston, CHI = Chicago Stars, DEN = Denver, GFC = Gotham FC, HOU = Houston Dash, KC = Kansas City Current, NC = North Carolina Courage, ORL = Orlando Pride, POR = Portland Thorns, LOU = Racing Louisville, SD = San Diego Wave, SEA = Seattle Reign, UTA = Utah Royals, WAS = Washington Spirit.
+
+Rules: a single-team post → exactly that one abbreviation; a multi-team post → all clubs named; league-wide → []. Only use the 16 abbreviations above. Echo each post's id exactly.`;
 
 // Forced structured output (output_config.format) — Haiku 4.5 returns the first
 // text block as JSON matching this schema. No min/max constraints (unsupported);
 // additionalProperties:false is required on every object.
-const VERDICT_SCHEMA = {
+const SOCIAL_SCHEMA = {
 	type: "object",
 	additionalProperties: false,
 	properties: {
@@ -136,8 +153,10 @@ const VERDICT_SCHEMA = {
 				properties: {
 					id: { type: "string" },
 					isNWSL: { type: "boolean" },
+					teams: { type: "array", items: { type: "string" } },
+					leagueNews: { type: "boolean" },
 				},
-				required: ["id", "isNWSL"],
+				required: ["id", "isNWSL", "teams", "leagueNews"],
 			},
 		},
 	},
@@ -984,7 +1003,7 @@ type NewsCard = {
  *  survivors missing an image/blurb are OG-scraped (the club-news plumbing, now on
  *  real article URLs). Per-feed failures are isolated (a dead feed → []), so one
  *  outlet down never trips the feed's stale fallback. */
-async function buildNewsCards(env: Env, ctx: ExecutionContext): Promise<unknown[]> {
+async function buildNewsCards(teams: string[], env: Env, ctx: ExecutionContext): Promise<unknown[]> {
 	const perFeed = await Promise.all(
 		NEWS_FEEDS.map(async (feed) => {
 			try {
@@ -1006,6 +1025,7 @@ async function buildNewsCards(env: Env, ctx: ExecutionContext): Promise<unknown[
 						layout: "newsArticle",
 						platform: "article",
 						placement: "feed",
+						sourceType: "news",
 						teamAbbreviation: undefined, // set by tagNewsTeams (single-team)
 						isLeague: true, // default; tagNewsTeams narrows when single-team
 						headline: it.title,
@@ -1025,8 +1045,9 @@ async function buildNewsCards(env: Env, ctx: ExecutionContext): Promise<unknown[
 		}),
 	);
 
-	// Haiku FIRST (drop non-NWSL + route), so we only spend OG scrapes on keepers.
-	const kept = await tagNewsTeams(perFeed.flat(), env, ctx);
+	// Haiku FIRST (drop non-NWSL + non-followed-team + route), so we only spend OG
+	// scrapes on keepers.
+	const kept = await tagNewsTeams(perFeed.flat(), teams, env, ctx);
 	return enrichNewsOG(kept, env, ctx);
 }
 
@@ -1179,24 +1200,31 @@ async function handleFeed(url: URL, env: Env, ctx: ExecutionContext): Promise<Re
 		// a total Bluesky outage.
 		const reporterHandles = FEED_HANDLES.filter((h) => h.kind === "reporter");
 		const leagueHandles = FEED_HANDLES.filter((h) => h.kind === "league");
-		const [rawReporters, leagueCards, teamCards, newsCards, social] = await Promise.all([
+		const [rawReporters, rawLeague, teamCards, newsCards, social] = await Promise.all([
 			buildBlueskyCards(reporterHandles),
 			buildBlueskyCards(leagueHandles),
 			buildTeamBlueskyCards(teams),
-			// News (B1): per-outlet RSS → Haiku NWSL-gate + team-tag → OG-enrich →
-			// newsArticle cards (placement "feed"). Self-isolating; failures yield [].
-			buildNewsCards(env, ctx),
+			// News (B1): per-outlet RSS → Haiku NWSL-gate + team-tag + followed-team
+			// filter → OG-enrich → newsArticle cards. Self-isolating; failures yield [].
+			buildNewsCards(teams, env, ctx),
 			// Social (B3b): the cron-built IG snapshot; here we take the player
 			// clips (placement "feed") routed to the followed teams. Club Bluesky is
 			// already in teamCards (now placement "feed" too).
 			readSocialCards(env),
 		]);
-		// Only reporters get the Haiku relevance pass (they post off-topic too);
-		// league outlets + club accounts are NWSL-dedicated and pass untouched.
-		// News cards are already Haiku-tagged inside buildNewsCards.
-		const reporters = await filterReporterRelevance(rawReporters, env, ctx);
+		// Reporter + league-outlet Bluesky carry no team tag of their own and post
+		// off-topic too → one Haiku pass gates relevance, team-tags, and filters to
+		// the followed teams (classifySocialBluesky). Club-official Bluesky (teamCards)
+		// and player IG (playerSocial) are trusted fast paths — already team-tagged,
+		// no Haiku. News is gated+filtered inside buildNewsCards.
+		const socialBluesky = await classifySocialBluesky(
+			[...rawReporters, ...rawLeague],
+			teams,
+			env,
+			ctx,
+		);
 		const playerSocial = socialFor(social, teams, new Set(["feed"]));
-		cards = [...reporters, ...leagueCards, ...teamCards, ...newsCards, ...playerSocial].sort(
+		cards = [...socialBluesky, ...teamCards, ...newsCards, ...playerSocial].sort(
 			byTimestampDesc,
 		);
 		// Collapse identical-text duplicates (bot double-posts) BEFORE the cap, so a
@@ -1299,6 +1327,9 @@ function mapBskyPost(post: BskyPost, h: FeedHandle): unknown | null {
 		id: `bsky-${rkey}`,
 		layout,
 		platform: "bluesky",
+		// Source class for the app's Feed chips (Clubs · Reporters · …). Players come
+		// from the IG pipe; here it's club-official / reporter / league-outlet.
+		sourceType: isTeam ? "club" : h.kind === "league" ? "league" : "reporter",
 		// B3b: ALL Bluesky now lives in the Feed only (was "both" for team posts). The
 		// club's Home voice is its IG now; club Bluesky is its real-time/social
 		// voice → Feed "Social". teamAbbreviation still scopes a team post to followers.
@@ -1344,11 +1375,49 @@ function extractBskyImage(embed?: { $type?: string; [k: string]: unknown }): str
 // Haiku relevance / no-hot-takes filter (Step 2).
 // ---------------------------------------------------------------------------
 
-interface Verdict {
+interface SocialVerdict {
 	id: string;
 	isNWSL: boolean;
+	teams: string[];
+	leagueNews: boolean;
 }
-type FeedCard = { id?: string; handle?: string; bodyText?: string };
+type FeedCard = {
+	id?: string;
+	handle?: string;
+	bodyText?: string;
+	teamAbbreviation?: string;
+	isLeague?: boolean;
+};
+
+/**
+ * The shared keep/tag/drop rule for the Haiku-classified feed buckets (social
+ * Bluesky + news). Given a verdict (or undefined when unjudged) and the requested
+ * followed teams:
+ *  - non-NWSL → drop;
+ *  - tagged to specific team(s) → keep ONLY if one is followed (return its abbr so
+ *    the caller colors/labels the card), else drop (someone else's team);
+ *  - no team → keep as league-wide ONLY if it clears the league-news bar
+ *    (`requireLeagueNews`); otherwise drop.
+ * `failClosed` decides an UNJUDGED item (KV miss + Haiku outage/no key): social
+ * fails CLOSED (drop the leak, per owner); news fails OPEN (keep league-wide,
+ * staying resilient). A kept item with no `abbr` is league-wide (caller sets
+ * isLeague true).
+ */
+function decideFeedItem(
+	v: { isNWSL: boolean; teams: string[]; leagueNews?: boolean } | undefined,
+	followed: Set<string>,
+	opts: { requireLeagueNews: boolean; failClosed: boolean },
+): { keep: boolean; abbr?: string } {
+	if (!v) return opts.failClosed ? { keep: false } : { keep: true };
+	if (!v.isNWSL) return { keep: false };
+	const tagged = (v.teams ?? []).filter((t) => NEWS_TEAM_ABBR_SET.has(t));
+	if (tagged.length > 0) {
+		const hit = tagged.filter((t) => followed.has(t));
+		return hit.length > 0 ? { keep: true, abbr: hit[0] } : { keep: false };
+	}
+	if (opts.requireLeagueNews && !v.leagueNews) return { keep: false };
+	return { keep: true }; // genuinely league-wide
+}
 
 /** Keep at most `max` posts per author handle (cards arrive newest-first, so this
  *  keeps the freshest few) — a free cap so one prolific account can't flood the
@@ -1440,6 +1509,9 @@ export function mapApifyInstagram(raw: unknown, h: SocialHandle): unknown | null
 		layout: "socialVideo",
 		platform: "instagram",
 		placement: h.kind === "team" ? "home" : "feed",
+		// Source class for the app's Feed chips (Clubs vs Players — both are
+		// socialVideo/IG, so the layout alone can't tell them apart).
+		sourceType: h.kind === "team" ? "club" : "player",
 		teamAbbreviation: h.abbr,
 		isLeague: false,
 		authorName: h.name,
@@ -1564,63 +1636,90 @@ function socialFor(cards: unknown[], teams: string[], placements: Set<string>): 
 }
 
 /**
- * Drop reporter posts that aren't about NWSL/women's soccer. Each card's verdict
- * is cached in KV by its stable post id (tagged once, ever); only never-seen cards
- * are batched to Haiku on a cache miss. Fail-OPEN: a card with no verdict (KV miss
- * + Haiku error or no key) is KEPT, so an outage degrades to the un-gated reporter
- * feed. KV writes are deferred via ctx.waitUntil so tagging never blocks the
- * response longer than the one Haiku round-trip.
+ * Classify the third-party Bluesky bucket (reporter + league-outlet posts): gate
+ * relevance AND team-tag, then keep/drop per decideFeedItem against the requested
+ * `teams`. A post about a followed club gets that club's abbr (color/label); a
+ * genuinely league-wide NWSL-news post is kept league-wide; off-topic, non-followed
+ * -team, and general-chatter posts are dropped. Each post's verdict is cached in KV
+ * by its stable post id under a versioned key (`sv2-`, so the schema change
+ * invalidates the old relevance-only verdicts); only never-seen posts hit Haiku on a
+ * miss. Fails toward DROP when unjudged (KV miss + Haiku error/no key) — the club +
+ * player fast paths keep the feed populated. KV writes are deferred via
+ * ctx.waitUntil so tagging never blocks longer than the one Haiku round-trip.
  */
-async function filterReporterRelevance(
+async function classifySocialBluesky(
 	cards: unknown[],
+	teams: string[],
 	env: Env,
 	ctx: ExecutionContext,
 ): Promise<unknown[]> {
 	const typed = cards as FeedCard[];
-	const verdicts = new Map<string, Verdict>();
+	if (typed.length === 0) return [];
+	const followed = new Set(teams);
+	const verdicts = new Map<string, SocialVerdict>();
+	const vkey = (id: string) => `sv2-${id}`;
 
 	// 1. Load cached verdicts (one KV read per card; misses return null).
 	const cached = await Promise.all(
-		typed.map((c) => (c.id ? env.FEED_TAGS.get(c.id, "json") : Promise.resolve(null))),
+		typed.map((c) => (c.id ? env.FEED_TAGS.get(vkey(c.id), "json") : Promise.resolve(null))),
 	);
 	const uncached: FeedCard[] = [];
 	typed.forEach((c, i) => {
-		const v = cached[i] as Verdict | null;
+		const v = cached[i] as SocialVerdict | null;
 		if (v) verdicts.set(c.id!, v);
 		else if (c.id) uncached.push(c);
 	});
 
-	// 2. Tag the misses via Haiku, batched. No key → skip (everything fails open).
+	// 2. Classify the misses via Haiku, batched. No key → skip (those fail closed below).
 	if (uncached.length > 0 && env.ANTHROPIC_API_KEY) {
 		for (let i = 0; i < uncached.length; i += HAIKU_BATCH) {
 			const batch = uncached.slice(i, i + HAIKU_BATCH);
-			let out: Verdict[] | null;
+			let out: SocialVerdict[] | null;
 			try {
-				out = await haikuTagBatch(batch, env.ANTHROPIC_API_KEY);
+				out = await haikuClassifySocialBatch(batch, env.ANTHROPIC_API_KEY);
 			} catch {
-				out = null; // fail open: leave this batch unjudged → kept below
+				out = null; // fail closed: this batch stays unjudged → dropped below
 			}
 			if (out) {
 				for (const v of out) {
 					if (!v?.id) continue;
-					verdicts.set(v.id, v);
+					const tms = (v.teams ?? []).filter((t) => NEWS_TEAM_ABBR_SET.has(t));
+					const clean: SocialVerdict = {
+						id: v.id,
+						isNWSL: v.isNWSL === true,
+						teams: tms,
+						leagueNews: v.leagueNews === true,
+					};
+					verdicts.set(v.id, clean);
 					ctx.waitUntil(
-						env.FEED_TAGS.put(v.id, JSON.stringify(v), { expirationTtl: TAG_TTL }),
+						env.FEED_TAGS.put(vkey(v.id), JSON.stringify(clean), { expirationTtl: TAG_TTL }),
 					);
 				}
 			}
 		}
 	}
 
-	// 3. Keep a card unless it was JUDGED off-topic (unjudged = keep, fail-open).
-	return typed.filter((c) => {
+	// 3. Keep + tag (or drop). Social fails CLOSED on an unjudged post; the high bar
+	//    on league-wide drops general reporter chatter.
+	const keepers: unknown[] = [];
+	for (const c of typed) {
 		const v = c.id ? verdicts.get(c.id) : undefined;
-		return v ? v.isNWSL : true;
-	});
+		const d = decideFeedItem(v, followed, { requireLeagueNews: true, failClosed: true });
+		if (!d.keep) continue;
+		if (d.abbr) {
+			c.teamAbbreviation = d.abbr;
+			c.isLeague = false;
+		} else {
+			c.teamAbbreviation = undefined;
+			c.isLeague = true;
+		}
+		keepers.push(c);
+	}
+	return keepers;
 }
 
-/** Tag one batch of cards via a single Haiku call (forced JSON via output_config). */
-async function haikuTagBatch(cards: FeedCard[], apiKey: string): Promise<Verdict[]> {
+/** Classify one batch of social posts via a single Haiku call (forced JSON). */
+async function haikuClassifySocialBatch(cards: FeedCard[], apiKey: string): Promise<SocialVerdict[]> {
 	const list = cards
 		.map((c) => {
 			const handle = (c.handle ?? "").replace(/^@/, "");
@@ -1642,10 +1741,10 @@ async function haikuTagBatch(cards: FeedCard[], apiKey: string): Promise<Verdict
 			messages: [
 				{
 					role: "user",
-					content: `${FEED_POLICY}\n\nClassify each post. Echo its id exactly.\n\n${list}`,
+					content: `${SOCIAL_POLICY}\n\nClassify each post. Echo its id exactly.\n\n${list}`,
 				},
 			],
-			output_config: { format: { type: "json_schema", schema: VERDICT_SCHEMA } },
+			output_config: { format: { type: "json_schema", schema: SOCIAL_SCHEMA } },
 		}),
 	});
 	if (!r.ok) throw new Error(`haiku ${r.status}`);
@@ -1653,7 +1752,7 @@ async function haikuTagBatch(cards: FeedCard[], apiKey: string): Promise<Verdict
 	const json = (await r.json()) as { content?: Array<{ type?: string; text?: string }> };
 	const text = json.content?.find((b) => b.type === "text")?.text;
 	if (!text) throw new Error("haiku: no text block");
-	return (JSON.parse(text) as { verdicts?: Verdict[] }).verdicts ?? [];
+	return (JSON.parse(text) as { verdicts?: SocialVerdict[] }).verdicts ?? [];
 }
 
 // ---------------------------------------------------------------------------
@@ -1670,21 +1769,22 @@ interface NewsVerdict {
 }
 
 /**
- * Gate each news card on NWSL relevance and tag the keepers to team(s) (verdict
- * KV-cached by card id, ~7d). A card JUDGED `isNWSL: false` is DROPPED (the feeds
- * carry non-NWSL items). For a keeper, exactly ONE team sets `teamAbbreviation` +
- * clears `isLeague` (routes to that club's followers); zero or multiple teams stay
- * `isLeague: true` (shown to all NWSL followers — the single-`teamAbbreviation`
- * model can't carry a set). Fail-OPEN: no key / Haiku error leaves a card unjudged
- * and KEPT as league-wide, so an outage degrades to the un-gated feed rather than
- * an empty chip. Unknown abbreviations are ignored.
+ * Gate each news card on NWSL relevance, tag the keepers to team(s), AND filter by
+ * the requested `teams` (verdict KV-cached by card id, ~7d). Per decideFeedItem: a
+ * card judged non-NWSL is dropped; a card tagged to specific team(s) is kept ONLY if
+ * one is followed (tagged for color), else dropped (someone else's team); a
+ * league-wide NWSL card is kept league-wide and shown to all followers. News fails
+ * OPEN (no key / Haiku error → kept league-wide) so an outage degrades to the
+ * un-gated feed rather than an empty chip. Unknown abbreviations are ignored.
  */
 async function tagNewsTeams(
 	cards: NewsCard[],
+	teams: string[],
 	env: Env,
 	ctx: ExecutionContext,
 ): Promise<NewsCard[]> {
 	if (cards.length === 0) return cards;
+	const followed = new Set(teams);
 	const verdicts = new Map<string, NewsVerdict>();
 
 	// 1. Load cached verdicts (one KV read per card; misses return null). The key is
@@ -1723,14 +1823,19 @@ async function tagNewsTeams(
 		}
 	}
 
-	// 3. Drop judged-off-topic cards; route the keepers. Unjudged (fail-open) → kept.
+	// 3. Keep + tag (or drop) per the shared rule. News fails OPEN on an unjudged
+	//    card (kept league-wide) and has no league-news bar (an article is news).
 	const keepers: NewsCard[] = [];
 	for (const c of cards) {
 		const v = verdicts.get(c.id);
-		if (v && v.isNWSL === false) continue; // judged non-NWSL → drop
-		if (v && v.teams.length === 1) {
-			c.teamAbbreviation = v.teams[0];
+		const d = decideFeedItem(v, followed, { requireLeagueNews: false, failClosed: false });
+		if (!d.keep) continue;
+		if (d.abbr) {
+			c.teamAbbreviation = d.abbr;
 			c.isLeague = false;
+		} else {
+			c.teamAbbreviation = undefined;
+			c.isLeague = true;
 		}
 		keepers.push(c);
 	}
