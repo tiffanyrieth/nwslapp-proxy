@@ -478,12 +478,15 @@ export default {
 		if (url.pathname === "/headshots") {
 			return handleHeadshots(url, env, ctx);
 		}
+		if (url.pathname === "/crest/manifest") {
+			return handleAssetManifest(env);
+		}
 		if (url.pathname === "/crest") {
 			return handleCrest(url, env, ctx);
 		}
 
 		return new Response(
-			"Not found. This proxy serves GET /scoreboard, /summary, /team-videos, /feed, /spotlight, /trivia, /headshots, and /crest.",
+			"Not found. This proxy serves GET /scoreboard, /summary, /team-videos, /feed, /spotlight, /trivia, /headshots, /crest, and /crest/manifest.",
 			{ status: 404 },
 		);
 	},
@@ -2048,6 +2051,30 @@ async function handleTrivia(url: URL, env: Env, ctx: ExecutionContext): Promise<
 }
 
 const CREST_TTL = 30 * 24 * 3600; // 30d edge cache — team crests effectively never change
+
+/** Serve the asset version manifest: `GET /crest/manifest` →
+ *  `{ generatedAt, crests: {ABBR: hash}, flags: {CODE: hash} }`. The app's AssetRefreshService
+ *  diffs this against the hashes it bundled and re-downloads ONLY a crest/flag whose source
+ *  master changed (a rebrand). Each hash is sha256(sourceMaster) truncated to 16 hex — the SAME
+ *  masters the app hashed at build time — so a fresh install matches and nothing re-downloads.
+ *  Built offline by `scripts/build_asset_manifest.mjs` and stored in KV `asset:manifest`. */
+async function handleAssetManifest(env: Env): Promise<Response> {
+	let json: string | null;
+	try {
+		json = await env.FEED_TAGS.get("asset:manifest");
+	} catch {
+		return new Response("manifest unavailable", { status: 502 });
+	}
+	// Not built yet → empty manifest (the app then keeps every bundled asset; never an error path).
+	const body = json ?? JSON.stringify({ crests: {}, flags: {} });
+	return new Response(body, {
+		status: 200,
+		headers: {
+			"Content-Type": "application/json",
+			"Cache-Control": `public, max-age=${CREST_TTL}`,
+		},
+	});
+}
 
 /** Serve a team's NWSL crest as a transparent PNG: `GET /crest?team=WAS`. The PNGs are
  *  rasterized offline from NWSL's vector/raster sources (named-transform-only CDN ⇒ no clean
