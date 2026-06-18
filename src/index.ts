@@ -486,6 +486,9 @@ export default {
 		if (url.pathname === "/crest/manifest") {
 			return handleAssetManifest(env);
 		}
+		if (url.pathname === "/national-teams") {
+			return handleNationalTeams(ctx);
+		}
 		if (url.pathname === "/crest") {
 			return handleCrest(url, env, ctx);
 		}
@@ -494,7 +497,7 @@ export default {
 		}
 
 		return new Response(
-			"Not found. This proxy serves GET /scoreboard, /summary, /team-videos, /feed, /spotlight, /trivia, /headshots, /crest, /crest/manifest, and POST /telemetry.",
+			"Not found. This proxy serves GET /scoreboard, /summary, /team-videos, /feed, /spotlight, /trivia, /headshots, /crest, /crest/manifest, /national-teams, and POST /telemetry.",
 			{ status: 404 },
 		);
 	},
@@ -2082,6 +2085,56 @@ async function handleAssetManifest(env: Env): Promise<Response> {
 			"Cache-Control": `public, max-age=${CREST_TTL}`,
 		},
 	});
+}
+
+/** The data-driven women's national-team directory: `GET /national-teams` → a deduped, name-sorted
+ *  `[{code, name, flag}]` built from the UNION of ESPN's `/teams` across the women's national-team
+ *  feeds. Lets the app's "Browse all" list reflect real ESPN coverage and pick up future additions
+ *  with no app release (and no hand-maintained list). `flag` is ESPN's own country-flag href, keyed
+ *  by the same code that identifies the team (no FIFA→ISO translation that could mis-flag a team).
+ *  Edge-cached 24h — rosters change rarely. Keep WOMENS_NT_FEEDS in sync with the app's
+ *  NationalTeamFeed.all (the same feeds it pulls fixtures from). */
+const WOMENS_NT_FEEDS = ["fifa.friendly.w", "fifa.shebelieves", "concacaf.w.gold", "concacaf.womens.championship"];
+const NATIONAL_TEAMS_TTL = 24 * 3600;
+
+async function handleNationalTeams(ctx: ExecutionContext): Promise<Response> {
+	const cacheKey = new Request("https://nwslapp-proxy/national-teams", { method: "GET" });
+	const cache = caches.default;
+	const hit = await cache.match(cacheKey);
+	if (hit) return withCacheStatus(hit, "HIT");
+
+	const byCode = new Map<string, { code: string; name: string; flag: string }>();
+	await Promise.all(
+		WOMENS_NT_FEEDS.map(async (slug) => {
+			try {
+				const res = await fetch(
+					`https://site.api.espn.com/apis/site/v2/sports/soccer/${slug}/teams`,
+					{ headers: { "User-Agent": "Mozilla/5.0 Chrome/120" } },
+				);
+				if (!res.ok) return;
+				const data = (await res.json()) as {
+					sports?: { leagues?: { teams?: { team?: { abbreviation?: string; displayName?: string; logos?: { href?: string }[] } }[] }[] }[];
+				};
+				const teams = data?.sports?.[0]?.leagues?.[0]?.teams ?? [];
+				for (const entry of teams) {
+					const team = entry.team ?? {};
+					const code = (team.abbreviation ?? "").toUpperCase();
+					if (!code || byCode.has(code)) continue;
+					byCode.set(code, { code, name: team.displayName ?? code, flag: team.logos?.[0]?.href ?? "" });
+				}
+			} catch {
+				/* a single feed failing just narrows coverage; never fail the whole list */
+			}
+		}),
+	);
+
+	const list = [...byCode.values()].sort((a, b) => a.name.localeCompare(b.name));
+	const body = new Response(JSON.stringify(list), {
+		status: 200,
+		headers: { "Content-Type": "application/json", "Cache-Control": `public, max-age=${NATIONAL_TEAMS_TTL}` },
+	});
+	ctx.waitUntil(cache.put(cacheKey, body.clone()));
+	return withCacheStatus(body, "MISS");
 }
 
 /** Collect the app's NO-SILENT-FAILURE telemetry: `POST /telemetry` with a small JSON batch of
