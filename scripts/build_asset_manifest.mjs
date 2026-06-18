@@ -40,10 +40,11 @@ const TEAM_GUIDS = {
 	BAY: "19674698cec24f53af8866cd21abaf8f", UTA: "acffc559cf7d485a9c05fa23ab57054b",
 };
 
-// FIFA code → flagcdn slug (mirrors NWSLApp NationalTeam.all — keep in sync).
+// FIFA code → flagcdn slug. Only the FEATURED set is bundled (and thus manifested) — the
+// browse-all flags are download-and-cache, not bundled, so they aren't refresh-managed here.
+// Keep in sync with NWSLApp NationalTeam.featured + BundledAssetManifest.flags.
 const FLAG_SLUGS = {
 	USA: "us", MEX: "mx", CAN: "ca", BRA: "br", COL: "co", ENG: "gb-eng", JAM: "jm", JPN: "jp",
-	AUS: "au", FRA: "fr", GER: "de", HAI: "ht", KOR: "kr", NGA: "ng", ESP: "es", SWE: "se",
 };
 
 const crestURL = (guid) =>
@@ -52,19 +53,24 @@ const flagURL = (slug) => `https://flagcdn.com/${slug}.svg`;
 
 const dryRun = process.argv.slice(2).includes("--dry-run");
 
-async function hashOf(url) {
+// Hash the SOURCE MASTER and note whether it's vector (an SVG). `v` drives the app's
+// no-downgrade rule: a vector-bundled asset is only ever replaced by a raster override when
+// the new master is itself raster-only (v === false).
+async function entryFor(url) {
 	const res = await fetch(url, { headers: { "User-Agent": UA } });
 	if (!res.ok) throw new Error(`${res.status} ${url}`);
 	const buf = Buffer.from(await res.arrayBuffer());
-	return createHash("sha256").update(buf).digest("hex").slice(0, 16);
+	const h = createHash("sha256").update(buf).digest("hex").slice(0, 16);
+	const v = (res.headers.get("content-type") || "").includes("svg");
+	return { h, v };
 }
 
-async function hashMap(entries, toURL) {
+async function entryMap(entries, toURL) {
 	const out = {};
 	for (const [key, val] of Object.entries(entries)) {
 		try {
-			out[key] = await hashOf(toURL(val));
-			console.log(`✓ ${key.padEnd(4)} ${out[key]}`);
+			out[key] = await entryFor(toURL(val));
+			console.log(`✓ ${key.padEnd(4)} ${out[key].h} ${out[key].v ? "vector" : "raster"}`);
 		} catch (e) {
 			console.error(`✗ ${key}: ${e.message}`);
 		}
@@ -73,9 +79,9 @@ async function hashMap(entries, toURL) {
 }
 
 console.log("Hashing crest masters…");
-const crests = await hashMap(TEAM_GUIDS, crestURL);
+const crests = await entryMap(TEAM_GUIDS, crestURL);
 console.log("Hashing flag masters…");
-const flags = await hashMap(FLAG_SLUGS, flagURL);
+const flags = await entryMap(FLAG_SLUGS, flagURL);
 
 const manifest = { generatedAt: new Date().toISOString(), crests, flags };
 const json = JSON.stringify(manifest);
