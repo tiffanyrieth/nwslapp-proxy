@@ -37,6 +37,7 @@ const SCOREBOARD_LEAGUES = new Set<string>([
 	"fifa.friendly.w",                // Women's international friendlies (global)
 	"concacaf.w.gold",                // Concacaf W Gold Cup (national teams)
 	"concacaf.womens.championship",   // Concacaf W Championship (national teams, pre-2024)
+	"uefa.weuro",                     // UEFA Women's Euro (national teams — Europe's powers)
 	"concacaf.w.champions_cup",       // Concacaf W Champions Cup (CLUB: NWSL clubs vs Liga MX)
 ]);
 const scoreboardUpstream = (slug: string) =>
@@ -2094,11 +2095,15 @@ async function handleAssetManifest(env: Env): Promise<Response> {
  *  by the same code that identifies the team (no FIFA→ISO translation that could mis-flag a team).
  *  Edge-cached 24h — rosters change rarely. Keep WOMENS_NT_FEEDS in sync with the app's
  *  NationalTeamFeed.all (the same feeds it pulls fixtures from). */
-const WOMENS_NT_FEEDS = ["fifa.friendly.w", "fifa.shebelieves", "concacaf.w.gold", "concacaf.womens.championship"];
+const WOMENS_NT_FEEDS = [
+	"fifa.friendly.w", "fifa.shebelieves", "concacaf.w.gold", "concacaf.womens.championship",
+	"uefa.weuro", "fifa.wwc", "fifa.w.olympics",
+];
 const NATIONAL_TEAMS_TTL = 24 * 3600;
 
+const NATIONAL_TEAMS_CV = "2"; // bump to drop the stale edge-cached directory after a feed change
 async function handleNationalTeams(ctx: ExecutionContext): Promise<Response> {
-	const cacheKey = new Request("https://nwslapp-proxy/national-teams", { method: "GET" });
+	const cacheKey = new Request(`https://nwslapp-proxy/national-teams?cv=${NATIONAL_TEAMS_CV}`, { method: "GET" });
 	const cache = caches.default;
 	const hit = await cache.match(cacheKey);
 	if (hit) return withCacheStatus(hit, "HIT");
