@@ -435,6 +435,11 @@ export default {
 			}
 		}
 
+		// POST telemetry ingest must be registered BEFORE the GET-only guard below.
+		if (url.pathname === "/telemetry") {
+			return handleTelemetryIngest(request, env, ctx);
+		}
+
 		// All other routes are GET-only; reject early so the 405 is shared.
 		if (request.method !== "GET") {
 			return new Response("Method not allowed. Use GET.", {
@@ -484,9 +489,12 @@ export default {
 		if (url.pathname === "/crest") {
 			return handleCrest(url, env, ctx);
 		}
+		if (url.pathname === "/telemetry/recent") {
+			return handleTelemetryRecent(request, env);
+		}
 
 		return new Response(
-			"Not found. This proxy serves GET /scoreboard, /summary, /team-videos, /feed, /spotlight, /trivia, /headshots, /crest, and /crest/manifest.",
+			"Not found. This proxy serves GET /scoreboard, /summary, /team-videos, /feed, /spotlight, /trivia, /headshots, /crest, /crest/manifest, and POST /telemetry.",
 			{ status: 404 },
 		);
 	},
@@ -2074,6 +2082,60 @@ async function handleAssetManifest(env: Env): Promise<Response> {
 			"Cache-Control": `public, max-age=${CREST_TTL}`,
 		},
 	});
+}
+
+/** Collect the app's NO-SILENT-FAILURE telemetry: `POST /telemetry` with a small JSON batch of
+ *  NON-PII operational events (kind + a short operational detail like a team abbr/host, a relative
+ *  timestamp, app + OS version). Stores each batch in KV under a reverse-time key (newest first)
+ *  with a 30-day TTL and logs it (visible in `wrangler tail`), so a field miss reaches the owner
+ *  without a user report. Deliberately stores NO identifiers and NO client IP — App Store
+ *  "Diagnostics" data, not linked to identity. Best-effort: malformed input is dropped, never 5xx. */
+async function handleTelemetryIngest(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
+	if (request.method !== "POST") return new Response("POST only", { status: 405 });
+	let body: { app?: unknown; os?: unknown; events?: unknown };
+	try {
+		body = (await request.json()) as typeof body;
+	} catch {
+		return new Response("bad json", { status: 400 });
+	}
+	const raw = Array.isArray(body.events) ? body.events.slice(0, 100) : [];
+	// Whitelist + cap every field so nothing unexpected (or PII-shaped) is persisted.
+	const events = raw
+		.map((e) => {
+			const ev = e as { kind?: unknown; detail?: unknown; ts?: unknown };
+			return {
+				kind: String(ev.kind ?? "").slice(0, 40),
+				detail: String(ev.detail ?? "").slice(0, 80),
+				ts: typeof ev.ts === "number" ? ev.ts : null,
+			};
+		})
+		.filter((e) => e.kind);
+	if (events.length === 0) return new Response(null, { status: 204 });
+
+	const record = {
+		at: new Date().toISOString(),
+		app: String(body.app ?? "").slice(0, 20),
+		os: String(body.os ?? "").slice(0, 20),
+		events,
+	};
+	console.log("telemetry", JSON.stringify(record));
+	// Reverse-time key so a later list() returns newest-first. NO client IP stored.
+	const key = `diag:${1e15 - Date.now()}:${crypto.randomUUID().slice(0, 8)}`;
+	ctx.waitUntil(env.FEED_TAGS.put(key, JSON.stringify(record), { expirationTtl: 60 * 60 * 24 * 30 }));
+	return new Response(null, { status: 204 });
+}
+
+/** Owner view of recent telemetry: `GET /telemetry/recent` (newest first), gated by the same
+ *  `x-admin-key`/`BRACKET_ADMIN_KEY` secret as the other admin routes. */
+async function handleTelemetryRecent(request: Request, env: Env): Promise<Response> {
+	const key = (env as unknown as { BRACKET_ADMIN_KEY?: string }).BRACKET_ADMIN_KEY;
+	if (!key || request.headers.get("x-admin-key") !== key) {
+		return new Response("forbidden", { status: 403 });
+	}
+	const list = await env.FEED_TAGS.list({ prefix: "diag:", limit: 100 });
+	const records = await Promise.all(list.keys.map((k) => env.FEED_TAGS.get(k.name)));
+	const parsed = records.filter((s): s is string => s !== null).map((s) => JSON.parse(s));
+	return Response.json(parsed);
 }
 
 /** Serve a team's NWSL crest as a transparent PNG: `GET /crest?team=WAS`. The PNGs are
