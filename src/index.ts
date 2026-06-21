@@ -83,12 +83,15 @@ const TEAM_SEED_VIDEO: Record<string, string> = {
 //              fetch it with BROWSER_UA, take the latest links under `articlePath`,
 //              then OG-scrape each (fetchOG also reads JSON-LD `datePublished` — several
 //              club platforms put the date there, not in a `<meta og:>` tag).
-//   3) googleNews — last resort for a club whose official site is bot-blocked, JS-only,
-//              or carries no machine-readable date. Per-club Google News RSS (keyless).
-//              Honest: tagged sourceType "news" (press), not "club".
+//   3) fallback — last resort for a club whose official site is bot-blocked, JS-only, or
+//              carries no machine-readable date. Filters the curated NWSL outlet RSS
+//              (NEWS_FEEDS) by club name. Honest: tagged sourceType "news" (press), not
+//              "club". (Google News RSS was tried first but returns EMPTY to Cloudflare
+//              Workers — datacenter IPs get a consent page — so any fallback source MUST
+//              be Workers-reachable; the NEWS_FEEDS already are.)
 //
 // RESILIENCE / NO SILENT FAILURES: an rss/index club that yields 0 cards auto-falls
-// back to Google News AND emits a `clubNewsFallback` diag event, so a broken official
+// back to the outlet fallback AND emits a `clubNewsFallback` diag event, so a broken official
 // source is VISIBLE (never a silently-empty club). A club empty even after fallback
 // emits `clubNewsEmpty`. The deploy-time health check (scripts/health_check_club_news.mjs)
 // fails if ANY club returns 0. See buildClubNewsCards + emitDiag.
@@ -97,20 +100,20 @@ const TEAM_SEED_VIDEO: Record<string, string> = {
 //   1. Probe with the browser UA:
 //        curl -A "<BROWSER_UA>" https://<domain>/feed/        # valid RSS → `rss`
 //        curl -A "<BROWSER_UA>" https://<domain>/<newsPath>   # SSRs article links → `index`
-//      Neither (403 / JS-only / no date) → `googleNews`.
+//      Neither (403 / JS-only / no date) → `fallback`.
 //   2. `npm run healthcheck` — curls all 16, fails if any returns 0 articles.
 //   NOTE: several clubs live on a PARENT/shared domain under a sub-path — keep the
 //   prefix in BOTH `url` and `articlePath` (see HOU/UTA/ORL).
 type ClubNewsSource =
 	| { kind: "rss"; url: string }
 	| { kind: "index"; url: string; articlePath: string }
-	| { kind: "googleNews" };
+	| { kind: "fallback" };
 
 const CLUB_NEWS: Record<string, ClubNewsSource> = {
 	// ── Official RSS/Atom (dated, structured) ──
 	BAY: { kind: "rss", url: "https://bayfc.com/feed/" },
 	// Denver is a 2026 expansion club — its WordPress feed currently has only the
-	// default "Hello world!" stub (filtered), so DEN auto-falls-back to Google News +
+	// default "Hello world!" stub (filtered), so DEN auto-falls-back to the outlet fallback +
 	// a clubNewsFallback diag until the club posts real content (then RSS takes over).
 	DEN: { kind: "rss", url: "https://denversummitfc.com/feed/" },
 	LOU: { kind: "rss", url: "https://racingloufc.com/feed/" },
@@ -137,14 +140,14 @@ const CLUB_NEWS: Record<string, ClubNewsSource> = {
 	UTA: { kind: "index", url: "https://www.rsl.com/utahroyals/news/", articlePath: "/utahroyals/news/" },
 	ORL: { kind: "index", url: "https://www.orlandocitysc.com/pride/news/", articlePath: "/pride/news/" },
 
-	// ── Google News fallback (official site unusable) ──
+	// ── Outlet fallback (official site unusable → curated NWSL press, sourceType "news") ──
 	// GFC: gothamfc.com articles carry NO machine-readable date (no og:published / JSON-LD),
 	//      so they can't be dated/sorted reliably — press-sourced until they add one.
-	GFC: { kind: "googleNews" },
+	GFC: { kind: "fallback" },
 	// CHI: chicagostars.com returns a Cloudflare 403 to every path/UA (incl. a server fetch).
-	CHI: { kind: "googleNews" },
+	CHI: { kind: "fallback" },
 	// BOS: brand-new Shopify site is JS-rendered with no feed (revisit when they add a news section).
-	BOS: { kind: "googleNews" },
+	BOS: { kind: "fallback" },
 };
 
 // A desktop-browser UA so article fetches get the full SSR'd HTML (with OG tags)
@@ -924,14 +927,14 @@ const CLUBNEWS_TTL = 2 * 60 * 60; // 2h per-club cache (Home's own route cache i
 const CLUBNEWS_PER_CLUB = 4; // most-recent articles surfaced per club
 
 /** Home "Club News": each followed club's own recent article-news, via its configured
- *  CLUB_NEWS strategy (rss / index-scrape / googleNews). Per-club + best-effort: one
+ *  CLUB_NEWS strategy (rss / index-scrape / fallback). Per-club + best-effort: one
  *  club failing never breaks the others or the route. */
 async function buildClubNewsCards(teams: string[], env: Env, ctx: ExecutionContext): Promise<unknown[]> {
 	const per = await Promise.all(teams.map((abbr) => clubNewsFor(abbr, env, ctx)));
 	return per.flat();
 }
 
-/** Resolve one club's news cards: KV cache → primary strategy → Google News fallback,
+/** Resolve one club's news cards: KV cache → primary strategy → outlet fallback,
  *  emitting `diag` telemetry on any official-source miss (NO SILENT FAILURES). */
 async function clubNewsFor(abbr: string, env: Env, ctx: ExecutionContext): Promise<unknown[]> {
 	const src = CLUB_NEWS[abbr];
@@ -945,19 +948,19 @@ async function clubNewsFor(abbr: string, env: Env, ctx: ExecutionContext): Promi
 	try {
 		if (src.kind === "rss") cards = await clubRssCards(abbr, src.url);
 		else if (src.kind === "index") cards = await clubIndexCards(abbr, src.url, src.articlePath);
-		// kind === "googleNews": handled by the fallback path below.
+		// kind === "fallback": handled by the outlet-fallback path below.
 	} catch {
 		cards = [];
 	}
 
 	// A configured OFFICIAL source returning nothing is a failure — surface it (visible in
 	// Diagnostics), then fall back so the club is never empty.
-	if (cards.length === 0 && src.kind !== "googleNews") {
+	if (cards.length === 0 && src.kind !== "fallback") {
 		emitDiag(env, ctx, "clubNewsFallback", abbr);
 	}
 	if (cards.length === 0) {
 		try {
-			cards = await buildGoogleNewsCards(abbr);
+			cards = await buildOutletFallbackCards(abbr);
 		} catch {
 			cards = [];
 		}
@@ -1012,32 +1015,64 @@ async function clubIndexCards(abbr: string, indexUrl: string, articlePath: strin
 	return built.filter((c): c is NewsCard => c !== null).slice(0, CLUBNEWS_PER_CLUB);
 }
 
-/** Strategy / fallback: a club's recent news via keyless per-club Google News RSS.
- *  Press, not club-official, so tagged sourceType "news". Google titles are
- *  "Headline - Publisher"; we split the publisher off for the card's source name. */
-async function buildGoogleNewsCards(abbr: string): Promise<NewsCard[]> {
+/** Strategy / fallback: a club's recent news filtered from the curated NWSL outlet RSS
+ *  feeds (NEWS_FEEDS — the same feeds /feed already pulls successfully from the Worker).
+ *  Press, not club-official → sourceType "news". NOTE: this replaced a per-club Google
+ *  News RSS fallback, which returns EMPTY to Cloudflare Workers (datacenter IPs get a
+ *  consent/empty page) — caught only by the deploy-time health check + clubNewsEmpty
+ *  telemetry, never locally. Use a Workers-reachable source here, always. */
+async function buildOutletFallbackCards(abbr: string): Promise<NewsCard[]> {
+	const match = clubNewsMatcher(abbr);
+	const perFeed = await Promise.all(
+		NEWS_FEEDS.map(async (feed) => {
+			try {
+				const r = await fetch(feed.url, {
+					headers: {
+						"User-Agent": BROWSER_UA,
+						Accept: "application/rss+xml, application/xml, text/xml",
+					},
+				});
+				if (!r.ok) return [] as NewsCard[];
+				const xml = await r.text();
+				// Match each RAW item block (title + body/content:encoded + categories), not
+				// just parseOutletRSS's excerpt — outlets often name a club only in the
+				// article body, which the <description> excerpt omits (that hid NC's coverage).
+				const blocks = xml.match(/<(?:item|entry)[\s>][\s\S]*?<\/(?:item|entry)>/g) ?? [];
+				const out: NewsCard[] = [];
+				for (const block of blocks) {
+					if (!match(block)) continue;
+					const it = parseOutletRSS(block)[0];
+					if (!it) continue;
+					const timestamp = isoNoFraction(it.pubDate);
+					if (!timestamp) continue;
+					out.push(clubNewsCard(abbr, it.link, it.title, it.description, feed.source, it.image, timestamp, "news"));
+				}
+				return out;
+			} catch {
+				return [] as NewsCard[];
+			}
+		}),
+	);
+	return perFeed.flat().sort(byTimestampDesc).slice(0, CLUBNEWS_PER_CLUB) as NewsCard[];
+}
+
+/** Match an article's text to a club for the outlet fallback: the club's name (with and
+ *  without an FC/SC suffix) plus a distinctive press nickname where the name and the way
+ *  outlets refer to the club differ. Terms <4 chars are dropped (too generic). */
+function clubNewsMatcher(abbr: string): (text: string) => boolean {
 	const name = CLUB_SOCIAL[abbr]?.name ?? abbr;
-	const q = encodeURIComponent(`"${name}" when:30d`);
-	const url = `https://news.google.com/rss/search?q=${q}&hl=en-US&gl=US&ceid=US:en`;
-	const r = await fetch(url, {
-		headers: { "User-Agent": BROWSER_UA, Accept: "application/rss+xml, application/xml" },
-	});
-	if (!r.ok) return [];
-	const cards: NewsCard[] = [];
-	for (const it of parseOutletRSS(await r.text())) {
-		const timestamp = isoNoFraction(it.pubDate);
-		if (!timestamp) continue;
-		const dash = it.title.lastIndexOf(" - ");
-		const headline = dash > 0 ? it.title.slice(0, dash) : it.title;
-		const publisher = dash > 0 ? it.title.slice(dash + 3) : "Google News";
-		cards.push(clubNewsCard(abbr, it.link, headline, it.description, publisher, it.image, timestamp, "news"));
-		if (cards.length >= CLUBNEWS_PER_CLUB) break;
-	}
-	return cards;
+	const terms = new Set<string>([name, name.replace(/\s+(FC|SC)$/i, "")]);
+	const nick: Record<string, string> = { GFC: "Gotham", NC: "Courage", POR: "Thorns" };
+	if (nick[abbr]) terms.add(nick[abbr]);
+	const lowered = [...terms].map((t) => t.toLowerCase()).filter((t) => t.length >= 4);
+	return (text) => {
+		const low = text.toLowerCase();
+		return lowered.some((t) => low.includes(t));
+	};
 }
 
 /** One Home club-news card (newsArticle layout). `sourceType` is "club" for the club's
- *  own site, "news" for the Google News fallback. */
+ *  own site, "news" for the outlet fallback. */
 function clubNewsCard(
 	abbr: string,
 	url: string,
@@ -1213,7 +1248,7 @@ export function extractJsonLdArticle(
 
 /** WordPress/CMS placeholder posts that aren't real club news (a brand-new club site
  *  with only the default first post). Filtered so the club falls back gracefully to
- *  Google News + a `clubNewsFallback` diag, instead of surfacing junk. */
+ *  the outlet fallback + a `clubNewsFallback` diag, instead of surfacing junk. */
 export function isPlaceholderArticle(title: string): boolean {
 	return /^(hello world!?|sample post|uncategorized|test post)$/i.test(title.trim());
 }
