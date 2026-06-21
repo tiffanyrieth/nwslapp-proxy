@@ -67,23 +67,84 @@ const TEAM_SEED_VIDEO: Record<string, string> = {
 	SD: "qI3vFXoOEQk", SEA: "1JwgDxClwPA", UTA: "CzlPKyGe1eI", WAS: "IdSPrFaTxco",
 };
 
-// Per-club article URLs from each club's OWN site, surfaced on Home as NEWS cards
-// (diversifies Home beyond YouTube). Each URL is fetched and its Open Graph
-// metadata (og:title / og:description / og:image / article:published_time) is
-// scraped into a `newsArticle` ContentCard — the iMessage/Slack link-preview
-// model. `source` is the club display name on the card (→ crest).
+// ─────────────────────────────────────────────────────────────────────────────
+// Club news — Home "Club News" (newsArticle cards, the green "NEWS" pill).
 //
-// TEMP curated list, OG-fetched LIVE so titles/images stay real. Auto-discovery
-// is a later step and easy here: club sites mostly run WordPress, so `/feed/`
-// (RSS) and `/wp-json/wp/v2/posts` are open + keyless (verified on
-// washingtonspirit.com). Only WAS for now.
-const TEAM_ARTICLES: Record<string, Array<{ url: string; source: string }>> = {
-	WAS: [
-		{
-			url: "https://washingtonspirit.com/blog/2026/06/09/washington-spirit-star-trinity-rodman-and-owner-michele-kang-named-to-inaugural-time100-sports-list/",
-			source: "Washington Spirit",
-		},
-	],
+// Every followed club's OWN recent article-news on Home, as the iMessage/Slack
+// link-preview model: headline + blurb + image + tap-out, deep-linked to the club's
+// site. (Supersedes the old single-URL TEAM_ARTICLES, which only ever covered WAS —
+// see git history: the OG→card mechanism always worked; the source list never grew.)
+//
+// MAINTENANCE — tiered discovery, in priority order:
+//   1) rss   — the club's own RSS/Atom feed (WordPress `/feed/`, HubSpot
+//              `/<blog>/rss.xml`, …). Cleanest: structured title/date/image, no
+//              scraping. PREFER whenever a valid feed exists.
+//   2) index — the club SSRs a news INDEX listing article links in the raw HTML. We
+//              fetch it with BROWSER_UA, take the latest links under `articlePath`,
+//              then OG-scrape each (fetchOG also reads JSON-LD `datePublished` — several
+//              club platforms put the date there, not in a `<meta og:>` tag).
+//   3) googleNews — last resort for a club whose official site is bot-blocked, JS-only,
+//              or carries no machine-readable date. Per-club Google News RSS (keyless).
+//              Honest: tagged sourceType "news" (press), not "club".
+//
+// RESILIENCE / NO SILENT FAILURES: an rss/index club that yields 0 cards auto-falls
+// back to Google News AND emits a `clubNewsFallback` diag event, so a broken official
+// source is VISIBLE (never a silently-empty club). A club empty even after fallback
+// emits `clubNewsEmpty`. The deploy-time health check (scripts/health_check_club_news.mjs)
+// fails if ANY club returns 0. See buildClubNewsCards + emitDiag.
+//
+// TO ADD / FIX A CLUB (rebrand, domain move, or the health check flags it empty):
+//   1. Probe with the browser UA:
+//        curl -A "<BROWSER_UA>" https://<domain>/feed/        # valid RSS → `rss`
+//        curl -A "<BROWSER_UA>" https://<domain>/<newsPath>   # SSRs article links → `index`
+//      Neither (403 / JS-only / no date) → `googleNews`.
+//   2. `npm run healthcheck` — curls all 16, fails if any returns 0 articles.
+//   NOTE: several clubs live on a PARENT/shared domain under a sub-path — keep the
+//   prefix in BOTH `url` and `articlePath` (see HOU/UTA/ORL).
+type ClubNewsSource =
+	| { kind: "rss"; url: string }
+	| { kind: "index"; url: string; articlePath: string }
+	| { kind: "googleNews" };
+
+const CLUB_NEWS: Record<string, ClubNewsSource> = {
+	// ── Official RSS/Atom (dated, structured) ──
+	BAY: { kind: "rss", url: "https://bayfc.com/feed/" },
+	// Denver is a 2026 expansion club — its WordPress feed currently has only the
+	// default "Hello world!" stub (filtered), so DEN auto-falls-back to Google News +
+	// a clubNewsFallback diag until the club posts real content (then RSS takes over).
+	DEN: { kind: "rss", url: "https://denversummitfc.com/feed/" },
+	LOU: { kind: "rss", url: "https://racingloufc.com/feed/" },
+	SD: { kind: "rss", url: "https://sandiegowavefc.com/feed/" },
+	WAS: { kind: "rss", url: "https://washingtonspirit.com/feed/" },
+	// Angel City runs on HubSpot — its blog RSS lives under the /acfc-post blog path
+	// (the /news page redirects there). Owner-confirmed Jun 2026.
+	LA: { kind: "rss", url: "https://angelcity.com/acfc-post/rss.xml" },
+
+	// ── SSR news index → scrape links → OG-scrape (date via JSON-LD on these platforms) ──
+	KC: { kind: "index", url: "https://www.kansascitycurrent.com/news", articlePath: "/news/" },
+	// NC + POR are configured for their official index but currently auto-fall-back (NC's
+	// index lists only category links, not article slugs, in SSR HTML; thorns.com article
+	// pages carry no machine-readable date). The clubNewsFallback diag flags both — revisit
+	// if their sites expose article links / dates (then they promote to official with no
+	// config change).
+	NC: { kind: "index", url: "https://nccourage.com/news", articlePath: "/news/" },
+	POR: { kind: "index", url: "https://www.thorns.com/news", articlePath: "/news/" },
+	SEA: { kind: "index", url: "https://www.reignfc.com/news", articlePath: "/news/" },
+	// These three live on a shared PARENT domain under a club sub-path (owner-confirmed
+	// Jun 2026), NOT their own *.com — keep the sub-path in url AND articlePath:
+	// HOU under the Houston Dynamo site, UTA on the RSL platform, ORL under Orlando City.
+	HOU: { kind: "index", url: "https://www.houstondynamofc.com/houstondash/news/", articlePath: "/houstondash/news/" },
+	UTA: { kind: "index", url: "https://www.rsl.com/utahroyals/news/", articlePath: "/utahroyals/news/" },
+	ORL: { kind: "index", url: "https://www.orlandocitysc.com/pride/news/", articlePath: "/pride/news/" },
+
+	// ── Google News fallback (official site unusable) ──
+	// GFC: gothamfc.com articles carry NO machine-readable date (no og:published / JSON-LD),
+	//      so they can't be dated/sorted reliably — press-sourced until they add one.
+	GFC: { kind: "googleNews" },
+	// CHI: chicagostars.com returns a Cloudflare 403 to every path/UA (incl. a server fetch).
+	CHI: { kind: "googleNews" },
+	// BOS: brand-new Shopify site is JS-rendered with no feed (revisit when they add a news section).
+	BOS: { kind: "googleNews" },
 };
 
 // A desktop-browser UA so article fetches get the full SSR'd HTML (with OG tags)
@@ -744,14 +805,14 @@ async function handleTeamVideos(
 
 	let cards: unknown[];
 	try {
-		// YouTube uploads + club-site news (OG) + the club's own IG (B3b, read
-		// from the cron-built KV snapshot, placement "home"), merged newest-first.
-		// Articles + social are best-effort (neither throws); only a YouTube outage
-		// trips the stale/502 fallback below. Club Bluesky moved OFF Home into the Feed
-		// in B3b — IG is the club's Home voice now.
+		// YouTube uploads + each club's own article-news (per-club CLUB_NEWS discovery,
+		// all 16 clubs) + the club's own IG (read from the cron-built KV snapshot,
+		// placement "home"), merged newest-first. News + social are best-effort (neither
+		// throws); only a YouTube outage trips the stale/502 fallback below. Club Bluesky
+		// lives in the Feed now — IG is the club's Home voice.
 		const [videos, articles, social] = await Promise.all([
 			buildTeamCards(teams, env.YOUTUBE_API_KEY),
-			buildArticleCards(teams),
+			buildClubNewsCards(teams, env, ctx),
 			readSocialCards(env),
 		]);
 		cards = dedupeByContent(
@@ -859,43 +920,198 @@ type Card = { timestamp?: string };
  * Best-effort — a fetch or a missing title drops only that one card (never
  * throws), so a news hiccup can't take down the YouTube cards it's merged with.
  */
-async function buildArticleCards(teams: string[]): Promise<unknown[]> {
-	const jobs: Array<{ abbr: string; url: string; source: string }> = [];
-	for (const abbr of teams) {
-		for (const a of TEAM_ARTICLES[abbr] ?? []) jobs.push({ abbr, url: a.url, source: a.source });
-	}
-	if (jobs.length === 0) return [];
+const CLUBNEWS_TTL = 2 * 60 * 60; // 2h per-club cache (Home's own route cache is 1h)
+const CLUBNEWS_PER_CLUB = 4; // most-recent articles surfaced per club
 
+/** Home "Club News": each followed club's own recent article-news, via its configured
+ *  CLUB_NEWS strategy (rss / index-scrape / googleNews). Per-club + best-effort: one
+ *  club failing never breaks the others or the route. */
+async function buildClubNewsCards(teams: string[], env: Env, ctx: ExecutionContext): Promise<unknown[]> {
+	const per = await Promise.all(teams.map((abbr) => clubNewsFor(abbr, env, ctx)));
+	return per.flat();
+}
+
+/** Resolve one club's news cards: KV cache → primary strategy → Google News fallback,
+ *  emitting `diag` telemetry on any official-source miss (NO SILENT FAILURES). */
+async function clubNewsFor(abbr: string, env: Env, ctx: ExecutionContext): Promise<unknown[]> {
+	const src = CLUB_NEWS[abbr];
+	if (!src) return [];
+
+	const cacheKey = `clubnews-${abbr}`;
+	const cached = (await env.FEED_TAGS.get(cacheKey, "json")) as NewsCard[] | null;
+	if (cached) return cached;
+
+	let cards: NewsCard[] = [];
+	try {
+		if (src.kind === "rss") cards = await clubRssCards(abbr, src.url);
+		else if (src.kind === "index") cards = await clubIndexCards(abbr, src.url, src.articlePath);
+		// kind === "googleNews": handled by the fallback path below.
+	} catch {
+		cards = [];
+	}
+
+	// A configured OFFICIAL source returning nothing is a failure — surface it (visible in
+	// Diagnostics), then fall back so the club is never empty.
+	if (cards.length === 0 && src.kind !== "googleNews") {
+		emitDiag(env, ctx, "clubNewsFallback", abbr);
+	}
+	if (cards.length === 0) {
+		try {
+			cards = await buildGoogleNewsCards(abbr);
+		} catch {
+			cards = [];
+		}
+	}
+
+	if (cards.length === 0) {
+		emitDiag(env, ctx, "clubNewsEmpty", abbr); // true miss — flagged, not hidden
+	} else {
+		ctx.waitUntil(env.FEED_TAGS.put(cacheKey, JSON.stringify(cards), { expirationTtl: CLUBNEWS_TTL }));
+	}
+	return cards;
+}
+
+/** Strategy: the club's own RSS/Atom feed → cards (structured, dated; no scraping). */
+async function clubRssCards(abbr: string, url: string): Promise<NewsCard[]> {
+	const r = await fetch(url, {
+		headers: { "User-Agent": BROWSER_UA, Accept: "application/rss+xml, application/xml, text/xml" },
+	});
+	if (!r.ok) return [];
+	const name = CLUB_SOCIAL[abbr]?.name ?? abbr;
+	const cards: NewsCard[] = [];
+	for (const it of parseOutletRSS(await r.text())) {
+		const timestamp = isoNoFraction(it.pubDate);
+		if (!timestamp) continue; // undatable → skip rather than fake "now"
+		if (isPlaceholderArticle(it.title)) continue; // stub-site default post → not real news
+		cards.push(clubNewsCard(abbr, it.link, it.title, it.description, name, it.image, timestamp, "club"));
+		if (cards.length >= CLUBNEWS_PER_CLUB) break;
+	}
+	return cards;
+}
+
+/** Strategy: scrape the club's SSR'd news index for the latest article links, then
+ *  OG-scrape each (fetchOG reads JSON-LD dates too). The date gate doubles as the
+ *  "is this a real article?" filter — section/category pages carry no date → dropped. */
+async function clubIndexCards(abbr: string, indexUrl: string, articlePath: string): Promise<NewsCard[]> {
+	const r = await fetch(indexUrl, { headers: { "User-Agent": BROWSER_UA, Accept: "text/html" } });
+	if (!r.ok) return [];
+	const links = extractArticleLinks(await r.text(), indexUrl, articlePath);
+	const name = CLUB_SOCIAL[abbr]?.name ?? abbr;
 	const built = await Promise.all(
-		jobs.map(async ({ abbr, url, source }) => {
+		links.map(async (link) => {
 			try {
-				const og = await fetchOG(url);
-				// `timestamp` is required app-side; skip a card we can't date rather
-				// than fake a time (would mis-sort it to "now").
-				const published = isoNoFraction(og.published);
-				if (!og.title || !published) return null;
-				return {
-					id: `nws-${url.split("/").filter(Boolean).pop()}`, // slug = stable id
-					layout: "newsArticle",
-					platform: "article",
-					placement: "home",
-					teamAbbreviation: abbr,
-					isLeague: false,
-					headline: og.title,
-					blurb: og.description, // undefined → nil (e.g. generic site default)
-					sourceName: source,
-					thumbnailURL: og.image,
-					igFallback: false,
-					timestamp: published,
-					url,
-					ctaLabel: "Read more",
-				};
+				const og = await fetchOG(link);
+				const timestamp = isoNoFraction(og.published);
+				if (!og.title || !timestamp || isPlaceholderArticle(og.title)) return null;
+				return clubNewsCard(abbr, link, og.title, og.description, name, og.image, timestamp, "club");
 			} catch {
 				return null;
 			}
 		}),
 	);
-	return built.filter(Boolean);
+	return built.filter((c): c is NewsCard => c !== null).slice(0, CLUBNEWS_PER_CLUB);
+}
+
+/** Strategy / fallback: a club's recent news via keyless per-club Google News RSS.
+ *  Press, not club-official, so tagged sourceType "news". Google titles are
+ *  "Headline - Publisher"; we split the publisher off for the card's source name. */
+async function buildGoogleNewsCards(abbr: string): Promise<NewsCard[]> {
+	const name = CLUB_SOCIAL[abbr]?.name ?? abbr;
+	const q = encodeURIComponent(`"${name}" when:30d`);
+	const url = `https://news.google.com/rss/search?q=${q}&hl=en-US&gl=US&ceid=US:en`;
+	const r = await fetch(url, {
+		headers: { "User-Agent": BROWSER_UA, Accept: "application/rss+xml, application/xml" },
+	});
+	if (!r.ok) return [];
+	const cards: NewsCard[] = [];
+	for (const it of parseOutletRSS(await r.text())) {
+		const timestamp = isoNoFraction(it.pubDate);
+		if (!timestamp) continue;
+		const dash = it.title.lastIndexOf(" - ");
+		const headline = dash > 0 ? it.title.slice(0, dash) : it.title;
+		const publisher = dash > 0 ? it.title.slice(dash + 3) : "Google News";
+		cards.push(clubNewsCard(abbr, it.link, headline, it.description, publisher, it.image, timestamp, "news"));
+		if (cards.length >= CLUBNEWS_PER_CLUB) break;
+	}
+	return cards;
+}
+
+/** One Home club-news card (newsArticle layout). `sourceType` is "club" for the club's
+ *  own site, "news" for the Google News fallback. */
+function clubNewsCard(
+	abbr: string,
+	url: string,
+	headline: string,
+	blurb: string | undefined,
+	sourceName: string,
+	image: string | undefined,
+	timestamp: string,
+	sourceType: "club" | "news",
+): NewsCard {
+	return {
+		id: `clubnews-${hashId(url)}`,
+		layout: "newsArticle",
+		platform: "article",
+		placement: "home",
+		sourceType,
+		teamAbbreviation: abbr,
+		isLeague: false,
+		headline,
+		blurb,
+		sourceName,
+		thumbnailURL: image,
+		igFallback: false,
+		timestamp,
+		url,
+		ctaLabel: sourceType === "club" ? "Read more" : "Read article",
+	};
+}
+
+/** Extract candidate article URLs from a club's news-index HTML: same-origin links
+ *  whose path is a direct child of `articlePath` (a slug, not a nested section), minus
+ *  obvious non-articles (index/tag/author/page/category/video/search/feed). Permissive
+ *  by design — the OG date gate in clubIndexCards is the final article filter. */
+export function extractArticleLinks(html: string, indexUrl: string, articlePath: string, max = 12): string[] {
+	const origin = new URL(indexUrl).origin;
+	const deny = /\/(index|tags?|authors?|page|categor(?:y|ies)|videos?|search|archive|feed|rss)(\/|$|\.)/i;
+	const seen = new Set<string>();
+	const out: string[] = [];
+	const hrefRe = /href="([^"#?]+)"/gi;
+	let m: RegExpExecArray | null;
+	while ((m = hrefRe.exec(html)) !== null && out.length < max) {
+		let abs: URL;
+		try {
+			abs = m[1].startsWith("http") ? new URL(m[1]) : new URL(m[1], origin);
+		} catch {
+			continue;
+		}
+		if (abs.origin !== origin) continue;
+		if (!abs.pathname.startsWith(articlePath)) continue;
+		const slug = abs.pathname.slice(articlePath.length).replace(/\/$/, "");
+		if (!slug || slug.includes("/")) continue; // direct child only (the article slug)
+		if (deny.test(abs.pathname)) continue;
+		const u = abs.origin + abs.pathname;
+		if (seen.has(u)) continue;
+		seen.add(u);
+		out.push(u);
+	}
+	return out;
+}
+
+/** NO SILENT FAILURES (proxy edition): write one operational event to the SAME KV +
+ *  record shape the app's `POST /telemetry` sink uses (see handleTelemetryIngest), so a
+ *  proxy-side miss surfaces in the owner's `GET /telemetry/recent` Diagnostics alongside
+ *  app telemetry. Best-effort, non-PII. */
+function emitDiag(env: Env, ctx: ExecutionContext, kind: string, detail: string): void {
+	const record = {
+		at: new Date().toISOString(),
+		app: "proxy",
+		os: "worker",
+		events: [{ kind: kind.slice(0, 40), detail: detail.slice(0, 80), ts: Date.now() }],
+	};
+	console.log("telemetry", JSON.stringify(record));
+	const key = `diag:${1e15 - Date.now()}:${crypto.randomUUID().slice(0, 8)}`;
+	ctx.waitUntil(env.FEED_TAGS.put(key, JSON.stringify(record), { expirationTtl: 60 * 60 * 24 * 30 }));
 }
 
 /** Normalize any ISO-ish date to "YYYY-MM-DDTHH:MM:SSZ" — no fractional seconds,
@@ -910,7 +1126,10 @@ function isoNoFraction(s?: string): string | undefined {
 }
 
 /** Scrape an article page's Open Graph metadata (title/description/image) + the
- *  `article:published_time`. */
+ *  publish date. The date falls back to JSON-LD `datePublished` when there's no
+ *  `<meta article:published_time>` — several club platforms (the MLS digital platform
+ *  behind Houston/Utah/Orlando/Portland/etc.) carry the date ONLY in JSON-LD, so
+ *  without this the date gate would drop every one of their articles. */
 async function fetchOG(
 	url: string,
 ): Promise<{ title?: string; description?: string; image?: string; published?: string }> {
@@ -923,12 +1142,80 @@ async function fetchOG(
 		return m ? decodeEntities(m[1]) : undefined;
 	};
 
+	const ld = extractJsonLdArticle(html);
 	return {
-		title: meta("og:title")?.trim(),
-		description: meta("og:description"),
-		image: meta("og:image"),
-		published: meta("article:published_time"),
+		title: meta("og:title")?.trim() ?? ld?.headline?.trim(),
+		description: meta("og:description") ?? ld?.description,
+		image: meta("og:image") ?? ld?.image,
+		published: meta("article:published_time") ?? ld?.datePublished,
 	};
+}
+
+/** Pull date/headline/image from a page's JSON-LD Article node (NewsArticle / Article /
+ *  BlogPosting). Best-effort: scans each `<script type="application/ld+json">`, handles a
+ *  bare object, an array, or an `@graph`. Returns the first article-typed node found. */
+export function extractJsonLdArticle(
+	html: string,
+): { datePublished?: string; headline?: string; image?: string; description?: string } | undefined {
+	const blocks = html.match(/<script[^>]*type="application\/ld\+json"[^>]*>([\s\S]*?)<\/script>/gi) ?? [];
+	for (const block of blocks) {
+		const json = block.replace(/<script[^>]*>/i, "").replace(/<\/script>/i, "").trim();
+		let parsed: unknown;
+		try {
+			parsed = JSON.parse(json);
+		} catch {
+			continue; // malformed LD block — skip
+		}
+		const root = parsed as { [k: string]: unknown };
+		const nodes: unknown[] = Array.isArray(parsed)
+			? parsed
+			: Array.isArray(root["@graph"])
+				? (root["@graph"] as unknown[])
+				: [parsed];
+		for (const node of nodes) {
+			const n = node as { [k: string]: unknown };
+			const t = n?.["@type"];
+			const types = Array.isArray(t) ? t : [t];
+			if (!types.some((x) => /(news)?article|blogposting/i.test(String(x ?? "")))) continue;
+			const rawImg = Array.isArray(n.image) ? n.image[0] : n.image;
+			const img =
+				typeof rawImg === "string" ? rawImg : ((rawImg as { url?: string })?.url ?? undefined);
+			return {
+				datePublished: typeof n.datePublished === "string" ? n.datePublished : undefined,
+				headline: typeof n.headline === "string" ? n.headline : undefined,
+				image: typeof img === "string" ? img : undefined,
+				description: typeof n.description === "string" ? n.description : undefined,
+			};
+		}
+	}
+
+	// Fallback: some club platforms (the MLS digital platform behind Houston/Orlando/
+	// Utah) ship the NewsArticle's "headline"/"datePublished"/"image" inline in a JS/JSON
+	// blob — no og: tags, no parseable ld+json <script>. Targeted regex recovers them
+	// (a NewsArticle page carries one canonical headline+date pair).
+	const field = (key: string): string | undefined => {
+		const m = new RegExp(`"${key}"\\s*:\\s*"([^"]+)"`, "i").exec(html);
+		return m ? decodeEntities(m[1]) : undefined;
+	};
+	const datePublished = field("datePublished");
+	const headline = field("headline");
+	if (datePublished || headline) {
+		const imgM = /"(?:thumbnailUrl|leadMediaUrl|image)"\s*:\s*"(https?:\/\/[^"]+)"/i.exec(html);
+		return {
+			datePublished,
+			headline,
+			image: imgM ? decodeEntities(imgM[1]) : undefined,
+			description: undefined,
+		};
+	}
+	return undefined;
+}
+
+/** WordPress/CMS placeholder posts that aren't real club news (a brand-new club site
+ *  with only the default first post). Filtered so the club falls back gracefully to
+ *  Google News + a `clubNewsFallback` diag, instead of surfacing junk. */
+export function isPlaceholderArticle(title: string): boolean {
+	return /^(hello world!?|sample post|uncategorized|test post)$/i.test(title.trim());
 }
 
 /** Decode the handful of HTML entities OG `content` attrs carry (e.g. `&#x27;`). */
@@ -1430,6 +1717,7 @@ type FeedCard = {
 	bodyText?: string;
 	teamAbbreviation?: string;
 	isLeague?: boolean;
+	sourceType?: string; // "club" | "league" | "reporter" | "player" | "news" — gates reporter vs league
 };
 
 /**
@@ -1446,7 +1734,7 @@ type FeedCard = {
  * staying resilient). A kept item with no `abbr` is league-wide (caller sets
  * isLeague true).
  */
-function decideFeedItem(
+export function decideFeedItem(
 	v: { isNWSL: boolean; teams: string[]; leagueNews?: boolean } | undefined,
 	followed: Set<string>,
 	opts: { requireLeagueNews: boolean; failClosed: boolean },
@@ -1742,12 +2030,17 @@ async function classifySocialBluesky(
 		}
 	}
 
-	// 3. Keep + tag (or drop). Social fails CLOSED on an unjudged post; the high bar
-	//    on league-wide drops general reporter chatter.
+	// 3. Keep + tag (or drop). Social fails CLOSED on an unjudged post. The league-wide
+	//    bar is split by source: official LEAGUE outlets must clear the hard-news bar
+	//    (requireLeagueNews), but REPORTERS don't — a reporter's value is exactly the
+	//    analysis / rumor / transfer chatter that bar would drop, so general league-wide
+	//    NWSL reporter posts are kept (still gated on isNWSL + still fail-closed). The
+	//    MAX_PER_HANDLE cap bounds how many any one reporter contributes.
 	const keepers: unknown[] = [];
 	for (const c of typed) {
 		const v = c.id ? verdicts.get(c.id) : undefined;
-		const d = decideFeedItem(v, followed, { requireLeagueNews: true, failClosed: true });
+		const isReporter = c.sourceType === "reporter";
+		const d = decideFeedItem(v, followed, { requireLeagueNews: !isReporter, failClosed: true });
 		if (!d.keep) continue;
 		if (d.abbr) {
 			c.teamAbbreviation = d.abbr;
