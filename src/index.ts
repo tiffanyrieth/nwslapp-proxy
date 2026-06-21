@@ -112,10 +112,6 @@ type ClubNewsSource =
 const CLUB_NEWS: Record<string, ClubNewsSource> = {
 	// ── Official RSS/Atom (dated, structured) ──
 	BAY: { kind: "rss", url: "https://bayfc.com/feed/" },
-	// Denver is a 2026 expansion club — its WordPress feed currently has only the
-	// default "Hello world!" stub (filtered), so DEN auto-falls-back to the outlet fallback +
-	// a clubNewsFallback diag until the club posts real content (then RSS takes over).
-	DEN: { kind: "rss", url: "https://denversummitfc.com/feed/" },
 	LOU: { kind: "rss", url: "https://racingloufc.com/feed/" },
 	SD: { kind: "rss", url: "https://sandiegowavefc.com/feed/" },
 	WAS: { kind: "rss", url: "https://washingtonspirit.com/feed/" },
@@ -125,6 +121,11 @@ const CLUB_NEWS: Record<string, ClubNewsSource> = {
 
 	// ── SSR news index → scrape links → OG-scrape (date via JSON-LD on these platforms) ──
 	KC: { kind: "index", url: "https://www.kansascitycurrent.com/news", articlePath: "/news/" },
+	// Denver's WordPress /feed/ is only the default "Hello world!" stub, but its real news
+	// lives at /news/ — articles nested under a category (/news/<cat>/<slug>/) on the www
+	// host, dated via microdata (<meta itemprop="datePublished"> / <time>). Owner-flagged
+	// Jun 2026 (don't use /feed/).
+	DEN: { kind: "index", url: "https://www.denversummitfc.com/news/", articlePath: "/news/" },
 	// NC + POR are configured for their official index but currently auto-fall-back (NC's
 	// index lists only category links, not article slugs, in SSR HTML; thorns.com article
 	// pages carry no machine-readable date). The clubNewsFallback diag flags both — revisit
@@ -1102,13 +1103,16 @@ function clubNewsCard(
 	};
 }
 
-/** Extract candidate article URLs from a club's news-index HTML: same-origin links
- *  whose path is a direct child of `articlePath` (a slug, not a nested section), minus
- *  obvious non-articles (index/tag/author/page/category/video/search/feed). Permissive
- *  by design — the OG date gate in clubIndexCards is the final article filter. */
+/** Extract candidate article URLs from a club's news-index HTML: links under `articlePath`
+ *  whose FINAL path segment looks like an article slug (a long, multi-word title), minus
+ *  obvious non-articles (tag/author/page/category/video/search/feed). Host match is
+ *  www-insensitive and the slug may be NESTED under a section (e.g. some sites file
+ *  articles as `/news/<category>/<slug>/`). Permissive by design — the date gate in
+ *  clubIndexCards is the final article filter. */
 export function extractArticleLinks(html: string, indexUrl: string, articlePath: string, max = 12): string[] {
 	const origin = new URL(indexUrl).origin;
-	const deny = /\/(index|tags?|authors?|page|categor(?:y|ies)|videos?|search|archive|feed|rss)(\/|$|\.)/i;
+	const host = new URL(indexUrl).hostname.replace(/^www\./, "");
+	const deny = /\/(tags?|authors?|page|categor(?:y|ies)|videos?|search|archive|feed|rss)(\/|$|\.)/i;
 	const seen = new Set<string>();
 	const out: string[] = [];
 	const hrefRe = /href="([^"#?]+)"/gi;
@@ -1120,11 +1124,17 @@ export function extractArticleLinks(html: string, indexUrl: string, articlePath:
 		} catch {
 			continue;
 		}
-		if (abs.origin !== origin) continue;
+		if (abs.hostname.replace(/^www\./, "") !== host) continue; // same site, www-insensitive
 		if (!abs.pathname.startsWith(articlePath)) continue;
-		const slug = abs.pathname.slice(articlePath.length).replace(/\/$/, "");
-		if (!slug || slug.includes("/")) continue; // direct child only (the article slug)
+		const rest = abs.pathname.slice(articlePath.length).replace(/\/$/, "");
+		if (!rest) continue; // the index itself
 		if (deny.test(abs.pathname)) continue;
+		// An article slug is a long, multi-word title; a section/category segment is short.
+		// This (not "direct child only") is what tells an article from a listing page and
+		// allows nested `/news/<category>/<slug>/` paths.
+		const lastSeg = rest.split("/").pop() ?? "";
+		const hyphens = (lastSeg.match(/-/g) ?? []).length;
+		if (lastSeg.length < 24 && hyphens < 3) continue;
 		const u = abs.origin + abs.pathname;
 		if (seen.has(u)) continue;
 		seen.add(u);
@@ -1182,8 +1192,26 @@ async function fetchOG(
 		title: meta("og:title")?.trim() ?? ld?.headline?.trim(),
 		description: meta("og:description") ?? ld?.description,
 		image: meta("og:image") ?? ld?.image,
-		published: meta("article:published_time") ?? ld?.datePublished,
+		// Date precedence: og: → JSON-LD → microdata `<meta itemprop="datePublished">`
+		// (WordPress/Yoast on some club sites) → `<time datetime>`. Without the last two,
+		// sites that expose the date ONLY as microdata (e.g. denversummitfc.com) get dropped.
+		published:
+			meta("article:published_time") ?? ld?.datePublished ?? metaDate(html) ?? timeDate(html),
 	};
+}
+
+/** `<meta itemprop="datePublished" content="…">` (Schema.org microdata), either attr order. */
+function metaDate(html: string): string | undefined {
+	const m =
+		/<meta[^>]*\bitemprop="datePublished"[^>]*\bcontent="([^"]+)"/i.exec(html) ??
+		/<meta[^>]*\bcontent="([^"]+)"[^>]*\bitemprop="datePublished"/i.exec(html);
+	return m ? m[1] : undefined;
+}
+
+/** First `<time datetime="…">` on the page (the article's published time on most CMS templates). */
+function timeDate(html: string): string | undefined {
+	const m = /<time[^>]*\bdatetime="([^"]+)"/i.exec(html);
+	return m ? m[1] : undefined;
 }
 
 /** Pull date/headline/image from a page's JSON-LD Article node (NewsArticle / Article /

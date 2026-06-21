@@ -25,7 +25,7 @@ const CLUBS = ["LA", "BAY", "BOS", "CHI", "DEN", "GFC", "HOU", "KC", "LOU", "NC"
 // reality, not a regression, so it WARNS instead of hard-failing — but it's still printed
 // and the Worker still emits clubNewsEmpty telemetry (never hidden). Remove a club here
 // once it starts generating news so a real future breakage fails loudly again.
-const EXPECTED_THIN = new Set(["DEN"]);
+const EXPECTED_THIN = new Set([]);
 
 async function checkClub(abbr) {
 	const url = `${BASE}/team-videos?teams=${abbr}&_hc=${Date.now()}-${abbr}`;
