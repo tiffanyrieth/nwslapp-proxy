@@ -17,7 +17,7 @@
  * ESPN directly from the app.
  */
 
-import { runBracketTick, forceCloseActiveRound, type BracketEnv } from "./bracket-engine";
+import { runBracketTick, forceCloseActiveRound, handleBracketAdmin, type BracketEnv } from "./bracket-engine";
 import { buildHeadshotMap, handleHeadshots } from "./headshots";
 
 const ESPN_SCOREBOARD =
@@ -504,6 +504,13 @@ export default {
 		// POST telemetry ingest must be registered BEFORE the GET-only guard below.
 		if (url.pathname === "/telemetry") {
 			return handleTelemetryIngest(request, env, ctx);
+		}
+
+		// Operator-only Bracket Battle admin: GET /bracket/admin = the page (public shell),
+		// POST /bracket/admin/api = key-gated control. Before the GET-only guard (it serves
+		// both methods + does its own BRACKET_ADMIN_KEY check).
+		if (url.pathname === "/bracket/admin" || url.pathname === "/bracket/admin/api") {
+			return handleBracketAdmin(request, env as unknown as BracketEnv & { BRACKET_ADMIN_KEY?: string });
 		}
 
 		// All other routes are GET-only; reject early so the 405 is shared.
