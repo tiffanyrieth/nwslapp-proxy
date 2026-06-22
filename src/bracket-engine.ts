@@ -602,15 +602,30 @@ async function tallyAndAdvance(env: BracketEnv, ed: EditionRow, now: number, con
   const perUserPts = new Map<string, number>();
   const perUserCorrect = new Map<string, number>();
   const perUserTotal = new Map<string, number>();
+  const picksByUser = new Map<string, Map<string, string>>(); // user → (matchup → pick)
   for (const v of votes) {
     perUserTotal.set(v.user_id, (perUserTotal.get(v.user_id) ?? 0) + 1);
     if (winnerByMatchup.get(v.matchup_id) === v.entrant_id) {
       perUserPts.set(v.user_id, (perUserPts.get(v.user_id) ?? 0) + pts);
       perUserCorrect.set(v.user_id, (perUserCorrect.get(v.user_id) ?? 0) + 1);
     }
+    let pm = picksByUser.get(v.user_id);
+    if (!pm) { pm = new Map(); picksByUser.set(v.user_id, pm); }
+    pm.set(v.matchup_id, v.entrant_id);
+  }
+  // Each user's correctness IN SLOT ORDER this round → the streak fold (carried across
+  // rounds in the DB; current resets on a miss, longest is the per-edition best).
+  const seqByUser = new Map<string, boolean[]>();
+  for (const [uid, picks] of picksByUser) {
+    const seq: boolean[] = [];
+    for (const m of matchups) {                       // matchups is slot-sorted above
+      const pick = picks.get(m.id);
+      if (pick !== undefined) seq.push(winnerByMatchup.get(m.id) === pick);
+    }
+    seqByUser.set(uid, seq);
   }
   await accumulateScores(env, ed.id, perUserPts, now);
-  await accumulateUserStats(env, ed.id, round, perUserCorrect, perUserTotal, now);
+  await accumulateUserStats(env, ed.id, round, perUserCorrect, perUserTotal, seqByUser, now);
   await sbPatch(env, "bracket_editions", `id=eq.${ed.id}`, { fan_count: new Set(votes.map((v) => v.user_id)).size });
 
   // Advance — or finish.
@@ -683,16 +698,19 @@ async function accumulateScores(env: BracketEnv, editionId: string, perUserPts: 
   await sbUpsert(env, "bracket_scores", rows, "user_id,edition_id");
 }
 
-/** Accumulate per-edition accuracy backing for the Leaderboard "Your Stats" tab: cumulative
- *  correct/total picks + the user's best single round (by accuracy). Service-role write. */
+/** Accumulate per-edition backing for the Leaderboard "Your Stats" tab: cumulative
+ *  correct/total picks, the user's best single round (by accuracy), and the consecutive-
+ *  correct streak (current carried across rounds + resets on a miss; longest = the
+ *  per-edition best). Service-role write. */
 async function accumulateUserStats(
   env: BracketEnv, editionId: string, round: number,
-  perUserCorrect: Map<string, number>, perUserTotal: Map<string, number>, now: number,
+  perUserCorrect: Map<string, number>, perUserTotal: Map<string, number>,
+  seqByUser: Map<string, boolean[]>, now: number,
 ): Promise<void> {
   if (perUserTotal.size === 0) return;
-  interface StatRow { user_id: string; correct_picks: number; total_picks: number; best_round: number | null; best_round_correct: number; best_round_total: number; }
+  interface StatRow { user_id: string; correct_picks: number; total_picks: number; best_round: number | null; best_round_correct: number; best_round_total: number; current_streak: number; longest_streak: number; }
   const existing = await sbGet<StatRow[]>(
-    env, `bracket_user_edition_stats?edition_id=eq.${editionId}&select=user_id,correct_picks,total_picks,best_round,best_round_correct,best_round_total`);
+    env, `bracket_user_edition_stats?edition_id=eq.${editionId}&select=user_id,correct_picks,total_picks,best_round,best_round_correct,best_round_total,current_streak,longest_streak`);
   const prevById = new Map(existing.map((s) => [s.user_id, s]));
   const rows = [...perUserTotal.keys()].map((uid) => {
     const prev = prevById.get(uid);
@@ -706,11 +724,19 @@ async function accumulateUserStats(
       const bestAcc = brt > 0 ? brc / brt : -1;
       if (thisAcc > bestAcc) { best_round = round; brc = rc; brt = rt; }
     }
+    // Fold this round's picks (slot order) onto the carried current streak.
+    let current = prev?.current_streak ?? 0;
+    let longest = prev?.longest_streak ?? 0;
+    for (const correct of seqByUser.get(uid) ?? []) {
+      current = correct ? current + 1 : 0;
+      if (current > longest) longest = current;
+    }
     return {
       user_id: uid, edition_id: editionId,
       correct_picks: (prev?.correct_picks ?? 0) + rc,
       total_picks: (prev?.total_picks ?? 0) + rt,
       best_round, best_round_correct: brc, best_round_total: brt,
+      current_streak: current, longest_streak: longest,
       updated_at: new Date(now).toISOString(),
     };
   });
