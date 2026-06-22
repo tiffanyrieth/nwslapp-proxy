@@ -168,10 +168,28 @@ async function emitDiag(env: BracketEnv, kind: string, detail: string): Promise<
 
 interface RosterPlayer { id: string; name: string; jersey: number | null; team: string; position: string; }
 
+/** ESPN intermittently throttles datacenter (Worker) IPs — a single fetch can come back
+ *  non-200 (often 429) or otherwise fail, which (pre-retry) left the bracket generator with
+ *  an empty roster pool. Retry a few times with a short backoff before giving up. */
+async function espnJSON<T>(url: string, tries = 3): Promise<T> {
+  let lastErr: unknown;
+  for (let i = 0; i < tries; i++) {
+    try {
+      const r = await fetch(url);
+      if (r.ok) return (await r.json()) as T;
+      lastErr = new Error(`${url} → ${r.status}`);
+    } catch (e) {
+      lastErr = e;
+    }
+    if (i < tries - 1) await new Promise((res) => setTimeout(res, 400 * (i + 1)));
+  }
+  throw lastErr instanceof Error ? lastErr : new Error(`ESPN fetch failed: ${url}`);
+}
+
 async function fetchTeamAbbrs(): Promise<{ id: string; abbr: string }[]> {
-  const json = (await (await fetch(`${ESPN_SITE}/teams`)).json()) as {
+  const json = await espnJSON<{
     sports?: { leagues?: { teams?: { team?: { id?: string; abbreviation?: string } }[] }[] }[];
-  };
+  }>(`${ESPN_SITE}/teams`);
   const teams = json.sports?.[0]?.leagues?.[0]?.teams ?? [];
   return teams
     .map((t) => ({ id: t.team?.id ?? "", abbr: (t.team?.abbreviation ?? "").toUpperCase() }))
@@ -179,9 +197,9 @@ async function fetchTeamAbbrs(): Promise<{ id: string; abbr: string }[]> {
 }
 
 async function fetchRoster(teamId: string, abbr: string): Promise<RosterPlayer[]> {
-  const json = (await (await fetch(`${ESPN_SITE}/teams/${teamId}/roster`)).json()) as {
+  const json = await espnJSON<{
     athletes?: { id?: string; displayName?: string; jersey?: string; position?: { abbreviation?: string } }[];
-  };
+  }>(`${ESPN_SITE}/teams/${teamId}/roster`);
   return (json.athletes ?? [])
     .filter((a) => a.id && a.displayName)
     .map((a) => ({
@@ -499,12 +517,14 @@ async function generateTheme(env: BracketEnv, config: BracketConfig, now: number
   const enc = encodeURIComponent(themeId);
   const order = (await sbGet<{ id: string }[]>(env, "bracket_editions?select=id")).length + 1;
 
+  // Seed BEFORE purging: a thin/failed pool (e.g. ESPN throttling the Worker) must NOT
+  // destroy the existing edition. Purge only once we have a viable pool to replace it with.
   const creative = await sbGet<{ id: string; theme_label: string; title: string }[]>(
     env, `bracket_creative_editions?id=eq.${enc}&select=id,theme_label,title&limit=1`);
   if (creative[0]) {
-    await purgeEdition(env, themeId);
     const pool = await seedPool(env, null, "minutes", config.defaultPoolSize, config, now);
-    if (pool.length < 8) { await emitDiag(env, "bracketCreativeThin", `${themeId} pool ${pool.length}`); return `manual start: ${themeId} pool too thin (${pool.length})`; }
+    if (pool.length < 8) { await emitDiag(env, "bracketCreativeThin", `${themeId} pool ${pool.length}`); return `manual start: ${themeId} pool too thin (${pool.length}) — old edition left intact, retry`; }
+    await purgeEdition(env, themeId);
     const msg = await writeEdition(env, { id: creative[0].id, themeLabel: creative[0].theme_label, title: creative[0].title, type: "creative" }, pool, config, now, order);
     await sbPatch(env, "bracket_creative_editions", `id=eq.${enc}`, { status: "used" });
     await markThemeUsed(env, config, themeId);
@@ -514,10 +534,10 @@ async function generateTheme(env: BracketEnv, config: BracketConfig, now: number
   const stats = await sbGet<{ id: string; theme_label: string; title: string; position_filter: string | null; seeding_stat: string }[]>(
     env, `bracket_stats_editions?id=eq.${enc}&select=id,theme_label,title,position_filter,seeding_stat&limit=1`);
   if (stats[0]) {
-    await purgeEdition(env, themeId);
     const group = (stats[0].position_filter as "F" | "M" | "D" | "G" | null) ?? null;
     const pool = await seedPool(env, group, stats[0].seeding_stat, config.defaultPoolSize, config, now);
-    if (pool.length < 8) { await emitDiag(env, "bracketStatsThin", `${themeId} pool ${pool.length}`); return `manual start: ${themeId} pool too thin (${pool.length})`; }
+    if (pool.length < 8) { await emitDiag(env, "bracketStatsThin", `${themeId} pool ${pool.length}`); return `manual start: ${themeId} pool too thin (${pool.length}) — old edition left intact, retry`; }
+    await purgeEdition(env, themeId);
     const msg = await writeEdition(env, { id: stats[0].id, themeLabel: stats[0].theme_label, title: stats[0].title, type: "statsSeeded" }, pool, config, now, order);
     await sbPatch(env, "bracket_stats_editions", `id=eq.${enc}`, { status: "used" });
     await markThemeUsed(env, config, themeId);
