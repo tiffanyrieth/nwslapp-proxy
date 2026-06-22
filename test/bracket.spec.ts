@@ -17,7 +17,15 @@ import {
   buildMergedRound,
   QUAL_CODES,
 } from "../src/bracket";
-import { startEditionThemeId } from "../src/bracket-engine";
+import { startEditionThemeId, slug } from "../src/bracket-engine";
+
+describe("slug — admin theme-id derivation", () => {
+  it("lowercases, hyphenates, and trims", () => {
+    expect(slug("Best Celebration")).toBe("best-celebration");
+    expect(slug("  Who Wins a Stare-Down?  ")).toBe("who-wins-a-stare-down");
+    expect(slug("Walkout Vibes!! 2026")).toBe("walkout-vibes-2026");
+  });
+});
 
 describe("startEditionThemeId — targeted manual start parsing", () => {
   it("returns null for a bare start_edition (rotation pick)", () => {
