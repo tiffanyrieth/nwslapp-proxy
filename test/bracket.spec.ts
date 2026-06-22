@@ -17,6 +17,22 @@ import {
   buildMergedRound,
   QUAL_CODES,
 } from "../src/bracket";
+import { startEditionThemeId } from "../src/bracket-engine";
+
+describe("startEditionThemeId — targeted manual start parsing", () => {
+  it("returns null for a bare start_edition (rotation pick)", () => {
+    expect(startEditionThemeId("start_edition")).toBe(null);
+  });
+  it("extracts the theme id from a targeted start", () => {
+    expect(startEditionThemeId("start_edition:who-wins-a-stare-down-2026")).toBe("who-wins-a-stare-down-2026");
+  });
+  it("trims surrounding whitespace", () => {
+    expect(startEditionThemeId("start_edition:  best-goalkeeper-2026  ")).toBe("best-goalkeeper-2026");
+  });
+  it("returns null for an empty suffix", () => {
+    expect(startEditionThemeId("start_edition:")).toBe(null);
+  });
+});
 
 // Inclusive integer range [lo..hi].
 function range(lo: number, hi: number): number[] {
