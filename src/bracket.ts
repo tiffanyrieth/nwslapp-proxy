@@ -7,8 +7,10 @@
 // Keyed (like the app's BracketRound) by how many ENTRANTS contest the round.
 export const ROUND_ENTRANTS = [64, 32, 16, 8, 4, 2] as const;
 
-/** Per-correct-pick value for a round (tiered 1·1·2·2·3·3 by round size). */
+/** Per-correct-pick value for a round (tiered 1·1·2·2·3·3 by round size). Qualifying
+ *  rounds (negative codes — see the qualifying section below) are all worth 1. */
 export function roundPoints(entrants: number): number {
+  if (entrants < 0) return 1; // qualifying
   switch (entrants) {
     case 64: return 1;
     case 32: return 1;
@@ -21,6 +23,7 @@ export function roundPoints(entrants: number): number {
 }
 
 export function roundTitle(entrants: number): string {
+  if (entrants < 0) return `Qualifying ${entrants + 5}`; // -4→Q1 … -1→Q4
   switch (entrants) {
     case 8: return "Quarterfinals";
     case 4: return "Semifinals";
@@ -29,9 +32,18 @@ export function roundTitle(entrants: number): string {
   }
 }
 
-/** Hours a round stays open: early rounds 48h, QF/SF/Final 72h (owner cadence). */
+/** Hours a round stays open: early rounds 48h, QF/SF/Final 72h (owner cadence). The
+ *  engine overrides this with bracket_config early/late day-windows; this is the fallback
+ *  + the pure-test reference. Qualifying counts as early. */
 export function roundHours(entrants: number): number {
+  if (entrants < 0) return 48; // qualifying — early
   return entrants <= 8 ? 72 : 48;
+}
+
+/** Early rounds get the shorter voting window: qualifying + the first two main rounds
+ *  (Round of 64, Round of 32). Round of 16 onward is "late". */
+export function isEarlyRound(code: number): boolean {
+  return code < 0 || code >= 32;
 }
 
 // ── Types ────────────────────────────────────────────────────────────────────
@@ -218,4 +230,131 @@ export function nextRound(round: number): number | null {
   const i = ROUND_ENTRANTS.indexOf(round as (typeof ROUND_ENTRANTS)[number]);
   if (i < 0 || i === ROUND_ENTRANTS.length - 1) return null;
   return ROUND_ENTRANTS[i + 1];
+}
+
+// ── Qualifying / large-pool structure ─────────────────────────────────────────
+// Pools larger than 64 run rolling-entry QUALIFYING rounds before a standard 64-player
+// main bracket. Round CODES match the app's BracketRound raw values: main rounds are the
+// entrant-count (64..2); qualifying rounds are NEGATIVE (q1 = −4, q2 = −3, q3 = −2,
+// q4 = −1), each 32 matchups worth 1 point. q1 is always the first round played (the
+// lowest seeds). Both the Worker (writer) and the iOS app (reader) decode `round` the same
+// way — this is the cross-repo contract.
+//
+// Invariants (no player dropped, every round ≤32 matchups):
+//   • The top 32 seeds BYE straight into the Round of 64.
+//   • The other 32 Round-of-64 slots are filled by qualifiers (the last QR's winners).
+//   • Each QR is 64 players → 32 winners. q1 = the lowest 64 seeds; each later QR mixes
+//     the prior 32 winners with the next-higher 32 seeds entering.
+//   • q = (size − 64) / 32, so size ∈ {96,128,160,192} ⇒ q ∈ {1,2,3,4}; size 64 ⇒ q 0.
+// Supported sizes top out at 192 (q ≤ 4, matching the app's four qualifying enum cases);
+// a larger requested pool snaps DOWN to 192 (the lowest seeds drop — the caller logs it).
+
+/** q1..q4 round codes, in play order (q1 first). */
+export const QUAL_CODES = [-4, -3, -2, -1] as const;
+
+export function isQualifying(code: number): boolean { return code < 0; }
+
+/** Human 1-based qualifying index for a code (−4 → 1 … −1 → 4). */
+export function qualIndex(code: number): number { return code + 5; }
+
+/** The largest SUPPORTED bracket size ≤ the requested pool. ≤64 passes through (the
+ *  classic round-1-bye path handles 33..64); 65..95 → 64; 96+ snaps to 64+32·q, q≤4. */
+export function plannedSize(poolCount: number): number {
+  if (poolCount <= 64) return poolCount;
+  if (poolCount < 96) return 64;
+  return 64 + 32 * Math.min(4, Math.floor((poolCount - 64) / 32));
+}
+
+export interface BracketStructure {
+  size: number;                          // 64/96/128/160/192 (after snapping)
+  qualifyingCount: number;               // 0..4
+  rounds: number[];                      // ordered round codes, e.g. [-4,-3,64,32,16,8,4,2]
+  entrySeeds: Record<number, number[]>;  // round code → the seeds NEWLY entering that round
+}
+
+function seedRange(lo: number, hi: number): number[] {
+  const out: number[] = [];
+  for (let s = lo; s <= hi; s++) out.push(s);
+  return out;
+}
+
+/**
+ * Plan the full round structure for a pool. For ≤64 it's the classic main bracket (qualifying
+ * count 0; first-round byes handle a non-power-of-two pool via buildFirstRound). For >64 it
+ * lays out the qualifying rounds + their rolling entry-seed schedule and the main bracket.
+ */
+export function planStructure(poolCount: number): BracketStructure {
+  const size = plannedSize(poolCount);
+  if (size <= 64) {
+    const first = nextPow2(Math.max(size, 2));
+    const rounds = ROUND_ENTRANTS.filter((r) => r <= first) as unknown as number[];
+    return { size, qualifyingCount: 0, rounds, entrySeeds: {} };
+  }
+  const q = (size - 64) / 32; // 1..4
+  const codes = QUAL_CODES.slice(0, q); // q1..qq
+  const entrySeeds: Record<number, number[]> = {};
+  // q1: the lowest 64 seeds.
+  entrySeeds[codes[0]] = seedRange(size - 63, size);
+  // q2..qq: each brings in the next-higher 32 seeds.
+  for (let k = 2; k <= q; k++) {
+    entrySeeds[codes[k - 1]] = seedRange(size - 63 - 32 * (k - 1), size - 32 - 32 * (k - 1));
+  }
+  // The top 32 seeds enter (bye) at the Round of 64, joining the 32 qualifiers.
+  entrySeeds[64] = seedRange(1, 32);
+  const rounds = [...codes, 64, 32, 16, 8, 4, 2];
+  return { size, qualifyingCount: q, rounds, entrySeeds };
+}
+
+/** The round code that follows `code` in a structure, or null after the Final. Works for
+ *  qualifying codes and main rounds alike (drives both generation and the app's flow). */
+export function nextCodeIn(structure: BracketStructure, code: number): number | null {
+  const i = structure.rounds.indexOf(code);
+  if (i < 0 || i === structure.rounds.length - 1) return null;
+  return structure.rounds[i + 1];
+}
+
+/**
+ * Build a round from a group of participants by SEED SPREAD (best vs worst), like the main
+ * draw — used for q1 (64 fresh entrants) and any all-fresh group. `participants` need not be
+ * a power of two; the next power of two frames the bracket and the surplus top seeds get a
+ * bye (returned separately), mirroring buildFirstRound. `roundCode` stamps the matchups.
+ */
+export function buildSeededRound(
+  participants: Entrant[],
+  roundCode: number,
+): { matchups: Matchup[]; byeIds: string[] } {
+  const sorted = [...participants].sort((a, b) => a.seed - b.seed);
+  const pool = sorted.length;
+  const bracket = nextPow2(Math.max(pool, 2));
+  const points = roundPoints(roundCode);
+  // Local re-rank 1..pool by seed so seedOrder spreads them regardless of global seeds.
+  const byLocal = new Map(sorted.map((e, i) => [i + 1, e]));
+  const order = seedOrder(bracket);
+  const matchups: Matchup[] = [];
+  const byes: Entrant[] = [];
+  let slot = 0;
+  for (let i = 0; i < bracket; i += 2) {
+    const a = byLocal.get(order[i]);
+    const b = byLocal.get(order[i + 1]);
+    if (a && b) matchups.push({ slot: slot++, round: roundCode, aId: a.id, bId: b.id, points });
+    else if (a || b) byes.push((a ?? b)!);
+  }
+  avoidSameTeam(matchups, participants);
+  return { matchups, byeIds: byes.sort((x, y) => x.seed - y.seed).map((e) => e.id) };
+}
+
+/**
+ * Build the matchups for a round generated AT TALLY: the prior round's `winners` (slot
+ * order) merged with any `newEntrants` entering now (seed order), paired sequentially.
+ * `interleaveByes` spreads the fresh entrants among the survivors so top seeds don't bunch.
+ * The engine applies `avoidSameTeam` afterward (it holds every advancing entrant's team).
+ */
+export function buildMergedRound(
+  winners: string[],
+  newEntrants: Entrant[],
+  roundCode: number,
+): Matchup[] {
+  const fresh = [...newEntrants].sort((a, b) => a.seed - b.seed);
+  const advancing = interleaveByes(winners, fresh.map((e) => e.id));
+  return nextRoundMatchups(advancing, roundCode);
 }

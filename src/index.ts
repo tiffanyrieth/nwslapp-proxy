@@ -574,13 +574,15 @@ export default {
 	// Await (not waitUntil) — a cron should keep its invocation alive until the work is
 	// done; best-effort, a failed refresh leaves the last good snapshot in place.
 	async scheduled(controller, env, _ctx): Promise<void> {
-		// The hourly cron drives the Bracket Battle engine (generate / tally + advance /
-		// rotate). The every-other-day cron refreshes the Instagram social cache.
-		if (controller.cron === "0 * * * *") {
+		// The every-5-min cron drives the Bracket Battle engine (manual-action pickup / auto
+		// tally + advance / rotate). The every-other-day cron refreshes the Instagram social
+		// cache. The full env is cast to BracketEnv — it carries FEED_TAGS too, so the engine
+		// can emit NO-SILENT-FAILURES diag telemetry.
+		if (controller.cron === "*/5 * * * *") {
 			try {
 				await runBracketTick(env as unknown as BracketEnv);
 			} catch {
-				/* swallow — the next hourly tick retries; the engine is idempotent */
+				/* swallow — the next 5-min tick retries; the engine is idempotent */
 			}
 			return;
 		}

@@ -9,7 +9,8 @@
 		"test": "vitest",
 		"cf-typegen": "wrangler types",
 		"load-trivia": "node scripts/load_trivia.mjs",
-		"healthcheck": "node scripts/health_check_club_news.mjs"
+		"healthcheck": "node scripts/health_check_club_news.mjs && node scripts/health_check_bracket.mjs",
+		"healthcheck:bracket": "node scripts/health_check_bracket.mjs"
 	},
 	"devDependencies": {
 		"@cloudflare/vitest-pool-workers": "^0.12.4",
