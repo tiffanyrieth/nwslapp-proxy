@@ -212,7 +212,7 @@ const SOCIAL_CACHE_TTL = 3 * 24 * 3600; // 3d KV safety net — the daily cron r
 const SOCIAL_POLICY = `You are filtering and tagging Bluesky posts for an NWSL (US National Women's Soccer League) fan app. The posts come from soccer reporters/journalists and NWSL media/league accounts, who also post off-topic things (other sports, foreign leagues, men's soccer, personal life, general chatter).
 
 For each post (handle + text) decide three things:
-1. "isNWSL": true ONLY if the post is clearly about the NWSL — an NWSL club, an NWSL match/result/standing/award, a player at an NWSL club, a transfer into or out of an NWSL club, or the US women's national team (USWNT). false for everything else, INCLUDING women's soccer that isn't NWSL (England's WSL, Liga F, the UEFA Women's Champions League, other foreign leagues), other sports (PWHL, WNBA), men's soccer (including the men's World Cup), and the author's personal/off-topic posts. When you are unsure whether a post is about the NWSL, return false.
+1. "isNWSL": true ONLY if the post is clearly about the NWSL — an NWSL club, an NWSL match/result/standing/award, a player at an NWSL club, a transfer into or out of an NWSL club, or the US women's national team (USWNT). false for everything else, INCLUDING women's soccer that isn't NWSL (England's WSL, Liga F, the UEFA Women's Champions League, other foreign leagues), other sports (PWHL, WNBA), men's soccer (including the men's World Cup), and the author's personal/off-topic posts. A post that only mentions another league, market, or country in passing — the size of the WSL's audience, a foreign transfer market, broadcast deals abroad — is NOT about the NWSL: the NWSL (a club/player/match/the league itself) or the USWNT must be the SUBJECT of the post. Example: "Japan is the joint-largest market for the WSL outside of the UK" is about England's WSL → isNWSL false. When you are unsure whether a post is about the NWSL, return false.
 2. "teams": if isNWSL, the NWSL club abbreviation(s) the post is primarily about; [] for genuinely league-wide/general NWSL or USWNT posts. If isNWSL is false, return [].
 3. "leagueNews": true ONLY when isNWSL is true AND teams is empty AND the post is genuine league-wide NWSL NEWS — expansion, the schedule/fixtures release, awards/honors, the playoff race, rule/CBA/roster-rule changes, or other league-wide announcements. false for general opinion, hot takes, predictions, banter, or chatter not tied to hard news. If isNWSL is false or teams is non-empty, return false.
 
@@ -2043,6 +2043,24 @@ function socialFor(cards: unknown[], teams: string[], placements: Set<string>): 
  * player fast paths keep the feed populated. KV writes are deferred via
  * ctx.waitUntil so tagging never blocks longer than the one Haiku round-trip.
  */
+// Deterministic backstop for the Haiku social gate. A post that centers a NON-NWSL
+// competition (England's WSL, Liga F, the UWCL, …) and carries NO NWSL/USWNT signal is
+// dropped even if Haiku mislabels it `isNWSL` — Haiku is probabilistic, and these
+// foreign-league false positives (e.g. a 5-month-old "WSL audience in Japan" post)
+// should never reach the feed. Conservative: fires ONLY when a foreign-league phrase is
+// present AND nothing ties the post to the NWSL, so genuine NWSL posts that merely name
+// another league in comparison still pass (they'll carry an NWSL signal). `\bWSL\b` does
+// not match inside "NWSL" (no word boundary before the W).
+const FOREIGN_LEAGUE_RE =
+	/\bWSL\b|women'?s super league|\bliga\s?f\b|frauen[-\s]?bundesliga|uefa women|women'?s champions league|\bUWCL\b|d1 arkema|premi[eè]re ligue/i;
+const NWSL_SIGNAL_RE =
+	/\bNWSL\b|\bUSWNT\b|national women'?s soccer|angel city|\bbay fc\b|boston legacy|chicago stars|gotham|houston dash|kansas city current|north carolina courage|orlando pride|portland thorns|racing louisville|san diego wave|seattle reign|utah royals|washington spirit/i;
+
+export function centersNonNWSLLeague(text: string | undefined): boolean {
+	if (!text) return false;
+	return FOREIGN_LEAGUE_RE.test(text) && !NWSL_SIGNAL_RE.test(text);
+}
+
 async function classifySocialBluesky(
 	cards: unknown[],
 	teams: string[],
@@ -2103,6 +2121,9 @@ async function classifySocialBluesky(
 	//    MAX_PER_HANDLE cap bounds how many any one reporter contributes.
 	const keepers: unknown[] = [];
 	for (const c of typed) {
+		// Deterministic foreign-league backstop — drop before trusting the Haiku verdict
+		// (also catches stale cached verdicts, no cache-key bump needed).
+		if (centersNonNWSLLeague(c.bodyText)) continue;
 		const v = c.id ? verdicts.get(c.id) : undefined;
 		const isReporter = c.sourceType === "reporter";
 		const d = decideFeedItem(v, followed, { requireLeagueNews: !isReporter, failClosed: true });
