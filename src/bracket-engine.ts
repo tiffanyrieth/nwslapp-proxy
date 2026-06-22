@@ -856,11 +856,29 @@ async function accumulateUserStats(
 }
 
 // ── Admin panel (operator-only) ─────────────────────────────────────────────────
-// Served at GET /bracket/admin (public shell); all data/control via POST
-// /bracket/admin/api, gated by BRACKET_ADMIN_KEY (mirrors /bracket/run). Reuses the
-// engine's private helpers so all Supabase logic stays in one place.
+// Both the page (GET /bracket/admin) AND the control API (POST /bracket/admin/api) are
+// gated by BRACKET_ADMIN_KEY. The page uses HTTP Basic auth (the browser's native password
+// prompt — username ignored, password = the key) so a plain GET navigation can authenticate
+// without a custom header; once authed, the browser auto-attaches the same Authorization to
+// the page's same-origin fetch() calls. The API also still accepts the `x-admin-key` header
+// so curl/scripts (and /bracket/run et al.) are unaffected. Reuses the engine's private
+// helpers so all Supabase logic stays in one place.
 
 type AdminEnv = BracketEnv & { BRACKET_ADMIN_KEY?: string };
+
+const ADMIN_REALM = 'Basic realm="Bracket Admin", charset="UTF-8"';
+
+/** True when the request carries the admin key — either as HTTP Basic auth (password = key,
+ *  username ignored) or the `x-admin-key` header. False if no key is configured. */
+function adminAuthed(request: Request, key: string | undefined): boolean {
+  if (!key) return false;
+  if (request.headers.get("x-admin-key") === key) return true;
+  const m = /^Basic\s+(.+)$/i.exec(request.headers.get("Authorization") ?? "");
+  if (!m) return false;
+  let decoded = "";
+  try { decoded = atob(m[1].trim()); } catch { return false; }
+  return decoded.slice(decoded.indexOf(":") + 1) === key; // "user:pass" → compare pass
+}
 
 /** Slug a theme title into an id segment (e.g. "Best Celebration" → "best-celebration"). */
 export function slug(s: string): string {
@@ -869,12 +887,16 @@ export function slug(s: string): string {
 
 export async function handleBracketAdmin(request: Request, env: AdminEnv): Promise<Response> {
   const url = new URL(request.url);
+  // 401 + WWW-Authenticate triggers the browser's native password dialog (and re-prompts on a
+  // stale credential) — for both the page navigation and any unauthenticated API call.
+  if (!adminAuthed(request, env.BRACKET_ADMIN_KEY)) {
+    return new Response("Authentication required.", { status: 401, headers: { "WWW-Authenticate": ADMIN_REALM } });
+  }
   if (request.method === "GET" && url.pathname === "/bracket/admin") {
     return new Response(ADMIN_PAGE_HTML, { headers: { "Content-Type": "text/html; charset=utf-8" } });
   }
-  const key = env.BRACKET_ADMIN_KEY;
-  if (request.method !== "POST" || !key || request.headers.get("x-admin-key") !== key) {
-    return new Response("forbidden", { status: 403 });
+  if (request.method !== "POST") {
+    return new Response("Method not allowed. Use POST.", { status: 405, headers: { Allow: "POST" } });
   }
   let body: Record<string, unknown> = {};
   try { body = (await request.json()) as Record<string, unknown>; } catch { /* {} */ }

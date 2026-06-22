@@ -1,7 +1,9 @@
 // Operator-only Bracket Battle admin panel — a single self-contained HTML page served by the
-// Worker at GET /bracket/admin. The shell is public markup (no secrets); every data/control
-// call goes to POST /bracket/admin/api with the operator's BRACKET_ADMIN_KEY in the
-// `x-admin-key` header (entered once, kept in sessionStorage). Functional, not pretty.
+// Worker at GET /bracket/admin. The page itself is gated by HTTP Basic auth (the browser's
+// native password prompt; password = BRACKET_ADMIN_KEY), so the markup is never served
+// unauthenticated. Once authed, the browser auto-attaches that credential to the page's
+// same-origin POST /bracket/admin/api calls — no key field, no sessionStorage. Functional,
+// not pretty.
 export const ADMIN_PAGE_HTML = `<!doctype html>
 <html lang="en">
 <head>
@@ -38,9 +40,7 @@ export const ADMIN_PAGE_HTML = `<!doctype html>
 <small>Operator-only. Nothing here is user-facing.</small>
 
 <div class="row" style="margin-top:10px">
-  <input class="k" id="key" type="password" placeholder="BRACKET_ADMIN_KEY" autocomplete="off">
-  <button class="go" onclick="saveKey()">Save key + load</button>
-  <button onclick="refresh()">Refresh</button>
+  <button class="go" onclick="refresh()">Refresh</button>
   <span id="tick" class="muted"></span>
 </div>
 <div id="msg"></div>
@@ -78,19 +78,17 @@ export const ADMIN_PAGE_HTML = `<!doctype html>
 <div id="history">—</div>
 
 <script>
-const KEY_LS = 'bracketAdminKey';
-function getKey(){ return sessionStorage.getItem(KEY_LS) || document.getElementById('key').value || ''; }
-function saveKey(){ sessionStorage.setItem(KEY_LS, document.getElementById('key').value.trim()); refresh(); }
 function esc(s){ return String(s==null?'':s).replace(/[&<>"]/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
 function setMsg(t, err){ const m=document.getElementById('msg'); m.textContent=t; m.className = err?'err':''; }
 
 async function api(op, extra){
+  // The browser attaches the page's HTTP Basic credential automatically (same origin).
   const r = await fetch('/bracket/admin/api', {
     method:'POST',
-    headers:{ 'Content-Type':'application/json', 'x-admin-key': getKey() },
+    headers:{ 'Content-Type':'application/json' },
     body: JSON.stringify(Object.assign({op}, extra||{})),
   });
-  if (r.status === 403){ setMsg('Forbidden — wrong or missing admin key.', true); throw new Error('forbidden'); }
+  if (r.status === 401){ setMsg('Auth expired — reload the page to sign in again.', true); throw new Error('unauthorized'); }
   const j = await r.json().catch(()=>({error:'bad response'}));
   if (j && j.error) setMsg('Error: '+j.error, true);
   return j;
@@ -180,8 +178,8 @@ setInterval(()=>{
   document.getElementById('tick').textContent = 'next */5 tick in ~'+Math.floor(s/60)+'m'+String(s%60).padStart(2,'0')+'s';
 }, 1000);
 
-// Auto-load if a key is already in this session.
-if (sessionStorage.getItem(KEY_LS)){ document.getElementById('key').value = sessionStorage.getItem(KEY_LS); refresh(); }
+// The page only loads once the browser has authenticated (HTTP Basic), so load immediately.
+refresh();
 </script>
 </body>
 </html>`;
