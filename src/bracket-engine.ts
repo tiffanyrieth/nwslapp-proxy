@@ -287,16 +287,16 @@ async function generateNext(env: BracketEnv, config: BracketConfig, now: number)
   const wantCreative = config.themeRotation === "sequential" ? true : editionCount % 2 === 0;
 
   const pickCreative = async (): Promise<string | null> => {
-    const rows = await sbGet<{ id: string; theme_label: string; title: string; entries: unknown }[]>(
-      env, "bracket_creative_editions?status=eq.ready&select=id,theme_label,title,entries&order=created_at.asc&limit=10");
+    const rows = await sbGet<{ id: string; theme_label: string; title: string }[]>(
+      env, "bracket_creative_editions?status=eq.ready&select=id,theme_label,title&order=created_at.asc&limit=10");
     const row = rows.find((r) => !used.has(r.id));
     if (!row) return null;
-    const entries = row.entries as { player_id: string; player_name: string; jersey_number: number | null; team_abbreviation: string; seed: number }[];
-    const entrants: Entrant[] = entries
-      .map((e) => ({ id: e.player_id, name: e.player_name, jersey: e.jersey_number, team: e.team_abbreviation, seed: e.seed }))
-      .sort((a, b) => a.seed - b.seed);
-    if (entrants.length < 8) { await emitDiag(env, "bracketCreativeThin", `${row.id} ${entrants.length} entries`); return null; }
-    const msg = await writeEdition(env, { id: row.id, themeLabel: row.theme_label, title: row.title, type: "creative" }, entrants, config, now, order);
+    // Creative editions are theme-only: the player pool comes from ESPN rosters (the WHOLE
+    // league — all positions — seeded by the same visibility heuristic as stats editions).
+    // Only the theme label differs; matchup cards show name/jersey/team, no content lines.
+    const pool = await buildStatsPool(env, null, config.defaultPoolSize);
+    if (pool.length < 8) { await emitDiag(env, "bracketCreativeThin", `${row.id} pool ${pool.length}`); return null; }
+    const msg = await writeEdition(env, { id: row.id, themeLabel: row.theme_label, title: row.title, type: "creative" }, pool, config, now, order);
     await sbPatch(env, "bracket_creative_editions", `id=eq.${encodeURIComponent(row.id)}`, { status: "used" });
     await markThemeUsed(env, config, row.id);
     return msg;
