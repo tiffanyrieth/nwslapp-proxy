@@ -473,6 +473,61 @@ async function markThemeUsed(env: BracketEnv, config: BracketConfig, id: string)
   await setConfigValue(env, "used_themes_this_season", next);
 }
 
+/** Delete every row of a prior edition (children first, then the edition) so a same-id
+ *  re-run starts truly fresh — `writeEdition` keys on the theme id, so a completed edition
+ *  under that id would otherwise collide and old votes/scores would pollute the new run.
+ *  No-op when nothing exists. Emits a diag (this is destructive). */
+async function purgeEdition(env: BracketEnv, id: string): Promise<void> {
+  const enc = encodeURIComponent(id);
+  const existing = await sbGet<{ id: string }[]>(env, `bracket_editions?id=eq.${enc}&select=id&limit=1`);
+  if (!existing[0]) return;
+  const byEd = `edition_id=eq.${enc}`;
+  await sbDelete(env, "bracket_votes", byEd);
+  await sbDelete(env, "bracket_scores", byEd);
+  await sbDelete(env, "bracket_user_edition_stats", byEd);
+  await sbDelete(env, "bracket_matchups", byEd);
+  await sbDelete(env, "bracket_entrants", byEd);
+  await sbDelete(env, "bracket_editions", `id=eq.${enc}`);
+  await emitDiag(env, "bracketEditionPurged", `${id} (re-run via targeted start)`);
+}
+
+/** Start a SPECIFIC theme by id — the `start_edition:<themeId>` manual action. Unlike
+ *  `generateNext` it ignores rotation AND the used-this-season list, and PURGES any prior
+ *  edition under the same id first (so re-running a completed theme starts fresh). Looks the
+ *  theme up in the creative library, then the stats library; mirrors generateNext's seeding. */
+async function generateTheme(env: BracketEnv, config: BracketConfig, now: number, themeId: string): Promise<string> {
+  const enc = encodeURIComponent(themeId);
+  const order = (await sbGet<{ id: string }[]>(env, "bracket_editions?select=id")).length + 1;
+
+  const creative = await sbGet<{ id: string; theme_label: string; title: string }[]>(
+    env, `bracket_creative_editions?id=eq.${enc}&select=id,theme_label,title&limit=1`);
+  if (creative[0]) {
+    await purgeEdition(env, themeId);
+    const pool = await seedPool(env, null, "minutes", config.defaultPoolSize, config, now);
+    if (pool.length < 8) { await emitDiag(env, "bracketCreativeThin", `${themeId} pool ${pool.length}`); return `manual start: ${themeId} pool too thin (${pool.length})`; }
+    const msg = await writeEdition(env, { id: creative[0].id, themeLabel: creative[0].theme_label, title: creative[0].title, type: "creative" }, pool, config, now, order);
+    await sbPatch(env, "bracket_creative_editions", `id=eq.${enc}`, { status: "used" });
+    await markThemeUsed(env, config, themeId);
+    return `manual start (targeted): ${msg}`;
+  }
+
+  const stats = await sbGet<{ id: string; theme_label: string; title: string; position_filter: string | null; seeding_stat: string }[]>(
+    env, `bracket_stats_editions?id=eq.${enc}&select=id,theme_label,title,position_filter,seeding_stat&limit=1`);
+  if (stats[0]) {
+    await purgeEdition(env, themeId);
+    const group = (stats[0].position_filter as "F" | "M" | "D" | "G" | null) ?? null;
+    const pool = await seedPool(env, group, stats[0].seeding_stat, config.defaultPoolSize, config, now);
+    if (pool.length < 8) { await emitDiag(env, "bracketStatsThin", `${themeId} pool ${pool.length}`); return `manual start: ${themeId} pool too thin (${pool.length})`; }
+    const msg = await writeEdition(env, { id: stats[0].id, themeLabel: stats[0].theme_label, title: stats[0].title, type: "statsSeeded" }, pool, config, now, order);
+    await sbPatch(env, "bracket_stats_editions", `id=eq.${enc}`, { status: "used" });
+    await markThemeUsed(env, config, themeId);
+    return `manual start (targeted): ${msg}`;
+  }
+
+  await emitDiag(env, "bracketManualThemeNotFound", themeId);
+  return `manual start: theme "${themeId}" not found in either library`;
+}
+
 // ── The tick ──────────────────────────────────────────────────────────────────
 
 interface EditionRow { id: string; current_round: number; round_closes_at: string | null; is_active: boolean; pool_size: number | null; mode: "manual" | "auto" | null; }
@@ -520,21 +575,23 @@ async function handleManual(env: BracketEnv, config: BracketConfig, active: Edit
   // missing `manual_action` key reads back as no action in getConfig.
   await sbDelete(env, "bracket_config", "key=eq.manual_action");
 
-  let result: string;
+  // `start_edition` (bare = next rotation pick) or `start_edition:<themeId>` (that exact
+  // theme, ignoring rotation + the used-list). Handled before the switch since the targeted
+  // form carries a suffix the switch can't match.
+  if (action === "start_edition" || (action as string).startsWith("start_edition:")) {
+    if (active) return `manual start: edition ${active.id} already active`;
+    const themeId = startEditionThemeId(action as string);
+    return themeId ? await generateTheme(env, config, now, themeId) : await generateNext(env, config, now);
+  }
+
   switch (action) {
     case "advance_round":
-      result = active ? await tallyAndAdvance(env, active, now, config, false) : "manual advance: no active edition";
-      break;
+      return active ? await tallyAndAdvance(env, active, now, config, false) : "manual advance: no active edition";
     case "close_edition":
-      result = active ? await tallyAndAdvance(env, active, now, config, true) : "manual close: no active edition";
-      break;
-    case "start_edition":
-      result = active ? `manual start: edition ${active.id} already active` : await generateNext(env, config, now);
-      break;
+      return active ? await tallyAndAdvance(env, active, now, config, true) : "manual close: no active edition";
     case "pause":
       if (active) await sbPatch(env, "bracket_editions", `id=eq.${active.id}`, { round_closes_at: null });
-      result = active ? `manual: round paused on ${active.id}` : "manual pause: no active edition";
-      break;
+      return active ? `manual: round paused on ${active.id}` : "manual pause: no active edition";
     case "resume":
       if (active) {
         await sbPatch(env, "bracket_editions", `id=eq.${active.id}`, {
@@ -542,13 +599,19 @@ async function handleManual(env: BracketEnv, config: BracketConfig, active: Edit
           round_closes_at: roundCloseISO(active.current_round, now, config),
         });
       }
-      result = active ? `manual: round resumed on ${active.id}` : "manual resume: no active edition";
-      break;
+      return active ? `manual: round resumed on ${active.id}` : "manual resume: no active edition";
     default:
-      result = `manual: unknown action "${action}"`;
       await emitDiag(env, "bracketUnknownAction", String(action));
+      return `manual: unknown action "${action}"`;
   }
-  return result;
+}
+
+/** Parse a `start_edition` action: `start_edition:<themeId>` → the themeId; bare
+ *  `start_edition` → null (rotation pick). Exported for unit tests. */
+export function startEditionThemeId(action: string): string | null {
+  const m = /^start_edition:(.+)$/.exec(action);
+  const id = m ? m[1].trim() : "";
+  return id.length ? id : null;
 }
 
 /** Auto mode: generate after the break, tally + advance when the open round closes. */
