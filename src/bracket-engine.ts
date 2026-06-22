@@ -413,11 +413,14 @@ async function writeEdition(
  *  creative ↔ stats (config.themeRotation), skipping themes used this season. Creative is
  *  the soul; it leads when one is ready and the rotation calls for it. */
 async function generateNext(env: BracketEnv, config: BracketConfig, now: number): Promise<string> {
-  const year = new Date(now).getUTCFullYear();
-  const editionCount = (await sbGet<{ id: string }[]>(env, "bracket_editions?select=id")).length;
-  const order = editionCount + 1;
+  // Alternate off the MOST RECENT edition's type — robust to a pre-existing/old edition or a
+  // failed generation. Parity on the total edition count is NOT: a stray stats edition (e.g. the
+  // old engine's `top-forward-…`) flips it the wrong way, so "previous was stats" wrongly picked
+  // stats again. With no history, lead with creative (the soul / recommended first drop).
+  const editions = await sbGet<{ type: string }[]>(env, "bracket_editions?select=type&order=created_at.desc");
+  const order = editions.length + 1;
   const used = new Set(config.usedThemesThisSeason);
-  const wantCreative = config.themeRotation === "sequential" ? true : editionCount % 2 === 0;
+  const wantCreative = config.themeRotation === "sequential" ? true : editions[0]?.type !== "creative";
 
   const pickCreative = async (): Promise<string | null> => {
     const rows = await sbGet<{ id: string; theme_label: string; title: string }[]>(
