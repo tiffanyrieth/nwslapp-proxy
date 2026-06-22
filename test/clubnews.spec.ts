@@ -4,7 +4,30 @@ import {
 	isPlaceholderArticle,
 	extractJsonLdArticle,
 	decideFeedItem,
+	centersNonNWSLLeague,
 } from "../src/index";
+
+describe("centersNonNWSLLeague — foreign-league relevance backstop", () => {
+	it("drops a post centering a non-NWSL league with no NWSL signal", () => {
+		expect(
+			centersNonNWSLLeague("Japan is the joint-largest market for the WSL outside of the UK"),
+		).toBe(true);
+		expect(centersNonNWSLLeague("Liga F transfer window roundup")).toBe(true);
+		expect(centersNonNWSLLeague("UEFA Women's Champions League draw")).toBe(true);
+	});
+
+	it("keeps NWSL posts, including ones that name another league in comparison", () => {
+		expect(centersNonNWSLLeague("NWSL playoff race tightens after the weekend")).toBe(false);
+		expect(centersNonNWSLLeague("Unlike the WSL, the NWSL has a salary cap")).toBe(false);
+		expect(centersNonNWSLLeague("Ally Sentnor traded to Angel City FC")).toBe(false);
+		expect(centersNonNWSLLeague("")).toBe(false);
+		expect(centersNonNWSLLeague(undefined)).toBe(false);
+	});
+
+	it("does not treat the WSL inside NWSL as a foreign-league hit", () => {
+		expect(centersNonNWSLLeague("Big NWSL transfer news today")).toBe(false);
+	});
+});
 
 // ── B3b: club-news discovery helpers ──────────────────────────────────────────
 
