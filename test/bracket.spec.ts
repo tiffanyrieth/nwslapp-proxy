@@ -7,8 +7,21 @@ import {
   nextRoundMatchups,
   nextRound,
   roundPoints,
+  roundTitle,
+  isEarlyRound,
   interleaveByes,
+  plannedSize,
+  planStructure,
+  nextCodeIn,
+  buildSeededRound,
+  buildMergedRound,
+  QUAL_CODES,
 } from "../src/bracket";
+
+// Inclusive integer range [lo..hi].
+function range(lo: number, hi: number): number[] {
+  return Array.from({ length: hi - lo + 1 }, (_, i) => lo + i);
+}
 
 // `n` entrants, seeds 1..n, teams spread across 16 by default.
 function entrants(n: number, teamOf: (i: number) => string = (i) => `T${i % 16}`) {
@@ -119,5 +132,89 @@ describe("advancement", () => {
 describe("roundPoints", () => {
   it("is tiered 1·1·2·2·3·3", () => {
     expect([64, 32, 16, 8, 4, 2].map(roundPoints)).toEqual([1, 1, 2, 2, 3, 3]);
+  });
+  it("scores every qualifying round at 1", () => {
+    expect(QUAL_CODES.map(roundPoints)).toEqual([1, 1, 1, 1]);
+  });
+});
+
+describe("qualifying round codes", () => {
+  it("title + early-window for qualifying codes (the cross-repo contract)", () => {
+    expect(QUAL_CODES.map(roundTitle)).toEqual([
+      "Qualifying 1", "Qualifying 2", "Qualifying 3", "Qualifying 4",
+    ]);
+    // Early window: qualifying + the first two main rounds (R64, R32); R16 onward is late.
+    expect([-4, -1, 64, 32].every(isEarlyRound)).toBe(true);
+    expect([16, 8, 4, 2].some(isEarlyRound)).toBe(false);
+  });
+});
+
+describe("plannedSize", () => {
+  it("passes ≤64 through, snaps 65..95 down to 64, and snaps 96+ to 64+32·q (≤192)", () => {
+    expect([50, 64].map(plannedSize)).toEqual([50, 64]);
+    expect([65, 80, 95].map(plannedSize)).toEqual([64, 64, 64]);
+    expect([96, 128, 160, 192].map(plannedSize)).toEqual([96, 128, 160, 192]);
+    expect([224, 256].map(plannedSize)).toEqual([192, 192]); // clamp to 4 qualifying rounds
+  });
+});
+
+describe("planStructure", () => {
+  it("≤64 has no qualifying rounds", () => {
+    const s = planStructure(60);
+    expect(s.qualifyingCount).toBe(0);
+    expect(s.rounds).toEqual([64, 32, 16, 8, 4, 2]);
+  });
+  it("128 → 2 qualifying rounds with the documented rolling entry", () => {
+    const s = planStructure(128);
+    expect(s.qualifyingCount).toBe(2);
+    expect(s.rounds).toEqual([-4, -3, 64, 32, 16, 8, 4, 2]);
+    expect(s.entrySeeds[-4]).toEqual(range(65, 128)); // q1: lowest 64 seeds
+    expect(s.entrySeeds[-3]).toEqual(range(33, 64));  // q2: next 32 enter
+    expect(s.entrySeeds[64]).toEqual(range(1, 32));   // byes enter the main bracket
+  });
+  it("every supported pool covers seeds 1..size exactly once across entry tiers", () => {
+    for (const size of [96, 128, 160, 192]) {
+      const s = planStructure(size);
+      const all = Object.values(s.entrySeeds).flat().sort((a, b) => a - b);
+      expect(all).toEqual(range(1, size)); // no gaps, no overlaps, nobody dropped
+    }
+  });
+  it("nextCodeIn walks qualifying → main → null", () => {
+    const s = planStructure(128);
+    expect(nextCodeIn(s, -4)).toBe(-3);
+    expect(nextCodeIn(s, -3)).toBe(64);
+    expect(nextCodeIn(s, 64)).toBe(32);
+    expect(nextCodeIn(s, 2)).toBeNull();
+  });
+  it("max points are rule-derived from the structure (128 → 145)", () => {
+    // matchups per round: qualifying/64 → 32, 32 → 16, 16 → 8, 8 → 4, 4 → 2, 2 → 1.
+    const matchupsForCode = (c: number) => (c < 0 || c === 64 ? 32 : c / 2);
+    const max = (size: number) =>
+      planStructure(size).rounds.reduce((sum, c) => sum + matchupsForCode(c) * roundPoints(c), 0);
+    expect(max(64)).toBe(81);   // classic 64-pool (matches the app's BracketScoring test)
+    expect(max(128)).toBe(145); // 32+32 (qual) +32+16 +16+8 +6+3
+  });
+});
+
+describe("buildSeededRound (qualifying round 1)", () => {
+  it("64 fresh entrants → 32 matchups stamped with the q1 code + 1 point, no byes", () => {
+    const { matchups, byeIds } = buildSeededRound(entrants(64), -4);
+    expect(matchups.length).toBe(32);
+    expect(byeIds.length).toBe(0);
+    expect(matchups.every((m) => m.round === -4 && m.points === 1)).toBe(true);
+    const ids = new Set(matchups.flatMap((m) => [m.aId, m.bId]));
+    expect(ids.size).toBe(64); // every entrant placed exactly once
+  });
+});
+
+describe("buildMergedRound (survivors + fresh entrants)", () => {
+  it("32 winners + 32 fresh → 32 main-bracket matchups, all 64 placed once", () => {
+    const winners = Array.from({ length: 32 }, (_, i) => `w${i + 1}`);
+    const fresh = entrants(32).map((e, i) => ({ ...e, id: `b${i + 1}`, seed: i + 1 }));
+    const ms = buildMergedRound(winners, fresh, 64);
+    expect(ms.length).toBe(32);
+    expect(ms.every((m) => m.round === 64 && m.points === 1)).toBe(true);
+    const ids = new Set(ms.flatMap((m) => [m.aId, m.bId]));
+    expect(ids.size).toBe(64);
   });
 });
