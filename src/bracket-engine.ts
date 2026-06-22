@@ -46,6 +46,7 @@ export interface BracketEnv {
 }
 
 const ESPN_SITE = "https://site.api.espn.com/apis/site/v2/sports/soccer/usa.nwsl";
+const ESPN_CORE = "https://sports.core.api.espn.com/v2/sports/soccer/leagues/usa.nwsl";
 
 // ── Config (bracket_config; read every tick) ───────────────────────────────────
 
@@ -62,6 +63,10 @@ interface BracketConfig {
   manualAction: ManualAction | null;
   themeRotation: "alternate" | "sequential";
   usedThemesThisSeason: string[];
+  /// How many per-athlete ESPN stat fetches a generation may attempt (free Workers cap is
+  /// 50 subrequests/invocation; default keeps the whole generation under it). Raise via
+  /// bracket_config on the Workers Paid plan (1000 cap) for full-pool exact seeding.
+  statFetchBudget: number;
 }
 
 async function getConfig(env: BracketEnv): Promise<BracketConfig> {
@@ -80,6 +85,7 @@ async function getConfig(env: BracketEnv): Promise<BracketConfig> {
     manualAction: typeof action === "string" ? (action as ManualAction) : null,
     themeRotation: str("theme_rotation", "alternate") === "sequential" ? "sequential" : "alternate",
     usedThemesThisSeason: Array.isArray(m.get("used_themes_this_season")) ? (m.get("used_themes_this_season") as string[]) : [],
+    statFetchBudget: num("stat_fetch_budget", 20),
   };
 }
 
@@ -187,16 +193,11 @@ const POSITION_GROUP: Record<string, "F" | "M" | "D" | "G"> = {
   G: "G", GK: "G",
 };
 
-/**
- * Build a stats-edition entrant list: every player of `group` (or all positions when null)
- * across the 16 teams, up to `cap`, seeded by ROUND-ROBIN INTERLEAVE across teams (a
- * visibility proxy — each club's players spread through the seed range, which keeps same-team
- * players out of the early rounds). 16 roster fetches total → fits the Workers subrequest
- * budget. NOTE: this is roster-depth seeding, NOT exact season-stat ranking (goals+assists,
- * save% …) — that needs per-athlete Core API stats and is tracked as a follow-up; the edition
- * still records its `seeding_stat` for display, and a heuristic-seeding diag is emitted.
- */
-async function buildStatsPool(env: BracketEnv, group: "F" | "M" | "D" | "G" | null, cap: number): Promise<Entrant[]> {
+/** Every player of `group` (or all positions when null) across the 16 teams, ordered by
+ *  ROUND-ROBIN INTERLEAVE across teams (each club's players spread through the list, jersey
+ *  order within a team) — this is both the same-team-spreading order AND the roster-depth
+ *  fallback seeding when stat data is thin. No cap (the caller ranks + caps). 17 fetches. */
+async function rosterCandidates(group: "F" | "M" | "D" | "G" | null): Promise<RosterPlayer[]> {
   const teams = await fetchTeamAbbrs();
   const rosters = await Promise.all(teams.map((t) => fetchRoster(t.id, t.abbr)));
   const byTeam = rosters.map((r) =>
@@ -204,19 +205,151 @@ async function buildStatsPool(env: BracketEnv, group: "F" | "M" | "D" | "G" | nu
       .sort((a, b) => (a.jersey ?? 999) - (b.jersey ?? 999)),
   );
   const ordered: RosterPlayer[] = [];
-  for (let depth = 0; ordered.length < cap; depth++) {
+  for (let depth = 0; ; depth++) {
     let added = false;
     for (const team of byTeam) {
       const p = team[depth];
-      if (p) {
-        ordered.push(p);
-        added = true;
-        if (ordered.length >= cap) break;
-      }
+      if (p) { ordered.push(p); added = true; }
     }
     if (!added) break;
   }
-  await emitDiag(env, "bracketStatSeedHeuristic", `${group ?? "ALL"} pool ${ordered.length} (roster-depth)`);
+  return ordered;
+}
+
+// ── Real season-stat seeding (ESPN Core API) ──────────────────────────────────
+// Stats/creative editions seed by the edition's stat where the data is cheaply available:
+//  • goals_assists (Best Forward) → ONE league-leaders call (top-25 each), no per-athlete.
+//  • save_pct / chances_tackles / tackles_interceptions / minutes → per-athlete season
+//    stats, fetched up to config.statFetchBudget candidates (the roster-depth-prioritised
+//    front of the list — each club's primary players). Candidates with no stat fall to
+//    roster-depth order; a diag records how much of the pool is real vs fallback. A failed
+//    fetch (e.g. over the subrequest cap) just drops to fallback — never a crash.
+
+function idFromRef(ref?: string): string | null {
+  const m = ref?.match(/athletes\/(\d+)/);
+  return m ? m[1] : null;
+}
+
+interface LeaderLine { goals: number; assists: number; saves: number }
+
+/** League leaders (1 call): athleteId → {goals, assists, saves} for the season. */
+async function fetchLeaders(year: number): Promise<Record<string, LeaderLine>> {
+  const map: Record<string, LeaderLine> = {};
+  try {
+    const json = (await (await fetch(`${ESPN_CORE}/seasons/${year}/types/1/leaders`)).json()) as {
+      categories?: { name?: string; leaders?: { value?: number; athlete?: { $ref?: string } }[] }[];
+    };
+    const want: Record<string, keyof LeaderLine> = {
+      goals: "goals", goalsLeaders: "goals", assists: "assists", assistsLeaders: "assists", saves: "saves", savesLeaders: "saves",
+    };
+    for (const cat of json.categories ?? []) {
+      const key = want[cat.name ?? ""];
+      if (!key) continue;
+      for (const l of cat.leaders ?? []) {
+        const id = idFromRef(l.athlete?.$ref);
+        if (!id) continue;
+        const e = map[id] ?? { goals: 0, assists: 0, saves: 0 };
+        e[key] = l.value ?? 0;
+        map[id] = e;
+      }
+    }
+  } catch { /* leaders unavailable → callers fall to roster-depth */ }
+  return map;
+}
+
+/** One athlete's season stats, flattened to "category.statName" → value. */
+async function fetchAthleteStats(id: string, year: number): Promise<Record<string, number>> {
+  const out: Record<string, number> = {};
+  const json = (await (await fetch(`${ESPN_CORE}/seasons/${year}/types/1/athletes/${id}/statistics`)).json()) as {
+    splits?: { categories?: { name?: string; stats?: { name?: string; value?: number }[] }[] };
+  };
+  for (const cat of json.splits?.categories ?? []) {
+    for (const s of cat.stats ?? []) out[`${cat.name}.${s.name}`] = s.value ?? 0;
+  }
+  return out;
+}
+
+/** Fetch many athletes' stats in small concurrent batches (failures drop to undefined). */
+async function fetchStatsForMany(ids: string[], year: number): Promise<Map<string, Record<string, number>>> {
+  const out = new Map<string, Record<string, number>>();
+  const CONC = 8;
+  for (let i = 0; i < ids.length; i += CONC) {
+    const batch = ids.slice(i, i + CONC);
+    const res = await Promise.all(batch.map(async (id) => {
+      try { return [id, await fetchAthleteStats(id, year)] as const; } catch { return [id, null] as const; }
+    }));
+    for (const [id, stats] of res) if (stats) out.set(id, stats);
+  }
+  return out;
+}
+
+/** A comparable seeding score from the edition's stat, or null when the data's absent
+ *  (→ the player falls to roster-depth order). save% is computed (the ESPN field is buggy). */
+function statScore(seedingStat: string, leaders: LeaderLine | undefined, per: Record<string, number> | undefined): number | null {
+  switch (seedingStat) {
+    case "goals_assists": {
+      if (!leaders) return null;
+      const v = leaders.goals + leaders.assists;
+      return v > 0 ? v : null;
+    }
+    case "save_pct": {
+      if (!per) return null;
+      const saves = per["goalKeeping.saves"] ?? 0, faced = per["goalKeeping.shotsFaced"] ?? 0;
+      if (faced <= 0) return null;
+      return (saves / faced) * 100 + (per["goalKeeping.cleanSheet"] ?? 0) * 0.1; // % + clean-sheet tiebreak
+    }
+    case "chances_tackles": {
+      if (!per) return null;
+      const v = (per["offensive.shotAssists"] ?? 0) + (per["defensive.effectiveTackles"] ?? 0);
+      return v > 0 ? v : null;
+    }
+    case "tackles_interceptions": {
+      if (!per) return null;
+      const v = (per["defensive.totalTackles"] ?? 0) + (per["defensive.interceptions"] ?? 0);
+      return v > 0 ? v : null;
+    }
+    case "minutes": {
+      if (!per) return null;
+      const v = per["general.minutes"] ?? 0;
+      return v > 0 ? v : null;
+    }
+    default: return null;
+  }
+}
+
+/** Seed an edition's pool of `cap` by the real stat where available, roster-depth tail
+ *  otherwise. Emits a diag describing how much of the pool is real vs fallback. */
+async function seedPool(
+  env: BracketEnv, group: "F" | "M" | "D" | "G" | null, seedingStat: string, cap: number, config: BracketConfig, now: number,
+): Promise<Entrant[]> {
+  const year = new Date(now).getUTCFullYear();
+  const candidates = await rosterCandidates(group);
+  if (candidates.length === 0) return [];
+
+  const score = new Map<string, number>();
+  let attempted = candidates.length;
+  if (seedingStat === "goals_assists") {
+    const leaders = await fetchLeaders(year);
+    for (const c of candidates) { const s = statScore(seedingStat, leaders[c.id], undefined); if (s != null) score.set(c.id, s); }
+  } else {
+    const budget = Math.max(0, config.statFetchBudget);
+    const ids = candidates.slice(0, budget).map((c) => c.id);
+    attempted = ids.length;
+    const stats = await fetchStatsForMany(ids, year);
+    for (const c of candidates) { const s = statScore(seedingStat, undefined, stats.get(c.id)); if (s != null) score.set(c.id, s); }
+  }
+
+  // Real-stat scores rank first (desc); everyone else keeps roster-depth order behind them.
+  const scored = candidates.filter((c) => score.has(c.id)).sort((a, b) => score.get(b.id)! - score.get(a.id)!);
+  const rest = candidates.filter((c) => !score.has(c.id));
+  const ordered = [...scored, ...rest].slice(0, cap);
+
+  const real = ordered.filter((c) => score.has(c.id)).length;
+  if (real === 0) {
+    await emitDiag(env, "bracketStatSeedHeuristic", `${group ?? "ALL"}/${seedingStat}: 0 by stat → roster-depth`);
+  } else if (real < ordered.length || attempted < candidates.length) {
+    await emitDiag(env, "bracketStatSeedPartial", `${group ?? "ALL"}/${seedingStat}: ${real}/${ordered.length} by stat`);
+  }
   return ordered.map((p, i) => ({ id: p.id, name: p.name, jersey: p.jersey, team: p.team, seed: i + 1 }));
 }
 
@@ -292,9 +425,9 @@ async function generateNext(env: BracketEnv, config: BracketConfig, now: number)
     const row = rows.find((r) => !used.has(r.id));
     if (!row) return null;
     // Creative editions are theme-only: the player pool comes from ESPN rosters (the WHOLE
-    // league — all positions — seeded by the same visibility heuristic as stats editions).
-    // Only the theme label differs; matchup cards show name/jersey/team, no content lines.
-    const pool = await buildStatsPool(env, null, config.defaultPoolSize);
+    // league — all positions — seeded by minutes played, a visibility proxy for who the
+    // crowd can form an opinion on). Only the theme label differs; cards show name/jersey/team.
+    const pool = await seedPool(env, null, "minutes", config.defaultPoolSize, config, now);
     if (pool.length < 8) { await emitDiag(env, "bracketCreativeThin", `${row.id} pool ${pool.length}`); return null; }
     const msg = await writeEdition(env, { id: row.id, themeLabel: row.theme_label, title: row.title, type: "creative" }, pool, config, now, order);
     await sbPatch(env, "bracket_creative_editions", `id=eq.${encodeURIComponent(row.id)}`, { status: "used" });
@@ -308,7 +441,7 @@ async function generateNext(env: BracketEnv, config: BracketConfig, now: number)
     const row = rows.find((r) => !used.has(r.id));
     if (!row) return null;
     const group = (row.position_filter as "F" | "M" | "D" | "G" | null) ?? null;
-    const pool = await buildStatsPool(env, group, config.defaultPoolSize);
+    const pool = await seedPool(env, group, row.seeding_stat, config.defaultPoolSize, config, now);
     if (pool.length < 8) { await emitDiag(env, "bracketStatsThin", `${row.id} pool ${pool.length}`); return null; }
     const msg = await writeEdition(env, { id: `${row.id}`, themeLabel: row.theme_label, title: row.title, type: "statsSeeded" }, pool, config, now, order);
     await sbPatch(env, "bracket_stats_editions", `id=eq.${encodeURIComponent(row.id)}`, { status: "used" });
