@@ -8,7 +8,8 @@
 		"start": "wrangler dev",
 		"test": "vitest",
 		"cf-typegen": "wrangler types",
-		"load-trivia": "node scripts/load_trivia.mjs"
+		"load-trivia": "node scripts/load_trivia.mjs",
+		"healthcheck": "node scripts/health_check_club_news.mjs"
 	},
 	"devDependencies": {
 		"@cloudflare/vitest-pool-workers": "^0.12.4",
