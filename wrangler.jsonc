@@ -21,8 +21,10 @@
 	// ("0 12 * * *") if you want max freshness and accept seed-fallback near month-end.
 	"triggers": {
 		// every-other-day at 12:00 UTC → Instagram social cache refresh.
-		// hourly → Bracket Battle engine tick (generate / tally + advance / rotate).
+		// every 5 min → Bracket Battle engine tick (manual-action pickup within ~5 min /
+		//   auto tally + advance / rotate). Cheap: reads config + the active edition and
+		//   acts only on a state change.
 		// weekly Mon 09:00 UTC → rebuild the NWSL↔ESPN player-headshot map.
-		"crons": ["0 12 */2 * *", "0 * * * *", "0 9 * * 1"],
+		"crons": ["0 12 */2 * *", "*/5 * * * *", "0 9 * * 1"],
 	},
 }
