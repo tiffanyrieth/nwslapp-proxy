@@ -36,6 +36,7 @@ import {
   type Matchup,
   type MatchupVotes,
 } from "./bracket";
+import { ADMIN_PAGE_HTML } from "./bracket-admin-page";
 
 export interface BracketEnv {
   SUPABASE_URL: string;
@@ -594,13 +595,20 @@ async function handleManual(env: BracketEnv, config: BracketConfig, active: Edit
   // old `setConfigValue(…, null)` sent SQL NULL, the upsert threw, and the action stuck. A
   // missing `manual_action` key reads back as no action in getConfig.
   await sbDelete(env, "bracket_config", "key=eq.manual_action");
+  return executeManualAction(env, action, active, now, config);
+}
 
-  // `start_edition` (bare = next rotation pick) or `start_edition:<themeId>` (that exact
-  // theme, ignoring rotation + the used-list). Handled before the switch since the targeted
-  // form carries a suffix the switch can't match.
-  if (action === "start_edition" || (action as string).startsWith("start_edition:")) {
+/** Execute ONE operator action immediately, INDEPENDENT of mode/cron. Shared by handleManual
+ *  (which consumes the queued action from bracket_config first) and the admin panel (which
+ *  calls it directly, so a button acts instantly regardless of mode). Pure dispatch — no queue
+ *  read/clear here. `start_edition` (bare = next rotation pick) / `start_edition:<themeId>`
+ *  (that exact theme) are handled before the switch since the targeted form carries a suffix. */
+export async function executeManualAction(
+  env: BracketEnv, action: string, active: EditionRow | null, now: number, config: BracketConfig,
+): Promise<string> {
+  if (action === "start_edition" || action.startsWith("start_edition:")) {
     if (active) return `manual start: edition ${active.id} already active`;
-    const themeId = startEditionThemeId(action as string);
+    const themeId = startEditionThemeId(action);
     return themeId ? await generateTheme(env, config, now, themeId) : await generateNext(env, config, now);
   }
 
@@ -845,4 +853,153 @@ async function accumulateUserStats(
     };
   });
   await sbUpsert(env, "bracket_user_edition_stats", rows, "user_id,edition_id");
+}
+
+// ── Admin panel (operator-only) ─────────────────────────────────────────────────
+// Served at GET /bracket/admin (public shell); all data/control via POST
+// /bracket/admin/api, gated by BRACKET_ADMIN_KEY (mirrors /bracket/run). Reuses the
+// engine's private helpers so all Supabase logic stays in one place.
+
+type AdminEnv = BracketEnv & { BRACKET_ADMIN_KEY?: string };
+
+/** Slug a theme title into an id segment (e.g. "Best Celebration" → "best-celebration"). */
+export function slug(s: string): string {
+  return s.toLowerCase().trim().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "");
+}
+
+export async function handleBracketAdmin(request: Request, env: AdminEnv): Promise<Response> {
+  const url = new URL(request.url);
+  if (request.method === "GET" && url.pathname === "/bracket/admin") {
+    return new Response(ADMIN_PAGE_HTML, { headers: { "Content-Type": "text/html; charset=utf-8" } });
+  }
+  const key = env.BRACKET_ADMIN_KEY;
+  if (request.method !== "POST" || !key || request.headers.get("x-admin-key") !== key) {
+    return new Response("forbidden", { status: 403 });
+  }
+  let body: Record<string, unknown> = {};
+  try { body = (await request.json()) as Record<string, unknown>; } catch { /* {} */ }
+  try {
+    const result = await bracketAdminOp(env, String(body.op ?? ""), body);
+    return new Response(JSON.stringify(result), { headers: { "Content-Type": "application/json" } });
+  } catch (e) {
+    const err = e as Error;
+    const safe = `${err.message ?? err}`.replace(/sb_secret_[A-Za-z0-9_]+|sb_publishable_[A-Za-z0-9_]+|eyJ[A-Za-z0-9_.\-]+/g, "[redacted]");
+    return new Response(JSON.stringify({ error: safe }), { status: 500, headers: { "Content-Type": "application/json" } });
+  }
+}
+
+function libTable(kind: unknown): string {
+  return kind === "stats" ? "bracket_stats_editions" : "bracket_creative_editions";
+}
+
+async function bracketAdminOp(env: AdminEnv, op: string, body: Record<string, unknown>): Promise<unknown> {
+  switch (op) {
+    case "state":
+      return adminState(env);
+    case "setMode":
+      await setConfigValue(env, "mode", body.mode === "auto" ? "auto" : "manual");
+      return { ok: true };
+    case "action": {
+      const config = await getConfig(env);
+      const active = await getActiveEdition(env);
+      const message = await executeManualAction(env, String(body.action ?? ""), active, Date.now(), config);
+      return { ok: true, message };
+    }
+    case "themeAdd": {
+      const title = String(body.title ?? "").trim();
+      if (!title) return { error: "title required" };
+      const season = Number((await getConfig(env)).season) || new Date().getUTCFullYear();
+      const id = `${slug(title)}-${season}`;
+      await sbInsert(env, "bracket_creative_editions", [{
+        id, theme_label: title.toUpperCase(), title, description: "", status: "ready", season,
+      }]);
+      return { ok: true, id };
+    }
+    case "themeEditTitle": {
+      const title = String(body.title ?? "").trim();
+      if (!title) return { error: "title required" };
+      await sbPatch(env, libTable(body.kind), `id=eq.${encodeURIComponent(String(body.id))}`, { title, theme_label: title.toUpperCase() });
+      return { ok: true };
+    }
+    case "themeStatus": {
+      const status = ["ready", "parked", "used"].includes(String(body.status)) ? String(body.status) : "ready";
+      await sbPatch(env, libTable(body.kind), `id=eq.${encodeURIComponent(String(body.id))}`, { status });
+      return { ok: true };
+    }
+    case "themeDelete":
+      await sbDelete(env, libTable(body.kind), `id=eq.${encodeURIComponent(String(body.id))}`);
+      return { ok: true };
+    case "clearUsedThemes":
+      await setConfigValue(env, "used_themes_this_season", []);
+      return { ok: true };
+    default:
+      return { error: `unknown op "${op}"` };
+  }
+}
+
+/** What `generateNext` WOULD pick next (rotation creative↔stats + creation order, skipping
+ *  used + non-ready) — computed read-only, without generating. */
+async function nextRotationPick(env: BracketEnv, config: BracketConfig): Promise<{ id: string; title: string; type: string } | null> {
+  const editions = await sbGet<{ type: string }[]>(env, "bracket_editions?select=type&order=created_at.desc&limit=1");
+  const wantCreative = config.themeRotation === "sequential" ? true : editions[0]?.type !== "creative";
+  const used = new Set(config.usedThemesThisSeason);
+  const creative = (await sbGet<{ id: string; title: string }[]>(env, "bracket_creative_editions?status=eq.ready&select=id,title&order=created_at.asc")).find((r) => !used.has(r.id));
+  const stats = (await sbGet<{ id: string; title: string }[]>(env, "bracket_stats_editions?status=eq.ready&select=id,title&order=created_at.asc")).find((r) => !used.has(r.id));
+  if (wantCreative) {
+    if (creative) return { ...creative, type: "creative" };
+    if (stats) return { ...stats, type: "statsSeeded" };
+  } else {
+    if (stats) return { ...stats, type: "statsSeeded" };
+    if (creative) return { ...creative, type: "creative" };
+  }
+  return null;
+}
+
+async function adminState(env: BracketEnv): Promise<unknown> {
+  const config = await getConfig(env);
+  const activeRows = await sbGet<Record<string, unknown>[]>(
+    env, "bracket_editions?is_active=eq.true&select=id,title,type,current_round,total_rounds,round_opened_at,round_closes_at,is_active,pool_size,mode&limit=1");
+  const active = activeRows[0] ?? null;
+  let activeOut: Record<string, unknown> | null = null;
+  if (active) {
+    const votes = await sbGet<{ user_id: string }[]>(
+      env, `bracket_votes?edition_id=eq.${encodeURIComponent(String(active.id))}&round=eq.${active.current_round}&select=user_id`);
+    activeOut = { ...active, thisRoundVotes: votes.length };
+  }
+  const creative = await sbGet<unknown[]>(env, "bracket_creative_editions?select=id,title,theme_label,status,created_at&order=created_at.asc");
+  const stats = await sbGet<unknown[]>(env, "bracket_stats_editions?select=id,title,theme_label,status,position_filter,seeding_stat,created_at&order=created_at.asc");
+  const nextPick = await nextRotationPick(env, config);
+  const history = await adminHistory(env);
+  return {
+    config: {
+      mode: config.mode, season: config.season, themeRotation: config.themeRotation,
+      usedThemes: config.usedThemesThisSeason, manualAction: config.manualAction,
+      defaultPoolSize: config.defaultPoolSize,
+    },
+    active: activeOut, nextPick, creative, stats, history,
+  };
+}
+
+/** Completed editions (newest first, capped). Winner = the championship (round 2) matchup's
+ *  community winner → entrant name; "—" if the edition was closed before a champion. Total
+ *  votes counted from bracket_votes (fine at operator scale; capped to recent editions). */
+async function adminHistory(env: BracketEnv): Promise<unknown[]> {
+  const eds = await sbGet<Record<string, unknown>[]>(
+    env, "bracket_editions?is_active=eq.false&select=id,title,type,total_rounds,current_round,created_at,completed_at&order=created_at.desc&limit=25");
+  const out: unknown[] = [];
+  for (const e of eds) {
+    const enc = encodeURIComponent(String(e.id));
+    const votes = await sbGet<{ user_id: string }[]>(env, `bracket_votes?edition_id=eq.${enc}&select=user_id`);
+    const finals = await sbGet<{ community_winner_id: string | null }[]>(
+      env, `bracket_matchups?edition_id=eq.${enc}&round=eq.2&select=community_winner_id&limit=1`);
+    let winner: string | null = null;
+    const winnerId = finals[0]?.community_winner_id ?? null;
+    if (winnerId) {
+      const ent = await sbGet<{ player_name: string }[]>(
+        env, `bracket_entrants?edition_id=eq.${enc}&entrant_id=eq.${encodeURIComponent(winnerId)}&select=player_name&limit=1`);
+      winner = ent[0]?.player_name ?? winnerId;
+    }
+    out.push({ ...e, totalVotes: votes.length, winner });
+  }
+  return out;
 }
