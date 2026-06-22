@@ -128,6 +128,13 @@ async function sbPatch(env: BracketEnv, table: string, query: string, body: unkn
   });
   if (!r.ok) throw new Error(`Supabase PATCH ${table} → ${r.status} ${await r.text()}`);
 }
+async function sbDelete(env: BracketEnv, table: string, query: string): Promise<void> {
+  const r = await fetch(sb(env, `${table}?${query}`), {
+    method: "DELETE",
+    headers: sbHeaders(env, { Prefer: "return=minimal" }),
+  });
+  if (!r.ok) throw new Error(`Supabase DELETE ${table} → ${r.status} ${await r.text()}`);
+}
 async function sbUpsert(env: BracketEnv, table: string, rows: unknown[], onConflict: string): Promise<void> {
   if (rows.length === 0) return;
   const r = await fetch(sb(env, `${table}?on_conflict=${onConflict}`), {
@@ -468,11 +475,11 @@ async function markThemeUsed(env: BracketEnv, config: BracketConfig, id: string)
 
 // ── The tick ──────────────────────────────────────────────────────────────────
 
-interface EditionRow { id: string; current_round: number; round_closes_at: string | null; is_active: boolean; pool_size: number | null; }
+interface EditionRow { id: string; current_round: number; round_closes_at: string | null; is_active: boolean; pool_size: number | null; mode: "manual" | "auto" | null; }
 
 async function getActiveEdition(env: BracketEnv): Promise<EditionRow | null> {
   const rows = await sbGet<EditionRow[]>(
-    env, "bracket_editions?is_active=eq.true&select=id,current_round,round_closes_at,is_active,pool_size&limit=1");
+    env, "bracket_editions?is_active=eq.true&select=id,current_round,round_closes_at,is_active,pool_size,mode&limit=1");
   return rows[0] ?? null;
 }
 
@@ -501,10 +508,17 @@ export async function runBracketTick(env: BracketEnv, now: number = Date.now()):
     : await handleAuto(env, config, active, now);
 }
 
-/** Manual mode: act on the queued operator action, then clear it. */
+/** Manual mode: CONSUME the queued operator action (exactly once), then act on it. */
 async function handleManual(env: BracketEnv, config: BracketConfig, active: EditionRow | null, now: number): Promise<string> {
   const action = config.manualAction;
   if (!action) return "manual: idle (no pending action)";
+
+  // Consume FIRST, before acting — so a terminal or failing action can't re-fire on every
+  // 5-min tick (the original bug: an `advance_round` that never cleared marched an edition to
+  // completion). Clear by DELETING the row: `bracket_config.value` is `jsonb NOT NULL`, so the
+  // old `setConfigValue(…, null)` sent SQL NULL, the upsert threw, and the action stuck. A
+  // missing `manual_action` key reads back as no action in getConfig.
+  await sbDelete(env, "bracket_config", "key=eq.manual_action");
 
   let result: string;
   switch (action) {
@@ -534,7 +548,6 @@ async function handleManual(env: BracketEnv, config: BracketConfig, active: Edit
       result = `manual: unknown action "${action}"`;
       await emitDiag(env, "bracketUnknownAction", String(action));
   }
-  await setConfigValue(env, "manual_action", null); // one-shot — clear after acting
   return result;
 }
 
@@ -546,6 +559,11 @@ async function handleAuto(env: BracketEnv, config: BracketConfig, active: Editio
       return "auto: in the break between editions";
     }
     return await generateNext(env, config, now);
+  }
+  // Defense-in-depth: a manual-mode edition is NEVER auto-advanced, even if the global config
+  // is somehow 'auto'. Only an explicit manual_action (handleManual) may step it.
+  if (active.mode === "manual") {
+    return `auto: skipped — edition ${active.id} is in manual mode`;
   }
   if (active.round_closes_at && new Date(active.round_closes_at).getTime() <= now) {
     return await tallyAndAdvance(env, active, now, config, false);
