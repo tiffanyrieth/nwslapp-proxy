@@ -43,7 +43,7 @@ const warns = [];
 
 try {
   const editions = await sb(
-    "bracket_editions?is_active=eq.true&select=id,current_round,round_closes_at,pool_size,total_rounds&limit=1");
+    "bracket_editions?is_active=eq.true&select=id,current_round,round_closes_at,pool_size,total_rounds,mode&limit=1");
 
   console.log(`\nBracket health check — ${URL}\n`);
 
@@ -76,7 +76,11 @@ try {
     fails.push(`${staleUnresolved.length} matchup(s) in non-current rounds are unresolved (a tally never ran)`);
   }
   if (ed.round_closes_at == null) {
-    warns.push("round is paused (round_closes_at is null) — manual mode hold");
+    // Manual mode = no deadline by design (the round stays open until the operator advances) →
+    // a null close time is NORMAL there, not a paused/stuck round. Only flag it in auto mode.
+    if (ed.mode !== "manual") {
+      warns.push("round has no close time (round_closes_at is null) in AUTO mode — paused or never set");
+    }
   } else if (Date.now() - new Date(ed.round_closes_at).getTime() > OVERDUE_GRACE_MS) {
     fails.push(`current round closed >90 min ago but hasn't advanced (stuck tally?)`);
   }

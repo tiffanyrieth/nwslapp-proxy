@@ -55,7 +55,7 @@ const ESPN_CORE = "https://sports.core.api.espn.com/v2/sports/soccer/leagues/usa
 type Mode = "manual" | "auto";
 type ManualAction = "advance_round" | "close_edition" | "start_edition" | "pause" | "resume";
 
-interface BracketConfig {
+export interface BracketConfig {
   mode: Mode;
   season: string;
   defaultPoolSize: number;
@@ -382,8 +382,12 @@ async function seedPool(
 
 // ── Edition generation ─────────────────────────────────────────────────────────
 
-/** Voting-window close time for a round code, from config (early/late day windows). */
-function roundCloseISO(code: number, now: number, config: BracketConfig): string {
+/** Voting-window close time for a round code, or NULL in manual mode. Manual mode means the
+ *  operator advances rounds by hand, so the round stays open indefinitely — writing no deadline
+ *  keeps votes flowing (the app reads null as "Voting open") instead of auto-closing after a
+ *  couple of days. Auto mode uses the config early/late day windows. Exported for unit tests. */
+export function roundCloseISO(code: number, now: number, config: BracketConfig): string | null {
+  if (config.mode === "manual") return null;
   const days = isEarlyRound(code) ? config.earlyRoundDays : config.lateRoundDays;
   return new Date(now + days * 24 * 3600 * 1000).toISOString();
 }
