@@ -17,7 +17,7 @@ import {
   buildMergedRound,
   QUAL_CODES,
 } from "../src/bracket";
-import { startEditionThemeId, slug } from "../src/bracket-engine";
+import { roundCloseISO, startEditionThemeId, slug } from "../src/bracket-engine";
 
 describe("slug — admin theme-id derivation", () => {
   it("lowercases, hyphenates, and trims", () => {
@@ -240,5 +240,24 @@ describe("buildMergedRound (survivors + fresh entrants)", () => {
     expect(ms.every((m) => m.round === 64 && m.points === 1)).toBe(true);
     const ids = new Set(ms.flatMap((m) => [m.aId, m.bId]));
     expect(ids.size).toBe(64);
+  });
+});
+
+describe("roundCloseISO — manual mode writes no deadline", () => {
+  const cfg = (mode: "manual" | "auto") => ({
+    mode, season: "2026", defaultPoolSize: 128, earlyRoundDays: 2, lateRoundDays: 3,
+    breakDays: 7, manualAction: null, themeRotation: "alternate" as const,
+    usedThemesThisSeason: [] as string[], statFetchBudget: 20,
+  });
+
+  it("returns null in manual mode (round stays open until the operator advances)", () => {
+    expect(roundCloseISO(64, 0, cfg("manual"))).toBe(null);
+    expect(roundCloseISO(8, 0, cfg("manual"))).toBe(null);
+  });
+
+  it("returns the early/late dated ISO in auto mode", () => {
+    // R64 is an early round → earlyRoundDays (2); QF (8) is late → lateRoundDays (3).
+    expect(roundCloseISO(64, 0, cfg("auto"))).toBe(new Date(2 * 86_400_000).toISOString());
+    expect(roundCloseISO(8, 0, cfg("auto"))).toBe(new Date(3 * 86_400_000).toISOString());
   });
 });
