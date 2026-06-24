@@ -358,3 +358,18 @@ export function buildMergedRound(
   const advancing = interleaveByes(winners, fresh.map((e) => e.id));
   return nextRoundMatchups(advancing, roundCode);
 }
+
+/**
+ * Assemble the 64 Round-of-64 entrants for a large (>64) pool: the 32 bye holders keep
+ * their original seeds (1-32); the 32 qualifier winners get EFFECTIVE seeds 33-64 by
+ * their original-seed rank (best survivor → 33, worst → 64). Feed the result to
+ * `buildSeededRound(…, 64)` so seedOrder spreads all 64 across the quadrants (1v64,
+ * 32v33, seeds 1 & 2 in opposite halves) — instead of `buildMergedRound`'s sequential
+ * pairing, which let top seeds bunch into the same quadrant. Pure — unit-tested.
+ */
+export function roundOf64Entrants(byeHolders: Entrant[], qualifierWinners: Entrant[]): Entrant[] {
+  const ranked = [...qualifierWinners]
+    .sort((a, b) => a.seed - b.seed)
+    .map((e, i) => ({ ...e, seed: 33 + i }));
+  return [...byeHolders, ...ranked];
+}
