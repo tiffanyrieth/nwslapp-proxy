@@ -15,6 +15,7 @@ import {
   nextCodeIn,
   buildSeededRound,
   buildMergedRound,
+  roundOf64Entrants,
   QUAL_CODES,
 } from "../src/bracket";
 import { roundCloseISO, startEditionThemeId, slug } from "../src/bracket-engine";
@@ -259,5 +260,55 @@ describe("roundCloseISO — manual mode writes no deadline", () => {
     // R64 is an early round → earlyRoundDays (2); QF (8) is late → lateRoundDays (3).
     expect(roundCloseISO(64, 0, cfg("auto"))).toBe(new Date(2 * 86_400_000).toISOString());
     expect(roundCloseISO(8, 0, cfg("auto"))).toBe(new Date(3 * 86_400_000).toISOString());
+  });
+});
+
+describe("roundOf64Entrants — main-bracket quadrant seeding (>64 pools)", () => {
+  // 32 bye holders (original seeds 1-32) + 32 qualifier winners (original seeds 33-64).
+  // Unique teams everywhere so no avoidSameTeam swap perturbs the placement (that's
+  // exercised separately below).
+  const byes = Array.from({ length: 32 }, (_, i) => ({
+    id: `e${i + 1}`, name: "", jersey: null, team: `BT${i + 1}`, seed: i + 1,
+  }));
+  const winners = Array.from({ length: 32 }, (_, i) => ({
+    id: `w${i + 1}`, name: "", jersey: null, team: `WT${i + 1}`, seed: 33 + i,
+  }));
+
+  const slotOf = (ms: { slot: number; aId: string; bId: string }[], id: string) =>
+    ms.find((m) => m.aId === id || m.bId === id)!.slot;
+  const half = (slot: number) => Math.floor(slot / 16); // 0 = top half, 1 = bottom
+
+  it("places seeds 1 and 2 in opposite halves, with seed 1 facing effective seed 64", () => {
+    const { matchups } = buildSeededRound(roundOf64Entrants(byes, winners), 64);
+    expect(matchups).toHaveLength(32);
+    // Seeds 1 & 2 can only meet in the Final → opposite 16-matchup halves.
+    expect(half(slotOf(matchups, "e1"))).not.toBe(half(slotOf(matchups, "e2")));
+    // Top seed draws the lowest effective seed: e1 (seed 1) vs w32 (orig seed 64 → eff 64).
+    const m1 = matchups.find((m) => m.aId === "e1" || m.bId === "e1")!;
+    expect(m1.aId === "e1" ? m1.bId : m1.aId).toBe("w32");
+  });
+
+  it("maps qualifier winners to effective seeds 33-64 by original-seed rank", () => {
+    // Survivors with original seeds spread across 33-126 (incl. upset survivors > 64),
+    // fed in REVERSE order to prove the sort.
+    const origs = Array.from({ length: 32 }, (_, i) => 33 + i * 3); // 33,36,…,126
+    const survivors = origs.slice().reverse().map((s, i) => ({
+      id: `q${s}`, name: "", jersey: null, team: `QT${i + 1}`, seed: s,
+    }));
+    const tail = roundOf64Entrants(byes, survivors).slice(32); // the winners, re-seeded
+    expect(tail.map((e) => e.seed)).toEqual(Array.from({ length: 32 }, (_, i) => 33 + i));
+    expect(tail[0].id).toBe("q33");   // best survivor (orig 33) → effective 33
+    expect(tail[31].id).toBe("q126"); // worst survivor (orig 126) → effective 64
+  });
+
+  it("breaks a same-team Round of 64 matchup (seed 1 vs effective seed 64 on one club)", () => {
+    // Force seed 1 (e1) and the worst qualifier (w32 → effective 64) onto the same club,
+    // which seedOrder would pair in slot 0; avoidSameTeam must split them.
+    const byesT = byes.map((e, i) => (i === 0 ? { ...e, team: "SAME" } : e));
+    const winnersT = winners.map((e, i) => (i === 31 ? { ...e, team: "SAME" } : e));
+    const { matchups } = buildSeededRound(roundOf64Entrants(byesT, winnersT), 64);
+    const team = new Map<string, string>();
+    [...byesT, ...winnersT].forEach((e) => team.set(e.id, e.team));
+    expect(matchups.some((m) => team.get(m.aId) === "SAME" && team.get(m.bId) === "SAME")).toBe(false);
   });
 });

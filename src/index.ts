@@ -506,6 +506,14 @@ export default {
 			return handleTelemetryIngest(request, env, ctx);
 		}
 
+		// POST account deletion: the privileged "right to be forgotten" route. Verifies the
+		// caller's Supabase JWT, then service-role deletes their auth.users row (cascading
+		// every per-user table). The client can't do this — deleting an auth user needs the
+		// service-role key. Registered before the GET-only guard (it's POST + self-checks).
+		if (url.pathname === "/account/delete") {
+			return handleAccountDelete(request, env, ctx);
+		}
+
 		// Operator-only Bracket Battle admin: GET /bracket/admin = the page (public shell),
 		// POST /bracket/admin/api = key-gated control. Before the GET-only guard (it serves
 		// both methods + does its own BRACKET_ADMIN_KEY check).
@@ -1150,6 +1158,87 @@ export function extractArticleLinks(html: string, indexUrl: string, articlePath:
 		out.push(u);
 	}
 	return out;
+}
+
+/** Supabase secrets the account-delete route needs. They're Worker secrets (set via
+ *  `wrangler secret`, used by the bracket engine too) but may not be in the generated
+ *  Env typing, so we read them through a narrow cast. */
+type SupabaseAdminEnv = { SUPABASE_URL?: string; SUPABASE_SERVICE_ROLE_KEY?: string };
+
+const jsonResponse = (body: unknown, status: number): Response =>
+	new Response(JSON.stringify(body), { status, headers: { "Content-Type": "application/json" } });
+
+/** POST /account/delete — permanently delete the caller's account (App Store "account
+ *  deletion" requirement + GDPR right-to-be-forgotten). Flow:
+ *    1. Require a `Bearer <supabase-jwt>` — the caller's session token.
+ *    2. Verify it against Supabase Auth (`GET /auth/v1/user`) → the real user id. We
+ *       NEVER trust a client-supplied id; the token is the only identity source.
+ *    3. Service-role hard-delete that auth user (`DELETE /auth/v1/admin/users/{id}`),
+ *       which cascades every per-user row (the cascade migration backs this).
+ *  Fails LOUD: every error path emits diag + returns a non-2xx, so the app never reports
+ *  a successful delete while the data still exists. */
+async function handleAccountDelete(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
+	if (request.method !== "POST") {
+		return jsonResponse({ error: "use POST" }, 405);
+	}
+	// Secrets checked first (before auth) so a tokenless health probe can tell apart
+	// route-missing (404) / secret-missing (500) / ready (401). Leaks only "configured
+	// or not", never a value.
+	const cfg = env as unknown as SupabaseAdminEnv;
+	if (!cfg.SUPABASE_URL || !cfg.SUPABASE_SERVICE_ROLE_KEY) {
+		emitDiag(env, ctx, "accountDeleteMisconfig", "missing supabase secrets");
+		return jsonResponse({ error: "server misconfigured" }, 500);
+	}
+	const base = cfg.SUPABASE_URL.replace(/\/$/, "");
+
+	const authz = request.headers.get("Authorization") ?? "";
+	const token = authz.startsWith("Bearer ") ? authz.slice(7).trim() : "";
+	if (!token) {
+		return jsonResponse({ error: "missing bearer token" }, 401);
+	}
+
+	// 2. Verify the JWT → user id.
+	let userId: string;
+	try {
+		const userResp = await fetch(`${base}/auth/v1/user`, {
+			headers: { Authorization: `Bearer ${token}`, apikey: cfg.SUPABASE_SERVICE_ROLE_KEY },
+		});
+		if (!userResp.ok) {
+			emitDiag(env, ctx, "accountDeleteAuth", `verify ${userResp.status}`);
+			return jsonResponse({ error: "invalid or expired session" }, 401);
+		}
+		const user = (await userResp.json()) as { id?: string };
+		if (!user.id) {
+			emitDiag(env, ctx, "accountDeleteAuth", "no user id in token");
+			return jsonResponse({ error: "invalid session" }, 401);
+		}
+		userId = user.id;
+	} catch (e) {
+		emitDiag(env, ctx, "accountDeleteAuth", `verify threw: ${(e as Error).message.slice(0, 40)}`);
+		return jsonResponse({ error: "could not verify session" }, 502);
+	}
+
+	// 3. Hard-delete the auth user (default is a hard delete → FK cascade fires).
+	try {
+		const delResp = await fetch(`${base}/auth/v1/admin/users/${userId}`, {
+			method: "DELETE",
+			headers: {
+				apikey: cfg.SUPABASE_SERVICE_ROLE_KEY,
+				Authorization: `Bearer ${cfg.SUPABASE_SERVICE_ROLE_KEY}`,
+			},
+		});
+		if (!delResp.ok) {
+			const body = (await delResp.text()).slice(0, 60);
+			emitDiag(env, ctx, "accountDeleteFail", `${delResp.status} ${body}`);
+			return jsonResponse({ error: `deletion failed (${delResp.status})` }, 502);
+		}
+	} catch (e) {
+		emitDiag(env, ctx, "accountDeleteFail", `delete threw: ${(e as Error).message.slice(0, 40)}`);
+		return jsonResponse({ error: "deletion failed" }, 502);
+	}
+
+	emitDiag(env, ctx, "accountDeleted", userId.slice(0, 8));
+	return jsonResponse({ ok: true }, 200);
 }
 
 /** NO SILENT FAILURES (proxy edition): write one operational event to the SAME KV +

@@ -20,6 +20,7 @@ import {
   buildFirstRound,
   buildSeededRound,
   buildMergedRound,
+  roundOf64Entrants,
   planStructure,
   nextCodeIn,
   isQualifying,
@@ -761,7 +762,23 @@ async function tallyAndAdvance(env: BracketEnv, ed: EditionRow, now: number, con
     const newEntrants: Entrant[] = entrantRows
       .filter((e) => newSeeds.has(e.seed))
       .map((e) => ({ id: e.entrant_id, name: "", jersey: null, team: e.team_abbreviation, seed: e.seed }));
-    const next = buildMergedRound(winners, newEntrants, nextCode);
+    let next: Matchup[];
+    if (nextCode === 64) {
+      // ── MAIN BRACKET (Round of 64): seedOrder placement for proper quadrant
+      // structure. `newEntrants` are the 32 bye holders (original seeds 1-32); the 32
+      // qualifier `winners` get effective seeds 33-64 (roundOf64Entrants), then
+      // buildSeededRound spreads all 64 — vs buildMergedRound's sequential pairing,
+      // which let top seeds bunch into the same quadrant.
+      const qualifierWinners: Entrant[] = winners.map((wId) => ({
+        id: wId, name: "", jersey: null,
+        team: teamOf.get(wId) ?? "",
+        seed: seedOf.get(wId) ?? 999,
+      }));
+      next = buildSeededRound(roundOf64Entrants(newEntrants, qualifierWinners), 64).matchups;
+    } else {
+      // ── QUALIFYING: sequential pairing is correct for feeder rounds. ──
+      next = buildMergedRound(winners, newEntrants, nextCode);
+    }
     // Same-team protection through qualifying + Round of 64 + Round of 32.
     if (isQualifying(nextCode) || nextCode >= 32) {
       avoidSameTeam(next, entrantRows.map((e) => ({ id: e.entrant_id, name: "", jersey: null, team: e.team_abbreviation, seed: e.seed })));
