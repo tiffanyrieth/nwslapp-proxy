@@ -39,6 +39,7 @@ const SCOREBOARD_LEAGUES = new Set<string>([
 	"concacaf.womens.championship",   // Concacaf W Championship (national teams, pre-2024)
 	"uefa.weuro",                     // UEFA Women's Euro (national teams — Europe's powers)
 	"concacaf.w.champions_cup",       // Concacaf W Champions Cup (CLUB: NWSL clubs vs Liga MX)
+	"usa.nwsl.cup",                   // NWSL Challenge Cup (CLUB: one annual NWSL-vs-NWSL match)
 ]);
 const scoreboardUpstream = (slug: string) =>
 	`https://site.api.espn.com/apis/site/v2/sports/soccer/${slug}/scoreboard`;
