@@ -571,15 +571,20 @@ export default {
 		if (url.pathname === "/national-teams") {
 			return handleNationalTeams(ctx);
 		}
-		if (url.pathname === "/crest") {
+		// `/crest/{ABBR}` (preferred) or legacy `/crest?team=ABBR`. `/crest/manifest` is
+		// matched earlier, so it never reaches here.
+		if (url.pathname === "/crest" || url.pathname.startsWith("/crest/")) {
 			return handleCrest(url, env, ctx);
+		}
+		if (url.pathname === "/roster") {
+			return handleRoster(url, env, ctx);
 		}
 		if (url.pathname === "/telemetry/recent") {
 			return handleTelemetryRecent(request, env);
 		}
 
 		return new Response(
-			"Not found. This proxy serves GET /scoreboard, /summary, /team-videos, /feed, /spotlight, /trivia, /headshots, /crest, /crest/manifest, /national-teams, and POST /telemetry.",
+			"Not found. This proxy serves GET /scoreboard, /summary, /team-videos, /feed, /spotlight, /trivia, /headshots, /crest, /crest/manifest, /roster, /national-teams, and POST /telemetry.",
 			{ status: 404 },
 		);
 	},
@@ -2679,8 +2684,13 @@ async function handleTelemetryRecent(request: Request, env: Env): Promise<Respon
  *  crest (TeamLogo's fallback). Read-only and keyed by the normalized abbreviation, so every
  *  request for a team maps to one edge-cache entry. */
 async function handleCrest(url: URL, env: Env, ctx: ExecutionContext): Promise<Response> {
-	const team = (url.searchParams.get("team") ?? "").toUpperCase().replace(/[^A-Z]/g, "");
-	if (!team) return new Response("missing ?team", { status: 400 });
+	// Team comes from the path (`/crest/{ABBR}`, the preferred form) or the legacy
+	// `?team=` query. The path form exists because a consumer's managed fetch cache can
+	// pin a 404 keyed on the `/crest` path ALONE (ignoring the query), which a query
+	// cache-version bump then can't evict — a per-team path sidesteps that entirely.
+	const pathTeam = url.pathname.startsWith("/crest/") ? url.pathname.slice("/crest/".length) : "";
+	const team = (pathTeam || url.searchParams.get("team") || "").toUpperCase().replace(/[^A-Z]/g, "");
+	if (!team) return new Response("missing team", { status: 400 });
 
 	const cache = caches.default;
 	const cacheUrl = new URL(url);
@@ -2698,7 +2708,10 @@ async function handleCrest(url: URL, env: Env, ctx: ExecutionContext): Promise<R
 	} catch {
 		return new Response("crest unavailable", { status: 502 });
 	}
-	if (!bytes) return new Response("no crest for team", { status: 404 }); // app falls back to ESPN
+	// `no-store` on the 404 so a consumer NEVER pins this miss in its managed cache (the
+	// bug that made the self-hosted crest "dead": an early 404 cached for a day). The app
+	// falls back to ESPN/ring on a 404 anyway.
+	if (!bytes) return new Response("no crest for team", { status: 404, headers: { "Cache-Control": "no-store" } });
 
 	const headers = new Headers();
 	headers.set("Content-Type", "image/png");
@@ -2706,6 +2719,115 @@ async function handleCrest(url: URL, env: Env, ctx: ExecutionContext): Promise<R
 	const body = new Response(bytes, { status: 200, headers });
 	ctx.waitUntil(cache.put(cacheKey, body.clone()));
 	return withCacheStatus(body, "MISS");
+}
+
+// Roster resilience: ESPN occasionally serves an implausibly small roster for a
+// team (e.g. 1 player) while every other team is full. We cache the last-known-good
+// roster in KV and serve it (with an honest `proxyCachedAsOf` marker) when ESPN
+// comes back short — so the app stops over-relying on data ESPN doesn't prioritize.
+const ESPN_ROSTER = (id: string) => `https://site.api.espn.com/apis/site/v2/sports/soccer/usa.nwsl/teams/${id}/roster`;
+const ROSTER_GOOD_MIN = 16; // a real NWSL squad is ~22–26; below this is implausible, not a small squad
+const ROSTER_CACHE_TTL = 60 * 60 * 24 * 90; // 90d last-known-good
+const ROSTER_EDGE_TTL = 60 * 60 * 6; // 6h upstream edge cache (fan-out); short so a healed roster recovers same-day
+
+interface RosterCacheRecord {
+	fetchedAt: string; // ISO timestamp of the good fetch (surfaced to the app as proxyCachedAsOf)
+	body: unknown; // ESPN's roster payload, verbatim
+}
+
+export function athleteCount(body: unknown): number {
+	const a = (body as { athletes?: unknown })?.athletes;
+	return Array.isArray(a) ? a.length : -1;
+}
+
+/** Pure roster-serve decision (unit-tested; the route wires fetch/KV/diag around it):
+ *  - "live": ESPN returned a plausible squad → serve it (and the caller caches it).
+ *  - "cached": ESPN came back short but a fuller last-known-good exists → serve cached + marker.
+ *  - "live-small": ESPN short and no better cache → serve the small live payload honestly.
+ *  - "none": no live payload and no cache → caller 502s. */
+export function chooseRosterServe(opts: {
+	hasLive: boolean;
+	liveCount: number;
+	hasCached: boolean;
+	cachedCount: number;
+}): "live" | "cached" | "live-small" | "none" {
+	const { hasLive, liveCount, hasCached, cachedCount } = opts;
+	if (hasLive && liveCount >= ROSTER_GOOD_MIN) return "live";
+	if (hasCached && cachedCount > liveCount) return "cached";
+	if (hasLive) return "live-small";
+	return "none";
+}
+
+/** Serialize a roster body. When served from the last-known-good cache, inject a top-level
+ *  `proxyCachedAsOf` so the app can show an honest "Roster as of <date>" indicator. */
+export function rosterResponse(body: unknown, cachedAsOf: string | null): Response {
+	const out =
+		cachedAsOf && body && typeof body === "object"
+			? { ...(body as Record<string, unknown>), proxyCachedAsOf: cachedAsOf }
+			: body;
+	// Short max-age: a roster can change (and ESPN can heal), so fan-out briefly but don't pin.
+	return Response.json(out, { headers: { "Cache-Control": "public, max-age=300" } });
+}
+
+/** Serve one club's roster: `GET /roster?team=<espnTeamId>`. Passes ESPN through when it
+ *  returns a plausible squad (and caches it as last-known-good), but falls back to the cached
+ *  roster when ESPN comes back implausibly small or fails — never silently (emits diag). */
+async function handleRoster(url: URL, env: Env, ctx: ExecutionContext): Promise<Response> {
+	const id = (url.searchParams.get("team") ?? "").replace(/[^0-9]/g, "");
+	if (!id) return new Response("missing ?team", { status: 400 });
+	const kvKey = `roster:${id}`;
+
+	// 1. Fetch ESPN live (briefly edge-cached for fan-out).
+	let live: unknown = null;
+	let liveCount = -1;
+	try {
+		const r = await fetch(ESPN_ROSTER(id), {
+			headers: { Accept: "application/json" },
+			cf: { cacheEverything: true, cacheTtlByStatus: { "200-299": ROSTER_EDGE_TTL, "404": 0, "500-599": 0 } },
+		});
+		if (r.ok) {
+			live = await r.json();
+			liveCount = athleteCount(live);
+		} else {
+			emitDiag(env, ctx, "rosterUpstreamStatus", `${id} → ${r.status}`);
+		}
+	} catch (e) {
+		emitDiag(env, ctx, "rosterUpstreamThrew", `${id}: ${(e as Error).message.slice(0, 40)}`);
+	}
+
+	// 2. Plausible squad → refresh last-known-good, serve verbatim (no marker).
+	if (liveCount >= ROSTER_GOOD_MIN) {
+		const record: RosterCacheRecord = { fetchedAt: new Date().toISOString(), body: live };
+		ctx.waitUntil(env.FEED_TAGS.put(kvKey, JSON.stringify(record), { expirationTtl: ROSTER_CACHE_TTL }));
+		return rosterResponse(live, null);
+	}
+
+	// 3. Implausibly small (or upstream failed) → fall back to last-known-good if it's fuller.
+	let cached: RosterCacheRecord | null = null;
+	try {
+		cached = (await env.FEED_TAGS.get(kvKey, "json")) as RosterCacheRecord | null;
+	} catch {
+		/* KV read failure → treat as no cache, fall through */
+	}
+	const cachedCount = cached ? athleteCount(cached.body) : -1;
+	const decision = chooseRosterServe({
+		hasLive: live != null,
+		liveCount,
+		hasCached: cached != null,
+		cachedCount,
+	});
+	if (decision === "cached" && cached) {
+		emitDiag(env, ctx, "rosterStaleServe", `${id} live=${liveCount} cached=${cachedCount}`);
+		return rosterResponse(cached.body, cached.fetchedAt);
+	}
+	if (decision === "live-small") {
+		// Nothing better than the live (small) payload — serve it honestly (diag flags it).
+		emitDiag(env, ctx, "rosterImplausibleNoCache", `${id} live=${liveCount}`);
+		return rosterResponse(live, null);
+	}
+	// No live payload AND no cache to fall back to → loud failure.
+	emitDiag(env, ctx, "rosterUnavailable", `${id} live=${liveCount} cached=${cachedCount}`);
+	return new Response("roster unavailable", { status: 502 });
 }
 
 /** Build one spotlight per requested team (newest matchday squad → weekly pick →

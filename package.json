@@ -9,7 +9,8 @@
 		"test": "vitest",
 		"cf-typegen": "wrangler types",
 		"load-trivia": "node scripts/load_trivia.mjs",
-		"healthcheck": "node scripts/health_check_club_news.mjs && node scripts/health_check_bracket.mjs && node scripts/health_check_account_delete.mjs",
+		"healthcheck": "node scripts/health_check_club_news.mjs && node scripts/health_check_roster.mjs && node scripts/health_check_bracket.mjs && node scripts/health_check_account_delete.mjs",
+		"healthcheck:roster": "node scripts/health_check_roster.mjs",
 		"healthcheck:bracket": "node scripts/health_check_bracket.mjs",
 		"healthcheck:account": "node scripts/health_check_account_delete.mjs"
 	},
