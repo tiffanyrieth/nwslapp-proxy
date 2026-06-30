@@ -1,0 +1,41 @@
+#!/bin/sh
+#
+# pre-commit — prevent accidental commits straight onto the default branch.
+#
+# Why: the project workflow is "never work on main — branch first, merge via PR."
+# Nothing in git enforces that by default, so a distracted `git commit` while
+# sitting on main slips right through. This hook is the tripwire for that mistake.
+#
+# Exception: a commit whose ONLY staged change is CLAUDE.md is allowed straight onto
+# main. CLAUDE.md is project documentation, not code — it's refreshed at session end
+# and doesn't warrant its own branch/PR. Any other staged path (even alongside
+# CLAUDE.md) still trips the guard. (Inert in repos with no CLAUDE.md — kept so every
+# repo shares one canonical hook.)
+#
+# This is a local guardrail, NOT a security control: it only runs on this
+# machine, and you can bypass it on purpose with `git commit --no-verify`.
+#
+
+protected="main"
+branch=$(git symbolic-ref --short -q HEAD)
+
+if [ "$branch" = "$protected" ]; then
+    staged=$(git diff --cached --name-only)
+    # Drop the allowed doc path; anything left means a non-docs file is staged → block.
+    other=$(printf '%s\n' "$staged" | grep -v '^CLAUDE\.md$')
+    if [ -n "$staged" ] && [ -z "$other" ]; then
+        echo "📝 CLAUDE.md-only change — allowed onto '$protected' (docs exception)." >&2
+        exit 0
+    fi
+
+    echo "" >&2
+    echo "✋ You're about to commit directly onto '$protected'." >&2
+    echo "   Project rule: branch first." >&2
+    echo "     git checkout -b feature/<short-description>" >&2
+    echo "" >&2
+    echo "   (A CLAUDE.md-only commit is allowed here; otherwise override with: git commit --no-verify)" >&2
+    echo "" >&2
+    exit 1
+fi
+
+exit 0
