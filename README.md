@@ -71,3 +71,16 @@ npx wrangler tail    # live request logs
 
 Cloudflare Workers · TypeScript · Wrangler · Vitest. No KV/D1 — the Cache API
 needs no bindings.
+
+## Git hooks (branch-first guardrail)
+
+Local hooks in `hooks/` enforce the workflow: `pre-commit` blocks commits straight
+to `main` (branch first, merge via PR); `pre-push` blocks force-pushing or deleting
+`main`. They're a local tripwire, not server-side enforcement, and `core.hooksPath`
+isn't pushed — so **activate them once per fresh clone**:
+
+```bash
+git config core.hooksPath hooks
+```
+
+Bypass on purpose with `git commit --no-verify` / `git push --no-verify`.
