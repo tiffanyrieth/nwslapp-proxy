@@ -19,6 +19,13 @@
 
 import { runBracketTick, forceCloseActiveRound, handleBracketAdmin, type BracketEnv } from "./bracket-engine";
 import { buildHeadshotMap, handleHeadshots } from "./headshots";
+import {
+	exchangeAuthorizationCode,
+	storeAppleRefreshToken,
+	readAppleRefreshToken,
+	revokeRefreshToken,
+	type AppleAuthEnv,
+} from "./apple-auth";
 
 const ESPN_SCOREBOARD =
 	"https://site.api.espn.com/apis/site/v2/sports/soccer/usa.nwsl/scoreboard";
@@ -513,6 +520,14 @@ export default {
 		// service-role key. Registered before the GET-only guard (it's POST + self-checks).
 		if (url.pathname === "/account/delete") {
 			return handleAccountDelete(request, env, ctx);
+		}
+
+		// POST SIWA token exchange: trade Apple's short-lived authorizationCode for a
+		// refresh_token (stored on the user's profiles row) so account deletion can revoke
+		// the Apple credential (guideline 5.1.1(v)). Verifies the caller's Supabase JWT;
+		// before the GET-only guard (it's POST + self-checks secrets).
+		if (url.pathname === "/auth/apple-token-exchange") {
+			return handleAppleTokenExchange(request, env, ctx);
 		}
 
 		// Operator-only Bracket Battle admin: GET /bracket/admin = the page (public shell),
@@ -1224,6 +1239,28 @@ async function handleAccountDelete(request: Request, env: Env, ctx: ExecutionCon
 		return jsonResponse({ error: "could not verify session" }, 502);
 	}
 
+	// 2b. Revoke the Sign in with Apple credential (guideline 5.1.1(v)) BEFORE deleting,
+	// so Apple stops treating the user as linked. Best-effort and fully non-fatal: a
+	// missing token (existing users pre-migration), unconfigured SIWA secrets, or Apple
+	// being down must NEVER block the delete — the user's data always gets removed. Every
+	// branch emits a diag (no silent failures), then we fall through to the cascade.
+	const appleEnv = env as unknown as AppleAuthEnv;
+	try {
+		if (!appleEnv.SIWA_PRIVATE_KEY || !appleEnv.SIWA_KEY_ID || !appleEnv.APPLE_TEAM_ID) {
+			emitDiag(env, ctx, "appleRevokeSkip", "siwa not configured");
+		} else {
+			const refreshToken = await readAppleRefreshToken(appleEnv, userId);
+			if (!refreshToken) {
+				emitDiag(env, ctx, "appleRevokeSkip", `no token ${userId.slice(0, 8)}`);
+			} else {
+				await revokeRefreshToken(appleEnv, refreshToken);
+				emitDiag(env, ctx, "appleRevoked", userId.slice(0, 8));
+			}
+		}
+	} catch (e) {
+		emitDiag(env, ctx, "appleRevokeFail", `${(e as Error).message.slice(0, 60)}`);
+	}
+
 	// 3. Hard-delete the auth user (default is a hard delete → FK cascade fires).
 	try {
 		const delResp = await fetch(`${base}/auth/v1/admin/users/${userId}`, {
@@ -1244,6 +1281,91 @@ async function handleAccountDelete(request: Request, env: Env, ctx: ExecutionCon
 	}
 
 	emitDiag(env, ctx, "accountDeleted", userId.slice(0, 8));
+	return jsonResponse({ ok: true }, 200);
+}
+
+/** POST /auth/apple-token-exchange — trade Apple's short-lived authorizationCode for a
+ *  refresh_token and store it on the caller's profiles row (for later SIWA revocation).
+ *  Body: { authorizationCode: string, userId: string }. Flow:
+ *    1. Require Bearer <supabase-jwt>; verify against Supabase Auth → the real user id.
+ *       We NEVER trust the client-supplied userId; it must match the token's id.
+ *    2. Exchange the code at Apple (ES256 client_secret JWT), then upsert the
+ *       refresh_token onto profiles.
+ *  Fire-and-forget on the app side: failures emit diag + a non-2xx (the user's account
+ *  still works; they just get a token on their next sign-in). */
+async function handleAppleTokenExchange(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
+	if (request.method !== "POST") {
+		return jsonResponse({ error: "use POST" }, 405);
+	}
+	// Secrets checked before auth so a tokenless health probe tells apart route-missing
+	// (404) / secret-missing (500) / ready (401). Leaks only "configured or not".
+	const cfg = env as unknown as AppleAuthEnv;
+	if (!cfg.SUPABASE_URL || !cfg.SUPABASE_SERVICE_ROLE_KEY) {
+		emitDiag(env, ctx, "appleExchangeMisconfig", "missing supabase secrets");
+		return jsonResponse({ error: "server misconfigured" }, 500);
+	}
+	if (!cfg.SIWA_PRIVATE_KEY || !cfg.SIWA_KEY_ID || !cfg.APPLE_TEAM_ID) {
+		emitDiag(env, ctx, "appleExchangeMisconfig", "missing siwa secrets");
+		return jsonResponse({ error: "server misconfigured" }, 500);
+	}
+	const base = cfg.SUPABASE_URL.replace(/\/$/, "");
+
+	const authz = request.headers.get("Authorization") ?? "";
+	const token = authz.startsWith("Bearer ") ? authz.slice(7).trim() : "";
+	if (!token) {
+		return jsonResponse({ error: "missing bearer token" }, 401);
+	}
+
+	// 1. Verify the JWT → user id (same pattern as handleAccountDelete).
+	let userId: string;
+	try {
+		const userResp = await fetch(`${base}/auth/v1/user`, {
+			headers: { Authorization: `Bearer ${token}`, apikey: cfg.SUPABASE_SERVICE_ROLE_KEY },
+		});
+		if (!userResp.ok) {
+			emitDiag(env, ctx, "appleExchangeAuth", `verify ${userResp.status}`);
+			return jsonResponse({ error: "invalid or expired session" }, 401);
+		}
+		const user = (await userResp.json()) as { id?: string };
+		if (!user.id) {
+			emitDiag(env, ctx, "appleExchangeAuth", "no user id in token");
+			return jsonResponse({ error: "invalid session" }, 401);
+		}
+		userId = user.id;
+	} catch (e) {
+		emitDiag(env, ctx, "appleExchangeAuth", `verify threw: ${(e as Error).message.slice(0, 40)}`);
+		return jsonResponse({ error: "could not verify session" }, 502);
+	}
+
+	// Parse the body; the client-supplied userId must match the token's id.
+	let body: { authorizationCode?: string; userId?: string };
+	try {
+		body = (await request.json()) as { authorizationCode?: string; userId?: string };
+	} catch {
+		return jsonResponse({ error: "invalid JSON body" }, 400);
+	}
+	if (!body.authorizationCode) {
+		return jsonResponse({ error: "missing authorizationCode" }, 400);
+	}
+	// Case-insensitive: Supabase returns a lowercase UUID, while the app's
+	// UUID.uuidString is uppercase — same id, different case. The stored row keys off
+	// the authoritative token-derived `userId`, never the body value.
+	if (body.userId && body.userId.toLowerCase() !== userId.toLowerCase()) {
+		emitDiag(env, ctx, "appleExchangeAuth", "body userId != token userId");
+		return jsonResponse({ error: "user mismatch" }, 403);
+	}
+
+	// 2. Exchange at Apple + store. Either step failing is non-fatal to the user (the app
+	// treats this fire-and-forget), but we fail LOUD with a diag + non-2xx.
+	try {
+		const refreshToken = await exchangeAuthorizationCode(cfg, body.authorizationCode);
+		await storeAppleRefreshToken(cfg, userId, refreshToken);
+	} catch (e) {
+		emitDiag(env, ctx, "appleExchangeFail", `${(e as Error).message.slice(0, 60)}`);
+		return jsonResponse({ error: "token exchange failed" }, 502);
+	}
+
+	emitDiag(env, ctx, "appleTokenStored", userId.slice(0, 8));
 	return jsonResponse({ ok: true }, 200);
 }
 

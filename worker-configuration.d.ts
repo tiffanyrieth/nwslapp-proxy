@@ -22,4 +22,16 @@ interface Env {
 	// the social builder yields [] (Home/Feed fall back to seed for those cards) —
 	// every other source is unaffected.
 	APIFY_TOKEN?: string;
+
+	// Sign in with Apple (SIWA) revocation — secrets set via `wrangler secret put`.
+	// Back POST /auth/apple-token-exchange + the account-delete revoke step: the .p8
+	// signs an ES256 client_secret JWT used against Apple's /auth/token + /auth/revoke.
+	// Distinct from the match-watcher's APNs key. When unset, the exchange endpoint 500s
+	// (health-gated) and account deletion skips revoke (Supabase delete still proceeds).
+	//   SIWA_PRIVATE_KEY  the .p8 private key, full PEM text   (Apple)
+	//   SIWA_KEY_ID       the .p8's 10-char Key ID             (Apple)
+	//   APPLE_TEAM_ID     Apple Developer Team ID              (Apple)
+	SIWA_PRIVATE_KEY?: string;
+	SIWA_KEY_ID?: string;
+	APPLE_TEAM_ID?: string;
 }
