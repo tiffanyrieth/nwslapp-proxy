@@ -153,7 +153,11 @@ const CLUB_NEWS: Record<string, ClubNewsSource> = {
 	// GFC: gothamfc.com articles carry NO machine-readable date (no og:published / JSON-LD),
 	//      so they can't be dated/sorted reliably — press-sourced until they add one.
 	GFC: { kind: "fallback" },
-	// CHI: chicagostars.com returns a Cloudflare 403 to every path/UA (incl. a server fetch).
+	// CHI: chicagostars.com/feed/ IS a valid, dated official WordPress RSS feed from a normal
+	// (residential) IP — but the Cloudflare Worker's datacenter IP still gets blocked/empty
+	// (re-tested Jun 30 2026: configured as `rss`, the Worker fetched 0 and auto-fell-back to
+	// press). So CHI stays on press fallback (sourceType "news") until the host stops blocking
+	// datacenter egress. Re-test by flipping to `{ kind: "rss", url: ".../feed/" }` + deploy.
 	CHI: { kind: "fallback" },
 	// BOS: brand-new Shopify site is JS-rendered with no feed (revisit when they add a news section).
 	BOS: { kind: "fallback" },
