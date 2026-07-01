@@ -1026,6 +1026,15 @@ async function clubNewsFor(abbr: string, env: Env, ctx: ExecutionContext): Promi
 		}
 	}
 
+	// Fill any MISSING article thumbnail by OG-scraping the article's og:image — WordPress
+	// club feeds (e.g. Washington Spirit) don't put the post's FEATURED image in the RSS body,
+	// so an article whose image isn't inline lands here text-only. This is the same best-effort,
+	// KV-cached enrichment the league/outlet feeds already use; run it BEFORE caching so the
+	// recovered image persists in the club cache. Cards that already have an image are skipped.
+	if (cards.length > 0) {
+		cards = await enrichNewsOG(cards, env, ctx);
+	}
+
 	if (cards.length === 0) {
 		emitDiag(env, ctx, "clubNewsEmpty", abbr); // true miss — flagged, not hidden
 	} else {
