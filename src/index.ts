@@ -27,6 +27,12 @@ import {
 	type AppleAuthEnv,
 } from "./apple-auth";
 
+// Forced-update version gate (served at GET /config). To force everyone onto a newer TestFlight
+// build, raise MIN_APP_BUILD (the integer the app compares against its CFBundleVersion) and redeploy.
+// MIN_APP_VERSION is the informational marketing string. minBuild=21 blocks builds 19 and 20 on deploy.
+const MIN_APP_VERSION = "0.4.2";
+const MIN_APP_BUILD = 21;
+
 const ESPN_SCOREBOARD =
 	"https://site.api.espn.com/apis/site/v2/sports/soccer/usa.nwsl/scoreboard";
 const ESPN_SUMMARY =
@@ -546,6 +552,17 @@ export default {
 			return new Response("Method not allowed. Use GET.", {
 				status: 405,
 				headers: { Allow: "GET" },
+			});
+		}
+
+		// Forced-update version gate. The app calls this at launch and blocks itself if its
+		// CFBundleVersion < minBuild. Deliberately trivial: two hardcoded numbers, no KV/DB — to
+		// force an update, bump these + redeploy. minBuild is the integer compared (monotonic
+		// per-upload); minVersion is informational. Short cache so a bump propagates within the hour.
+		if (url.pathname === "/config") {
+			return new Response(JSON.stringify({ minVersion: MIN_APP_VERSION, minBuild: MIN_APP_BUILD }), {
+				status: 200,
+				headers: { "Content-Type": "application/json", "Cache-Control": "public, max-age=300" },
 			});
 		}
 
