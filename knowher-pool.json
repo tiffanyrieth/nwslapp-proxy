@@ -1,0 +1,2205 @@
+{
+  "weekKey": "2026-W27",
+  "season": 2026,
+  "players": [
+    {
+      "teamAbbreviation": "LA",
+      "espnAthleteId": "317692",
+      "playerName": "Sveindís Jónsdóttir",
+      "jerseyNumber": 32,
+      "position": "Forward",
+      "tagline": "The Icelandic forward who arrived in LA ready to make history.",
+      "questions": [
+        {
+          "id": "la-jonsdottir-position",
+          "category": "herGame",
+          "prompt": "What position does Sveindís Jónsdóttir play for Angel City?",
+          "options": [
+            "Defender",
+            "Midfielder",
+            "Forward",
+            "Goalkeeper"
+          ],
+          "correctIndex": 2,
+          "revealFact": "She's one of Angel City's key attacking threats up top."
+        },
+        {
+          "id": "la-jonsdottir-jersey",
+          "category": "herGame",
+          "prompt": "What jersey number does Sveindís Jónsdóttir wear for Angel City FC?",
+          "options": [
+            "7",
+            "10",
+            "23",
+            "32"
+          ],
+          "correctIndex": 3,
+          "revealFact": "She takes the pitch wearing #32 for Angel City."
+        },
+        {
+          "id": "la-jonsdottir-nationality",
+          "category": "herGame",
+          "prompt": "Sveindís Jónsdóttir represents which national team?",
+          "options": [
+            "Norway",
+            "Sweden",
+            "Iceland",
+            "Denmark"
+          ],
+          "correctIndex": 2,
+          "revealFact": "She's a proud Icelandic international."
+        },
+        {
+          "id": "la-jonsdottir-age",
+          "category": "herGame",
+          "prompt": "How old is Sveindís Jónsdóttir?",
+          "options": [
+            "23",
+            "25",
+            "27",
+            "29"
+          ],
+          "correctIndex": 1,
+          "revealFact": "She's 25 and already making a major impact in the NWSL."
+        },
+        {
+          "id": "la-jonsdottir-goals",
+          "category": "herGame",
+          "prompt": "How many goals has Sveindís Jónsdóttir scored in the 2026 NWSL season?",
+          "options": [
+            "1",
+            "2",
+            "3",
+            "5"
+          ],
+          "correctIndex": 2,
+          "revealFact": "She's netted 3 goals so far this season."
+        },
+        {
+          "id": "la-jonsdottir-assists",
+          "category": "herGame",
+          "prompt": "How many assists does Sveindís Jónsdóttir have in the 2026 season?",
+          "options": [
+            "0",
+            "1",
+            "2",
+            "4"
+          ],
+          "correctIndex": 2,
+          "revealFact": "She's chipped in 2 assists on top of her goals this year."
+        },
+        {
+          "id": "la-jonsdottir-starts",
+          "category": "herGame",
+          "prompt": "How many matches has Sveindís Jónsdóttir started in the 2026 season?",
+          "options": [
+            "5",
+            "6",
+            "7",
+            "9"
+          ],
+          "correctIndex": 2,
+          "revealFact": "She's been a regular starter with 7 starts this season."
+        },
+        {
+          "id": "la-jonsdottir-minutes",
+          "category": "herGame",
+          "prompt": "About how many minutes has Sveindís Jónsdóttir played in the 2026 season?",
+          "options": [
+            "400",
+            "500",
+            "625",
+            "700"
+          ],
+          "correctIndex": 2,
+          "revealFact": "She's logged 625 minutes on the pitch so far this season."
+        },
+        {
+          "id": "la-jonsdottir-club",
+          "category": "herStory",
+          "prompt": "Which club did Sveindís Jónsdóttir join in 2025 before the start of a new NWSL era in LA?",
+          "options": [
+            "Bay FC",
+            "San Diego Wave FC",
+            "Angel City FC",
+            "Portland Thorns FC"
+          ],
+          "correctIndex": 2,
+          "revealFact": "She signed with Angel City FC through 2027."
+        },
+        {
+          "id": "la-jonsdottir-funfact",
+          "category": "trueOrFalse",
+          "prompt": "True or false: Sveindís Jónsdóttir became the first Icelander to score four goals in a single UEFA Women's Champions League match.",
+          "options": [
+            "True",
+            "False"
+          ],
+          "correctIndex": 0,
+          "revealFact": "She did it in a 25-minute span off the bench for Wolfsburg against AS Roma in December 2024."
+        }
+      ]
+    },
+    {
+      "teamAbbreviation": "BAY",
+      "espnAthleteId": "310652",
+      "playerName": "Racheal Kundananji",
+      "jerseyNumber": 9,
+      "position": "Forward",
+      "tagline": "The Zambian striker who broke the bank and the mold.",
+      "questions": [
+        {
+          "id": "bay-kundananji-position",
+          "category": "herGame",
+          "prompt": "What position does Racheal Kundananji play for Bay FC?",
+          "options": [
+            "Forward",
+            "Midfielder",
+            "Defender",
+            "Goalkeeper"
+          ],
+          "correctIndex": 0,
+          "revealFact": "She leads the line as a forward for Bay FC."
+        },
+        {
+          "id": "bay-kundananji-jersey",
+          "category": "herGame",
+          "prompt": "What jersey number does Racheal Kundananji wear?",
+          "options": [
+            "7",
+            "9",
+            "11",
+            "17"
+          ],
+          "correctIndex": 1,
+          "revealFact": "She wears #9 for Bay FC."
+        },
+        {
+          "id": "bay-kundananji-nationality",
+          "category": "herGame",
+          "prompt": "Racheal Kundananji represents which country internationally?",
+          "options": [
+            "Nigeria",
+            "Zambia",
+            "South Africa",
+            "Ghana"
+          ],
+          "correctIndex": 1,
+          "revealFact": "She's a star for the Zambian national team."
+        },
+        {
+          "id": "bay-kundananji-age",
+          "category": "herGame",
+          "prompt": "How old is Racheal Kundananji?",
+          "options": [
+            "24",
+            "26",
+            "28",
+            "30"
+          ],
+          "correctIndex": 1,
+          "revealFact": "She's 26 years old."
+        },
+        {
+          "id": "bay-kundananji-goals",
+          "category": "herGame",
+          "prompt": "How many goals has Racheal Kundananji scored in the 2026 NWSL season?",
+          "options": [
+            "0",
+            "1",
+            "3",
+            "5"
+          ],
+          "correctIndex": 1,
+          "revealFact": "She's scored 1 goal so far this season."
+        },
+        {
+          "id": "bay-kundananji-starts",
+          "category": "herGame",
+          "prompt": "How many matches has Racheal Kundananji started this season?",
+          "options": [
+            "4",
+            "6",
+            "8",
+            "10"
+          ],
+          "correctIndex": 1,
+          "revealFact": "She's started 6 matches for Bay FC this season."
+        },
+        {
+          "id": "bay-kundananji-appearances",
+          "category": "herGame",
+          "prompt": "How many total appearances does Racheal Kundananji have in the 2026 season?",
+          "options": [
+            "6",
+            "8",
+            "10",
+            "12"
+          ],
+          "correctIndex": 1,
+          "revealFact": "She's made 8 appearances so far this season."
+        },
+        {
+          "id": "bay-kundananji-minutes",
+          "category": "herGame",
+          "prompt": "About how many minutes has Racheal Kundananji played this season?",
+          "options": [
+            "350",
+            "450",
+            "558",
+            "650"
+          ],
+          "correctIndex": 2,
+          "revealFact": "She's logged 558 minutes for Bay FC this season."
+        },
+        {
+          "id": "bay-kundananji-assists",
+          "category": "herGame",
+          "prompt": "How many assists does Racheal Kundananji have in the 2026 season?",
+          "options": [
+            "0",
+            "1",
+            "2",
+            "3"
+          ],
+          "correctIndex": 0,
+          "revealFact": "She's focused on finishing this season with 0 assists so far."
+        },
+        {
+          "id": "bay-kundananji-funfact",
+          "category": "trueOrFalse",
+          "prompt": "True or false: Racheal Kundananji signed with Bay FC for a women's world-record transfer fee.",
+          "options": [
+            "True",
+            "False"
+          ],
+          "correctIndex": 0,
+          "revealFact": "Her 2024 move from Madrid CFF, worth roughly $787,000, was the biggest transfer fee in women's soccer history at the time."
+        }
+      ]
+    },
+    {
+      "teamAbbreviation": "BOS",
+      "espnAthleteId": "225339",
+      "playerName": "Nichelle Prince",
+      "jerseyNumber": 12,
+      "position": "Forward",
+      "tagline": "The Canadian veteran bringing Olympic gold pedigree to Boston.",
+      "questions": [
+        {
+          "id": "bos-prince-position",
+          "category": "herGame",
+          "prompt": "What position does Nichelle Prince play for Boston Legacy FC?",
+          "options": [
+            "Forward",
+            "Defender",
+            "Goalkeeper",
+            "Midfielder"
+          ],
+          "correctIndex": 0,
+          "revealFact": "She's a forward who brings speed and experience to Boston's attack."
+        },
+        {
+          "id": "bos-prince-jersey",
+          "category": "herGame",
+          "prompt": "What jersey number does Nichelle Prince wear?",
+          "options": [
+            "9",
+            "12",
+            "17",
+            "21"
+          ],
+          "correctIndex": 1,
+          "revealFact": "She wears #12 for Boston Legacy FC."
+        },
+        {
+          "id": "bos-prince-nationality",
+          "category": "herGame",
+          "prompt": "Nichelle Prince represents which country?",
+          "options": [
+            "USA",
+            "Canada",
+            "Jamaica",
+            "England"
+          ],
+          "correctIndex": 1,
+          "revealFact": "She's a longtime member of the Canadian national team."
+        },
+        {
+          "id": "bos-prince-age",
+          "category": "herGame",
+          "prompt": "How old is Nichelle Prince?",
+          "options": [
+            "29",
+            "31",
+            "33",
+            "35"
+          ],
+          "correctIndex": 1,
+          "revealFact": "She's 31 years old."
+        },
+        {
+          "id": "bos-prince-starts",
+          "category": "herGame",
+          "prompt": "How many matches has Nichelle Prince started in the 2026 season?",
+          "options": [
+            "8",
+            "9",
+            "11",
+            "13"
+          ],
+          "correctIndex": 2,
+          "revealFact": "She's started 11 matches for Boston Legacy this season."
+        },
+        {
+          "id": "bos-prince-minutes",
+          "category": "herGame",
+          "prompt": "About how many minutes has Nichelle Prince played this season?",
+          "options": [
+            "700",
+            "800",
+            "909",
+            "1000"
+          ],
+          "correctIndex": 2,
+          "revealFact": "She's logged 909 minutes this season."
+        },
+        {
+          "id": "bos-prince-goals",
+          "category": "herGame",
+          "prompt": "How many goals has Nichelle Prince scored in the 2026 season?",
+          "options": [
+            "0",
+            "1",
+            "3",
+            "5"
+          ],
+          "correctIndex": 1,
+          "revealFact": "She's scored 1 goal so far this season."
+        },
+        {
+          "id": "bos-prince-assists",
+          "category": "herGame",
+          "prompt": "How many assists does Nichelle Prince have this season?",
+          "options": [
+            "0",
+            "1",
+            "2",
+            "4"
+          ],
+          "correctIndex": 2,
+          "revealFact": "She's tallied 2 assists this season."
+        },
+        {
+          "id": "bos-prince-trade",
+          "category": "herStory",
+          "prompt": "Which club did Nichelle Prince join Boston Legacy FC from in January 2026?",
+          "options": [
+            "Houston Dash",
+            "Washington Spirit",
+            "Kansas City Current",
+            "Gotham FC"
+          ],
+          "correctIndex": 2,
+          "revealFact": "She was acquired from the 2025 NWSL Shield-winning Kansas City Current."
+        },
+        {
+          "id": "bos-prince-funfact",
+          "category": "trueOrFalse",
+          "prompt": "True or false: Nichelle Prince eats oatmeal on the morning of every game, a tradition she picked up from her dad.",
+          "options": [
+            "True",
+            "False"
+          ],
+          "correctIndex": 0,
+          "revealFact": "Her father made her oatmeal before every track meet and soccer game growing up, and the ritual stuck."
+        }
+      ]
+    },
+    {
+      "teamAbbreviation": "CHI",
+      "espnAthleteId": "233163",
+      "playerName": "Mallory Swanson",
+      "jerseyNumber": 9,
+      "position": "Forward",
+      "tagline": "The Olympic gold medalist anchoring Chicago's attack.",
+      "questions": [
+        {
+          "id": "chi-swanson-position",
+          "category": "herGame",
+          "prompt": "What position does Mallory Swanson play for the Chicago Stars?",
+          "options": [
+            "Midfielder",
+            "Forward",
+            "Defender",
+            "Goalkeeper"
+          ],
+          "correctIndex": 1,
+          "revealFact": "She's a dynamic forward known for her speed and finishing."
+        },
+        {
+          "id": "chi-swanson-jersey",
+          "category": "herGame",
+          "prompt": "What jersey number does Mallory Swanson wear?",
+          "options": [
+            "7",
+            "9",
+            "11",
+            "23"
+          ],
+          "correctIndex": 1,
+          "revealFact": "She wears #9 for the Chicago Stars."
+        },
+        {
+          "id": "chi-swanson-nationality",
+          "category": "herGame",
+          "prompt": "Mallory Swanson represents which national team?",
+          "options": [
+            "Canada",
+            "USA",
+            "England",
+            "Australia"
+          ],
+          "correctIndex": 1,
+          "revealFact": "She's a key attacker for the USWNT."
+        },
+        {
+          "id": "chi-swanson-age",
+          "category": "herGame",
+          "prompt": "How old is Mallory Swanson?",
+          "options": [
+            "26",
+            "28",
+            "30",
+            "32"
+          ],
+          "correctIndex": 1,
+          "revealFact": "She's 28 years old."
+        },
+        {
+          "id": "chi-swanson-starts",
+          "category": "herGame",
+          "prompt": "How many matches has Mallory Swanson started in the 2026 season?",
+          "options": [
+            "1",
+            "3",
+            "5",
+            "7"
+          ],
+          "correctIndex": 0,
+          "revealFact": "She's made 1 start this season."
+        },
+        {
+          "id": "chi-swanson-minutes",
+          "category": "herGame",
+          "prompt": "About how many minutes has Mallory Swanson played this season?",
+          "options": [
+            "90",
+            "122",
+            "200",
+            "300"
+          ],
+          "correctIndex": 1,
+          "revealFact": "She's logged 122 minutes this season."
+        },
+        {
+          "id": "chi-swanson-appearances",
+          "category": "herGame",
+          "prompt": "How many total appearances has Mallory Swanson made this season?",
+          "options": [
+            "2",
+            "3",
+            "5",
+            "7"
+          ],
+          "correctIndex": 1,
+          "revealFact": "She's appeared in 3 matches this season."
+        },
+        {
+          "id": "chi-swanson-goals",
+          "category": "herGame",
+          "prompt": "How many goals has Mallory Swanson scored this season?",
+          "options": [
+            "0",
+            "1",
+            "2",
+            "3"
+          ],
+          "correctIndex": 1,
+          "revealFact": "She's scored 1 goal so far this season."
+        },
+        {
+          "id": "chi-swanson-college",
+          "category": "herStory",
+          "prompt": "Which college did Mallory Swanson briefly attend before turning pro?",
+          "options": [
+            "Stanford",
+            "UCLA",
+            "USC",
+            "North Carolina"
+          ],
+          "correctIndex": 1,
+          "revealFact": "She was committed to UCLA before deciding to go pro straight out of high school."
+        },
+        {
+          "id": "chi-swanson-funfact",
+          "category": "trueOrFalse",
+          "prompt": "True or false: Mallory Swanson scored the gold-medal-winning goal for the USWNT in the 2024 Paris Olympics final.",
+          "options": [
+            "True",
+            "False"
+          ],
+          "correctIndex": 0,
+          "revealFact": "Her goal against Brazil in the final secured the USWNT's Olympic gold medal."
+        }
+      ]
+    },
+    {
+      "teamAbbreviation": "DEN",
+      "espnAthleteId": "263902",
+      "playerName": "Yazmeen Ryan",
+      "jerseyNumber": 9,
+      "position": "Forward",
+      "tagline": "The two-time champion bringing winning experience to Denver's inaugural roster.",
+      "questions": [
+        {
+          "id": "den-ryan-position",
+          "category": "herGame",
+          "prompt": "What position does Yazmeen Ryan play for Denver Summit FC?",
+          "options": [
+            "Defender",
+            "Forward",
+            "Goalkeeper",
+            "Midfielder"
+          ],
+          "correctIndex": 1,
+          "revealFact": "She's a forward who can also slot into midfield."
+        },
+        {
+          "id": "den-ryan-jersey",
+          "category": "herGame",
+          "prompt": "What jersey number does Yazmeen Ryan wear for Denver Summit FC?",
+          "options": [
+            "7",
+            "9",
+            "11",
+            "13"
+          ],
+          "correctIndex": 1,
+          "revealFact": "She wears #9 for Denver Summit."
+        },
+        {
+          "id": "den-ryan-nationality",
+          "category": "herGame",
+          "prompt": "Yazmeen Ryan represents which national team?",
+          "options": [
+            "Canada",
+            "USA",
+            "Mexico",
+            "Brazil"
+          ],
+          "correctIndex": 1,
+          "revealFact": "She's part of the United States national team pool."
+        },
+        {
+          "id": "den-ryan-age",
+          "category": "herGame",
+          "prompt": "How old is Yazmeen Ryan?",
+          "options": [
+            "25",
+            "27",
+            "29",
+            "31"
+          ],
+          "correctIndex": 1,
+          "revealFact": "She's 27 years old."
+        },
+        {
+          "id": "den-ryan-starts",
+          "category": "herGame",
+          "prompt": "How many matches has Yazmeen Ryan started in the 2026 season?",
+          "options": [
+            "6",
+            "8",
+            "10",
+            "12"
+          ],
+          "correctIndex": 2,
+          "revealFact": "She's started 10 matches for Denver this season."
+        },
+        {
+          "id": "den-ryan-minutes",
+          "category": "herGame",
+          "prompt": "About how many minutes has Yazmeen Ryan played this season?",
+          "options": [
+            "700",
+            "800",
+            "903",
+            "1000"
+          ],
+          "correctIndex": 2,
+          "revealFact": "She's logged 903 minutes this season."
+        },
+        {
+          "id": "den-ryan-goals",
+          "category": "herGame",
+          "prompt": "How many goals has Yazmeen Ryan scored this season?",
+          "options": [
+            "1",
+            "2",
+            "3",
+            "4"
+          ],
+          "correctIndex": 1,
+          "revealFact": "She's scored 2 goals so far this season."
+        },
+        {
+          "id": "den-ryan-assists",
+          "category": "herGame",
+          "prompt": "How many assists does Yazmeen Ryan have this season?",
+          "options": [
+            "1",
+            "2",
+            "3",
+            "4"
+          ],
+          "correctIndex": 2,
+          "revealFact": "She's tallied 3 assists this season."
+        },
+        {
+          "id": "den-ryan-college",
+          "category": "herStory",
+          "prompt": "Which college did Yazmeen Ryan play for before entering the NWSL?",
+          "options": [
+            "Stanford",
+            "TCU",
+            "UCLA",
+            "Ohio State"
+          ],
+          "correctIndex": 1,
+          "revealFact": "She starred for the TCU Horned Frogs, captaining the team in 2020."
+        },
+        {
+          "id": "den-ryan-championships",
+          "category": "herStory",
+          "prompt": "Yazmeen Ryan has won NWSL Championships with which two clubs?",
+          "options": [
+            "Portland Thorns and Gotham FC",
+            "Houston Dash and San Diego Wave",
+            "Chicago Stars and Bay FC",
+            "Seattle Reign and Utah Royals"
+          ],
+          "correctIndex": 0,
+          "revealFact": "She won titles with the Portland Thorns and NJ/NY Gotham FC before joining Denver."
+        }
+      ]
+    },
+    {
+      "teamAbbreviation": "GFC",
+      "espnAthleteId": "209984",
+      "playerName": "Rose Lavelle",
+      "jerseyNumber": 16,
+      "position": "Midfielder",
+      "tagline": "The reigning U.S. Soccer Player of the Year, pulling strings for Gotham.",
+      "questions": [
+        {
+          "id": "gfc-lavelle-position",
+          "category": "herGame",
+          "prompt": "What position does Rose Lavelle play for Gotham FC?",
+          "options": [
+            "Forward",
+            "Midfielder",
+            "Defender",
+            "Goalkeeper"
+          ],
+          "correctIndex": 1,
+          "revealFact": "She's a creative midfielder known for her dribbling and vision."
+        },
+        {
+          "id": "gfc-lavelle-jersey",
+          "category": "herGame",
+          "prompt": "What jersey number does Rose Lavelle wear?",
+          "options": [
+            "10",
+            "14",
+            "16",
+            "20"
+          ],
+          "correctIndex": 2,
+          "revealFact": "She wears #16 for Gotham FC."
+        },
+        {
+          "id": "gfc-lavelle-nationality",
+          "category": "herGame",
+          "prompt": "Rose Lavelle represents which national team?",
+          "options": [
+            "Canada",
+            "England",
+            "USA",
+            "Ireland"
+          ],
+          "correctIndex": 2,
+          "revealFact": "She's a mainstay of the USWNT midfield."
+        },
+        {
+          "id": "gfc-lavelle-age",
+          "category": "herGame",
+          "prompt": "How old is Rose Lavelle?",
+          "options": [
+            "28",
+            "29",
+            "31",
+            "33"
+          ],
+          "correctIndex": 2,
+          "revealFact": "She's 31 years old."
+        },
+        {
+          "id": "gfc-lavelle-starts",
+          "category": "herGame",
+          "prompt": "How many matches has Rose Lavelle started in the 2026 season?",
+          "options": [
+            "5",
+            "7",
+            "9",
+            "11"
+          ],
+          "correctIndex": 1,
+          "revealFact": "She's started 7 matches this season."
+        },
+        {
+          "id": "gfc-lavelle-minutes",
+          "category": "herGame",
+          "prompt": "About how many minutes has Rose Lavelle played this season?",
+          "options": [
+            "500",
+            "600",
+            "660",
+            "800"
+          ],
+          "correctIndex": 2,
+          "revealFact": "She's logged 660 minutes this season."
+        },
+        {
+          "id": "gfc-lavelle-goals",
+          "category": "herGame",
+          "prompt": "How many goals has Rose Lavelle scored this season?",
+          "options": [
+            "1",
+            "2",
+            "3",
+            "4"
+          ],
+          "correctIndex": 1,
+          "revealFact": "She's scored 2 goals so far this season."
+        },
+        {
+          "id": "gfc-lavelle-appearances",
+          "category": "herGame",
+          "prompt": "How many total appearances has Rose Lavelle made this season?",
+          "options": [
+            "7",
+            "8",
+            "9",
+            "10"
+          ],
+          "correctIndex": 2,
+          "revealFact": "She's appeared in 9 matches this season."
+        },
+        {
+          "id": "gfc-lavelle-title",
+          "category": "herStory",
+          "prompt": "Rose Lavelle scored the winning goal in which recent NWSL Championship for Gotham FC?",
+          "options": [
+            "2022",
+            "2023",
+            "2024",
+            "2025"
+          ],
+          "correctIndex": 3,
+          "revealFact": "Her 80th-minute strike won the 2025 NWSL Championship and earned her the game's MVP award."
+        },
+        {
+          "id": "gfc-lavelle-funfact",
+          "category": "trueOrFalse",
+          "prompt": "True or false: Rose Lavelle has a pet English Bulldog named Wilma Jean Wrinkles.",
+          "options": [
+            "True",
+            "False"
+          ],
+          "correctIndex": 0,
+          "revealFact": "Wilma is a regular feature on Lavelle's social media and even appeared on her Gotham FC bobblehead."
+        }
+      ]
+    },
+    {
+      "teamAbbreviation": "HOU",
+      "espnAthleteId": "212207",
+      "playerName": "Jane Campbell",
+      "jerseyNumber": 1,
+      "position": "Goalkeeper",
+      "tagline": "Houston's ironwoman between the posts for a decade running.",
+      "questions": [
+        {
+          "id": "hou-campbell-position",
+          "category": "herGame",
+          "prompt": "What position does Jane Campbell play for the Houston Dash?",
+          "options": [
+            "Defender",
+            "Midfielder",
+            "Forward",
+            "Goalkeeper"
+          ],
+          "correctIndex": 3,
+          "revealFact": "She's Houston's starting goalkeeper."
+        },
+        {
+          "id": "hou-campbell-jersey",
+          "category": "herGame",
+          "prompt": "What jersey number does Jane Campbell wear?",
+          "options": [
+            "0",
+            "1",
+            "13",
+            "22"
+          ],
+          "correctIndex": 1,
+          "revealFact": "She wears #1 for the Houston Dash."
+        },
+        {
+          "id": "hou-campbell-nationality",
+          "category": "herGame",
+          "prompt": "Jane Campbell represents which national team?",
+          "options": [
+            "Canada",
+            "USA",
+            "England",
+            "Brazil"
+          ],
+          "correctIndex": 1,
+          "revealFact": "She's part of the U.S. Women's National Team goalkeeper pool."
+        },
+        {
+          "id": "hou-campbell-age",
+          "category": "herGame",
+          "prompt": "How old is Jane Campbell?",
+          "options": [
+            "29",
+            "31",
+            "33",
+            "35"
+          ],
+          "correctIndex": 1,
+          "revealFact": "She's 31 years old."
+        },
+        {
+          "id": "hou-campbell-starts",
+          "category": "herGame",
+          "prompt": "How many matches has Jane Campbell started in the 2026 season?",
+          "options": [
+            "9",
+            "10",
+            "11",
+            "12"
+          ],
+          "correctIndex": 2,
+          "revealFact": "She's started all 11 of Houston's matches so far this season."
+        },
+        {
+          "id": "hou-campbell-minutes",
+          "category": "herGame",
+          "prompt": "About how many minutes has Jane Campbell played this season?",
+          "options": [
+            "800",
+            "900",
+            "983",
+            "1050"
+          ],
+          "correctIndex": 2,
+          "revealFact": "She's logged 983 minutes in goal this season."
+        },
+        {
+          "id": "hou-campbell-cleansheets",
+          "category": "herGame",
+          "prompt": "How many clean sheets does Jane Campbell have in the 2026 season?",
+          "options": [
+            "1",
+            "2",
+            "3",
+            "5"
+          ],
+          "correctIndex": 2,
+          "revealFact": "She's recorded 3 clean sheets this season."
+        },
+        {
+          "id": "hou-campbell-appearances",
+          "category": "herGame",
+          "prompt": "How many total appearances has Jane Campbell made this season?",
+          "options": [
+            "9",
+            "10",
+            "11",
+            "12"
+          ],
+          "correctIndex": 2,
+          "revealFact": "She's appeared in all 11 of Houston's matches this season."
+        },
+        {
+          "id": "hou-campbell-college",
+          "category": "herStory",
+          "prompt": "Which college did Jane Campbell play for before joining the Dash?",
+          "options": [
+            "Stanford",
+            "UCLA",
+            "Ohio State",
+            "North Carolina"
+          ],
+          "correctIndex": 0,
+          "revealFact": "She was a standout goalkeeper for the Stanford Cardinal."
+        },
+        {
+          "id": "hou-campbell-funfact",
+          "category": "trueOrFalse",
+          "prompt": "True or false: Jane Campbell became the youngest goalkeeper ever called up to the senior USWNT, at age 17.",
+          "options": [
+            "True",
+            "False"
+          ],
+          "correctIndex": 0,
+          "revealFact": "She earned her first national training camp call-up at just 17 years old, back in 2013."
+        }
+      ]
+    },
+    {
+      "teamAbbreviation": "KC",
+      "espnAthleteId": "379824",
+      "playerName": "Temwa Chawinga",
+      "jerseyNumber": 6,
+      "position": "Forward",
+      "tagline": "The back-to-back MVP putting Malawi on the soccer map.",
+      "questions": [
+        {
+          "id": "kc-chawinga-position",
+          "category": "herGame",
+          "prompt": "What position does Temwa Chawinga play for the Kansas City Current?",
+          "options": [
+            "Forward",
+            "Midfielder",
+            "Defender",
+            "Goalkeeper"
+          ],
+          "correctIndex": 0,
+          "revealFact": "She's a lethal forward leading KC's attack."
+        },
+        {
+          "id": "kc-chawinga-jersey",
+          "category": "herGame",
+          "prompt": "What jersey number does Temwa Chawinga wear?",
+          "options": [
+            "6",
+            "9",
+            "11",
+            "20"
+          ],
+          "correctIndex": 0,
+          "revealFact": "She wears #6 for the Current."
+        },
+        {
+          "id": "kc-chawinga-nationality",
+          "category": "herGame",
+          "prompt": "Temwa Chawinga represents which country?",
+          "options": [
+            "Zambia",
+            "Nigeria",
+            "Malawi",
+            "South Africa"
+          ],
+          "correctIndex": 2,
+          "revealFact": "She's a proud Malawian international."
+        },
+        {
+          "id": "kc-chawinga-age",
+          "category": "herGame",
+          "prompt": "How old is Temwa Chawinga?",
+          "options": [
+            "25",
+            "27",
+            "29",
+            "31"
+          ],
+          "correctIndex": 1,
+          "revealFact": "She's 27 years old."
+        },
+        {
+          "id": "kc-chawinga-goals",
+          "category": "herGame",
+          "prompt": "How many goals has Temwa Chawinga scored in the 2026 season?",
+          "options": [
+            "4",
+            "5",
+            "6",
+            "7"
+          ],
+          "correctIndex": 3,
+          "revealFact": "She's already scored 7 goals this season."
+        },
+        {
+          "id": "kc-chawinga-assists",
+          "category": "herGame",
+          "prompt": "How many assists does Temwa Chawinga have this season?",
+          "options": [
+            "0",
+            "1",
+            "2",
+            "3"
+          ],
+          "correctIndex": 2,
+          "revealFact": "She's tallied 2 assists this season."
+        },
+        {
+          "id": "kc-chawinga-starts",
+          "category": "herGame",
+          "prompt": "How many matches has Temwa Chawinga started in the 2026 season?",
+          "options": [
+            "6",
+            "7",
+            "8",
+            "9"
+          ],
+          "correctIndex": 2,
+          "revealFact": "She's started 8 matches this season."
+        },
+        {
+          "id": "kc-chawinga-minutes",
+          "category": "herGame",
+          "prompt": "About how many minutes has Temwa Chawinga played this season?",
+          "options": [
+            "450",
+            "545",
+            "600",
+            "700"
+          ],
+          "correctIndex": 1,
+          "revealFact": "She's logged 545 minutes this season."
+        },
+        {
+          "id": "kc-chawinga-funfact",
+          "category": "trueOrFalse",
+          "prompt": "True or false: Temwa Chawinga is the first player in NWSL history to win the league MVP award in two consecutive seasons.",
+          "options": [
+            "True",
+            "False"
+          ],
+          "correctIndex": 0,
+          "revealFact": "She won MVP in both 2024 and 2025, a first in league history."
+        }
+      ]
+    },
+    {
+      "teamAbbreviation": "NC",
+      "espnAthleteId": "279297",
+      "playerName": "Ashley Sanchez",
+      "jerseyNumber": 2,
+      "position": "Midfielder",
+      "tagline": "The playmaker rewriting her story in North Carolina.",
+      "questions": [
+        {
+          "id": "nc-sanchez-position",
+          "category": "herGame",
+          "prompt": "What position does Ashley Sanchez play for the North Carolina Courage?",
+          "options": [
+            "Forward",
+            "Midfielder",
+            "Defender",
+            "Goalkeeper"
+          ],
+          "correctIndex": 1,
+          "revealFact": "She's a creative midfielder who can also play higher up the pitch."
+        },
+        {
+          "id": "nc-sanchez-jersey",
+          "category": "herGame",
+          "prompt": "What jersey number does Ashley Sanchez wear?",
+          "options": [
+            "2",
+            "6",
+            "10",
+            "14"
+          ],
+          "correctIndex": 0,
+          "revealFact": "She wears #2 for the Courage."
+        },
+        {
+          "id": "nc-sanchez-nationality",
+          "category": "herGame",
+          "prompt": "Ashley Sanchez represents which national team?",
+          "options": [
+            "Mexico",
+            "USA",
+            "Canada",
+            "Spain"
+          ],
+          "correctIndex": 1,
+          "revealFact": "She's represented the United States at multiple youth and senior levels."
+        },
+        {
+          "id": "nc-sanchez-age",
+          "category": "herGame",
+          "prompt": "How old is Ashley Sanchez?",
+          "options": [
+            "25",
+            "27",
+            "29",
+            "31"
+          ],
+          "correctIndex": 1,
+          "revealFact": "She's 27 years old."
+        },
+        {
+          "id": "nc-sanchez-goals",
+          "category": "herGame",
+          "prompt": "How many goals has Ashley Sanchez scored in the 2026 season?",
+          "options": [
+            "4",
+            "5",
+            "6",
+            "7"
+          ],
+          "correctIndex": 3,
+          "revealFact": "She's had a career-best year with 7 goals so far."
+        },
+        {
+          "id": "nc-sanchez-assists",
+          "category": "herGame",
+          "prompt": "How many assists does Ashley Sanchez have this season?",
+          "options": [
+            "0",
+            "1",
+            "2",
+            "3"
+          ],
+          "correctIndex": 1,
+          "revealFact": "She's added 1 assist this season."
+        },
+        {
+          "id": "nc-sanchez-starts",
+          "category": "herGame",
+          "prompt": "How many matches has Ashley Sanchez started in the 2026 season?",
+          "options": [
+            "9",
+            "10",
+            "11",
+            "12"
+          ],
+          "correctIndex": 2,
+          "revealFact": "She's started 11 matches this season."
+        },
+        {
+          "id": "nc-sanchez-minutes",
+          "category": "herGame",
+          "prompt": "About how many minutes has Ashley Sanchez played this season?",
+          "options": [
+            "800",
+            "900",
+            "942",
+            "1000"
+          ],
+          "correctIndex": 2,
+          "revealFact": "She's logged 942 minutes this season."
+        },
+        {
+          "id": "nc-sanchez-college",
+          "category": "herStory",
+          "prompt": "Ashley Sanchez set the career assist record at which college?",
+          "options": [
+            "Stanford",
+            "UCLA",
+            "USC",
+            "Virginia"
+          ],
+          "correctIndex": 1,
+          "revealFact": "She set UCLA's program career assist record before turning pro."
+        },
+        {
+          "id": "nc-sanchez-title",
+          "category": "herStory",
+          "prompt": "Ashley Sanchez won an NWSL Championship in 2021 with which club?",
+          "options": [
+            "Washington Spirit",
+            "North Carolina Courage",
+            "Gotham FC",
+            "OL Reign"
+          ],
+          "correctIndex": 0,
+          "revealFact": "She helped the Washington Spirit capture their first NWSL title in 2021 before later joining the Courage."
+        }
+      ]
+    },
+    {
+      "teamAbbreviation": "ORL",
+      "espnAthleteId": "158712",
+      "playerName": "Marta",
+      "jerseyNumber": 10,
+      "position": "Forward",
+      "tagline": "The Queen of football, still lacing up for the Pride.",
+      "questions": [
+        {
+          "id": "orl-marta-position",
+          "category": "herGame",
+          "prompt": "What position does Marta play for the Orlando Pride?",
+          "options": [
+            "Midfielder",
+            "Forward",
+            "Defender",
+            "Goalkeeper"
+          ],
+          "correctIndex": 1,
+          "revealFact": "She's a forward and Orlando's all-time leading scorer."
+        },
+        {
+          "id": "orl-marta-jersey",
+          "category": "herGame",
+          "prompt": "What jersey number does Marta wear?",
+          "options": [
+            "7",
+            "9",
+            "10",
+            "11"
+          ],
+          "correctIndex": 2,
+          "revealFact": "She wears the iconic #10 for Orlando."
+        },
+        {
+          "id": "orl-marta-nationality",
+          "category": "herGame",
+          "prompt": "Marta represents which national team?",
+          "options": [
+            "Argentina",
+            "Brazil",
+            "Portugal",
+            "Colombia"
+          ],
+          "correctIndex": 1,
+          "revealFact": "She captained the Brazilian national team for years."
+        },
+        {
+          "id": "orl-marta-age",
+          "category": "herGame",
+          "prompt": "How old is Marta?",
+          "options": [
+            "36",
+            "38",
+            "40",
+            "42"
+          ],
+          "correctIndex": 2,
+          "revealFact": "She's 40 years old and still going strong."
+        },
+        {
+          "id": "orl-marta-starts",
+          "category": "herGame",
+          "prompt": "How many matches has Marta started in the 2026 season?",
+          "options": [
+            "1",
+            "2",
+            "3",
+            "4"
+          ],
+          "correctIndex": 1,
+          "revealFact": "She's started 2 matches this season."
+        },
+        {
+          "id": "orl-marta-minutes",
+          "category": "herGame",
+          "prompt": "About how many minutes has Marta played this season?",
+          "options": [
+            "150",
+            "223",
+            "300",
+            "400"
+          ],
+          "correctIndex": 1,
+          "revealFact": "She's logged 223 minutes this season."
+        },
+        {
+          "id": "orl-marta-appearances",
+          "category": "herGame",
+          "prompt": "How many total appearances has Marta made this season?",
+          "options": [
+            "5",
+            "6",
+            "7",
+            "8"
+          ],
+          "correctIndex": 2,
+          "revealFact": "She's appeared in 7 matches this season."
+        },
+        {
+          "id": "orl-marta-goals",
+          "category": "herGame",
+          "prompt": "How many goals has Marta scored this season?",
+          "options": [
+            "0",
+            "1",
+            "2",
+            "3"
+          ],
+          "correctIndex": 1,
+          "revealFact": "She's scored 1 goal so far this season."
+        },
+        {
+          "id": "orl-marta-awards",
+          "category": "herStory",
+          "prompt": "How many times has Marta won the FIFA World Player of the Year award?",
+          "options": [
+            "4",
+            "5",
+            "6",
+            "7"
+          ],
+          "correctIndex": 2,
+          "revealFact": "She's won it a record six times, five of them in a row."
+        },
+        {
+          "id": "orl-marta-funfact",
+          "category": "trueOrFalse",
+          "prompt": "True or false: Marta holds the record for most goals scored at the FIFA World Cup — men's or women's — with 17.",
+          "options": [
+            "True",
+            "False"
+          ],
+          "correctIndex": 0,
+          "revealFact": "Her 17 World Cup goals put her ahead of every player in history, regardless of gender."
+        }
+      ]
+    },
+    {
+      "teamAbbreviation": "POR",
+      "espnAthleteId": "43770",
+      "playerName": "Sophia Wilson",
+      "jerseyNumber": 9,
+      "position": "Forward",
+      "tagline": "Portland's homegrown superstar, back and better than ever.",
+      "questions": [
+        {
+          "id": "por-wilson-position",
+          "category": "herGame",
+          "prompt": "What position does Sophia Wilson play for the Portland Thorns?",
+          "options": [
+            "Midfielder",
+            "Defender",
+            "Forward",
+            "Goalkeeper"
+          ],
+          "correctIndex": 2,
+          "revealFact": "She's a dynamic forward and the face of the Thorns franchise."
+        },
+        {
+          "id": "por-wilson-jersey",
+          "category": "herGame",
+          "prompt": "What jersey number does Sophia Wilson wear?",
+          "options": [
+            "7",
+            "9",
+            "11",
+            "17"
+          ],
+          "correctIndex": 1,
+          "revealFact": "She wears #9 for Portland."
+        },
+        {
+          "id": "por-wilson-nationality",
+          "category": "herGame",
+          "prompt": "Sophia Wilson represents which national team?",
+          "options": [
+            "Canada",
+            "USA",
+            "England",
+            "Australia"
+          ],
+          "correctIndex": 1,
+          "revealFact": "She's a key USWNT attacker."
+        },
+        {
+          "id": "por-wilson-age",
+          "category": "herGame",
+          "prompt": "How old is Sophia Wilson?",
+          "options": [
+            "23",
+            "25",
+            "27",
+            "29"
+          ],
+          "correctIndex": 1,
+          "revealFact": "She's 25 years old."
+        },
+        {
+          "id": "por-wilson-goals",
+          "category": "herGame",
+          "prompt": "How many goals has Sophia Wilson scored in the 2026 season?",
+          "options": [
+            "3",
+            "4",
+            "5",
+            "6"
+          ],
+          "correctIndex": 2,
+          "revealFact": "She's scored 5 goals so far this season."
+        },
+        {
+          "id": "por-wilson-assists",
+          "category": "herGame",
+          "prompt": "How many assists does Sophia Wilson have this season?",
+          "options": [
+            "0",
+            "1",
+            "2",
+            "3"
+          ],
+          "correctIndex": 1,
+          "revealFact": "She's added 1 assist this season."
+        },
+        {
+          "id": "por-wilson-starts",
+          "category": "herGame",
+          "prompt": "How many matches has Sophia Wilson started in the 2026 season?",
+          "options": [
+            "8",
+            "9",
+            "10",
+            "11"
+          ],
+          "correctIndex": 2,
+          "revealFact": "She's started 10 matches this season."
+        },
+        {
+          "id": "por-wilson-appearances",
+          "category": "herGame",
+          "prompt": "How many total appearances has Sophia Wilson made this season?",
+          "options": [
+            "11",
+            "12",
+            "13",
+            "14"
+          ],
+          "correctIndex": 2,
+          "revealFact": "She's appeared in 13 matches this season."
+        },
+        {
+          "id": "por-wilson-college",
+          "category": "herStory",
+          "prompt": "Sophia Wilson helped lead which college to a national championship in 2019?",
+          "options": [
+            "UCLA",
+            "Stanford",
+            "North Carolina",
+            "Florida State"
+          ],
+          "correctIndex": 1,
+          "revealFact": "She helped Stanford win the 2019 national championship before turning pro."
+        },
+        {
+          "id": "por-wilson-funfact",
+          "category": "trueOrFalse",
+          "prompt": "True or false: Sophia Wilson became the first player in NWSL history to win league MVP and Championship MVP in the same season.",
+          "options": [
+            "True",
+            "False"
+          ],
+          "correctIndex": 0,
+          "revealFact": "She pulled off the double in 2022, scoring twice in the final to seal the title."
+        }
+      ]
+    },
+    {
+      "teamAbbreviation": "LOU",
+      "espnAthleteId": "293305",
+      "playerName": "Emma Sears",
+      "jerseyNumber": 13,
+      "position": "Midfielder",
+      "tagline": "Racing Louisville's homegrown breakout star.",
+      "questions": [
+        {
+          "id": "lou-sears-position",
+          "category": "herGame",
+          "prompt": "What position does Emma Sears play for Racing Louisville?",
+          "options": [
+            "Defender",
+            "Goalkeeper",
+            "Midfielder",
+            "Center Back"
+          ],
+          "correctIndex": 2,
+          "revealFact": "She plays as a midfielder, though she started her career as a wide forward."
+        },
+        {
+          "id": "lou-sears-jersey",
+          "category": "herGame",
+          "prompt": "What jersey number does Emma Sears wear?",
+          "options": [
+            "7",
+            "10",
+            "13",
+            "22"
+          ],
+          "correctIndex": 2,
+          "revealFact": "She wears #13 for Racing Louisville."
+        },
+        {
+          "id": "lou-sears-nationality",
+          "category": "herGame",
+          "prompt": "Emma Sears represents which national team?",
+          "options": [
+            "Canada",
+            "USA",
+            "Mexico",
+            "Jamaica"
+          ],
+          "correctIndex": 1,
+          "revealFact": "She earned her first USWNT call-up in October 2024."
+        },
+        {
+          "id": "lou-sears-age",
+          "category": "herGame",
+          "prompt": "How old is Emma Sears?",
+          "options": [
+            "23",
+            "25",
+            "27",
+            "29"
+          ],
+          "correctIndex": 1,
+          "revealFact": "She's 25 years old."
+        },
+        {
+          "id": "lou-sears-goals",
+          "category": "herGame",
+          "prompt": "How many goals has Emma Sears scored in the 2026 season?",
+          "options": [
+            "1",
+            "2",
+            "3",
+            "4"
+          ],
+          "correctIndex": 1,
+          "revealFact": "She's scored 2 goals so far this season."
+        },
+        {
+          "id": "lou-sears-assists",
+          "category": "herGame",
+          "prompt": "How many assists does Emma Sears have this season?",
+          "options": [
+            "1",
+            "2",
+            "3",
+            "4"
+          ],
+          "correctIndex": 2,
+          "revealFact": "She's tallied 3 assists this season."
+        },
+        {
+          "id": "lou-sears-starts",
+          "category": "herGame",
+          "prompt": "How many matches has Emma Sears started in the 2026 season?",
+          "options": [
+            "7",
+            "8",
+            "9",
+            "10"
+          ],
+          "correctIndex": 2,
+          "revealFact": "She's started 9 matches this season."
+        },
+        {
+          "id": "lou-sears-minutes",
+          "category": "herGame",
+          "prompt": "About how many minutes has Emma Sears played this season?",
+          "options": [
+            "650",
+            "700",
+            "774",
+            "850"
+          ],
+          "correctIndex": 2,
+          "revealFact": "She's logged 774 minutes this season."
+        },
+        {
+          "id": "lou-sears-debut",
+          "category": "herStory",
+          "prompt": "Emma Sears became the first player since Christen Press in 2013 to do what on her USWNT debut?",
+          "options": [
+            "Score a hat-trick",
+            "Score a goal and record an assist",
+            "Play all 90 minutes",
+            "Wear the captain's armband"
+          ],
+          "correctIndex": 1,
+          "revealFact": "She scored and assisted in a 3-1 win over Iceland in October 2024, her first cap."
+        },
+        {
+          "id": "lou-sears-funfact",
+          "category": "trueOrFalse",
+          "prompt": "True or false: Emma Sears once stepped away from soccer entirely to pursue a career in nutrition before deciding to go pro.",
+          "options": [
+            "True",
+            "False"
+          ],
+          "correctIndex": 0,
+          "revealFact": "After finishing at Ohio State, she spent six months away from the game focused on nutrition before a former coach convinced her to return."
+        }
+      ]
+    },
+    {
+      "teamAbbreviation": "SD",
+      "espnAthleteId": "258819",
+      "playerName": "Ludmila",
+      "jerseyNumber": 17,
+      "position": "Forward",
+      "tagline": "The Brazilian speedster bringing record-breaking firepower to San Diego.",
+      "questions": [
+        {
+          "id": "sd-ludmila-position",
+          "category": "herGame",
+          "prompt": "What position does Ludmila play for the San Diego Wave?",
+          "options": [
+            "Midfielder",
+            "Defender",
+            "Forward",
+            "Goalkeeper"
+          ],
+          "correctIndex": 2,
+          "revealFact": "She's a pacey forward known for stretching defenses."
+        },
+        {
+          "id": "sd-ludmila-jersey",
+          "category": "herGame",
+          "prompt": "What jersey number does Ludmila wear for San Diego?",
+          "options": [
+            "9",
+            "14",
+            "17",
+            "23"
+          ],
+          "correctIndex": 2,
+          "revealFact": "She wears #17 for the Wave."
+        },
+        {
+          "id": "sd-ludmila-nationality",
+          "category": "herGame",
+          "prompt": "Ludmila represents which national team?",
+          "options": [
+            "Argentina",
+            "Brazil",
+            "Colombia",
+            "Portugal"
+          ],
+          "correctIndex": 1,
+          "revealFact": "She's a member of the Brazilian national team."
+        },
+        {
+          "id": "sd-ludmila-age",
+          "category": "herGame",
+          "prompt": "How old is Ludmila?",
+          "options": [
+            "27",
+            "29",
+            "31",
+            "33"
+          ],
+          "correctIndex": 2,
+          "revealFact": "She's 31 years old."
+        },
+        {
+          "id": "sd-ludmila-starts",
+          "category": "herGame",
+          "prompt": "How many matches has Ludmila started in the 2026 season?",
+          "options": [
+            "9",
+            "10",
+            "11",
+            "12"
+          ],
+          "correctIndex": 3,
+          "revealFact": "She's started all 12 of San Diego's matches this season."
+        },
+        {
+          "id": "sd-ludmila-minutes",
+          "category": "herGame",
+          "prompt": "About how many minutes has Ludmila played this season?",
+          "options": [
+            "800",
+            "900",
+            "934",
+            "1000"
+          ],
+          "correctIndex": 2,
+          "revealFact": "She's logged 934 minutes this season."
+        },
+        {
+          "id": "sd-ludmila-appearances",
+          "category": "herGame",
+          "prompt": "How many total appearances has Ludmila made this season?",
+          "options": [
+            "11",
+            "12",
+            "13",
+            "14"
+          ],
+          "correctIndex": 2,
+          "revealFact": "She's appeared in 13 matches this season."
+        },
+        {
+          "id": "sd-ludmila-goals",
+          "category": "herGame",
+          "prompt": "How many goals has Ludmila scored this season?",
+          "options": [
+            "0",
+            "1",
+            "2",
+            "3"
+          ],
+          "correctIndex": 1,
+          "revealFact": "She's scored 1 goal so far this season."
+        },
+        {
+          "id": "sd-ludmila-trade",
+          "category": "herStory",
+          "prompt": "Which club did San Diego acquire Ludmila from in January 2026?",
+          "options": [
+            "Chicago Stars FC",
+            "Bay FC",
+            "Orlando Pride",
+            "Angel City FC"
+          ],
+          "correctIndex": 0,
+          "revealFact": "The Wave paid $800,000 in transfer funds to bring her over from the Chicago Stars."
+        },
+        {
+          "id": "sd-ludmila-funfact",
+          "category": "trueOrFalse",
+          "prompt": "True or false: Ludmila holds the NWSL record for fastest hat-trick, scoring three goals in just over 10 minutes.",
+          "options": [
+            "True",
+            "False"
+          ],
+          "correctIndex": 0,
+          "revealFact": "She scored three goals in 10 minutes and 9 seconds for the Chicago Stars in 2025, setting the league record."
+        }
+      ]
+    },
+    {
+      "teamAbbreviation": "SEA",
+      "espnAthleteId": "259621",
+      "playerName": "Jess Fishlock",
+      "jerseyNumber": 10,
+      "position": "Midfielder",
+      "tagline": "The Welsh Dragon closing out a legendary Seattle career.",
+      "questions": [
+        {
+          "id": "sea-fishlock-position",
+          "category": "herGame",
+          "prompt": "What position does Jess Fishlock play for Seattle Reign?",
+          "options": [
+            "Forward",
+            "Midfielder",
+            "Defender",
+            "Goalkeeper"
+          ],
+          "correctIndex": 1,
+          "revealFact": "She's a midfielder and Seattle Reign's captain."
+        },
+        {
+          "id": "sea-fishlock-jersey",
+          "category": "herGame",
+          "prompt": "What jersey number does Jess Fishlock wear?",
+          "options": [
+            "7",
+            "8",
+            "10",
+            "14"
+          ],
+          "correctIndex": 2,
+          "revealFact": "She wears #10 for Seattle Reign."
+        },
+        {
+          "id": "sea-fishlock-nationality",
+          "category": "herGame",
+          "prompt": "Jess Fishlock represents which country?",
+          "options": [
+            "England",
+            "Scotland",
+            "Wales",
+            "Ireland"
+          ],
+          "correctIndex": 2,
+          "revealFact": "She's Wales' all-time leading scorer and cap holder."
+        },
+        {
+          "id": "sea-fishlock-age",
+          "category": "herGame",
+          "prompt": "How old is Jess Fishlock?",
+          "options": [
+            "35",
+            "37",
+            "39",
+            "41"
+          ],
+          "correctIndex": 2,
+          "revealFact": "She's 39 years old and still competing at a high level."
+        },
+        {
+          "id": "sea-fishlock-starts",
+          "category": "herGame",
+          "prompt": "How many matches has Jess Fishlock started in the 2026 season?",
+          "options": [
+            "3",
+            "4",
+            "5",
+            "6"
+          ],
+          "correctIndex": 2,
+          "revealFact": "She's started 5 matches this season."
+        },
+        {
+          "id": "sea-fishlock-minutes",
+          "category": "herGame",
+          "prompt": "About how many minutes has Jess Fishlock played this season?",
+          "options": [
+            "250",
+            "300",
+            "345",
+            "400"
+          ],
+          "correctIndex": 2,
+          "revealFact": "She's logged 345 minutes this season."
+        },
+        {
+          "id": "sea-fishlock-appearances",
+          "category": "herGame",
+          "prompt": "How many total appearances has Jess Fishlock made this season?",
+          "options": [
+            "4",
+            "5",
+            "6",
+            "7"
+          ],
+          "correctIndex": 1,
+          "revealFact": "She's appeared in 5 matches this season."
+        },
+        {
+          "id": "sea-fishlock-goals",
+          "category": "herGame",
+          "prompt": "How many goals has Jess Fishlock scored this season?",
+          "options": [
+            "0",
+            "1",
+            "2",
+            "3"
+          ],
+          "correctIndex": 1,
+          "revealFact": "She's scored 1 goal so far this season."
+        },
+        {
+          "id": "sea-fishlock-tenure",
+          "category": "herStory",
+          "prompt": "Jess Fishlock is the longest-tenured player in NWSL history, having played for Seattle Reign since which year?",
+          "options": [
+            "2011",
+            "2013",
+            "2015",
+            "2017"
+          ],
+          "correctIndex": 1,
+          "revealFact": "She's been with the club since the league's inaugural 2013 season."
+        },
+        {
+          "id": "sea-fishlock-funfact",
+          "category": "trueOrFalse",
+          "prompt": "True or false: Jess Fishlock was appointed a Member of the Order of the British Empire (MBE) for her contributions to women's football and the LGBTQ+ community.",
+          "options": [
+            "True",
+            "False"
+          ],
+          "correctIndex": 0,
+          "revealFact": "She received the honor in 2018, presented by the Prince of Wales at Buckingham Palace."
+        }
+      ]
+    },
+    {
+      "teamAbbreviation": "UTA",
+      "espnAthleteId": "317623",
+      "playerName": "Cloé Lacasse",
+      "jerseyNumber": 24,
+      "position": "Midfielder",
+      "tagline": "The Canadian forward who found her joy again in Utah.",
+      "questions": [
+        {
+          "id": "uta-lacasse-position",
+          "category": "herGame",
+          "prompt": "What position does Cloé Lacasse play for the Utah Royals?",
+          "options": [
+            "Defender",
+            "Goalkeeper",
+            "Forward",
+            "Winger/Midfielder"
+          ],
+          "correctIndex": 3,
+          "revealFact": "She's an attacking wide player, often deployed as a midfielder for Utah."
+        },
+        {
+          "id": "uta-lacasse-jersey",
+          "category": "herGame",
+          "prompt": "What jersey number does Cloé Lacasse wear?",
+          "options": [
+            "11",
+            "17",
+            "24",
+            "29"
+          ],
+          "correctIndex": 2,
+          "revealFact": "She wears #24 for the Utah Royals."
+        },
+        {
+          "id": "uta-lacasse-nationality",
+          "category": "herGame",
+          "prompt": "Cloé Lacasse represents which national team?",
+          "options": [
+            "USA",
+            "Canada",
+            "Iceland",
+            "Portugal"
+          ],
+          "correctIndex": 1,
+          "revealFact": "She represents Canada internationally, despite once seeking Icelandic eligibility."
+        },
+        {
+          "id": "uta-lacasse-age",
+          "category": "herGame",
+          "prompt": "How old is Cloé Lacasse?",
+          "options": [
+            "28",
+            "30",
+            "32",
+            "34"
+          ],
+          "correctIndex": 2,
+          "revealFact": "She's 32 years old."
+        },
+        {
+          "id": "uta-lacasse-starts",
+          "category": "herGame",
+          "prompt": "How many matches has Cloé Lacasse started in the 2026 season?",
+          "options": [
+            "9",
+            "10",
+            "11",
+            "12"
+          ],
+          "correctIndex": 3,
+          "revealFact": "She's started all 12 of Utah's matches this season."
+        },
+        {
+          "id": "uta-lacasse-minutes",
+          "category": "herGame",
+          "prompt": "About how many minutes has Cloé Lacasse played this season?",
+          "options": [
+            "800",
+            "900",
+            "954",
+            "1050"
+          ],
+          "correctIndex": 2,
+          "revealFact": "She's logged 954 minutes this season."
+        },
+        {
+          "id": "uta-lacasse-goals",
+          "category": "herGame",
+          "prompt": "How many goals has Cloé Lacasse scored this season?",
+          "options": [
+            "2",
+            "3",
+            "4",
+            "5"
+          ],
+          "correctIndex": 2,
+          "revealFact": "She's scored 4 goals so far this season."
+        },
+        {
+          "id": "uta-lacasse-assists",
+          "category": "herGame",
+          "prompt": "How many assists does Cloé Lacasse have this season?",
+          "options": [
+            "1",
+            "2",
+            "3",
+            "4"
+          ],
+          "correctIndex": 2,
+          "revealFact": "She's tallied 3 assists this season."
+        },
+        {
+          "id": "uta-lacasse-hattrick",
+          "category": "herStory",
+          "prompt": "Cloé Lacasse scored the first hat-trick in Utah Royals franchise history against which team?",
+          "options": [
+            "San Diego Wave",
+            "Seattle Reign",
+            "Chicago Stars",
+            "Houston Dash"
+          ],
+          "correctIndex": 1,
+          "revealFact": "She scored a first-half hat-trick against Seattle Reign in October 2024."
+        },
+        {
+          "id": "uta-lacasse-funfact",
+          "category": "trueOrFalse",
+          "prompt": "True or false: Before focusing on soccer, Cloé Lacasse was a black belt on Canada's national taekwondo team.",
+          "options": [
+            "True",
+            "False"
+          ],
+          "correctIndex": 0,
+          "revealFact": "She competed nationally in taekwondo as a kid before choosing to pursue soccer full-time at age 12."
+        }
+      ]
+    },
+    {
+      "teamAbbreviation": "WAS",
+      "espnAthleteId": "317423",
+      "playerName": "Trinity Rodman",
+      "jerseyNumber": 2,
+      "position": "Forward",
+      "tagline": "The electric forward at the heart of the Spirit's attack.",
+      "questions": [
+        {
+          "id": "was-rodman-position",
+          "category": "herGame",
+          "prompt": "What position does Trinity Rodman play for the Spirit?",
+          "options": [
+            "Defender",
+            "Midfielder",
+            "Forward",
+            "Goalkeeper"
+          ],
+          "correctIndex": 2,
+          "revealFact": "She's a forward — pace, dribbling and end product all in one."
+        },
+        {
+          "id": "was-rodman-jersey",
+          "category": "herGame",
+          "prompt": "What jersey number does Trinity Rodman wear?",
+          "options": [
+            "2",
+            "5",
+            "9",
+            "23"
+          ],
+          "correctIndex": 0,
+          "revealFact": "She wears #2 for the Washington Spirit."
+        },
+        {
+          "id": "was-rodman-nationality",
+          "category": "herGame",
+          "prompt": "Trinity Rodman represents which national team?",
+          "options": [
+            "Canada",
+            "USA",
+            "England",
+            "Jamaica"
+          ],
+          "correctIndex": 1,
+          "revealFact": "She's a key attacker for the USWNT."
+        },
+        {
+          "id": "was-rodman-age",
+          "category": "herGame",
+          "prompt": "How old is Trinity Rodman?",
+          "options": [
+            "22",
+            "24",
+            "26",
+            "28"
+          ],
+          "correctIndex": 1,
+          "revealFact": "She's 24 years old."
+        },
+        {
+          "id": "was-rodman-goals",
+          "category": "herGame",
+          "prompt": "How many goals has Trinity Rodman scored in the 2026 season?",
+          "options": [
+            "1",
+            "2",
+            "3",
+            "4"
+          ],
+          "correctIndex": 2,
+          "revealFact": "She's scored 3 goals so far this season."
+        },
+        {
+          "id": "was-rodman-assists",
+          "category": "herGame",
+          "prompt": "How many assists does Trinity Rodman have this season?",
+          "options": [
+            "2",
+            "3",
+            "4",
+            "5"
+          ],
+          "correctIndex": 2,
+          "revealFact": "She's tallied 4 assists this season, tops on the team."
+        },
+        {
+          "id": "was-rodman-starts",
+          "category": "herGame",
+          "prompt": "How many matches has Trinity Rodman started in the 2026 season?",
+          "options": [
+            "9",
+            "10",
+            "11",
+            "12"
+          ],
+          "correctIndex": 2,
+          "revealFact": "She's started 11 matches this season."
+        },
+        {
+          "id": "was-rodman-minutes",
+          "category": "herGame",
+          "prompt": "About how many minutes has Trinity Rodman played this season?",
+          "options": [
+            "800",
+            "850",
+            "906",
+            "950"
+          ],
+          "correctIndex": 2,
+          "revealFact": "She's logged 906 minutes this season."
+        },
+        {
+          "id": "was-rodman-draft",
+          "category": "herStory",
+          "prompt": "Trinity Rodman made history in the 2021 NWSL Draft by becoming:",
+          "options": [
+            "The oldest player ever drafted",
+            "The youngest player ever drafted",
+            "The first international draft pick",
+            "The first goalkeeper picked first overall"
+          ],
+          "correctIndex": 1,
+          "revealFact": "She was picked second overall at just 18 years old, becoming the league's youngest draftee at the time."
+        },
+        {
+          "id": "was-rodman-funfact",
+          "category": "trueOrFalse",
+          "prompt": "True or false: Trinity Rodman published a children's book called \"Wake Up and Kick It.\"",
+          "options": [
+            "True",
+            "False"
+          ],
+          "correctIndex": 0,
+          "revealFact": "The 2022 book is about the resilience and optimism behind her rise in the sport."
+        }
+      ]
+    }
+  ]
+}
