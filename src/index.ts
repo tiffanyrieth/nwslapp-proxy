@@ -20,6 +20,14 @@
 import { runBracketTick, forceCloseActiveRound, handleBracketAdmin, type BracketEnv } from "./bracket-engine";
 import { buildHeadshotMap, handleHeadshots } from "./headshots";
 import {
+	handleKnowHerAdmin,
+	computeEligiblePlayers,
+	filterPoolByTeams,
+	KNOWHER_POOL_KEY,
+	type KnowHerPool,
+	type KnowHerEnv,
+} from "./knowher";
+import {
 	exchangeAuthorizationCode,
 	storeAppleRefreshToken,
 	readAppleRefreshToken,
@@ -547,6 +555,13 @@ export default {
 			return handleBracketAdmin(request, env as unknown as BracketEnv & { BRACKET_ADMIN_KEY?: string });
 		}
 
+		// Operator-only Know Her Game admin: GET /knowher/admin = the page, POST /knowher/admin/api
+		// = key-gated content ops (paste pool → KV, flip manual/auto, view eligible players). Before
+		// the GET-only guard (it serves both methods + does its own BRACKET_ADMIN_KEY check).
+		if (url.pathname === "/knowher/admin" || url.pathname === "/knowher/admin/api") {
+			return handleKnowHerAdmin(request, env as unknown as KnowHerEnv);
+		}
+
 		// All other routes are GET-only; reject early so the 405 is shared.
 		if (request.method !== "GET") {
 			return new Response("Method not allowed. Use GET.", {
@@ -598,6 +613,12 @@ export default {
 		if (url.pathname === "/trivia") {
 			return handleTrivia(url, env, ctx);
 		}
+		if (url.pathname === "/knowher") {
+			return handleKnowHer(url, env, ctx);
+		}
+		if (url.pathname === "/knowher/eligible") {
+			return handleKnowHerEligible(url, env);
+		}
 		if (url.pathname === "/headshots") {
 			return handleHeadshots(url, env, ctx);
 		}
@@ -620,7 +641,7 @@ export default {
 		}
 
 		return new Response(
-			"Not found. This proxy serves GET /scoreboard, /summary, /team-videos, /feed, /spotlight, /trivia, /headshots, /crest, /crest/manifest, /roster, /national-teams, and POST /telemetry.",
+			"Not found. This proxy serves GET /scoreboard, /summary, /team-videos, /feed, /spotlight, /trivia, /knowher, /knowher/eligible, /headshots, /crest, /crest/manifest, /roster, /national-teams, and POST /telemetry.",
 			{ status: 404 },
 		);
 	},
@@ -2691,6 +2712,78 @@ async function handleTrivia(url: URL, env: Env, ctx: ExecutionContext): Promise<
 	// long after a load). Only a real pool is worth caching.
 	if (pool.length > 0) {
 		ctx.waitUntil(cache.put(cacheKey, body.clone()));
+	}
+	return withCacheStatus(body, "MISS");
+}
+
+const KNOWHER_TTL = 6 * 3600; // 6h edge cache — the weekly pool changes rarely (owner reloads via the admin)
+const KNOWHER_ELIGIBLE_TTL = 3600; // 1h — roster stats move a few times/day
+
+/** Know Her Game's weekly pool, filtered to the requested `teams` (docs §3/§4): the app
+ *  fetches `?teams=WAS,POR` and gets only those followed teams' featured players. Returns an
+ *  empty `players` array (never cached) when the pool hasn't been loaded — the app then hides
+ *  the game (online-only, no seed). Content lives in KV `knowher-pool-v1`, loaded by the owner
+ *  via GET /knowher/admin (manual mode) or the deferred auto generator. */
+async function handleKnowHer(url: URL, env: Env, ctx: ExecutionContext): Promise<Response> {
+	const teams = normalizeTeams(url.searchParams.get("teams"));
+
+	const cache = caches.default;
+	const cacheUrl = new URL(url);
+	cacheUrl.search = "";
+	cacheUrl.searchParams.set("teams", teams.join(","));
+	cacheUrl.searchParams.set("cv", "1");
+	const cacheKey = new Request(cacheUrl.toString(), { method: "GET" });
+
+	const hit = await cache.match(cacheKey);
+	if (hit) return withCacheStatus(hit, "HIT");
+
+	let pool: KnowHerPool | null;
+	try {
+		pool = (await env.FEED_TAGS.get(KNOWHER_POOL_KEY, "json")) as KnowHerPool | null;
+	} catch {
+		// A KV read failure serves a stale copy if we have one, else 502 (the app treats any
+		// non-2xx as "couldn't load" and hides the game — no seed fallback, online-only).
+		return (await serveStale(cache, cacheKey)) ?? upstreamError();
+	}
+
+	const filtered = pool ? filterPoolByTeams(pool, teams) : { weekKey: "", season: 0, players: [] };
+	const headers = new Headers();
+	headers.set("Content-Type", "application/json");
+	headers.set("Cache-Control", `public, max-age=${KNOWHER_TTL}`);
+	const body = new Response(JSON.stringify(filtered), { status: 200, headers });
+	// Never cache an empty result: a request that lands before the pool is loaded (or for a team
+	// with no featured player this week) must not pin `[]` at the edge for 6h.
+	if (filtered.players.length > 0) {
+		ctx.waitUntil(cache.put(cacheKey, body.clone()));
+	}
+	return withCacheStatus(body, "MISS");
+}
+
+/** Roster-learning eligibility for one team (docs §4): `?team=WAS` → the players who started
+ *  ≥ 1 match this season, ranked core-starters-first. Powers the admin's "who's pickable" view
+ *  and the deferred auto generator's weekly selection. */
+async function handleKnowHerEligible(url: URL, env: Env): Promise<Response> {
+	const team = (url.searchParams.get("team") ?? "").toUpperCase();
+	if (!team) return new Response(`Missing ?team=`, { status: 400 });
+	const year = Number(url.searchParams.get("year")) || new Date().getUTCFullYear();
+	const cache = caches.default;
+	const cacheKey = new Request(url.toString(), { method: "GET" });
+	const hit = await cache.match(cacheKey);
+	if (hit) return withCacheStatus(hit, "HIT");
+
+	let players;
+	try {
+		players = await computeEligiblePlayers(team, year);
+	} catch {
+		return upstreamError();
+	}
+	const headers = new Headers();
+	headers.set("Content-Type", "application/json");
+	headers.set("Cache-Control", `public, max-age=${KNOWHER_ELIGIBLE_TTL}`);
+	const body = new Response(JSON.stringify({ team, year, count: players.length, players }), { status: 200, headers });
+	if (players.length > 0) {
+		// Note: no ctx here (admin/debug endpoint) — cache synchronously via the returned clone.
+		await cache.put(cacheKey, body.clone());
 	}
 	return withCacheStatus(body, "MISS");
 }

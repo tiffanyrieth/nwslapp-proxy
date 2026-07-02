@@ -1,0 +1,96 @@
+{
+  "weekKey": "2026-W27",
+  "season": 2026,
+  "players": [
+    {
+      "teamAbbreviation": "WAS",
+      "espnAthleteId": "317423",
+      "playerName": "Trinity Rodman",
+      "jerseyNumber": 2,
+      "position": "Forward",
+      "tagline": "The electric forward at the heart of the Spirit's attack.",
+      "questions": [
+        {
+          "id": "was-rodman-position",
+          "category": "herGame",
+          "prompt": "What position does Trinity Rodman play for the Spirit?",
+          "options": ["Defender", "Midfielder", "Forward", "Goalkeeper"],
+          "correctIndex": 2,
+          "revealFact": "She's a forward — pace, dribbling and end product all in one."
+        },
+        {
+          "id": "was-rodman-number",
+          "category": "herGame",
+          "prompt": "What squad number does she wear for Washington?",
+          "options": ["2", "11", "24", "33"],
+          "correctIndex": 0,
+          "revealFact": "Rodman wears the No. 2 for the Spirit."
+        },
+        {
+          "id": "was-rodman-goals",
+          "category": "herGame",
+          "prompt": "How many goals has she scored so far this NWSL season?",
+          "options": ["1", "3", "5", "7"],
+          "correctIndex": 1,
+          "revealFact": "Three goals — and counting — in the 2026 campaign."
+        },
+        {
+          "id": "was-rodman-assists",
+          "category": "herGame",
+          "prompt": "How many assists does she have this season?",
+          "options": ["0", "2", "4", "6"],
+          "correctIndex": 2,
+          "revealFact": "Four assists — she creates as much as she finishes."
+        },
+        {
+          "id": "was-rodman-starts",
+          "category": "herGame",
+          "prompt": "How many matches has she started this season?",
+          "options": ["5", "8", "11", "14"],
+          "correctIndex": 2,
+          "revealFact": "Eleven starts — a fixture in the Spirit's front line."
+        },
+        {
+          "id": "was-rodman-minutes",
+          "category": "herGame",
+          "prompt": "Roughly how many minutes has she logged this season?",
+          "options": ["About 300", "About 600", "About 900", "About 1,200"],
+          "correctIndex": 2,
+          "revealFact": "About 900 minutes on the pitch this season."
+        },
+        {
+          "id": "was-rodman-nation",
+          "category": "herStory",
+          "prompt": "Which country does Trinity Rodman represent internationally?",
+          "options": ["Canada", "United States", "England", "Mexico"],
+          "correctIndex": 1,
+          "revealFact": "She's a full United States international."
+        },
+        {
+          "id": "was-rodman-born",
+          "category": "herStory",
+          "prompt": "In which year was she born?",
+          "options": ["1998", "2000", "2002", "2004"],
+          "correctIndex": 2,
+          "revealFact": "Born in 2002 — one of the league's brightest young talents."
+        },
+        {
+          "id": "was-rodman-everystart",
+          "category": "trueOrFalse",
+          "prompt": "True or false: she has started every match she's appeared in this season.",
+          "options": ["True", "False"],
+          "correctIndex": 0,
+          "revealFact": "True — every one of her appearances this season has been a start."
+        },
+        {
+          "id": "was-rodman-club",
+          "category": "trueOrFalse",
+          "prompt": "True or false: she plays her club soccer for the Washington Spirit.",
+          "options": ["True", "False"],
+          "correctIndex": 0,
+          "revealFact": "True — Rodman has been a cornerstone of the Washington Spirit."
+        }
+      ]
+    }
+  ]
+}
