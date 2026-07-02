@@ -38,6 +38,7 @@ import {
   type MatchupVotes,
 } from "./bracket";
 import { ADMIN_PAGE_HTML } from "./bracket-admin-page";
+import { adminAuthed, adminRealm } from "./admin-auth";
 
 export interface BracketEnv {
   SUPABASE_URL: string;
@@ -168,7 +169,7 @@ async function emitDiag(env: BracketEnv, kind: string, detail: string): Promise<
 
 // ── ESPN player pool ───────────────────────────────────────────────────────────
 
-interface RosterPlayer { id: string; name: string; jersey: number | null; team: string; position: string; }
+export interface RosterPlayer { id: string; name: string; jersey: number | null; team: string; position: string; }
 
 /** ESPN intermittently throttles datacenter (Worker) IPs — a single fetch can come back
  *  non-200 (often 429) or otherwise fail, which (pre-retry) left the bracket generator with
@@ -188,7 +189,7 @@ async function espnJSON<T>(url: string, tries = 3): Promise<T> {
   throw lastErr instanceof Error ? lastErr : new Error(`ESPN fetch failed: ${url}`);
 }
 
-async function fetchTeamAbbrs(): Promise<{ id: string; abbr: string }[]> {
+export async function fetchTeamAbbrs(): Promise<{ id: string; abbr: string }[]> {
   const json = await espnJSON<{
     sports?: { leagues?: { teams?: { team?: { id?: string; abbreviation?: string } }[] }[] }[];
   }>(`${ESPN_SITE}/teams`);
@@ -198,7 +199,7 @@ async function fetchTeamAbbrs(): Promise<{ id: string; abbr: string }[]> {
     .filter((t) => t.id && t.abbr);
 }
 
-async function fetchRoster(teamId: string, abbr: string): Promise<RosterPlayer[]> {
+export async function fetchRoster(teamId: string, abbr: string): Promise<RosterPlayer[]> {
   const json = await espnJSON<{
     athletes?: { id?: string; displayName?: string; jersey?: string; position?: { abbreviation?: string } }[];
   }>(`${ESPN_SITE}/teams/${teamId}/roster`);
@@ -297,7 +298,7 @@ async function fetchAthleteStats(id: string, year: number): Promise<Record<strin
 }
 
 /** Fetch many athletes' stats in small concurrent batches (failures drop to undefined). */
-async function fetchStatsForMany(ids: string[], year: number): Promise<Map<string, Record<string, number>>> {
+export async function fetchStatsForMany(ids: string[], year: number): Promise<Map<string, Record<string, number>>> {
   const out = new Map<string, Record<string, number>>();
   const CONC = 8;
   for (let i = 0; i < ids.length; i += CONC) {
@@ -887,19 +888,7 @@ async function accumulateUserStats(
 
 type AdminEnv = BracketEnv & { BRACKET_ADMIN_KEY?: string };
 
-const ADMIN_REALM = 'Basic realm="Bracket Admin", charset="UTF-8"';
-
-/** True when the request carries the admin key — either as HTTP Basic auth (password = key,
- *  username ignored) or the `x-admin-key` header. False if no key is configured. */
-function adminAuthed(request: Request, key: string | undefined): boolean {
-  if (!key) return false;
-  if (request.headers.get("x-admin-key") === key) return true;
-  const m = /^Basic\s+(.+)$/i.exec(request.headers.get("Authorization") ?? "");
-  if (!m) return false;
-  let decoded = "";
-  try { decoded = atob(m[1].trim()); } catch { return false; }
-  return decoded.slice(decoded.indexOf(":") + 1) === key; // "user:pass" → compare pass
-}
+const ADMIN_REALM = adminRealm("Bracket Admin");
 
 /** Slug a theme title into an id segment (e.g. "Best Celebration" → "best-celebration"). */
 export function slug(s: string): string {
