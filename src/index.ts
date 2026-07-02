@@ -27,6 +27,7 @@ import {
 	type KnowHerPool,
 	type KnowHerEnv,
 } from "./knowher";
+import { handleQuizResults } from "./quiz-results";
 import {
 	exchangeAuthorizationCode,
 	storeAppleRefreshToken,
@@ -619,6 +620,9 @@ export default {
 		if (url.pathname === "/knowher/eligible") {
 			return handleKnowHerEligible(url, env);
 		}
+		if (url.pathname === "/quiz-results") {
+			return handleQuizResults(url, env as unknown as { SUPABASE_URL?: string; SUPABASE_SERVICE_ROLE_KEY?: string }, ctx);
+		}
 		if (url.pathname === "/headshots") {
 			return handleHeadshots(url, env, ctx);
 		}
@@ -641,7 +645,7 @@ export default {
 		}
 
 		return new Response(
-			"Not found. This proxy serves GET /scoreboard, /summary, /team-videos, /feed, /spotlight, /trivia, /knowher, /knowher/eligible, /headshots, /crest, /crest/manifest, /roster, /national-teams, and POST /telemetry.",
+			"Not found. This proxy serves GET /scoreboard, /summary, /team-videos, /feed, /spotlight, /trivia, /knowher, /knowher/eligible, /quiz-results, /headshots, /crest, /crest/manifest, /roster, /national-teams, and POST /telemetry.",
 			{ status: 404 },
 		);
 	},
