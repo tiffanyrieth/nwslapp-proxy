@@ -2709,11 +2709,11 @@ async function handleTrivia(url: URL, env: Env, ctx: ExecutionContext): Promise<
 
 	const headers = new Headers();
 	headers.set("Content-Type", "application/json");
-	headers.set("Cache-Control", `public, max-age=${TRIVIA_TTL}`);
+	// Never cache an EMPTY pool — at the edge OR on the client. A `[]` sent with a 6h max-age
+	// would make URLSession keep serving "no trivia" for 6h after a load; `no-store` re-checks
+	// each launch until the pool exists. Only a real pool gets the long TTL + edge cache.
+	headers.set("Cache-Control", pool.length > 0 ? `public, max-age=${TRIVIA_TTL}` : "no-store");
 	const body = new Response(JSON.stringify(pool), { status: 200, headers });
-	// Never cache an EMPTY pool: a request that lands before the pool is loaded
-	// must not pin `[]` at the edge for 6h (that would force the app onto its seed
-	// long after a load). Only a real pool is worth caching.
 	if (pool.length > 0) {
 		ctx.waitUntil(cache.put(cacheKey, body.clone()));
 	}
@@ -2751,13 +2751,16 @@ async function handleKnowHer(url: URL, env: Env, ctx: ExecutionContext): Promise
 	}
 
 	const filtered = pool ? filterPoolByTeams(pool, teams) : { weekKey: "", season: 0, players: [] };
+	const hasPlayers = filtered.players.length > 0;
 	const headers = new Headers();
 	headers.set("Content-Type", "application/json");
-	headers.set("Cache-Control", `public, max-age=${KNOWHER_TTL}`);
+	// Never cache an EMPTY result — not at the edge AND not on the client. An empty response
+	// means the game isn't available yet (pre-load / offseason / no featured followed team); if
+	// the CLIENT caches that for 6h (URLSession honors max-age), it keeps showing "no game" long
+	// after the pool is loaded. `no-store` makes the app re-check every launch until content lands.
+	headers.set("Cache-Control", hasPlayers ? `public, max-age=${KNOWHER_TTL}` : "no-store");
 	const body = new Response(JSON.stringify(filtered), { status: 200, headers });
-	// Never cache an empty result: a request that lands before the pool is loaded (or for a team
-	// with no featured player this week) must not pin `[]` at the edge for 6h.
-	if (filtered.players.length > 0) {
+	if (hasPlayers) {
 		ctx.waitUntil(cache.put(cacheKey, body.clone()));
 	}
 	return withCacheStatus(body, "MISS");
