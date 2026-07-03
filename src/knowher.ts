@@ -22,7 +22,7 @@ export const KNOWHER_MODE_KEY = "knowher:mode"; // KV: "manual" | "auto" (defaul
 //   herGame = Her game · herStory = Her story · herWorld = Her world · trueOrFalse = True or false
 export const KNOWHER_CATEGORIES = new Set(["herGame", "herStory", "herWorld", "trueOrFalse"]);
 const MIN_QUESTIONS = 8; // NYT-model ~10 floor with a little flex (docs §2); 8 stat + 1–2 fun
-const MAX_QUESTIONS = 15;
+const MAX_QUESTIONS = 25; // 10 is the FLOOR, not a cap — a rich player (lots of good facts) can go higher (owner)
 
 export interface KnowHerQuestion {
   id: string;

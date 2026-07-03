@@ -2069,135 +2069,133 @@
       "playerName": "Trinity Rodman",
       "jerseyNumber": 2,
       "position": "Forward",
-      "tagline": "The electric forward at the heart of the Spirit's attack.",
+      "tagline": "Fast, fearless, and never traveling without her PS5 — Trinity Rodman brought the fun back to the game.",
       "questions": [
         {
-          "id": "was-rodman-position",
-          "category": "herGame",
-          "prompt": "What position does Trinity Rodman play for the Spirit?",
+          "id": "was-rodman-ps5",
+          "category": "herWorld",
+          "prompt": "Which of these has Trinity Rodman actually done?",
           "options": [
-            "Defender",
-            "Midfielder",
-            "Forward",
-            "Goalkeeper"
-          ],
-          "correctIndex": 2,
-          "revealFact": "She's a forward — pace, dribbling and end product all in one."
-        },
-        {
-          "id": "was-rodman-jersey",
-          "category": "herGame",
-          "prompt": "What jersey number does Trinity Rodman wear?",
-          "options": [
-            "2",
-            "5",
-            "9",
-            "23"
+            "Never travels without her PS5, and her go-to game is Fortnite",
+            "Streams her games live on Twitch after every match",
+            "Refuses to own a gaming console",
+            "Only plays retro arcade games on road trips"
           ],
           "correctIndex": 0,
-          "revealFact": "She wears #2 for the Washington Spirit."
-        },
-        {
-          "id": "was-rodman-nationality",
-          "category": "herGame",
-          "prompt": "Trinity Rodman represents which national team?",
-          "options": [
-            "Canada",
-            "USA",
-            "England",
-            "Jamaica"
-          ],
-          "correctIndex": 1,
-          "revealFact": "She's a key attacker for the USWNT."
-        },
-        {
-          "id": "was-rodman-age",
-          "category": "herGame",
-          "prompt": "How old is Trinity Rodman?",
-          "options": [
-            "22",
-            "24",
-            "26",
-            "28"
-          ],
-          "correctIndex": 1,
-          "revealFact": "She's 24 years old."
-        },
-        {
-          "id": "was-rodman-goals",
-          "category": "herGame",
-          "prompt": "How many goals has Trinity Rodman scored in the 2026 season?",
-          "options": [
-            "1",
-            "2",
-            "3",
-            "4"
-          ],
-          "correctIndex": 2,
-          "revealFact": "She's scored 3 goals so far this season."
-        },
-        {
-          "id": "was-rodman-assists",
-          "category": "herGame",
-          "prompt": "How many assists does Trinity Rodman have this season?",
-          "options": [
-            "2",
-            "3",
-            "4",
-            "5"
-          ],
-          "correctIndex": 2,
-          "revealFact": "She's tallied 4 assists this season, tops on the team."
-        },
-        {
-          "id": "was-rodman-starts",
-          "category": "herGame",
-          "prompt": "How many matches has Trinity Rodman started in the 2026 season?",
-          "options": [
-            "9",
-            "10",
-            "11",
-            "12"
-          ],
-          "correctIndex": 2,
-          "revealFact": "She's started 11 matches this season."
+          "revealFact": "Rodman calls her PS5 a road-trip must-have and used to sneak into her brother's room just to play Fortnite."
         },
         {
           "id": "was-rodman-minutes",
           "category": "herGame",
-          "prompt": "About how many minutes has Trinity Rodman played this season?",
+          "prompt": "How many minutes has Trinity Rodman logged so far this season?",
           "options": [
-            "800",
-            "850",
+            "858",
             "906",
-            "950"
-          ],
-          "correctIndex": 2,
-          "revealFact": "She's logged 906 minutes this season."
-        },
-        {
-          "id": "was-rodman-draft",
-          "category": "herStory",
-          "prompt": "Trinity Rodman made history in the 2021 NWSL Draft by becoming:",
-          "options": [
-            "The oldest player ever drafted",
-            "The youngest player ever drafted",
-            "The first international draft pick",
-            "The first goalkeeper picked first overall"
+            "932",
+            "971"
           ],
           "correctIndex": 1,
-          "revealFact": "She was picked second overall at just 18 years old, becoming the league's youngest draftee at the time."
+          "revealFact": "906 minutes and counting — she's been a fixture in the Spirit's starting XI all season."
         },
         {
-          "id": "was-rodman-funfact",
+          "id": "was-rodman-makeup",
+          "category": "herStory",
+          "prompt": "Before she committed to soccer, what did a young Trinity briefly want to be?",
+          "options": [
+            "A makeup artist",
+            "A chef",
+            "A veterinarian",
+            "A news anchor"
+          ],
+          "correctIndex": 0,
+          "revealFact": "Long before the goals and gold medals, Trinity dreamed of a career doing makeup."
+        },
+        {
+          "id": "was-rodman-hobby",
+          "category": "herWorld",
+          "prompt": "What hobby did Trinity Rodman get hooked on off the pitch?",
+          "options": [
+            "Reading romance novels",
+            "Competitive baking",
+            "Oil painting",
+            "Playing piano"
+          ],
+          "correctIndex": 0,
+          "revealFact": "She barely read after high school until romance novels — she's a big Colleen Hoover fan — hooked her for good."
+        },
+        {
+          "id": "was-rodman-sot",
+          "category": "herGame",
+          "prompt": "How many of her shots have found the target this season?",
+          "options": [
+            "11",
+            "13",
+            "14",
+            "16"
+          ],
+          "correctIndex": 2,
+          "revealFact": "14 shots on target this year — she's not just taking chances, she's testing keepers."
+        },
+        {
+          "id": "was-rodman-basketball-tf",
           "category": "trueOrFalse",
-          "prompt": "True or false: Trinity Rodman published a children's book called \"Wake Up and Kick It.\"",
+          "prompt": "True or False: Before falling for soccer at age four, Trinity also played competitive basketball as a kid.",
           "options": [
             "True",
             "False"
           ],
           "correctIndex": 0,
-          "revealFact": "The 2022 book is about the resilience and optimism behind her rise in the sport."
+          "revealFact": "She had the athletic genes for it, but told ESPN dribbling never felt natural — soccer won out."
+        },
+        {
+          "id": "was-rodman-brace-tf",
+          "category": "trueOrFalse",
+          "prompt": "True or False: Trinity Rodman scored a hat-trick in the USWNT's 2023 World Cup send-off match against Wales.",
+          "options": [
+            "True",
+            "False"
+          ],
+          "correctIndex": 1,
+          "revealFact": "False — she came off the bench and scored TWO, a memorable brace against Wales, but not three."
+        },
+        {
+          "id": "was-rodman-contributions",
+          "category": "herGame",
+          "prompt": "Combining goals and assists, how many direct goal contributions does Trinity Rodman have this season?",
+          "options": [
+            "5",
+            "6",
+            "7",
+            "9"
+          ],
+          "correctIndex": 2,
+          "revealFact": "3 goals plus 4 assists adds up to 7 — she's setting teammates up as much as she's finishing herself."
+        },
+        {
+          "id": "was-rodman-ecnl",
+          "category": "herWorld",
+          "prompt": "Which youth club did Trinity Rodman play for before turning pro?",
+          "options": [
+            "SoCal Blues",
+            "LA Galaxy Academy",
+            "Pateadores",
+            "San Diego Surf"
+          ],
+          "correctIndex": 0,
+          "revealFact": "She racked up four ECNL championships with SoCal Blues before the NWSL ever came calling."
+        },
+        {
+          "id": "was-rodman-shots-total",
+          "category": "herGame",
+          "prompt": "How many total shots has Trinity Rodman taken this season?",
+          "options": [
+            "29",
+            "33",
+            "36",
+            "41"
+          ],
+          "correctIndex": 2,
+          "revealFact": "36 shots and climbing — she's one of the most trigger-happy forwards in the league this year."
         }
       ]
     }
