@@ -23,6 +23,18 @@ plausible-close options (not obscurity), 2–3 fun-fact questions interleaved th
 lone-hyper-specific-True/False → MC "which of these has she actually done?" fix. **Supersedes the old
 `knowher_prototype.mjs`**, whose embedded guidance ("use hyper-specific true/false") is now BANNED.
 
+**⚠️ Prompt versions — keep the proven fallback.**
+- **BASELINE = Rodman-proven (2026-07-03).** The prompt WITHOUT the "🧪 MC difficulty self-audit" step
+  (below) generated the Trinity Rodman quiz, and the content was excellent: correct info, stats interleaved
+  with fun facts, and it correctly identified/dropped sources below our standard — a **major early-risk
+  win** (accurate, guardrailed, source-discriminating generation was the biggest early worry). This is the
+  KNOWN-GOOD version; do not lose it.
+- **EXPERIMENTAL = MC difficulty self-audit (added 2026-07-03, UNTESTED).** The one gap in the Rodman run:
+  2 multiple-choice questions came out too easy (hand-edited in the live version). The self-audit step is a
+  tweak to fix that. It has NOT been validated. **Validate on the next runs** (ACFC re-gen + Sveindís
+  Jónsdóttir, planned 2026-07-04). **If it does not measurably harden the MC, DELETE the self-audit step to
+  return to baseline** — never keep an unproven tweak over the version that already works.
+
 ---
 
 ## PLAYER BLOCK — fill in with VERIFIED stats before running
@@ -66,6 +78,18 @@ maybe laugh (a relatable detail like "she travels with her PS5" is gold).
 - **At MOST ~4 stat/identity questions** (`herGame`), and make them THINK — MC options that are genuinely
   CLOSE (e.g. minutes with several plausible 900-range options). NO gimmes ("what position?", "what's her
   number?", "how many games has a star started?" → obviously ~all). A star's basic stats are boring.
+
+### 🧪 MC difficulty self-audit (EXPERIMENTAL — added 2026-07-03, not yet validated)
+
+Before finalizing, re-read EVERY 4-option MC (stat AND fun): if the correct answer is guessable *without*
+knowing her — the 3 distractors are obviously wrong, or the right one stands out by specificity/format —
+REWRITE it. Every MC must have **≥2 distractors a knowledgeable fan could genuinely pick.**
+- **Stat MCs:** distractors in the same realistic range (goals `2 / 3 / 4 / 5`, never `3 / 10 / 25 / 40`).
+- **"Which has she done" MCs:** the false options must be equally plausible, real-sounding activities — not
+  absurd throwaways.
+- Reject any MC where one option is the obvious answer.
+
+*(This step is unproven. If the next test runs don't show harder MC, delete this section → baseline.)*
 
 ### THE FIVE-LAYER GUARDRAIL (every human question — non-negotiable)
 
