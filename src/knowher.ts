@@ -22,7 +22,7 @@ export const KNOWHER_MODE_KEY = "knowher:mode"; // KV: "manual" | "auto" (defaul
 //   herGame = Her game · herStory = Her story · herWorld = Her world · trueOrFalse = True or false
 export const KNOWHER_CATEGORIES = new Set(["herGame", "herStory", "herWorld", "trueOrFalse"]);
 const MIN_QUESTIONS = 8; // NYT-model ~10 floor with a little flex (docs §2); 8 stat + 1–2 fun
-const MAX_QUESTIONS = 15;
+const MAX_QUESTIONS = 25; // 10 is the FLOOR, not a cap — a rich player (lots of good facts) can go higher (owner)
 
 export interface KnowHerQuestion {
   id: string;
@@ -226,7 +226,23 @@ async function knowHerAdminOp(env: KnowHerEnv, op: string, body: Record<string, 
       const v = validateKnowHerPool(body.pool);
       if ("error" in v) return { error: v.error };
       await env.FEED_TAGS.put(KNOWHER_POOL_KEY, JSON.stringify(v.pool));
-      return { ok: true, playerCount: v.pool.players.length, note: "Live after the 6h edge cache expires (bump cv to force)." };
+      return { ok: true, playerCount: v.pool.players.length, note: "Live within ~5 min (the /knowher edge cache TTL)." };
+    }
+    case "upsertPlayer": {
+      // Merge ONE player into the existing pool (replace by team, or add) — so a single player's
+      // JSON can be pasted without re-sending the whole 16-team pool. Keeps the pool's weekKey/season.
+      const pool = (await env.FEED_TAGS.get(KNOWHER_POOL_KEY, "json")) as KnowHerPool | null;
+      if (!pool) return { error: "No pool loaded yet — paste a full pool first, then you can update one player." };
+      // Validate the player by wrapping it in the current pool frame (reuses the full validator).
+      const v = validateKnowHerPool({ weekKey: pool.weekKey, season: pool.season, players: [body.player] });
+      if ("error" in v) return { error: v.error };
+      const player = v.pool.players[0];
+      const abbr = player.teamAbbreviation.toUpperCase();
+      const others = pool.players.filter((p) => p.teamAbbreviation.toUpperCase() !== abbr);
+      const updated: KnowHerPool = { ...pool, players: [...others, player] };
+      await env.FEED_TAGS.put(KNOWHER_POOL_KEY, JSON.stringify(updated));
+      return { ok: true, updatedTeam: abbr, playerName: player.playerName, questions: player.questions.length,
+               playerCount: updated.players.length, note: "Live within ~5 min (the /knowher edge cache TTL)." };
     }
     case "eligible": {
       const team = String(body.team ?? "").toUpperCase();
@@ -282,10 +298,15 @@ const KNOWHER_ADMIN_HTML = `<!doctype html>
 <div class="row"><input id="team" placeholder="team abbr e.g. WAS" style="width:160px"><button onclick="eligible()">Look up</button></div>
 <div id="elig" class="card muted">—</div>
 
-<h2>Paste content</h2>
-<small>A pool document: { "weekKey":"2026-W27", "season":2026, "players":[ … ] }. Validated before it goes live.</small>
+<h2>Update ONE player</h2>
+<small>Paste a SINGLE player object (with "teamAbbreviation", "espnAthleteId", … and its "questions"). Merges into the pool BY TEAM — the other players stay put. This is the quick per-player edit.</small>
+<textarea id="oneplayer" placeholder='{ "teamAbbreviation": "WAS", "espnAthleteId": "317423", "playerName": "…", "jerseyNumber": 2, "position": "Forward", "tagline": "…", "questions": [ … ] }'></textarea>
+<div class="row"><button class="go" onclick="saveOnePlayer()">Validate + update this player</button></div>
+
+<h2>Replace the WHOLE pool</h2>
+<small>A full pool document: { "weekKey":"2026-W27", "season":2026, "players":[ … all teams … ] }. REPLACES everything. Validated before it goes live.</small>
 <textarea id="pool" placeholder='{ "weekKey": "2026-W27", "season": 2026, "players": [ ... ] }'></textarea>
-<div class="row"><button class="go" onclick="save()">Validate + save to KV</button></div>
+<div class="row"><button class="go" onclick="save()">Validate + replace whole pool</button></div>
 
 <script>
 const msg = (t, err) => { const m = document.getElementById('msg'); m.textContent = t; m.className = err ? 'err' : ''; };
@@ -318,6 +339,19 @@ async function eligible() {
     document.getElementById('elig').innerHTML = html + '</table>';
     msg('Found ' + r.count + ' eligible for ' + team + '.');
   } catch (e) { msg(String(e), true); }
+}
+async function saveOnePlayer() {
+  let v;
+  try { v = JSON.parse(document.getElementById('oneplayer').value); } catch (e) { return msg('Invalid JSON: ' + e.message, true); }
+  // Accept a bare player object OR a pool doc wrapping ONE player (what the generator emits).
+  let player = v;
+  if (v && Array.isArray(v.players)) {
+    if (v.players.length !== 1) return msg('That looks like a full pool (' + v.players.length + ' players) — use "Replace the WHOLE pool" below.', true);
+    player = v.players[0];
+  }
+  msg('Validating…');
+  try { const r = await api('upsertPlayer', { player }); if (r.error) return msg('Rejected: ' + r.error, true); msg('Updated ' + r.updatedTeam + ' (' + r.playerName + ', ' + r.questions + ' Qs). Pool now ' + r.playerCount + ' players. ' + r.note); refresh(); }
+  catch (e) { msg(String(e), true); }
 }
 async function save() {
   let pool;

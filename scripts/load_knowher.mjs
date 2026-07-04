@@ -22,7 +22,7 @@ const KV_KEY = "knowher-pool-v1";
 const KV_BINDING = "FEED_TAGS";
 const CATEGORIES = new Set(["herGame", "herStory", "herWorld", "trueOrFalse"]);
 const MIN_QUESTIONS = 8;
-const MAX_QUESTIONS = 15;
+const MAX_QUESTIONS = 25; // 10 is the FLOOR, not a cap — rich players can go higher (owner)
 
 const args = process.argv.slice(2);
 const dryRun = args.includes("--dry-run");

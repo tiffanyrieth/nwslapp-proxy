@@ -2720,7 +2720,8 @@ async function handleTrivia(url: URL, env: Env, ctx: ExecutionContext): Promise<
 	return withCacheStatus(body, "MISS");
 }
 
-const KNOWHER_TTL = 6 * 3600; // 6h edge cache — the weekly pool changes rarely (owner reloads via the admin)
+const KNOWHER_TTL = 5 * 60; // 5 min — SHORT so owner content edits (iteration + the weekly swap) go live
+// near-instantly, not after 6h. The pool is tiny, so a 5-min edge/client cache still sheds ~all load.
 const KNOWHER_ELIGIBLE_TTL = 3600; // 1h — roster stats move a few times/day
 
 /** Know Her Game's weekly pool, filtered to the requested `teams` (docs §3/§4): the app
@@ -2735,7 +2736,7 @@ async function handleKnowHer(url: URL, env: Env, ctx: ExecutionContext): Promise
 	const cacheUrl = new URL(url);
 	cacheUrl.search = "";
 	cacheUrl.searchParams.set("teams", teams.join(","));
-	cacheUrl.searchParams.set("cv", "1");
+	cacheUrl.searchParams.set("cv", "2"); // bump to abandon the old 6h-TTL edge entries on deploy
 	const cacheKey = new Request(cacheUrl.toString(), { method: "GET" });
 
 	const hit = await cache.match(cacheKey);
