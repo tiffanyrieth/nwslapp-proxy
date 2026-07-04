@@ -1,11 +1,13 @@
 /**
  * nwslapp-proxy — NWSLApp's ESPN caching proxy (V2 milestone 0.2.0).
  *
- * Two routes, both transparent caching pass-throughs of ESPN's unofficial NWSL
+ * The core routes are transparent caching pass-throughs of ESPN's unofficial NWSL
  * endpoints: `GET /scoreboard` (the full-season fixture list) and `GET /summary`
  * (one match's rich detail, added in 0.3.1). Each forwards to ESPN, caches the
  * response at the edge, and fans out — so one upstream ESPN call serves every
- * app instance ("poll once, fan out").
+ * app instance ("poll once, fan out"). Alongside them sit enriched endpoints that
+ * add data ESPN doesn't carry (e.g. `/roster` last-known-good, and `/weather`, a
+ * past match's historical kickoff temperature from Open-Meteo — see weather.ts).
  *
  * Response bodies are returned UNCHANGED (transparent pass-through), so the iOS
  * app's existing `Scoreboard` / `MatchSummary` decoders need zero changes.
@@ -28,6 +30,7 @@ import {
 	type KnowHerEnv,
 } from "./knowher";
 import { handleQuizResults } from "./quiz-results";
+import { handleWeather } from "./weather";
 import {
 	exchangeAuthorizationCode,
 	storeAppleRefreshToken,
@@ -640,12 +643,24 @@ export default {
 		if (url.pathname === "/roster") {
 			return handleRoster(url, env, ctx);
 		}
+		if (url.pathname === "/weather") {
+			// Historical kickoff weather for a past match (see weather.ts). The event →
+			// (venue, kickoff, state) lookup reuses this worker's OWN edge-cached /summary
+			// pass-through — the byte-identical URL the app itself requests, so it's almost
+			// always a warm HIT. emitDiag is injected to keep weather.ts self-contained.
+			const getSummary = async (eventId: string) => {
+				const summaryUrl = new URL(`/summary?event=${eventId}`, url);
+				const resp = await proxyAndCache(summaryUrl, ESPN_SUMMARY, chooseSummaryTTL, ctx);
+				return resp.ok ? ((await resp.json()) as never) : null;
+			};
+			return handleWeather(url, env, ctx, getSummary, emitDiag);
+		}
 		if (url.pathname === "/telemetry/recent") {
 			return handleTelemetryRecent(request, env);
 		}
 
 		return new Response(
-			"Not found. This proxy serves GET /scoreboard, /summary, /team-videos, /feed, /spotlight, /trivia, /knowher, /knowher/eligible, /quiz-results, /headshots, /crest, /crest/manifest, /roster, /national-teams, and POST /telemetry.",
+			"Not found. This proxy serves GET /scoreboard, /summary, /weather, /team-videos, /feed, /spotlight, /trivia, /knowher, /knowher/eligible, /quiz-results, /headshots, /crest, /crest/manifest, /roster, /national-teams, and POST /telemetry.",
 			{ status: 404 },
 		);
 	},
@@ -1467,7 +1482,7 @@ async function handleAppleTokenExchange(request: Request, env: Env, ctx: Executi
  *  record shape the app's `POST /telemetry` sink uses (see handleTelemetryIngest), so a
  *  proxy-side miss surfaces in the owner's `GET /telemetry/recent` Diagnostics alongside
  *  app telemetry. Best-effort, non-PII. */
-function emitDiag(env: Env, ctx: ExecutionContext, kind: string, detail: string): void {
+export function emitDiag(env: Env, ctx: ExecutionContext, kind: string, detail: string): void {
 	const record = {
 		at: new Date().toISOString(),
 		app: "proxy",
