@@ -91,6 +91,15 @@ describe("chooseSummaryTTL", () => {
 		expect(ttl).toBeLessThanOrEqual(720);
 	});
 
+	it("polls ~every 10min in the final ~2h so the ~1h-pre lineup publish isn't missed (pre, T-90min)", () => {
+		// At T-90min a stale-until-kickoff cache would sleep through the lineup drop; the lineup-window
+		// tier caps the TTL at 10 min instead.
+		const t90 = new Date(Date.now() + 90 * 60 * 1000).toISOString();
+		const ttl = chooseSummaryTTL(summaryWithState("pre", t90));
+		expect(ttl).toBeGreaterThanOrEqual(60);
+		expect(ttl).toBeLessThanOrEqual(600);
+	});
+
 	it("re-checks quickly when kickoff has passed but ESPN still says pre (delayed start / status lag -> 30s)", () => {
 		const past = new Date(Date.now() - 300 * 1000).toISOString();
 		expect(chooseSummaryTTL(summaryWithState("pre", past))).toBe(30);
