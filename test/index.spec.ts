@@ -61,8 +61,8 @@ describe("nwslapp-proxy route guards", () => {
 describe("chooseSummaryTTL", () => {
 	const encode = (obj: unknown): ArrayBuffer =>
 		new TextEncoder().encode(JSON.stringify(obj)).buffer;
-	const summaryWithState = (state: string) =>
-		encode({ header: { competitions: [{ status: { type: { state } } }] } });
+	const summaryWithState = (state: string, date?: string) =>
+		encode({ header: { competitions: [{ date, status: { type: { state } } }] } });
 
 	it("caches finished matches ~forever (post -> 1yr)", () => {
 		expect(chooseSummaryTTL(summaryWithState("post"))).toBe(31536000);
@@ -72,10 +72,28 @@ describe("chooseSummaryTTL", () => {
 		expect(chooseSummaryTTL(summaryWithState("in"))).toBe(30);
 	});
 
-	it("caches future matches until the next daily refresh, 07:00 UTC (pre -> dynamic, <=24h, >=60s)", () => {
+	it("caches far-future matches until the next daily refresh (pre, no/distant kickoff -> dynamic, <=24h, >=60s)", () => {
 		const ttl = chooseSummaryTTL(summaryWithState("pre"));
 		expect(ttl).toBeGreaterThanOrEqual(60);
 		expect(ttl).toBeLessThanOrEqual(86400);
+		// A kickoff days out is further than the daily refresh, so the cap is a no-op:
+		// same TTL as the no-date case.
+		const far = new Date(Date.now() + 3 * 86400 * 1000).toISOString();
+		expect(chooseSummaryTTL(summaryWithState("pre", far))).toBe(ttl);
+	});
+
+	it("caps a pre-kickoff shell at kickoff so it can't be served stale all game (pre, imminent kickoff)", () => {
+		// Kickoff in 10 min → TTL must not exceed 10min + the 120s buffer, so the
+		// empty shell expires around kickoff and the next fetch (now 'in') gets live data.
+		const soon = new Date(Date.now() + 600 * 1000).toISOString();
+		const ttl = chooseSummaryTTL(summaryWithState("pre", soon));
+		expect(ttl).toBeGreaterThanOrEqual(60);
+		expect(ttl).toBeLessThanOrEqual(720);
+	});
+
+	it("re-checks quickly when kickoff has passed but ESPN still says pre (delayed start / status lag -> 30s)", () => {
+		const past = new Date(Date.now() - 300 * 1000).toISOString();
+		expect(chooseSummaryTTL(summaryWithState("pre", past))).toBe(30);
 	});
 
 	it("falls back to 1hr on an unknown state", () => {
