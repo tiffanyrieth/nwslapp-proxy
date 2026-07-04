@@ -794,30 +794,61 @@ function chooseScoreboardTTL(body: ArrayBuffer): number {
  * Summary TTL: one match, so the state lives at a single path —
  * `header.competitions[0].status.type.state` (NOT the scoreboard's
  * `events[].status…`). Finished matches never change → cache ~forever; live →
- * 30s; future → once-daily (season-average preview data only shifts after other
- * matches finish). Parse failure → safe 1hr default.
+ * 30s; future → once-daily BUT capped at kickoff (see `preKickoffTTL`) so a
+ * pre-kickoff shell can't be served stale through the whole live game. Parse
+ * failure → safe 1hr default.
  */
 export function chooseSummaryTTL(body: ArrayBuffer): number {
 	try {
 		const json = JSON.parse(new TextDecoder().decode(body)) as {
 			header?: {
-				competitions?: Array<{ status?: { type?: { state?: string } } }>;
+				competitions?: Array<{
+					date?: string;
+					status?: { type?: { state?: string } };
+				}>;
 			};
 		};
-		const state = json.header?.competitions?.[0]?.status?.type?.state;
+		const competition = json.header?.competitions?.[0];
+		const state = competition?.status?.type?.state;
 		switch (state) {
 			case "post":
 				return IMMUTABLE_TTL;
 			case "in":
 				return LIVE_TTL;
 			case "pre":
-				return secondsUntilDailyRefresh();
+				return preKickoffTTL(competition?.date);
 			default:
 				return SUMMARY_DEFAULT_TTL;
 		}
 	} catch {
 		return SUMMARY_DEFAULT_TTL;
 	}
+}
+
+/**
+ * TTL for a "pre" (pre-kickoff) summary — the empty shell ESPN serves before a
+ * match starts (no lineups, no plays). We cap it at kickoff so it can NEVER
+ * outlive the pre→in transition: otherwise a shell cached minutes before kickoff
+ * is served — empty — for the ENTIRE live game and past full-time, until the next
+ * daily refresh (the "stale summary" bug). Once this expires around kickoff, the
+ * next fetch sees state "in" → LIVE_TTL → the real, populated summary flows.
+ *
+ * Far-future matches are unaffected: their kickoff is further out than the daily
+ * refresh, so the `min` keeps the original once-daily preview cadence.
+ *   - missing/unparseable `date` → original daily-refresh behavior (safe fallback).
+ *   - kickoff already passed but still "pre" (ESPN status lag / delayed start) →
+ *     a short TTL so we re-check and catch the live transition within seconds.
+ */
+const PRE_KICKOFF_BUFFER = 120;
+
+function preKickoffTTL(date?: string): number {
+	const daily = secondsUntilDailyRefresh();
+	if (!date) return daily;
+	const kickoff = Date.parse(date);
+	if (Number.isNaN(kickoff)) return daily;
+	const untilKickoff = Math.floor((kickoff - Date.now()) / 1000);
+	if (untilKickoff <= 0) return LIVE_TTL;
+	return Math.max(60, Math.min(daily, untilKickoff + PRE_KICKOFF_BUFFER));
 }
 
 /**
