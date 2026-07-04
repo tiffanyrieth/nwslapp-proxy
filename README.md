@@ -10,8 +10,12 @@ This is **V2 milestone 0.2.0** — deliberately scoped to a single route.
 
 ## What it does
 
-- **One route:** `GET /scoreboard` — anything else returns `404` (`405` for
-  non-GET).
+- **Primary route:** `GET /scoreboard` — plus a set of enriched endpoints
+  (`/summary`, `/roster`, `/headshots`, `/crest`, `/feed`, `/spotlight`,
+  `/weather`, …); the full current list is the `404` body. `/weather?event=<id>`
+  serves a past match's historical kickoff temperature + condition (Open-Meteo,
+  cached write-once in KV — see `src/weather.ts`). Anything unmatched returns
+  `404` (`405` for non-GET).
 - **Transparent pass-through:** forwards the request (query string verbatim) to
   ESPN's `…/usa.nwsl/scoreboard` and returns the JSON **unchanged**, so the app's
   existing decoder needs no changes.

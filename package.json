@@ -10,9 +10,10 @@
 		"cf-typegen": "wrangler types",
 		"load-trivia": "node scripts/load_trivia.mjs",
 		"load-knowher": "node scripts/load_knowher.mjs",
-		"healthcheck": "node scripts/health_check_club_news.mjs && node scripts/health_check_roster.mjs && node scripts/health_check_summary.mjs && node scripts/health_check_bracket.mjs && node scripts/health_check_account_delete.mjs && node scripts/health_check_apple_auth.mjs",
+		"healthcheck": "node scripts/health_check_club_news.mjs && node scripts/health_check_roster.mjs && node scripts/health_check_summary.mjs && node scripts/health_check_weather.mjs && node scripts/health_check_bracket.mjs && node scripts/health_check_account_delete.mjs && node scripts/health_check_apple_auth.mjs",
 		"healthcheck:roster": "node scripts/health_check_roster.mjs",
 		"healthcheck:summary": "node scripts/health_check_summary.mjs",
+		"healthcheck:weather": "node scripts/health_check_weather.mjs",
 		"healthcheck:bracket": "node scripts/health_check_bracket.mjs",
 		"healthcheck:account": "node scripts/health_check_account_delete.mjs",
 		"healthcheck:apple": "node scripts/health_check_apple_auth.mjs"
