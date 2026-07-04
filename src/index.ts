@@ -840,6 +840,8 @@ export function chooseSummaryTTL(body: ArrayBuffer): number {
  *     a short TTL so we re-check and catch the live transition within seconds.
  */
 const PRE_KICKOFF_BUFFER = 120;
+const LINEUP_WINDOW_SECONDS = 7200;   // 2h out — ESPN posts the starting XI ~1h before kickoff
+const LINEUP_WINDOW_TTL = 600;        // 10-min freshness so the app + watcher catch the lineup drop
 
 function preKickoffTTL(date?: string): number {
 	const daily = secondsUntilDailyRefresh();
@@ -848,6 +850,12 @@ function preKickoffTTL(date?: string): number {
 	if (Number.isNaN(kickoff)) return daily;
 	const untilKickoff = Math.floor((kickoff - Date.now()) / 1000);
 	if (untilKickoff <= 0) return LIVE_TTL;
+	// Inside the final ~2h, poll ~every 10 min: a summary cached hours out (capped at kickoff) would
+	// otherwise sleep through the ~1h-pre lineup publish, so the app's pre-match view would show a stale
+	// pre-lineup shell until kickoff. Still expires by kickoff (the +buffer never overshoots meaningfully).
+	if (untilKickoff <= LINEUP_WINDOW_SECONDS) {
+		return Math.max(60, Math.min(LINEUP_WINDOW_TTL, untilKickoff + PRE_KICKOFF_BUFFER));
+	}
 	return Math.max(60, Math.min(daily, untilKickoff + PRE_KICKOFF_BUFFER));
 }
 
