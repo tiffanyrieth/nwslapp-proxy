@@ -13,15 +13,25 @@ interface Env {
 
 	// KV namespace caching one Haiku verdict per post id (bsky:{uri}), ~7d TTL —
 	// a post is tagged ONCE, ever; only never-seen posts hit Haiku on a cache miss.
-	// Also holds the B3b social-cards snapshot (SOCIAL_CACHE_KEY), refreshed by cron.
+	// Also holds the B3b social-cards snapshots (SOCIAL_CLUB_KEY via the Apify cron,
+	// SOCIAL_PLAYER_KEY via the Bright Data webhook; legacy SOCIAL_CACHE_KEY read-only).
 	FEED_TAGS: KVNamespace;
 
-	// Secret, set via `wrangler secret put APIFY_TOKEN`. Backs the B3b IG/TikTok
-	// social pipe: the daily cron calls Apify's low-cost IG + TikTok scrapers for
-	// curated club + player handles and caches the resulting cards in KV. When unset,
-	// the social builder yields [] (Home/Feed fall back to seed for those cards) —
-	// every other source is unaffected.
+	// Secret, set via `wrangler secret put APIFY_TOKEN`. Backs the B3b IG social pipe's
+	// CLUB side: the cron calls Apify's low-cost IG scraper for the 16 club handles (and,
+	// until BRIGHTDATA_TOKEN is set, the 34 player handles too — pre-split fallback) and
+	// caches the resulting cards in KV. When unset, the Apify builder yields [] and the
+	// last-good club snapshot keeps serving — every other source is unaffected.
 	APIFY_TOKEN?: string;
+
+	// Secrets, set via `wrangler secret put …` (stdin — trailing-newline gotcha). Back the
+	// B3b IG social pipe's PLAYER side (Bright Data Web Scraper API, free 5k records/mo):
+	//   BRIGHTDATA_TOKEN   Bearer token for POST /datasets/v3/trigger. Unset → the player
+	//                      scrape falls back to the Apify run (pre-split behavior).
+	//   BD_WEBHOOK_SECRET  opaque string BD echoes in the Authorization header of its
+	//                      results POST to /brightdata-webhook; the route 403s without it.
+	BRIGHTDATA_TOKEN?: string;
+	BD_WEBHOOK_SECRET?: string;
 
 	// Sign in with Apple (SIWA) revocation — secrets set via `wrangler secret put`.
 	// Back POST /auth/apple-token-exchange + the account-delete revoke step: the .p8
