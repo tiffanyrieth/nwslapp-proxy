@@ -19,8 +19,8 @@
  * ESPN directly from the app.
  */
 
-import { runBracketTick, forceCloseActiveRound, handleBracketAdmin, type BracketEnv } from "./bracket-engine";
-import { buildHeadshotMap, handleHeadshots } from "./headshots";
+import { runBracketTick, forceCloseActiveRound, handleBracketAdmin, type BracketEnv } from "./bracket-engine.ts";
+import { buildHeadshotMap, handleHeadshots } from "./headshots.ts";
 import {
 	handleKnowHerAdmin,
 	computeEligiblePlayers,
@@ -28,16 +28,16 @@ import {
 	KNOWHER_POOL_KEY,
 	type KnowHerPool,
 	type KnowHerEnv,
-} from "./knowher";
-import { handleQuizResults } from "./quiz-results";
-import { handleWeather } from "./weather";
+} from "./knowher.ts";
+import { handleQuizResults } from "./quiz-results.ts";
+import { handleWeather } from "./weather.ts";
 import {
 	exchangeAuthorizationCode,
 	storeAppleRefreshToken,
 	readAppleRefreshToken,
 	revokeRefreshToken,
 	type AppleAuthEnv,
-} from "./apple-auth";
+} from "./apple-auth.ts";
 
 // Forced-update version gate (served at GET /config). To force everyone onto a newer TestFlight
 // build, raise MIN_APP_BUILD (the integer the app compares against its CFBundleVersion) and redeploy.
@@ -208,29 +208,45 @@ const HAIKU_BATCH = 20; // posts per Haiku call (one numbered list → array of 
 const TAG_TTL = 7 * 24 * 3600; // a post's verdict is stable; cache it a week
 const MAX_PER_HANDLE = 3; // free anti-flood cap: keep at most N posts per account
 
-// B3b — Instagram social pipe (via Apify). Low-cost, pay-per-result, NO-rental actor
-// (owner chose the cheap path to stay inside Apify's free $5/mo credit):
-//   IG = sones/instagram-posts-scraper-lowcost  ($0.30/1k, HTTP-only)
-// TikTok (clockworks/tiktok-scraper, $1.70/1k, no rental) is DEFERRED for now but its
-// id + mapper are kept ready. Apify API path uses "~" for the actor "/".
+// B3b — Instagram social pipe, LOAD-BALANCED across two scrape services (2026-07-05):
+//   CLUBS (16 handles → Home tab)  = Apify sones/instagram-posts-scraper-lowcost ($0.30/1k).
+//     The cheap actor ignores postsPerProfile and returns ~12/profile — a FEATURE for clubs:
+//     Home serves the club pool uncapped and pages through the depth on refresh.
+//     16 × ~12 × ~15 runs/mo ≈ 2,880 items ≈ $0.86/mo — permanently inside Apify's free $5.
+//   PLAYERS (34 handles → Feed tab) = Bright Data Web Scraper API (free 5,000 records/mo,
+//     recurring). BD DOES honor a per-profile cap; players only ever serve 3/handle
+//     (capPerHandle), so a shallow pull is fine: 34 × 6 × ~15 ≈ 3,060 records/mo = $0.
+//     ⚠️ BD bills a record even when a handle returns EMPTY (renamed/dead account) — a stale
+//     handle list silently eats the free quota, so empties emit diag (bdHandleEmpty).
+//   Until BRIGHTDATA_TOKEN is set, players fall back to the Apify run (full 50-handle scrape,
+//   the pre-split behavior) so the split deploys without a flag day.
+// TikTok (clockworks/tiktok-scraper, $3.70/1k, no rental) is DEFERRED but its id + mapper
+// are kept ready. Apify API path uses "~" for the actor "/".
 // We DON'T scrape on the user request path (a 50-account sync run is too slow and would
-// risk a Worker timeout). Instead a CRON refreshes the card snapshot into KV
-// (SOCIAL_CACHE_KEY); /feed and /team-videos just READ that snapshot — pinning Apify to
-// ~1 run/cron regardless of app traffic. IG ~600 items/run × every-other-day ≈ $2.7/mo,
-// well under $5. Unset APIFY_TOKEN → the builder no-ops → seed fallback.
+// risk a Worker timeout). Instead a CRON refreshes the card snapshot into KV; /feed and
+// /team-videos just READ that snapshot — pinning scrape spend to ~1 run/cron regardless
+// of app traffic. The app's staleness filter (Home 72h / Feed 7d) drops old posts
+// client-side, so a mixed-age snapshot is fine to display.
 const APIFY_API = "https://api.apify.com/v2/acts";
 const APIFY_IG_ACTOR = "sones~instagram-posts-scraper-lowcost";
 const APIFY_TIKTOK_ACTOR = "clockworks~tiktok-scraper"; // deferred; kept ready for re-enable
-// Per-account post cap we ASK for. The cheap IG actor does NOT honor postsPerProfile
-// (or newerThan) — it returns ~12/profile of mixed-age posts regardless — so IG volume
-// (~600/run) is controlled by cron CADENCE (every other day, see wrangler.jsonc), not
-// per-post limits. The app's staleness filter (Home 72h / Feed 7d) drops the old posts
-// client-side, so a mixed-age KV snapshot is fine to display; we just can't avoid
-// paying to scrape them. (TikTok's clockworks actor DOES honor it via resultsPerPage,
-// relevant when TikTok is re-enabled.)
-const SOCIAL_POSTS_PER_PROFILE = 4;
-const SOCIAL_CACHE_KEY = "social-cards-v1"; // KV key for the cron-built card snapshot
-const SOCIAL_CACHE_TTL = 3 * 24 * 3600; // 3d KV safety net — the daily cron refreshes well within it
+const SOCIAL_POSTS_PER_PROFILE = 4; // requested of Apify (ignored by the cheap actor — see above)
+// Bright Data Web Scraper API (players). ASYNC: the cron POSTs /trigger with the player
+// profile URLs + webhook delivery params; BD scrapes (~1–3 min) then POSTs the finished
+// JSON to /brightdata-webhook, echoing BD_WEBHOOK_SECRET in the Authorization header.
+const BRIGHTDATA_API = "https://api.brightdata.com/datasets/v3";
+const BRIGHTDATA_IG_DATASET = "gd_lk5ns7kz21pck8jpis"; // Instagram Posts scraper dataset id
+const BD_POSTS_PER_PROFILE = 6; // BD honors per-profile caps; 3/handle is the serve cap anyway
+// The cron has no incoming request to derive its own origin from, so the webhook endpoint
+// base is pinned here (workers.dev origin; update if the worker ever moves to a custom domain).
+const PROXY_PUBLIC_ORIGIN = "https://nwslapp-proxy.tiffany-rieth.workers.dev";
+// SPLIT snapshot keys: clubs and players have DIFFERENT writers (Apify = the cron itself;
+// BD = the webhook, minutes later), so each side owns a KV key — two writers on one key
+// would race. The legacy combined key remains a read-only fallback until both exist.
+const SOCIAL_CACHE_KEY = "social-cards-v1"; // legacy combined snapshot (read fallback only)
+const SOCIAL_CLUB_KEY = "social-cards-club-v1"; // written by the Apify cron path
+const SOCIAL_PLAYER_KEY = "social-cards-player-v1"; // written by the Bright Data webhook
+const SOCIAL_CACHE_TTL = 3 * 24 * 3600; // 3d KV safety net — the every-2-day cron refreshes well within it
 
 // Social (reporter + league-outlet) Bluesky classifier. These accounts post
 // off-topic too, so each post is gated AND team-tagged: isNWSL (strict — false
@@ -536,6 +552,32 @@ export default {
 			return handleTelemetryIngest(request, env, ctx);
 		}
 
+		// POST Bright Data webhook: the async player-IG scrape's push delivery lands here
+		// (~1–3 min after the cron's trigger). Before the GET-only guard; self-authenticates
+		// against BD_WEBHOOK_SECRET (see handleBrightDataWebhook).
+		if (url.pathname === "/brightdata-webhook") {
+			return handleBrightDataWebhook(request, env, ctx);
+		}
+
+		// Admin-only: refresh the IG social snapshot on demand (the every-2-day cron does
+		// this automatically; this forces an immediate pull after a token swap or an aborted
+		// run). Same BRACKET_ADMIN_KEY gate as /headshots/run.
+		if (url.pathname === "/refresh-social") {
+			const key = (env as unknown as { BRACKET_ADMIN_KEY?: string }).BRACKET_ADMIN_KEY;
+			if (request.method !== "POST" || !key || request.headers.get("x-admin-key") !== key) {
+				return new Response("forbidden", { status: 403 });
+			}
+			try {
+				const summary = await refreshSocialCache(env, ctx);
+				return new Response(`${JSON.stringify(summary)}\n`, {
+					headers: { "Content-Type": "application/json" },
+				});
+			} catch (e) {
+				const err = e as Error;
+				return new Response(`refresh-social error: ${err.message}\n`, { status: 500 });
+			}
+		}
+
 		// POST account deletion: the privileged "right to be forgotten" route. Verifies the
 		// caller's Supabase JWT, then service-role deletes their auth.users row (cascading
 		// every per-user table). The client can't do this — deleting an auth user needs the
@@ -670,7 +712,7 @@ export default {
 	// blocks the app and Apify spend is pinned to ~1 run/day (see wrangler.jsonc crons).
 	// Await (not waitUntil) — a cron should keep its invocation alive until the work is
 	// done; best-effort, a failed refresh leaves the last good snapshot in place.
-	async scheduled(controller, env, _ctx): Promise<void> {
+	async scheduled(controller, env, ctx): Promise<void> {
 		// The every-5-min cron drives the Bracket Battle engine (manual-action pickup / auto
 		// tally + advance / rotate). The every-other-day cron refreshes the Instagram social
 		// cache. The full env is cast to BracketEnv — it carries FEED_TAGS too, so the engine
@@ -694,7 +736,7 @@ export default {
 			return;
 		}
 		try {
-			await refreshSocialCache(env);
+			await refreshSocialCache(env, ctx);
 		} catch {
 			/* swallow — next run retries; the stale snapshot stays serving */
 		}
@@ -2312,8 +2354,96 @@ export function mapApifyTikTok(raw: unknown, h: SocialHandle): unknown | null {
 	};
 }
 
-/** Build the social cards, split by platform so the caller can preserve one
- *  platform's last-good snapshot if the other came back empty. Cron-only.
+/** One Bright Data Instagram post → a `socialVideo` ContentCard, or null if unusable.
+ *  Field names are the BD Instagram Posts dataset output (`url`, `description`,
+ *  `date_posted`, `photos` [array], `user_posted`, `shortcode`, `likes`); fallbacks kept
+ *  for schema drift. SAME card shape as mapApifyInstagram — the app can't tell (and must
+ *  not care) which service scraped a card. */
+export function mapBrightDataInstagram(raw: unknown, h: SocialHandle): unknown | null {
+	const item = raw as Record<string, unknown>;
+	const code = (item.shortcode ?? item.post_id) as string | undefined;
+	const url = (item.url as string | undefined) ?? (code ? `https://www.instagram.com/p/${code}/` : undefined);
+	const ts = isoFromAny(item.date_posted ?? item.timestamp);
+	if (!url || !ts) return null;
+
+	const photos = item.photos;
+	const image =
+		(Array.isArray(photos) ? (photos[0] as string | undefined) : undefined) ??
+		(item.display_url as string | undefined) ??
+		(item.thumbnail as string | undefined);
+	const caption = (item.description ?? item.caption) as string | undefined;
+
+	return {
+		id: `ig-${code ?? hashId(url)}`,
+		layout: "socialVideo",
+		platform: "instagram",
+		placement: h.kind === "team" ? "home" : "feed",
+		sourceType: h.kind === "team" ? "club" : "player",
+		teamAbbreviation: h.abbr,
+		isLeague: false,
+		authorName: h.name,
+		handle: `@${h.handle}`, // only used by capPerHandle; footer shows authorName
+		bodyText: typeof caption === "string" ? caption || undefined : undefined,
+		thumbnailURL: typeof image === "string" ? image : undefined,
+		igFallback: false,
+		likes: numOrUndef(item.likes ?? item.like_count),
+		timestamp: ts,
+		url,
+		ctaLabel: "Open in Instagram",
+	};
+}
+
+/** POST /brightdata-webhook — Bright Data's push delivery for the async player scrape.
+ *  Auth: BD echoes BD_WEBHOOK_SECRET verbatim in the Authorization header (the trigger's
+ *  `auth_header` param); anything else 403s. Maps items → cards → writes the PLAYER
+ *  snapshot key (empty result keeps last-good). NO SILENT FAILURES: bad auth, unparseable
+ *  body, and billed-but-empty handles (they eat the free 5k quota) all emit diag. */
+export async function handleBrightDataWebhook(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
+	const secret = env.BD_WEBHOOK_SECRET;
+	if (request.method !== "POST" || !secret || request.headers.get("Authorization") !== secret) {
+		emitDiag(env, ctx, "bdWebhookAuth", `rejected ${request.method}`);
+		return new Response("forbidden", { status: 403 });
+	}
+	let items: unknown[];
+	try {
+		const body = (await request.json()) as unknown;
+		items = Array.isArray(body) ? body : (((body as { data?: unknown[] } | null)?.data as unknown[] | undefined) ?? []);
+	} catch {
+		emitDiag(env, ctx, "bdWebhookBadBody", "unparseable JSON");
+		return new Response("bad body", { status: 400 });
+	}
+
+	const players = SOCIAL_HANDLES.filter((h) => h.platform === "instagram" && h.kind === "player");
+	const byUser = new Map(players.map((h) => [h.handle.toLowerCase(), h]));
+	const seen = new Set<string>();
+	const cards = items
+		.map((it) => {
+			// BD keys the account on `user_posted`; the original input URL is a fallback.
+			const rec = it as { user_posted?: string; user_username?: string; input?: { url?: string } };
+			const fromInput = /instagram\.com\/([^/?]+)/.exec(rec.input?.url ?? "")?.[1];
+			const user = String(rec.user_posted ?? rec.user_username ?? fromInput ?? "").toLowerCase();
+			const h = byUser.get(user);
+			if (!h) return null;
+			seen.add(user);
+			return mapBrightDataInstagram(it, h);
+		})
+		.filter(Boolean) as unknown[];
+
+	// A handle with no delivered posts was still billed a record — flag it so a renamed/
+	// dead account can't silently drain the free quota run after run.
+	const missing = players.filter((h) => !seen.has(h.handle.toLowerCase()));
+	if (missing.length > 0 && cards.length > 0) {
+		emitDiag(env, ctx, "bdHandleEmpty", `${missing.length}: ${missing.map((h) => h.handle).slice(0, 5).join(",")}`);
+	}
+
+	const kept = await writeSideOrKeepLastGood(env, ctx, SOCIAL_PLAYER_KEY, cards, "player");
+	return new Response(JSON.stringify({ received: items.length, cards: cards.length, kept }), {
+		headers: { "Content-Type": "application/json" },
+	});
+}
+
+/** Scrape the given IG handles via Apify and map to cards (defaults to ALL IG handles —
+ *  the pre-split behavior, still used while BRIGHTDATA_TOKEN is unset). Cron-only.
  *
  *  TikTok is DEFERRED (owner: IG-only for now), so only Instagram is scraped — which
  *  also means a single actor runs, sidestepping the Apify FREE plan's 8192MB TOTAL
@@ -2321,11 +2451,11 @@ export function mapApifyTikTok(raw: unknown, h: SocialHandle): unknown | null {
  *  To re-enable TikTok: add a SEQUENTIAL second pass (after IG, to stay under that cap)
  *  scraping APIFY_TIKTOK_ACTOR over the CLUB_SOCIAL.tiktok handles → mapApifyTikTok.
  *  IG empty (or no APIFY_TOKEN) → caller keeps the last good snapshot (→ seed fallback). */
-async function buildSocialCards(env: Env): Promise<{ instagram: unknown[]; tiktok: unknown[] }> {
+async function buildSocialCards(env: Env, handles?: SocialHandle[]): Promise<{ instagram: unknown[]; tiktok: unknown[] }> {
 	const token = env.APIFY_TOKEN;
 	if (!token) return { instagram: [], tiktok: [] };
 
-	const igHandles = SOCIAL_HANDLES.filter((h) => h.platform === "instagram");
+	const igHandles = (handles ?? SOCIAL_HANDLES).filter((h) => h.platform === "instagram");
 	const igByUser = new Map(igHandles.map((h) => [h.handle.toLowerCase(), h]));
 
 	let instagram: unknown[] = [];
@@ -2351,28 +2481,105 @@ async function buildSocialCards(env: Env): Promise<{ instagram: unknown[]; tikto
 	return { instagram, tiktok: [] };
 }
 
-/** Cron entry: rebuild the social snapshot → KV. IG-only (TikTok deferred): writes the
- *  fresh IG cards, but if THIS run got nothing (intermittent Apify outage) it keeps the
- *  last-good IG snapshot rather than blanking the social slot. Writing IG-only also
- *  PURGES any stale TikTok cards a past run may have left in KV. When TikTok is
- *  re-enabled, restore a per-platform merge (fresh-or-last-good for each platform). */
-async function refreshSocialCache(env: Env): Promise<void> {
-	const { instagram } = await buildSocialCards(env);
-	const cards = instagram.length
-		? instagram
-		: (await readSocialCards(env)).filter(
-				(c) => (c as { platform?: string }).platform === "instagram",
-			);
-	if (cards.length === 0) return; // nothing now, nothing before — keep KV as-is
-	await env.FEED_TAGS.put(SOCIAL_CACHE_KEY, JSON.stringify(cards), {
-		expirationTtl: SOCIAL_CACHE_TTL,
-	});
+/** Cron/manual-refresh entry: rebuild the social snapshot → the SPLIT KV keys.
+ *  CLUB side: scraped via Apify inline (sync run) and written here. PLAYER side: when
+ *  Bright Data is configured, an ASYNC scrape is triggered and /brightdata-webhook writes
+ *  the player key minutes later; until then players ride the same Apify run (pre-split
+ *  fallback — the split deploys without a flag day). Returns a summary for /refresh-social. */
+async function refreshSocialCache(env: Env, ctx?: ExecutionContext): Promise<{ clubCards: number; players: string }> {
+	const igHandles = SOCIAL_HANDLES.filter((h) => h.platform === "instagram");
+	const bdConfigured = !!(env.BRIGHTDATA_TOKEN && env.BD_WEBHOOK_SECRET);
+
+	const apifyHandles = bdConfigured ? igHandles.filter((h) => h.kind === "team") : igHandles;
+	const { instagram } = await buildSocialCards(env, apifyHandles);
+	const clubs = instagram.filter((c) => (c as { placement?: string }).placement === "home");
+	const clubCards = await writeSideOrKeepLastGood(env, ctx, SOCIAL_CLUB_KEY, clubs, "club");
+
+	let players: string;
+	if (bdConfigured) {
+		players = await triggerBrightDataPlayers(env, ctx);
+	} else {
+		const fresh = instagram.filter((c) => (c as { placement?: string }).placement === "feed");
+		const kept = await writeSideOrKeepLastGood(env, ctx, SOCIAL_PLAYER_KEY, fresh, "player");
+		players = `apify-fallback:${kept}`;
+		if (ctx) emitDiag(env, ctx, "bdUnconfigured", "players via apify fallback");
+	}
+	return { clubCards, players };
 }
 
-/** Read the cron-built social snapshot (all placements), or [] if none yet. */
+/** Write one side's fresh cards to its KV key — or, when THIS scrape came back empty
+ *  (outage / aborted run), re-put the last-good snapshot with a fresh TTL so the safety
+ *  net can't age out mid-outage. Seeds from the LEGACY combined key when the side's own
+ *  key doesn't exist yet (first post-split runs). Returns the card count now in KV. */
+async function writeSideOrKeepLastGood(
+	env: Env,
+	ctx: ExecutionContext | undefined,
+	key: string,
+	fresh: unknown[],
+	side: "club" | "player",
+): Promise<number> {
+	let cards = fresh;
+	if (cards.length === 0) {
+		const placement = side === "club" ? "home" : "feed";
+		const [own, legacy] = await Promise.all([
+			env.FEED_TAGS.get(key, "json") as Promise<unknown[] | null>,
+			env.FEED_TAGS.get(SOCIAL_CACHE_KEY, "json") as Promise<Array<{ placement?: string }> | null>,
+		]);
+		cards = own ?? (legacy ?? []).filter((c) => c.placement === placement);
+		if (ctx) emitDiag(env, ctx, "socialScrapeEmpty", `${side}: kept last-good ${cards.length}`);
+	}
+	if (cards.length === 0) return 0; // nothing now, nothing before — keep KV as-is
+	await env.FEED_TAGS.put(key, JSON.stringify(cards), { expirationTtl: SOCIAL_CACHE_TTL });
+	return cards.length;
+}
+
+/** Fire the ASYNC Bright Data scrape for the 34 player handles. Results arrive minutes
+ *  later at POST /brightdata-webhook (delivery params on the trigger: our endpoint URL +
+ *  BD_WEBHOOK_SECRET echoed as the Authorization header). Returns a status note for
+ *  /refresh-social. Only called when BRIGHTDATA_TOKEN + BD_WEBHOOK_SECRET are set. */
+async function triggerBrightDataPlayers(env: Env, ctx?: ExecutionContext): Promise<string> {
+	const players = SOCIAL_HANDLES.filter((h) => h.platform === "instagram" && h.kind === "player");
+	// Discover-by-profile-URL with a per-profile cap — BD honors num_of_posts (unlike the
+	// cheap Apify actor), which is what keeps us inside the free 5k records/mo.
+	const inputs = players.map((h) => ({
+		url: `https://www.instagram.com/${h.handle}/`,
+		num_of_posts: BD_POSTS_PER_PROFILE,
+	}));
+	const params = new URLSearchParams({
+		dataset_id: BRIGHTDATA_IG_DATASET,
+		type: "discover_new",
+		discover_by: "url",
+		endpoint: `${PROXY_PUBLIC_ORIGIN}/brightdata-webhook`,
+		auth_header: env.BD_WEBHOOK_SECRET as string,
+		format: "json",
+		uncompressed_webhook: "true",
+	});
+	const r = await fetch(`${BRIGHTDATA_API}/trigger?${params}`, {
+		method: "POST",
+		headers: { Authorization: `Bearer ${env.BRIGHTDATA_TOKEN}`, "Content-Type": "application/json" },
+		body: JSON.stringify(inputs),
+	});
+	if (!r.ok) {
+		const body = await r.text().catch(() => "");
+		if (ctx) emitDiag(env, ctx, "bdTriggerFail", `${r.status} ${body.slice(0, 60)}`);
+		return `bd-trigger-failed:${r.status}`;
+	}
+	const json = (await r.json().catch(() => null)) as { snapshot_id?: string } | null;
+	return `bd-triggered:${json?.snapshot_id ?? "?"}`;
+}
+
+/** Read the social snapshot (club + player sides merged), falling back per side to the
+ *  legacy combined key until the split keys exist. [] if nothing yet. */
 async function readSocialCards(env: Env): Promise<unknown[]> {
-	const snapshot = (await env.FEED_TAGS.get(SOCIAL_CACHE_KEY, "json")) as unknown[] | null;
-	return snapshot ?? [];
+	const [club, player, legacy] = await Promise.all([
+		env.FEED_TAGS.get(SOCIAL_CLUB_KEY, "json") as Promise<unknown[] | null>,
+		env.FEED_TAGS.get(SOCIAL_PLAYER_KEY, "json") as Promise<unknown[] | null>,
+		env.FEED_TAGS.get(SOCIAL_CACHE_KEY, "json") as Promise<Array<{ placement?: string }> | null>,
+	]);
+	const legacyArr = legacy ?? [];
+	const clubs = club ?? legacyArr.filter((c) => c.placement === "home");
+	const players = player ?? legacyArr.filter((c) => c.placement === "feed");
+	return [...clubs, ...players];
 }
 
 /** Filter the social snapshot to the requested teams + the allowed placements

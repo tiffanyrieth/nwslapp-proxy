@@ -36,9 +36,9 @@ import {
   type Entrant,
   type Matchup,
   type MatchupVotes,
-} from "./bracket";
-import { ADMIN_PAGE_HTML } from "./bracket-admin-page";
-import { adminAuthed, adminRealm } from "./admin-auth";
+} from "./bracket.ts";
+import { ADMIN_PAGE_HTML } from "./bracket-admin-page.ts";
+import { adminAuthed, adminRealm } from "./admin-auth.ts";
 
 export interface BracketEnv {
   SUPABASE_URL: string;
