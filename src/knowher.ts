@@ -12,8 +12,8 @@
 // writes KV `knowher-pool-v1`. The AUTO weekly generator is deferred (docs/know-her-game.md
 // §5); its pipe (eligibility, mode flag, admin) is built now so nothing gets retrofitted.
 
-import { fetchTeamAbbrs, fetchRoster, fetchStatsForMany } from "./bracket-engine";
-import { adminAuthed, adminRealm } from "./admin-auth";
+import { fetchTeamAbbrs, fetchRoster, fetchStatsForMany } from "./bracket-engine.ts";
+import { adminAuthed, adminRealm } from "./admin-auth.ts";
 
 export const KNOWHER_POOL_KEY = "knowher-pool-v1"; // KV: the live pool document (this week's players)
 export const KNOWHER_MODE_KEY = "knowher:mode"; // KV: "manual" | "auto" (default manual)
