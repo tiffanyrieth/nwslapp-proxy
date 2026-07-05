@@ -729,6 +729,13 @@ async function proxyAndCache(
 	// `league` (scoreboard only) is encoded in `upstreamBase`'s path, not an ESPN
 	// query param — strip it from the forwarded search. No-op for routes without it.
 	upstream.searchParams.delete("league");
+	// `w` is a CACHE-KEY-ONLY window bucket (the app sends `w=near` on /summary inside the 2h
+	// pre-kickoff window). It forks the edge-cache key so entering the lineup window is a
+	// guaranteed MISS → fresh fetch under the short near TTL — an empty pre-lineup shell cached
+	// HOURS earlier (with a TTL running to ~kickoff) can no longer mask a freshly posted XI.
+	// ESPN must never see it; the caller computes it because only the caller knows kickoff
+	// at request time (the proxy would need the body it hasn't fetched yet).
+	upstream.searchParams.delete("w");
 
 	let espnResponse: Response;
 	try {
