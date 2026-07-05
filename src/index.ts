@@ -797,16 +797,34 @@ function chooseScoreboardTTL(body: ArrayBuffer): number {
 	try {
 		const json = JSON.parse(new TextDecoder().decode(body)) as {
 			events?: Array<{
+				date?: string;
 				status?: { type?: { state?: string } };
 				competitions?: Array<{ status?: { type?: { state?: string } } }>;
 			}>;
 		};
-		const isLive = (json.events ?? []).some(
+		const events = json.events ?? [];
+		const isLive = events.some(
 			(event) =>
 				event.status?.type?.state === "in" ||
 				(event.competitions ?? []).some((c) => c.status?.type?.state === "in"),
 		);
-		return isLive ? LIVE_TTL : SCOREBOARD_DEFAULT_TTL;
+		if (isLive) return LIVE_TTL;
+		// KICKOFF WINDOW (2026-07-05, BOS vs BAY lesson): the flat 300s pre-match TTL let a stale
+		// "everything is pre" snapshot straddle kickoff — the watcher, the V2 Live Activity flip,
+		// AND the app's schedule tab (all reading this one cache) lagged the live transition by up
+		// to 5 EXTRA minutes on top of ESPN's own late flip (ESPN went "in" ~10 min after the real
+		// whistle, clock reset to ~1'). While any match sits "pre" with a kickoff between 2 min out
+		// and 45 min AGO (ESPN's observed flip lag), cache at the live cadence so we track ESPN's
+		// transition within ~30s instead of ~5 min. ESPN's own lateness is not ours to fix.
+		const now = Date.now();
+		const nearKickoff = events.some((event) => {
+			const state = event.status?.type?.state ?? (event.competitions ?? [])[0]?.status?.type?.state;
+			if (state !== "pre" || !event.date) return false;
+			const kickoff = Date.parse(event.date);
+			if (!Number.isFinite(kickoff)) return false;
+			return now >= kickoff - 2 * 60 * 1000 && now <= kickoff + 45 * 60 * 1000;
+		});
+		return nearKickoff ? LIVE_TTL : SCOREBOARD_DEFAULT_TTL;
 	} catch {
 		return SCOREBOARD_DEFAULT_TTL;
 	}
