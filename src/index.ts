@@ -31,6 +31,7 @@ import {
 } from "./knowher.ts";
 import { handleQuizResults } from "./quiz-results.ts";
 import { handleWeather } from "./weather.ts";
+import { handlePlayoffOverride } from "./playoff-override.ts";
 import {
 	exchangeAuthorizationCode,
 	storeAppleRefreshToken,
@@ -700,9 +701,15 @@ export default {
 		if (url.pathname === "/telemetry/recent") {
 			return handleTelemetryRecent(request, env);
 		}
+		if (url.pathname === "/playoff-override") {
+			// Operator escape hatch: a KV JSON the app layers over its ESPN-derived playoff
+			// bracket, so an ESPN data/format break during the postseason is a server edit, not
+			// an App Store release. Dormant unless set. GET public; POST gated by x-admin-key.
+			return handlePlayoffOverride(request, url, env as unknown as { FEED_TAGS: KVNamespace; BRACKET_ADMIN_KEY?: string });
+		}
 
 		return new Response(
-			"Not found. This proxy serves GET /scoreboard, /summary, /weather, /team-videos, /feed, /spotlight, /trivia, /knowher, /knowher/eligible, /quiz-results, /headshots, /crest, /crest/manifest, /roster, /national-teams, and POST /telemetry.",
+			"Not found. This proxy serves GET /scoreboard, /summary, /weather, /team-videos, /feed, /spotlight, /trivia, /knowher, /knowher/eligible, /quiz-results, /headshots, /crest, /crest/manifest, /roster, /national-teams, /playoff-override, and POST /telemetry.",
 			{ status: 404 },
 		);
 	},
