@@ -609,6 +609,15 @@ export default {
 			return handleKnowHerAdmin(request, env as unknown as KnowHerEnv);
 		}
 
+		// Operator escape hatch: a KV JSON the app layers over its ESPN-derived playoff bracket,
+		// so an ESPN data/format break during the postseason is a server edit, not an App Store
+		// release. Dormant unless set. GET public; POST gated by x-admin-key. MUST be before the
+		// GET-only guard (it serves both methods + self-checks the key) — else POST 405s and the
+		// override can never be SET.
+		if (url.pathname === "/playoff-override") {
+			return handlePlayoffOverride(request, url, env as unknown as { FEED_TAGS: KVNamespace; BRACKET_ADMIN_KEY?: string });
+		}
+
 		// All other routes are GET-only; reject early so the 405 is shared.
 		if (request.method !== "GET") {
 			return new Response("Method not allowed. Use GET.", {
@@ -700,12 +709,6 @@ export default {
 		}
 		if (url.pathname === "/telemetry/recent") {
 			return handleTelemetryRecent(request, env);
-		}
-		if (url.pathname === "/playoff-override") {
-			// Operator escape hatch: a KV JSON the app layers over its ESPN-derived playoff
-			// bracket, so an ESPN data/format break during the postseason is a server edit, not
-			// an App Store release. Dormant unless set. GET public; POST gated by x-admin-key.
-			return handlePlayoffOverride(request, url, env as unknown as { FEED_TAGS: KVNamespace; BRACKET_ADMIN_KEY?: string });
 		}
 
 		return new Response(
