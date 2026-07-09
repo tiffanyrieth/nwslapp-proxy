@@ -64,6 +64,14 @@ const SCOREBOARD_LEAGUES = new Set<string>([
 	"concacaf.w.gold",                // Concacaf W Gold Cup (national teams)
 	"concacaf.womens.championship",   // Concacaf W Championship (national teams, pre-2024)
 	"uefa.weuro",                     // UEFA Women's Euro (national teams — Europe's powers)
+	"uefa.w.nations",                 // UEFA Women's Nations League (national teams — Euro WC/Olympic path)
+	"fifa.wworldq.uefa",              // FIFA Women's World Cup Qualifying — UEFA
+	"afc.w.asian.cup",                // AFC Women's Asian Cup (national teams — Asia)
+	"caf.w.nations",                  // Women's Africa Cup of Nations (national teams — Africa)
+	"conmebol.america.femenina",      // Copa América Femenina (national teams — South America)
+	"fifa.wwcq.ply",                  // FIFA Women's World Cup Qualifying — inter-confederation playoff
+	"fifa.w.concacaf.olympicsq",      // Concacaf Women's Olympic Qualifying
+	"global.pinatar_cup",             // Pinatar Cup (national-team invitational)
 	"concacaf.w.champions_cup",       // Concacaf W Champions Cup (CLUB: NWSL clubs vs Liga MX)
 	"usa.nwsl.cup",                   // NWSL Challenge Cup (CLUB: one annual NWSL-vs-NWSL match)
 ]);
@@ -3128,10 +3136,14 @@ async function handleAssetManifest(env: Env): Promise<Response> {
 const WOMENS_NT_FEEDS = [
 	"fifa.friendly.w", "fifa.shebelieves", "concacaf.w.gold", "concacaf.womens.championship",
 	"uefa.weuro", "fifa.wwc", "fifa.w.olympics",
+	// Confederation championships + WC/Olympic qualifying — close the blind spot so a followed NT's
+	// COMPETITIVE fixtures (not just friendlies) surface in the schedule + fire alerts.
+	"uefa.w.nations", "fifa.wworldq.uefa", "afc.w.asian.cup", "caf.w.nations",
+	"conmebol.america.femenina", "fifa.wwcq.ply", "fifa.w.concacaf.olympicsq", "global.pinatar_cup",
 ];
 const NATIONAL_TEAMS_TTL = 24 * 3600;
 
-const NATIONAL_TEAMS_CV = "2"; // bump to drop the stale edge-cached directory after a feed change
+const NATIONAL_TEAMS_CV = "3"; // bump to drop the stale edge-cached directory after a feed change
 async function handleNationalTeams(ctx: ExecutionContext): Promise<Response> {
 	const cacheKey = new Request(`https://nwslapp-proxy/national-teams?cv=${NATIONAL_TEAMS_CV}`, { method: "GET" });
 	const cache = caches.default;
