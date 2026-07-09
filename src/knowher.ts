@@ -17,6 +17,10 @@ import { adminAuthed, adminRealm } from "./admin-auth.ts";
 
 export const KNOWHER_POOL_KEY = "knowher-pool-v1"; // KV: the live pool document (this week's players)
 export const KNOWHER_MODE_KEY = "knowher:mode"; // KV: "manual" | "auto" (default manual)
+// Per-season "already featured" ledger (docs §4 "once per season, hard"): key `knowher:featured:{season}`.
+// A player featured this season is removed from the eligible pool so the weekly pick advances through the
+// roster (a season = a learning curriculum) instead of repeating stars. First per-team+season KV state.
+export const KNOWHER_FEATURED_PREFIX = "knowher:featured:"; // + season, e.g. "knowher:featured:2026"
 
 // The four question categories mirror the app's F3 labels (docs §7):
 //   herGame = Her game · herStory = Her story · herWorld = Her world · trueOrFalse = True or false
@@ -116,13 +120,38 @@ export interface EligiblePlayer {
   starts: number;
   minutes: number;
   appearances: number;
+  // Attached so /knowher/todo can hand the weekly generator VERIFIED stats (it must USE these numbers,
+  // never look them up — docs §5b). Keys resolved live from ESPN's `offensive` category.
+  goals: number;
+  assists: number;
+  shots: number;
+  shotsOnTarget: number;
 }
 
-/** Roster-learning eligible pool for one team+season (docs §4): every rostered player who
- *  STARTED ≥ 1 match this season, minus already-featured ids, ranked core-starters-first
- *  (starts desc, then minutes desc — a season is a learning curriculum). Pure subs (0 starts)
- *  and unplayed players (no stats) auto-drop. Reuses the bracket engine's ESPN primitives.
- *  Best-effort per player; a stat-fetch failure just excludes that player (never throws). */
+/** Pure ranking + gate + season-tail fallback (docs §4), split out so it's unit-testable without the
+ *  network. The eligible pool = anyone who has PLAYED (starts ≥ 1 OR minutes > 0), minus already-featured
+ *  ids. Ranked core-starters-first: starts desc, then minutes desc. This single ranking makes the
+ *  "season-tail fallback" emerge for free — while any unfeatured STARTER remains it sorts to the top; once
+ *  all starters are featured (removed via the ledger), the highest-minutes SUPERSUB (starts 0, minutes > 0)
+ *  is next. Unplayed players (no minutes) drop out. The tiebreak is athleteId (NOT name → not A–Z, so no
+ *  club/player is permanently buried); combined with once-per-season removal, that satisfies §4's
+ *  "weekly-deterministic, fair" ordering without a separate week seed. */
+export function rankEligible(players: EligiblePlayer[], excludeIds: Set<string> = new Set()): EligiblePlayer[] {
+  const eligible = players.filter((p) => !excludeIds.has(p.athleteId) && (p.starts >= 1 || p.minutes > 0));
+  eligible.sort((a, b) => b.starts - a.starts || b.minutes - a.minutes || (a.athleteId < b.athleteId ? -1 : 1));
+  return eligible;
+}
+
+/** This week's featured pick for a team = the top of the ranked, not-yet-featured pool (or null if none
+ *  left). Pure. Progression across the season comes from the once-per-season ledger removing each pick. */
+export function pickWeeklyFeatured(eligible: EligiblePlayer[]): EligiblePlayer | null {
+  return eligible[0] ?? null;
+}
+
+/** Roster-learning eligible pool for one team+season (docs §4). Reuses the bracket engine's ESPN
+ *  primitives, then defers gate/rank/fallback to the pure `rankEligible`. Best-effort per player; a
+ *  stat-fetch failure just excludes that player (never throws). Pass the season's featured ids to skip
+ *  already-featured players. */
 export async function computeEligiblePlayers(
   teamAbbr: string,
   year: number,
@@ -136,26 +165,75 @@ export async function computeEligiblePlayers(
   const ids = roster.map((p) => p.id).filter((id) => !excludeIds.has(id));
   const stats = await fetchStatsForMany(ids, year);
 
-  const eligible: EligiblePlayer[] = [];
-  for (const p of roster) {
-    if (excludeIds.has(p.id)) continue;
+  const players: EligiblePlayer[] = roster.map((p) => {
     const s = stats.get(p.id);
-    const starts = Math.round(s?.["general.starts"] ?? 0);
-    if (starts < 1) continue; // gate: must have started ≥ 1 match this season
-    eligible.push({
+    return {
       athleteId: p.id,
       name: p.name,
       jersey: p.jersey,
       position: p.position,
       team: p.team,
-      starts,
+      starts: Math.round(s?.["general.starts"] ?? 0),
       minutes: Math.round(s?.["general.minutes"] ?? 0),
       appearances: Math.round(s?.["general.appearances"] ?? 0),
-    });
+      goals: Math.round(s?.["offensive.totalGoals"] ?? 0),
+      assists: Math.round(s?.["offensive.goalAssists"] ?? 0),
+      shots: Math.round(s?.["offensive.totalShots"] ?? 0),
+      shotsOnTarget: Math.round(s?.["offensive.shotsOnTarget"] ?? 0),
+    };
+  });
+  return rankEligible(players, excludeIds);
+}
+
+// ── Featured ledger (once-per-season) ───────────────────────────────────────────
+export interface FeaturedEntry {
+  athleteId: string;
+  teamAbbr: string;
+  weekKey: string;
+}
+interface FeaturedLedger {
+  season: number;
+  featured: FeaturedEntry[];
+}
+
+/** The set of athleteIds already featured this season (empty if the ledger doesn't exist yet). */
+export async function readFeaturedIds(env: KnowHerEnv, season: number): Promise<Set<string>> {
+  const doc = (await env.FEED_TAGS.get(`${KNOWHER_FEATURED_PREFIX}${season}`, "json")) as FeaturedLedger | null;
+  return new Set((doc?.featured ?? []).map((f) => f.athleteId));
+}
+
+/** Mark players featured for the season (idempotent — re-marking an existing id is a no-op, so re-pasting
+ *  the same pool to fix a typo is harmless). Called on every live pool write. Returns the ledger size. */
+export async function markFeatured(
+  env: KnowHerEnv,
+  season: number,
+  weekKey: string,
+  players: Array<{ athleteId: string; teamAbbr: string }>,
+): Promise<number> {
+  const key = `${KNOWHER_FEATURED_PREFIX}${season}`;
+  const doc = ((await env.FEED_TAGS.get(key, "json")) as FeaturedLedger | null) ?? { season, featured: [] };
+  const seen = new Set(doc.featured.map((f) => f.athleteId));
+  for (const p of players) {
+    if (p.athleteId && !seen.has(p.athleteId)) {
+      doc.featured.push({ athleteId: p.athleteId, teamAbbr: p.teamAbbr, weekKey });
+      seen.add(p.athleteId);
+    }
   }
-  // Core-starters-first, deterministic (id tiebreak so the order is stable run-to-run).
-  eligible.sort((a, b) => b.starts - a.starts || b.minutes - a.minutes || (a.athleteId < b.athleteId ? -1 : 1));
-  return eligible;
+  await env.FEED_TAGS.put(key, JSON.stringify(doc));
+  return doc.featured.length;
+}
+
+/** Remove one athleteId from the season ledger (operator fix for a mistaken feature). Returns true if it
+ *  was present. */
+export async function unfeature(env: KnowHerEnv, season: number, athleteId: string): Promise<boolean> {
+  const key = `${KNOWHER_FEATURED_PREFIX}${season}`;
+  const doc = (await env.FEED_TAGS.get(key, "json")) as FeaturedLedger | null;
+  if (!doc) return false;
+  const before = doc.featured.length;
+  doc.featured = doc.featured.filter((f) => f.athleteId !== athleteId);
+  if (doc.featured.length === before) return false;
+  await env.FEED_TAGS.put(key, JSON.stringify(doc));
+  return true;
 }
 
 // ── Operator admin ────────────────────────────────────────────────────────────
@@ -201,8 +279,11 @@ async function knowHerAdminOp(env: KnowHerEnv, op: string, body: Record<string, 
     case "state": {
       const mode = (await env.FEED_TAGS.get(KNOWHER_MODE_KEY)) ?? "manual";
       const pool = (await env.FEED_TAGS.get(KNOWHER_POOL_KEY, "json")) as KnowHerPool | null;
+      const season = pool?.season ?? new Date().getUTCFullYear();
+      const featuredThisSeason = (await readFeaturedIds(env, season)).size;
       return {
         mode,
+        featuredThisSeason,
         pool: pool
           ? {
               weekKey: pool.weekKey,
@@ -226,7 +307,12 @@ async function knowHerAdminOp(env: KnowHerEnv, op: string, body: Record<string, 
       const v = validateKnowHerPool(body.pool);
       if ("error" in v) return { error: v.error };
       await env.FEED_TAGS.put(KNOWHER_POOL_KEY, JSON.stringify(v.pool));
-      return { ok: true, playerCount: v.pool.players.length, note: "Live within ~5 min (the /knowher edge cache TTL)." };
+      // Mark this pool's players featured-this-season so they drop out of future eligibility (idempotent).
+      const featuredThisSeason = await markFeatured(
+        env, v.pool.season, v.pool.weekKey,
+        v.pool.players.map((p) => ({ athleteId: p.espnAthleteId, teamAbbr: p.teamAbbreviation })),
+      );
+      return { ok: true, playerCount: v.pool.players.length, featuredThisSeason, note: "Live within ~5 min (the /knowher edge cache TTL)." };
     }
     case "upsertPlayer": {
       // Merge ONE player into the existing pool (replace by team, or add) — so a single player's
@@ -241,6 +327,7 @@ async function knowHerAdminOp(env: KnowHerEnv, op: string, body: Record<string, 
       const others = pool.players.filter((p) => p.teamAbbreviation.toUpperCase() !== abbr);
       const updated: KnowHerPool = { ...pool, players: [...others, player] };
       await env.FEED_TAGS.put(KNOWHER_POOL_KEY, JSON.stringify(updated));
+      await markFeatured(env, updated.season, updated.weekKey, [{ athleteId: player.espnAthleteId, teamAbbr: abbr }]);
       return { ok: true, updatedTeam: abbr, playerName: player.playerName, questions: player.questions.length,
                playerCount: updated.players.length, note: "Live within ~5 min (the /knowher edge cache TTL)." };
     }
@@ -248,8 +335,17 @@ async function knowHerAdminOp(env: KnowHerEnv, op: string, body: Record<string, 
       const team = String(body.team ?? "").toUpperCase();
       if (!team) return { error: "team required" };
       const year = Number(body.year) || new Date().getUTCFullYear();
-      const players = await computeEligiblePlayers(team, year);
-      return { team, year, count: players.length, players };
+      // Exclude players already featured this season so the view shows who's still pickable.
+      const featured = await readFeaturedIds(env, year);
+      const players = await computeEligiblePlayers(team, year, featured);
+      return { team, year, count: players.length, featuredThisSeason: featured.size, players };
+    }
+    case "unfeature": {
+      const season = Number(body.season) || new Date().getUTCFullYear();
+      const athleteId = String(body.athleteId ?? "").trim();
+      if (!athleteId) return { error: "athleteId required" };
+      const removed = await unfeature(env, season, athleteId);
+      return { ok: removed, athleteId, season, note: removed ? "Removed from the season ledger — pickable again." : "Not in the ledger." };
     }
     default:
       return { error: `unknown op "${op}"` };
@@ -294,9 +390,14 @@ const KNOWHER_ADMIN_HTML = `<!doctype html>
   <button onclick="setMode('auto')">Set AUTO (weekly generator — deferred)</button>
 </div>
 
-<h2>Eligible players (roster-learning: started ≥ 1 this season)</h2>
+<h2>Eligible players (roster-learning: played this season, not yet featured)</h2>
 <div class="row"><input id="team" placeholder="team abbr e.g. WAS" style="width:160px"><button onclick="eligible()">Look up</button></div>
 <div id="elig" class="card muted">—</div>
+<small class="muted">Starters (starts ≥ 1) rank first; season-tail supersubs (0 starts, minutes &gt; 0) follow. Already-featured players are excluded.</small>
+
+<h2>Un-feature a player (fix a mistake)</h2>
+<small>Removes an athleteId from this season's featured ledger so they're pickable again.</small>
+<div class="row"><input id="unfeatId" placeholder="espnAthleteId e.g. 317423" style="width:200px"><button onclick="unfeature()">Un-feature</button></div>
 
 <h2>Update ONE player</h2>
 <small>Paste a SINGLE player object (with "teamAbbreviation", "espnAthleteId", … and its "questions"). Merges into the pool BY TEAM — the other players stay put. This is the quick per-player edit.</small>
@@ -317,7 +418,7 @@ async function api(op, extra) {
 async function refresh() {
   try {
     const s = await api('state');
-    document.getElementById('mode').textContent = 'mode: ' + s.mode;
+    document.getElementById('mode').textContent = 'mode: ' + s.mode + ' · featured this season: ' + (s.featuredThisSeason ?? 0);
     const el = document.getElementById('state');
     if (!s.pool) { el.textContent = 'No pool loaded yet.'; return; }
     let html = '<b>' + s.pool.weekKey + '</b> · season ' + s.pool.season + ' · ' + s.pool.playerCount + ' players<table><tr><th>Team</th><th>Player</th><th>Qs</th></tr>';
@@ -339,6 +440,12 @@ async function eligible() {
     document.getElementById('elig').innerHTML = html + '</table>';
     msg('Found ' + r.count + ' eligible for ' + team + '.');
   } catch (e) { msg(String(e), true); }
+}
+async function unfeature() {
+  const athleteId = document.getElementById('unfeatId').value.trim();
+  if (!athleteId) return msg('Enter an espnAthleteId.', true);
+  try { const r = await api('unfeature', { athleteId }); if (r.error) return msg(r.error, true); msg(r.note + ' (' + athleteId + ')'); refresh(); }
+  catch (e) { msg(String(e), true); }
 }
 async function saveOnePlayer() {
   let v;
