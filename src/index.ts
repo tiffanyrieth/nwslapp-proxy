@@ -24,6 +24,8 @@ import { buildHeadshotMap, handleHeadshots } from "./headshots.ts";
 import {
 	handleKnowHerAdmin,
 	computeEligiblePlayers,
+	readFeaturedIds,
+	pickWeeklyFeatured,
 	filterPoolByTeams,
 	KNOWHER_POOL_KEY,
 	type KnowHerPool,
@@ -675,6 +677,9 @@ export default {
 		if (url.pathname === "/knowher/eligible") {
 			return handleKnowHerEligible(url, env);
 		}
+		if (url.pathname === "/knowher/todo") {
+			return handleKnowHerTodo(url, env, ctx);
+		}
 		if (url.pathname === "/quiz-results") {
 			return handleQuizResults(url, env as unknown as { SUPABASE_URL?: string; SUPABASE_SERVICE_ROLE_KEY?: string }, ctx);
 		}
@@ -712,7 +717,7 @@ export default {
 		}
 
 		return new Response(
-			"Not found. This proxy serves GET /scoreboard, /summary, /weather, /team-videos, /feed, /spotlight, /trivia, /knowher, /knowher/eligible, /quiz-results, /headshots, /crest, /crest/manifest, /roster, /national-teams, /playoff-override, and POST /telemetry.",
+			"Not found. This proxy serves GET /scoreboard, /summary, /weather, /team-videos, /feed, /spotlight, /trivia, /knowher, /knowher/eligible, /knowher/todo, /quiz-results, /headshots, /crest, /crest/manifest, /roster, /national-teams, /playoff-override, and POST /telemetry.",
 			{ status: 404 },
 		);
 	},
@@ -3076,19 +3081,57 @@ async function handleKnowHerEligible(url: URL, env: Env): Promise<Response> {
 	if (hit) return withCacheStatus(hit, "HIT");
 
 	let players;
+	let featuredCount = 0;
 	try {
-		players = await computeEligiblePlayers(team, year);
+		const featured = await readFeaturedIds(env as unknown as KnowHerEnv, year);
+		featuredCount = featured.size;
+		players = await computeEligiblePlayers(team, year, featured);
 	} catch {
 		return upstreamError();
 	}
 	const headers = new Headers();
 	headers.set("Content-Type", "application/json");
 	headers.set("Cache-Control", `public, max-age=${KNOWHER_ELIGIBLE_TTL}`);
-	const body = new Response(JSON.stringify({ team, year, count: players.length, players }), { status: 200, headers });
+	const body = new Response(JSON.stringify({ team, year, count: players.length, featuredThisSeason: featuredCount, players }), { status: 200, headers });
 	if (players.length > 0) {
 		// Note: no ctx here (admin/debug endpoint) — cache synchronously via the returned clone.
 		await cache.put(cacheKey, body.clone());
 	}
+	return withCacheStatus(body, "MISS");
+}
+
+/** `GET /knowher/todo?team=WAS` — the weekly generation feed (docs §5b): THIS week's featured pick for one
+ *  team, WITH verified ESPN stats attached, so the (later-automated) Claude routine never fetches stats —
+ *  only fun facts. Per-team by design: one team ≈ 28 ESPN subrequests (safe under the free 50/invocation
+ *  cap); the routine loops 16 quick calls. Excludes already-featured players (once-per-season ledger); a
+ *  null player in-season is a loud diag (nobody left to feature = a real signal, not a silent empty). */
+async function handleKnowHerTodo(url: URL, env: Env, ctx: ExecutionContext): Promise<Response> {
+	const team = (url.searchParams.get("team") ?? "").toUpperCase();
+	if (!team) return new Response(`Missing ?team=`, { status: 400 });
+	const year = Number(url.searchParams.get("year")) || new Date().getUTCFullYear();
+	const cache = caches.default;
+	const cacheKey = new Request(url.toString(), { method: "GET" });
+	const hit = await cache.match(cacheKey);
+	if (hit) return withCacheStatus(hit, "HIT");
+
+	let player;
+	try {
+		const featured = await readFeaturedIds(env as unknown as KnowHerEnv, year);
+		const eligible = await computeEligiblePlayers(team, year, featured);
+		player = pickWeeklyFeatured(eligible);
+	} catch {
+		return upstreamError();
+	}
+	// No one left to feature. In-season (Mar–Nov) that's worth a loud signal; offseason it's expected.
+	if (!player) {
+		const month = new Date().getUTCMonth() + 1;
+		if (month >= 3 && month <= 11) emitDiag(env, ctx, "knowherTodoEmpty", `team=${team} season=${year}`);
+	}
+	const headers = new Headers();
+	headers.set("Content-Type", "application/json");
+	headers.set("Cache-Control", `public, max-age=${KNOWHER_ELIGIBLE_TTL}`);
+	const body = new Response(JSON.stringify({ team, year, season: year, player }), { status: 200, headers });
+	if (player) ctx.waitUntil(cache.put(cacheKey, body.clone()));
 	return withCacheStatus(body, "MISS");
 }
 
