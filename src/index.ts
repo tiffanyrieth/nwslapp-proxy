@@ -659,7 +659,9 @@ export default {
 			if (!SCOREBOARD_LEAGUES.has(league)) {
 				return new Response(`Unknown league "${league}".`, { status: 400 });
 			}
-			return proxyAndCache(url, scoreboardUpstream(league), chooseScoreboardTTL, ctx);
+			// bustUpstream: ESPN serves the full-season scoreboard STALE for tens of minutes during
+			// live games; force a recompute on every MISS so the app's 30s poll gets fresh data.
+			return proxyAndCache(url, scoreboardUpstream(league), chooseScoreboardTTL, ctx, true);
 		}
 		if (url.pathname === "/summary") {
 			// Missing `?event=` isn't validated here — forwarded verbatim, letting
@@ -777,6 +779,13 @@ async function proxyAndCache(
 	upstreamBase: string,
 	chooseTTL: (body: ArrayBuffer) => number,
 	ctx: ExecutionContext,
+	// When true, append a per-fetch `_cb` cache-buster to the UPSTREAM (ESPN) URL only — the edge
+	// cache key stays the clean incoming URL, so app traffic still collapses to ≤2 ESPN hits/min. Used
+	// by /scoreboard: ESPN's own cache serves the full-season `dates=` query STALE for 25–47 min during
+	// live games (device-proven 2026-07-11 — a game stuck at `pre`/`HT`/`70'` while reality was 90'+),
+	// and only a query it hasn't cached forces a recompute. `_cb` is the same mechanism the watcher's
+	// VAR re-poll uses; every un-stuck moment that night came from exactly this poke.
+	bustUpstream = false,
 ): Promise<Response> {
 	// Cache key = the incoming URL (query string included), so different
 	// `dates`/`limit` or `event` values are cached independently.
@@ -801,6 +810,9 @@ async function proxyAndCache(
 	// ESPN must never see it; the caller computes it because only the caller knows kickoff
 	// at request time (the proxy would need the body it hasn't fetched yet).
 	upstream.searchParams.delete("w");
+	// Force ESPN to recompute rather than serve its own stale cache (see bustUpstream). Cache-key
+	// unaffected — this param is added AFTER `cacheKey` was built from the clean incoming URL.
+	if (bustUpstream) upstream.searchParams.set("_cb", String(Date.now()));
 
 	let espnResponse: Response;
 	try {
