@@ -111,12 +111,32 @@ export function filterPoolByTeams(pool: KnowHerPool, teams: string[]): KnowHerPo
   return { ...pool, players: pool.players.filter((p) => want.has(p.teamAbbreviation.toUpperCase())) };
 }
 
+/** ISO-8601 week (Monday-start) as "YYYY-Www" — the weekKey convention the pool stamps and the app's
+ *  KnowHerGameStore parses. TS twin of the helper in scripts/assemble_knowher_prompt.mjs — the shared
+ *  test (test/knowher.test.ts) locks both implementations to the same cases; change them in lock-step.
+ *  Used by the serving path's staleness telemetry (a pool left behind the current week = the weekly
+ *  automation silently failed — must be loud, never invisible). */
+export function isoWeekKey(date: Date = new Date()): string {
+  const d = new Date(Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), date.getUTCDate()));
+  const day = d.getUTCDay() || 7; // Mon=1 … Sun=7
+  d.setUTCDate(d.getUTCDate() + 4 - day); // shift to the Thursday of this ISO week
+  const isoYear = d.getUTCFullYear();
+  const yearStart = new Date(Date.UTC(isoYear, 0, 1));
+  const week = Math.ceil(((d.getTime() - yearStart.getTime()) / 86_400_000 + 1) / 7);
+  return `${isoYear}-W${String(week).padStart(2, "0")}`;
+}
+
 export interface EligiblePlayer {
   athleteId: string;
   name: string;
   jersey: number | null;
   position: string;
   team: string;
+  // Bio fields from the ESPN roster — the weekly generation prompt's player block byte-matches the
+  // proven Rodman format ("age 24, USA"), so /knowher/todo serves them alongside the stats. null when
+  // ESPN omits them (the assembler then drops that fragment rather than fabricating).
+  age: number | null;
+  country: string | null;
   starts: number;
   minutes: number;
   appearances: number;
@@ -126,6 +146,11 @@ export interface EligiblePlayer {
   assists: number;
   shots: number;
   shotsOnTarget: number;
+  // Keeper stats (ESPN `goalKeeping` category) — a GOALKEEPER pick's offensive numbers are all zero,
+  // which would strand the generator's "USE THESE NUMBERS" rule with nothing usable. Zero for outfield
+  // players; the assembler emits a keeper stat line (clean sheets / saves) when position is GK.
+  cleanSheets: number;
+  saves: number;
 }
 
 /** Pure ranking + gate + season-tail fallback (docs §4), split out so it's unit-testable without the
@@ -173,6 +198,8 @@ export async function computeEligiblePlayers(
       jersey: p.jersey,
       position: p.position,
       team: p.team,
+      age: p.age ?? null,
+      country: p.country ?? null,
       starts: Math.round(s?.["general.starts"] ?? 0),
       minutes: Math.round(s?.["general.minutes"] ?? 0),
       appearances: Math.round(s?.["general.appearances"] ?? 0),
@@ -180,6 +207,8 @@ export async function computeEligiblePlayers(
       assists: Math.round(s?.["offensive.goalAssists"] ?? 0),
       shots: Math.round(s?.["offensive.totalShots"] ?? 0),
       shotsOnTarget: Math.round(s?.["offensive.shotsOnTarget"] ?? 0),
+      cleanSheets: Math.round(s?.["goalKeeping.cleanSheet"] ?? 0),
+      saves: Math.round(s?.["goalKeeping.saves"] ?? 0),
     };
   });
   return rankEligible(players, excludeIds);
@@ -243,6 +272,10 @@ export async function unfeature(env: KnowHerEnv, season: number, athleteId: stri
 export interface KnowHerEnv {
   FEED_TAGS: KVNamespace;
   BRACKET_ADMIN_KEY?: string;
+  /** Dedicated secret for the automated weekly /knowher/ingest POST — deliberately NOT the master
+   *  BRACKET_ADMIN_KEY (the weekly Claude routine holds this key, so its blast radius is one feature
+   *  and it rotates independently of every other admin surface). */
+  KNOWHER_INGEST_KEY?: string;
 }
 
 const ADMIN_REALM = adminRealm("Know Her Game Admin");
@@ -274,6 +307,25 @@ export async function handleKnowHerAdmin(request: Request, env: KnowHerEnv): Pro
   }
 }
 
+/** The ONE publish path: validate → replace the live pool in KV → mark this pool's players
+ *  featured-this-season (idempotent) so they drop out of future eligibility. Shared by the operator's
+ *  admin `pasteContent` op AND the automated weekly `/knowher/ingest` — publishing must always run
+ *  markFeatured or the once-per-season pick rotation stalls (the KV-direct load_knowher.mjs script
+ *  bypasses it; never use that for weekly publishing). */
+export async function publishKnowHerPool(
+  env: KnowHerEnv,
+  poolInput: unknown,
+): Promise<{ ok: true; weekKey: string; playerCount: number; featuredThisSeason: number; note: string } | { error: string }> {
+  const v = validateKnowHerPool(poolInput);
+  if ("error" in v) return { error: v.error };
+  await env.FEED_TAGS.put(KNOWHER_POOL_KEY, JSON.stringify(v.pool));
+  const featuredThisSeason = await markFeatured(
+    env, v.pool.season, v.pool.weekKey,
+    v.pool.players.map((p) => ({ athleteId: p.espnAthleteId, teamAbbr: p.teamAbbreviation })),
+  );
+  return { ok: true, weekKey: v.pool.weekKey, playerCount: v.pool.players.length, featuredThisSeason, note: "Live within ~5 min (the /knowher edge cache TTL)." };
+}
+
 async function knowHerAdminOp(env: KnowHerEnv, op: string, body: Record<string, unknown>): Promise<unknown> {
   switch (op) {
     case "state": {
@@ -303,17 +355,8 @@ async function knowHerAdminOp(env: KnowHerEnv, op: string, body: Record<string, 
       await env.FEED_TAGS.put(KNOWHER_MODE_KEY, mode);
       return { ok: true, mode };
     }
-    case "pasteContent": {
-      const v = validateKnowHerPool(body.pool);
-      if ("error" in v) return { error: v.error };
-      await env.FEED_TAGS.put(KNOWHER_POOL_KEY, JSON.stringify(v.pool));
-      // Mark this pool's players featured-this-season so they drop out of future eligibility (idempotent).
-      const featuredThisSeason = await markFeatured(
-        env, v.pool.season, v.pool.weekKey,
-        v.pool.players.map((p) => ({ athleteId: p.espnAthleteId, teamAbbr: p.teamAbbreviation })),
-      );
-      return { ok: true, playerCount: v.pool.players.length, featuredThisSeason, note: "Live within ~5 min (the /knowher edge cache TTL)." };
-    }
+    case "pasteContent":
+      return publishKnowHerPool(env, body.pool);
     case "upsertPlayer": {
       // Merge ONE player into the existing pool (replace by team, or add) — so a single player's
       // JSON can be pasted without re-sending the whole 16-team pool. Keeps the pool's weekKey/season.

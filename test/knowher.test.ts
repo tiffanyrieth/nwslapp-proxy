@@ -14,8 +14,9 @@ import { rankEligible, pickWeeklyFeatured, type EligiblePlayer } from "../src/kn
 function p(athleteId: string, starts: number, minutes: number, over: Partial<EligiblePlayer> = {}): EligiblePlayer {
 	return {
 		athleteId, name: `P${athleteId}`, jersey: 1, position: "F", team: "WAS",
+		age: null, country: null,
 		starts, minutes, appearances: Math.max(starts, minutes > 0 ? 1 : 0),
-		goals: 0, assists: 0, shots: 0, shotsOnTarget: 0, ...over,
+		goals: 0, assists: 0, shots: 0, shotsOnTarget: 0, cleanSheets: 0, saves: 0, ...over,
 	};
 }
 
@@ -66,3 +67,30 @@ test("pickWeeklyFeatured: top of the ranked pool, or null when nobody is left", 
 	assert.equal(pickWeeklyFeatured(rankEligible([p("a", 3, 300), p("b", 9, 800)]))?.athleteId, "b");
 	assert.equal(pickWeeklyFeatured(rankEligible([p("x", 0, 0)])), null); // unplayed → empty → null
 });
+
+// ── isoWeekKey: the weekKey convention (Mon-start ISO week, "YYYY-Www") ─────────────────────────
+// TWO implementations exist on purpose (the Worker's staleness check in src/knowher.ts and the
+// assembler's in scripts/assemble_knowher_prompt.mjs — a Node script can't import Worker code paths
+// at runtime). This suite runs BOTH against the same cases so they can never drift apart.
+
+import { isoWeekKey as tsWeek } from "../src/knowher.ts";
+import { isoWeekKey as mjsWeek } from "../scripts/assemble_knowher_prompt.mjs";
+
+const WEEK_CASES = [
+	["2026-07-13", "2026-W29"], // a Monday mid-season (this build's live-verified assembly run)
+	["2026-07-19", "2026-W29"], // the Sunday of the same ISO week — same key all week
+	["2026-07-20", "2026-W30"], // next Monday rolls the key
+	["2026-01-01", "2026-W01"], // 2026-01-01 is a Thursday → W01
+	["2026-12-28", "2026-W53"], // a Monday; 2026 has 53 ISO weeks
+	["2027-01-01", "2026-W53"], // Friday of that same week → still the PRIOR iso-year's W53
+	["2024-12-30", "2025-W01"], // a Monday belonging to the NEXT iso-year's W01
+	["2025-01-05", "2025-W01"], // …and its Sunday
+];
+
+for (const [iso, want] of WEEK_CASES) {
+	test(`isoWeekKey(${iso}) = ${want} in both implementations`, () => {
+		const d = new Date(`${iso}T12:00:00Z`);
+		assert.equal(tsWeek(d), want, "src/knowher.ts");
+		assert.equal(mjsWeek(d), want, "scripts/assemble_knowher_prompt.mjs");
+	});
+}

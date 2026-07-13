@@ -1,10 +1,18 @@
-# Know Her Game — content generation prompt (16 players, batch)
+<!--
+  Know Her Game — CANONICAL weekly generation template (automation).
 
-This is the **fine-tuned Rodman-WORKING template scaled to 16 players** (one per NWSL club). It replaces the
-old stat-heavy batch prompt (that one produced dry, gimme-heavy quizzes with weak facts — the reason we
-narrowed to a single player to tune). Everything below is the KNOWN-GOOD single-player approach
-(`knowher-prompt-rodman-WORKING.md`), applied to the whole roster. Run it against a capable, web-search-enabled
-model; paste the JSON into the proxy's `/knowher/admin` portal. Manual run — this file changes nothing live.
+  Provenance: this is the PROVEN Rodman-WORKING query (scripts/knowher-prompt-rodman-WORKING.md — the
+  gold standard, keep untouched) scaled to 16 players, with the owner's 2026-07-13 fidelity rulings
+  applied: ">=6 MUST be human" (not "should"), NO web-search cap, thin-coverage anti-fabrication rule
+  kept, and all operator notes moved into THIS comment so the model receives exactly the Rodman-shaped
+  query. The wording below is DELICATE and owner-owned — never change it without an explicit owner
+  decision (query fidelity is the product).
+
+  Usage: scripts/assemble_knowher_prompt.mjs strips this comment and substitutes the two placeholders —
+  <<WEEK_KEY>> (ISO week, e.g. 2026-W29) and <<PLAYER_LIST>> (one block per team from /knowher/todo).
+  The assembled output IS the prompt; run it on a web-search-enabled Sonnet and POST the JSON to
+  /knowher/ingest (see scripts/knowher-weekly-routine.md). This file changes nothing live.
+-->
 
 You're writing a ~10-question quiz **for each player below** for a **women's soccer fandom app**. This is NOT a
 stats app. The legacy sports apps are male-focused, stat-heavy, and when they cover women's sports they do a
@@ -15,42 +23,11 @@ relatable detail like "she travels with her PS5" is gold).
 
 ## The players (verified 2026 stats — USE THESE NUMBERS, don't look stats up)
 
-- Sveindís Jónsdóttir — Angel City FC (LA) — Forward, #32 — age 25, Iceland — espnAthleteId 317692
-  2026 season: 7 starts, 625 minutes, 7 appearances, 3 goals, 2 assists
-- Racheal Kundananji — Bay FC (BAY) — Forward, #9 — age 26, Zambia — espnAthleteId 310652
-  2026 season: 6 starts, 558 minutes, 8 appearances, 1 goal, 0 assists
-- Nichelle Prince — Boston Legacy FC (BOS) — Forward, #12 — age 31, Canada — espnAthleteId 225339
-  2026 season: 11 starts, 909 minutes, 12 appearances, 1 goal, 2 assists
-- Mallory Swanson — Chicago Stars FC (CHI) — Forward, #9 — age 28, USA — espnAthleteId 233163
-  2026 season: 1 start, 122 minutes, 3 appearances, 1 goal, 0 assists
-- Yazmeen Ryan — Denver Summit FC (DEN) — Forward, #9 — age 27, USA — espnAthleteId 263902
-  2026 season: 10 starts, 903 minutes, 11 appearances, 2 goals, 3 assists
-- Rose Lavelle — Gotham FC (GFC) — Midfielder, #16 — age 31, USA — espnAthleteId 209984
-  2026 season: 7 starts, 660 minutes, 9 appearances, 2 goals, 0 assists
-- Jane Campbell — Houston Dash (HOU) — Goalkeeper, #1 — age 31, USA — espnAthleteId 212207
-  2026 season: 11 starts, 983 minutes, 11 appearances, 3 clean sheets
-- Temwa Chawinga — Kansas City Current (KC) — Forward, #6 — age 27, Malawi — espnAthleteId 379824
-  2026 season: 8 starts, 545 minutes, 8 appearances, 7 goals, 2 assists
-- Ashley Sanchez — North Carolina Courage (NC) — Midfielder, #2 — age 27, USA — espnAthleteId 279297
-  2026 season: 11 starts, 942 minutes, 11 appearances, 7 goals, 1 assist
-- Marta — Orlando Pride (ORL) — Forward, #10 — age 40, Brazil — espnAthleteId 158712
-  2026 season: 2 starts, 223 minutes, 7 appearances, 1 goal, 0 assists
-- Sophia Wilson — Portland Thorns FC (POR) — Forward, #9 — age 25, USA — espnAthleteId 43770
-  2026 season: 10 starts, 922 minutes, 13 appearances, 5 goals, 1 assist
-- Emma Sears — Racing Louisville FC (LOU) — Midfielder, #13 — age 25, USA — espnAthleteId 293305
-  2026 season: 9 starts, 774 minutes, 10 appearances, 2 goals, 3 assists
-- Ludmila — San Diego Wave FC (SD) — Forward, #17 — age 31, Brazil — espnAthleteId 258819
-  2026 season: 12 starts, 934 minutes, 13 appearances, 1 goal, 0 assists
-- Jess Fishlock — Seattle Reign FC (SEA) — Midfielder, #10 — age 39, Wales — espnAthleteId 259621
-  2026 season: 5 starts, 345 minutes, 5 appearances, 1 goal, 0 assists
-- Cloé Lacasse — Utah Royals (UTA) — Midfielder, #24 — age 32, Canada — espnAthleteId 317623
-  2026 season: 12 starts, 954 minutes, 12 appearances, 4 goals, 3 assists
-- Trinity Rodman — Washington Spirit (WAS) — Forward, #2 — age 24, USA — espnAthleteId 317423
-  2026 season: 11 starts, 906 minutes, 11 appearances, 3 goals, 4 assists, 36 shots (14 on target)
+<<PLAYER_LIST>>
 
 ## What to produce PER PLAYER (~10 questions) — HUMAN-FIRST
 
-- **At LEAST 6 of the ~10 should be HUMAN / STORY questions** (`herStory` / `herWorld` / `trueOrFalse`):
+- **At LEAST 6 of the ~10 must be HUMAN / STORY questions** (`herStory` / `herWorld` / `trueOrFalse`):
   personality, relatable quirks, life beyond soccer, origin story, career milestones. Most featured players
   have *tons* of these — dig (Google "<player> fun facts", inside and outside soccer). Warm, surprising,
   makes-you-smile details. INTERLEAVE them throughout (never dump them at the end).
@@ -88,7 +65,6 @@ she's dating or which relative is famous.
   social, unsourced blogs. Only cite URLs you actually retrieved — if you can't verify, drop it.
 - **Disambiguate:** confirm each fact is about THIS player (the correct NWSL player + her CURRENT club as
   listed above / her national team) — discard same-or-similar-name namesakes.
-- Keep it TIGHT: **≤ ~3 web searches per player.**
 
 ## Format — fix the True/False trap
 
@@ -110,8 +86,8 @@ Output ONLY this JSON (no prose around it), **every player above included** in t
 
 ```json
 {
-  "weekKey": "2026-W27",
-  "season": 2026,
+  "weekKey": "<<WEEK_KEY>>",
+  "season": <<SEASON>>,
   "players": [
     {
       "teamAbbreviation": "WAS",

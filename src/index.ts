@@ -27,6 +27,8 @@ import {
 	readFeaturedIds,
 	pickWeeklyFeatured,
 	filterPoolByTeams,
+	publishKnowHerPool,
+	isoWeekKey,
 	KNOWHER_POOL_KEY,
 	type KnowHerPool,
 	type KnowHerEnv,
@@ -617,6 +619,16 @@ export default {
 		// the GET-only guard (it serves both methods + does its own BRACKET_ADMIN_KEY check).
 		if (url.pathname === "/knowher/admin" || url.pathname === "/knowher/admin/api") {
 			return handleKnowHerAdmin(request, env as unknown as KnowHerEnv);
+		}
+
+		// Automated weekly Know Her Game publish (docs §5): the scheduled Claude routine POSTs the
+		// generated pool here. Gated by the DEDICATED KNOWHER_INGEST_KEY (x-ingest-key) — never the
+		// master admin key — and reuses the ONE publish path (validate → KV → markFeatured), so the
+		// once-per-season pick rotation always advances. Before the GET-only guard (it's POST +
+		// self-checks its key). Every outcome emits a diag — an automated pipeline's failures must
+		// be loud, never a silent non-publish.
+		if (url.pathname === "/knowher/ingest") {
+			return handleKnowHerIngest(request, env, ctx);
 		}
 
 		// Operator escape hatch: a KV JSON the app layers over its ESPN-derived playoff bracket,
@@ -3074,6 +3086,23 @@ async function handleKnowHer(url: URL, env: Env, ctx: ExecutionContext): Promise
 
 	const filtered = pool ? filterPoolByTeams(pool, teams) : { weekKey: "", season: 0, players: [] };
 	const hasPlayers = filtered.players.length > 0;
+	// Staleness telemetry (weekly-automation watchdog): in-season, a pool whose weekKey lags the
+	// current ISO week means the Monday generation run didn't land — the app keeps serving last
+	// week's players (deliberate graceful degradation), but that must be LOUD server-side, not
+	// invisible. Throttled to one diag/day via KV (cache misses recur every ~5 min all week).
+	if (pool && pool.weekKey !== isoWeekKey()) {
+		const month = new Date().getUTCMonth() + 1;
+		if (month >= 3 && month <= 11) {
+			ctx.waitUntil((async () => {
+				const THROTTLE_KEY = "knowher:stale-diag-at";
+				const last = Number(await env.FEED_TAGS.get(THROTTLE_KEY)) || 0;
+				if (Date.now() - last > 24 * 3600 * 1000) {
+					await env.FEED_TAGS.put(THROTTLE_KEY, String(Date.now()), { expirationTtl: 7 * 24 * 3600 });
+					emitDiag(env, ctx, "knowherStaleWeek", `serving ${pool.weekKey}, current ${isoWeekKey()}`);
+				}
+			})());
+		}
+	}
 	const headers = new Headers();
 	headers.set("Content-Type", "application/json");
 	// Never cache an EMPTY result — not at the edge AND not on the client. An empty response
@@ -3086,6 +3115,41 @@ async function handleKnowHer(url: URL, env: Env, ctx: ExecutionContext): Promise
 		ctx.waitUntil(cache.put(cacheKey, body.clone()));
 	}
 	return withCacheStatus(body, "MISS");
+}
+
+/** `POST /knowher/ingest` — the automated weekly publish (the scheduled Claude routine's target).
+ *  Auth = the dedicated `x-ingest-key` (KNOWHER_INGEST_KEY secret; unset → always 401, same
+ *  fail-closed rule as adminAuthed). Body = the generated pool JSON, either raw or wrapped as
+ *  `{ pool }` (the generator emits the raw document; the wrapper matches the admin op's shape).
+ *  Delegates to the ONE publish path (validate → KV → markFeatured). Diags: every accept AND
+ *  every rejection — the weekly pipeline has no human watching the POST. */
+async function handleKnowHerIngest(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
+	if (request.method !== "POST") {
+		return new Response("Method not allowed. Use POST.", { status: 405, headers: { Allow: "POST" } });
+	}
+	const key = (env as unknown as KnowHerEnv).KNOWHER_INGEST_KEY;
+	if (!key || request.headers.get("x-ingest-key") !== key) {
+		emitDiag(env, ctx, "knowherIngestAuth", key ? "bad x-ingest-key" : "KNOWHER_INGEST_KEY unset");
+		return new Response(JSON.stringify({ error: "unauthorized" }), {
+			status: 401, headers: { "Content-Type": "application/json" },
+		});
+	}
+	let body: Record<string, unknown>;
+	try {
+		body = (await request.json()) as Record<string, unknown>;
+	} catch {
+		emitDiag(env, ctx, "knowherIngestReject", "body is not JSON");
+		return new Response(JSON.stringify({ error: "body must be JSON" }), {
+			status: 400, headers: { "Content-Type": "application/json" },
+		});
+	}
+	const result = await publishKnowHerPool(env as unknown as KnowHerEnv, body.pool ?? body);
+	if ("error" in result) {
+		emitDiag(env, ctx, "knowherIngestReject", result.error.slice(0, 70));
+		return new Response(JSON.stringify(result), { status: 400, headers: { "Content-Type": "application/json" } });
+	}
+	emitDiag(env, ctx, "knowherIngestOk", `${result.weekKey} players=${result.playerCount}`);
+	return new Response(JSON.stringify(result), { status: 200, headers: { "Content-Type": "application/json" } });
 }
 
 /** Roster-learning eligibility for one team (docs §4): `?team=WAS` → the players who started

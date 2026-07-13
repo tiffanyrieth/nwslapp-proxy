@@ -169,7 +169,18 @@ async function emitDiag(env: BracketEnv, kind: string, detail: string): Promise<
 
 // ── ESPN player pool ───────────────────────────────────────────────────────────
 
-export interface RosterPlayer { id: string; name: string; jersey: number | null; team: string; position: string; }
+export interface RosterPlayer {
+  id: string;
+  name: string;
+  jersey: number | null;
+  team: string;
+  position: string;
+  /** Optional bio fields (ESPN roster `age`/`citizenship`) — consumed by Know Her Game's
+   *  /knowher/todo so the weekly generation prompt's player block byte-matches the proven
+   *  Rodman format ("age 24, USA"). Absent → null; nothing else keys on them. */
+  age?: number | null;
+  country?: string | null;
+}
 
 /** ESPN intermittently throttles datacenter (Worker) IPs — a single fetch can come back
  *  non-200 (often 429) or otherwise fail, which (pre-retry) left the bracket generator with
@@ -201,7 +212,10 @@ export async function fetchTeamAbbrs(): Promise<{ id: string; abbr: string }[]> 
 
 export async function fetchRoster(teamId: string, abbr: string): Promise<RosterPlayer[]> {
   const json = await espnJSON<{
-    athletes?: { id?: string; displayName?: string; jersey?: string; position?: { abbreviation?: string } }[];
+    athletes?: {
+      id?: string; displayName?: string; jersey?: string; position?: { abbreviation?: string };
+      age?: number; citizenship?: string;
+    }[];
   }>(`${ESPN_SITE}/teams/${teamId}/roster`);
   return (json.athletes ?? [])
     .filter((a) => a.id && a.displayName)
@@ -211,6 +225,8 @@ export async function fetchRoster(teamId: string, abbr: string): Promise<RosterP
       jersey: a.jersey ? Number(a.jersey) : null,
       team: abbr,
       position: (a.position?.abbreviation ?? "").toUpperCase(),
+      age: typeof a.age === "number" ? a.age : null,
+      country: a.citizenship || null,
     }));
 }
 
