@@ -8,7 +8,14 @@
 // src/knowher.ts validateKnowHerPool + the app's KnowHerGame model) and writes it to KV.
 //
 // The admin page (GET /knowher/admin) does the same paste→KV write interactively; this
-// script is the file-based / scriptable path (and what the deferred auto generator emulates).
+// script is the file-based / scriptable path.
+//
+// ⚠️ LEDGER BYPASS — do NOT use this for weekly publishing. This writes KV directly, so it
+// SKIPS markFeatured: the pool's players never enter the once-per-season featured ledger and
+// /knowher/todo keeps re-picking them (the rotation stalls). Weekly publishing goes through
+// POST /knowher/ingest (the automation) or the admin pasteContent op — both run the ONE
+// validate→KV→markFeatured path. This script remains for --dry-run VALIDATION (the weekly
+// routine uses exactly that) and manual emergency restores.
 //
 // USAGE:
 //   node scripts/load_knowher.mjs [path]            # validate + upload (default: knowher-pool.json)

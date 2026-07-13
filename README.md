@@ -28,6 +28,18 @@ This is **V2 milestone 0.2.0** — deliberately scoped to a single route.
 Out of scope for now: ESPN's teams, roster, and standings endpoints — the app
 still calls those directly.
 
+**Know Her Game weekly automation** (2026-07-13): a scheduled Claude Routine
+(Mon 09:00 UTC) runs `scripts/knowher-weekly-routine.md` — it assembles the
+week's generation prompt via `scripts/assemble_knowher_prompt.mjs` (fills
+`scripts/knowher-weekly-TEMPLATE.md` from `GET /knowher/todo?team=`, one call
+per club), generates the 16-player quiz pool, dry-run validates
+(`scripts/load_knowher.mjs --dry-run`), and publishes via
+**`POST /knowher/ingest`** (dedicated `KNOWHER_INGEST_KEY` secret, header
+`x-ingest-key`; validate → KV → featured-ledger mark, diags on every outcome).
+The serving path emits a `knowherStaleWeek` diag (in-season, throttled 1/day)
+if the live pool's weekKey ever lags the current ISO week. The prompt template
+wording is owner-owned — never edit it without an explicit decision.
+
 ## Example
 
 ```bash
