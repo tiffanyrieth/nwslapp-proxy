@@ -14,8 +14,9 @@ import { rankEligible, pickWeeklyFeatured, type EligiblePlayer } from "../src/kn
 function p(athleteId: string, starts: number, minutes: number, over: Partial<EligiblePlayer> = {}): EligiblePlayer {
 	return {
 		athleteId, name: `P${athleteId}`, jersey: 1, position: "F", team: "WAS",
+		age: null, country: null,
 		starts, minutes, appearances: Math.max(starts, minutes > 0 ? 1 : 0),
-		goals: 0, assists: 0, shots: 0, shotsOnTarget: 0, ...over,
+		goals: 0, assists: 0, shots: 0, shotsOnTarget: 0, cleanSheets: 0, saves: 0, ...over,
 	};
 }
 

@@ -117,6 +117,11 @@ export interface EligiblePlayer {
   jersey: number | null;
   position: string;
   team: string;
+  // Bio fields from the ESPN roster — the weekly generation prompt's player block byte-matches the
+  // proven Rodman format ("age 24, USA"), so /knowher/todo serves them alongside the stats. null when
+  // ESPN omits them (the assembler then drops that fragment rather than fabricating).
+  age: number | null;
+  country: string | null;
   starts: number;
   minutes: number;
   appearances: number;
@@ -126,6 +131,11 @@ export interface EligiblePlayer {
   assists: number;
   shots: number;
   shotsOnTarget: number;
+  // Keeper stats (ESPN `goalKeeping` category) — a GOALKEEPER pick's offensive numbers are all zero,
+  // which would strand the generator's "USE THESE NUMBERS" rule with nothing usable. Zero for outfield
+  // players; the assembler emits a keeper stat line (clean sheets / saves) when position is GK.
+  cleanSheets: number;
+  saves: number;
 }
 
 /** Pure ranking + gate + season-tail fallback (docs §4), split out so it's unit-testable without the
@@ -173,6 +183,8 @@ export async function computeEligiblePlayers(
       jersey: p.jersey,
       position: p.position,
       team: p.team,
+      age: p.age ?? null,
+      country: p.country ?? null,
       starts: Math.round(s?.["general.starts"] ?? 0),
       minutes: Math.round(s?.["general.minutes"] ?? 0),
       appearances: Math.round(s?.["general.appearances"] ?? 0),
@@ -180,6 +192,8 @@ export async function computeEligiblePlayers(
       assists: Math.round(s?.["offensive.goalAssists"] ?? 0),
       shots: Math.round(s?.["offensive.totalShots"] ?? 0),
       shotsOnTarget: Math.round(s?.["offensive.shotsOnTarget"] ?? 0),
+      cleanSheets: Math.round(s?.["goalKeeping.cleanSheet"] ?? 0),
+      saves: Math.round(s?.["goalKeeping.saves"] ?? 0),
     };
   });
   return rankEligible(players, excludeIds);
