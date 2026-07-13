@@ -18,7 +18,7 @@
 
 import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 const BASE = (() => {
   const i = process.argv.indexOf("--base");
@@ -106,6 +106,13 @@ async function fetchPick(abbr) {
   return res.json(); // { team, year, season, player|null }
 }
 
+// Run the assembly ONLY when invoked as the entry script — test/knowher.test.ts imports this module
+// for its isoWeekKey export, and an import must never fire 16 live fetches as a side effect.
+if (import.meta.url === pathToFileURL(process.argv[1] ?? "").href) {
+  await main();
+}
+
+async function main() {
 const template = readFileSync(
   join(dirname(fileURLToPath(import.meta.url)), "knowher-weekly-TEMPLATE.md"),
   "utf8",
@@ -147,3 +154,4 @@ process.stdout.write(
     .replace("<<PLAYER_LIST>>", blocks.join("\n")),
 );
 console.error(`✅ Assembled ${blocks.length}-player prompt for ${weekKey} (season ${season}).`);
+}
