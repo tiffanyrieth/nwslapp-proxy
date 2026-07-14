@@ -32,6 +32,18 @@ exact JSON shape to output. Honor every rule in it, including:
 - The five-layer guardrail and gold-tier sourcing rules for every human question.
 - If a fact can't be verified per those rules, drop it — a harder stat question beats a stretched fact.
 
+⚙️ **HOW to work through the 16 players — keep it LEAN (this is a cost/session rule):**
+- **Do NOT spawn a separate sub-agent per player.** Research and write the players YOURSELF. Spinning up
+  16 parallel research agents multiplies the session's token cost ~16× for no quality gain, and the run
+  is only as fast as the slowest straggler. Work through them sequentially, or in small groups of a few
+  at a time — you have all night, so favor low token cost over wall-clock speed.
+- **Respect the prompt's search budget** (~5–6 searches per player). For a thin-coverage player, once
+  you've spent that, STOP hunting and fall back to hard stat questions — the prompt explicitly allows a
+  5-human/5-stat quiz over a reached-for 6th fact. Don't grind endlessly on obscure players.
+- **jerseyNumber:** use the number in the player's block. If a player's line has no `#N` (ESPN lacked
+  it), do ONE quick lookup of her current squad number — don't turn it into a research detour, and never
+  block the whole run on it.
+
 Save ONLY the JSON document (nothing around it) to `/tmp/knowher-pool.json`. Keep the per-player source
 list separately for your final report (it must NOT be inside the JSON).
 
@@ -60,13 +72,18 @@ failing → **STOP** and report FAILURE with the HTTP status/body (do not echo t
 
 ### 5. Verify live
 
+Verify against a **teams-scoped** query, NOT the empty `?teams=` one — that empty-teams response has its
+own edge-cache entry that commonly still serves LAST week for up to ~5 min after a successful publish (a
+known lag, NOT a failure). Pick two teams you just published and use a fresh cache key:
+
 ```bash
-curl -sS "https://nwslapp-proxy.tiffany-rieth.workers.dev/knowher?teams=" | head -c 200
+curl -sS "https://nwslapp-proxy.tiffany-rieth.workers.dev/knowher?teams=WAS,LA" | head -c 200
 ```
 
-Confirm the served `weekKey` matches this week's and the player count matches what you published.
-(The edge cache is ≤5 min; a just-published pool may take one refresh — check the `weekKey` in the KV-
-backed response body, and if it still shows last week after 2 tries 60s apart, report it.)
+Confirm the served `weekKey` matches this week's. If the ingest POST in step 4 returned `{"ok":true,…}`,
+**the publish already succeeded** — a stale `weekKey` here is just the edge cache catching up, so do NOT
+report a failure over it. Note it in your report if you like, but the step-4 `ok:true` is the source of
+truth. (Don't burn time re-polling; one teams-scoped check is enough.)
 
 ### 6. Report
 

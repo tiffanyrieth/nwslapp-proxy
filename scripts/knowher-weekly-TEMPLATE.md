@@ -65,6 +65,10 @@ she's dating or which relative is famous.
   social, unsourced blogs. Only cite URLs you actually retrieved — if you can't verify, drop it.
 - **Disambiguate:** confirm each fact is about THIS player (the correct NWSL player + her CURRENT club as
   listed above / her national team) — discard same-or-similar-name namesakes.
+- **Search budget (soft):** aim for **~5–6 searches per player**. Well-covered players won't need that
+  many; for a thin-coverage player, once you've spent ~5–6 and the well is dry, STOP — fall back to
+  genuinely-hard stat questions (per the coverage rule above) rather than hunting endlessly. A great
+  5-human/5-stat quiz beats grinding a dozen searches for a 6th reached-for fact.
 
 ## Format — fix the True/False trap
 
@@ -79,6 +83,9 @@ she's dating or which relative is famous.
 - Each question: unique `id` (e.g. `"was-rodman-<slug>"`), a `prompt`, and a warm one-sentence `revealFact`
   (the "learn"/delight payoff). 8–15 questions per player (aim ~10). One player per team.
 - Also write a warm one-line `tagline` for each player.
+- **`jerseyNumber`:** take it from the player's line above (the `#N`). If a player's line shows no number
+  (ESPN didn't have it), do ONE quick lookup of her current squad number and use that — a plain integer,
+  required by the schema. Don't make it a research detour.
 
 ## OUTPUT — one JSON document, nothing else
 
