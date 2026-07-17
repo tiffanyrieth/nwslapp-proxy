@@ -3452,6 +3452,13 @@ function diagKeyTime(name: string): number {
 async function checkErrorSpike(env: Env): Promise<void> {
 	const cfg = env as unknown as { RESEND_API_KEY?: string; ALERT_EMAIL?: string };
 	if (!cfg.RESEND_API_KEY || !cfg.ALERT_EMAIL) return; // not set up yet → no-op
+	// Config sanity (NO SILENT FAILURES): a common setup slip is pasting the API key into
+	// ALERT_EMAIL (→ Resend 422 "invalid to field"). Catch a non-email value here and surface it
+	// as a clear diag instead of a cryptic per-incident 422 — and never leak the value.
+	if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(cfg.ALERT_EMAIL.trim())) {
+		emitDiag(env, ctx, "alertEmailMisconfig", "ALERT_EMAIL is not an email address — check the secret");
+		return;
+	}
 	const last = await env.FEED_TAGS.get(ALERT_SENT_KEY);
 	if (last && Date.now() - Number(last) < ALERT_THROTTLE_MS) return;
 
@@ -3487,7 +3494,7 @@ async function checkErrorSpike(env: Env): Promise<void> {
 		headers: { Authorization: `Bearer ${cfg.RESEND_API_KEY}`, "Content-Type": "application/json" },
 		body: JSON.stringify({
 			from: "NWSL App Alerts <onboarding@resend.dev>",
-			to: [cfg.ALERT_EMAIL],
+			to: [cfg.ALERT_EMAIL.trim()],
 			subject: `NWSLApp: ${count} error events in the last 15 min`,
 			text:
 				`Telemetry error spike (threshold ${ALERT_THRESHOLD} in ${ALERT_WINDOW_MS / 60000} min).\n\n` +
@@ -3497,7 +3504,12 @@ async function checkErrorSpike(env: Env): Promise<void> {
 				`Throttled to at most one email per hour.`,
 		}),
 	});
-	console.log(res.ok ? `[alert] error-spike email sent (${count} events)` : `[alert] resend send failed: ${res.status}`);
+	if (res.ok) {
+		console.log(`[alert] error-spike email sent (${count} events)`);
+	} else {
+		// Capture Resend's reason, not just the code — a bare status is useless mid-incident.
+		console.log(`[alert] resend send failed: ${res.status} ${(await res.text()).slice(0, 300)}`);
+	}
 }
 
 /** Owner view of recent telemetry: `GET /telemetry/recent` (newest first), gated by the same
