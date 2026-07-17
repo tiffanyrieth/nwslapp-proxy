@@ -3485,10 +3485,14 @@ async function checkErrorSpike(env: Env): Promise<void> {
 			continue;
 		}
 		for (const e of rec.events ?? []) {
-			if (e.kind && ALERT_ERROR_KINDS.has(e.kind)) {
-				count++;
-				if (samples.length < 6) samples.push(`${rec.app ?? "?"}: ${e.kind} — ${e.detail ?? ""}`);
-			}
+			if (!e.kind || !ALERT_ERROR_KINDS.has(e.kind)) continue;
+			// Expected third-party image flakiness (Instagram CDN URLs expire/rotate, YouTube & club
+			// thumbnails 404/hotlink-block) is an honest placeholder fallback, NOT an incident — but it
+			// rides `apiFailure`, so a batch of it could trip the spike alone and cry wolf. Exclude it
+			// from the PAGING count only; it stays in telemetry + the in-app Diagnostics screen.
+			if (e.kind === "apiFailure" && (e.detail ?? "").startsWith("image fetch ")) continue;
+			count++;
+			if (samples.length < 6) samples.push(`${rec.app ?? "?"}: ${e.kind} — ${e.detail ?? ""}`);
 		}
 	}
 	if (count < ALERT_THRESHOLD) return;
