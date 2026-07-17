@@ -565,6 +565,11 @@ export default {
 			return handleTelemetryIngest(request, env, ctx);
 		}
 
+		// POST anonymous usage counters (Level-3 analytics) — same pre-guard placement.
+		if (url.pathname === "/analytics") {
+			return handleAnalyticsIngest(request, env, ctx);
+		}
+
 		// POST Bright Data webhook: the async player-IG scrape's push delivery lands here
 		// (~1–3 min after the cron's trigger). Before the GET-only guard; self-authenticates
 		// against BD_WEBHOOK_SECRET (see handleBrightDataWebhook).
@@ -739,7 +744,7 @@ export default {
 		}
 
 		return new Response(
-			"Not found. This proxy serves GET /scoreboard, /summary, /weather, /team-videos, /feed, /spotlight, /trivia, /knowher, /knowher/eligible, /knowher/todo, /quiz-results, /headshots, /crest, /crest/manifest, /roster, /national-teams, /playoff-override, and POST /telemetry.",
+			"Not found. This proxy serves GET /scoreboard, /summary, /weather, /team-videos, /feed, /spotlight, /trivia, /knowher, /knowher/eligible, /knowher/todo, /quiz-results, /headshots, /crest, /crest/manifest, /roster, /national-teams, /playoff-override, and POST /telemetry, /analytics.",
 			{ status: 404 },
 		);
 	},
@@ -759,6 +764,15 @@ export default {
 				await runBracketTick(env as unknown as BracketEnv);
 			} catch {
 				/* swallow — the next 5-min tick retries; the engine is idempotent */
+			}
+			// Error-spike alerting rides the same 5-min tick (owner decision 2026-07-16: every
+			// existing channel is PULL — dashboards nobody watches mid-incident; the 7/15 CPU-error
+			// burst was found a day late. This is the PUSH channel.) Isolated: an alerting bug can
+			// never affect the bracket engine.
+			try {
+				await checkErrorSpike(env);
+			} catch {
+				/* swallow — best-effort; next tick retries */
 			}
 			return;
 		}
@@ -3342,6 +3356,148 @@ async function handleTelemetryIngest(request: Request, env: Env, ctx: ExecutionC
 	const key = `diag:${1e15 - Date.now()}:${crypto.randomUUID().slice(0, 8)}`;
 	ctx.waitUntil(env.FEED_TAGS.put(key, JSON.stringify(record), { expirationTtl: 60 * 60 * 24 * 30 }));
 	return new Response(null, { status: 204 });
+}
+
+// The whitelisted anonymous counter names — anything else is dropped, so a buggy or hostile
+// client can never grow the table with junk event names. Keep in sync with the app's
+// Analytics.Event mapping (NWSLApp/Services/Analytics.swift).
+const ANALYTICS_EVENTS = new Set([
+	"session_start",
+	"session_os",
+	"tab_opened",
+	"fanzone_game_opened",
+	"feed_item_tapped",
+	"feed_chip_tapped",
+]);
+
+/** Anonymous Level-3 usage counters: `POST /analytics` with a pre-summed per-session batch
+ *  `{ events: [{ event, param?, n }] }` → one atomic Supabase RPC (`increment_counters`,
+ *  SECURITY DEFINER, service_role-only) that ADDS each count into the daily rollup table
+ *  `analytics_counters` (app repo: supabase/migration_analytics_counters.sql). Mirrors
+ *  /telemetry's privacy posture exactly: NO identifiers, NO client IP, every field whitelisted +
+ *  capped; what's stored is only (day, event, param, count) — App Store "Usage Data, not linked
+ *  to identity". Best-effort: the app always gets a 204 (a dropped batch is a dropped count,
+ *  never a user-facing failure); an RPC failure emits a proxy diag so a persistent gap surfaces
+ *  in /telemetry/recent instead of silently zeroing the dashboard. */
+async function handleAnalyticsIngest(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
+	if (request.method !== "POST") return new Response("POST only", { status: 405 });
+	let body: { events?: unknown };
+	try {
+		body = (await request.json()) as typeof body;
+	} catch {
+		return new Response("bad json", { status: 400 });
+	}
+	const raw = Array.isArray(body.events) ? body.events.slice(0, 64) : [];
+	const events = raw
+		.map((e) => {
+			const ev = e as { event?: unknown; param?: unknown; n?: unknown };
+			const n = typeof ev.n === "number" && Number.isFinite(ev.n) ? Math.floor(ev.n) : 0;
+			return {
+				event: String(ev.event ?? ""),
+				param: String(ev.param ?? "").slice(0, 32),
+				n: Math.min(Math.max(n, 0), 10_000),
+			};
+		})
+		.filter((e) => ANALYTICS_EVENTS.has(e.event) && e.n > 0);
+	if (events.length === 0) return new Response(null, { status: 204 });
+
+	const sb = env as unknown as { SUPABASE_URL?: string; SUPABASE_SERVICE_ROLE_KEY?: string };
+	if (!sb.SUPABASE_URL || !sb.SUPABASE_SERVICE_ROLE_KEY) {
+		// Unconfigured environment (e.g. local dev without .dev.vars) → quiet no-op, not a 5xx.
+		return new Response(null, { status: 204 });
+	}
+	const base = sb.SUPABASE_URL.replace(/\/$/, "");
+	const key = sb.SUPABASE_SERVICE_ROLE_KEY;
+	ctx.waitUntil(
+		(async () => {
+			try {
+				const r = await fetch(`${base}/rest/v1/rpc/increment_counters`, {
+					method: "POST",
+					headers: { apikey: key, Authorization: `Bearer ${key}`, "Content-Type": "application/json" },
+					body: JSON.stringify({ p_events: events }),
+				});
+				if (!r.ok) emitDiag(env, ctx, "analyticsRpcFail", `increment_counters ${r.status}`);
+			} catch (err) {
+				emitDiag(env, ctx, "analyticsRpcFail", String(err).slice(0, 80));
+			}
+		})(),
+	);
+	return new Response(null, { status: 204 });
+}
+
+// ── Error-spike email alerting (2026-07-16) ──────────────────────────────────────────────────
+// Every telemetry channel is PULL (in-app Diagnostics, /telemetry/recent, dashboards) — nobody
+// watches a dashboard mid-incident; the 2026-07-15 exceededCpu burst surfaced a day late. This is
+// the PUSH half: the 5-min cron scans the recent `diag:` records and emails the owner (Resend)
+// when error-class events spike. Alert volume scales with INCIDENTS, not users → flat $0.
+// Unconfigured (no RESEND_API_KEY / ALERT_EMAIL secret) → silent no-op.
+
+/** Error-CLASS kinds only — traces and success breadcrumbs must never page the owner. */
+const ALERT_ERROR_KINDS = new Set([
+	"apiFailure", "parseError", "unexpectedEmpty", "staleServe",
+	"analyticsRpcFail", "metricKitDiagnostic", "tier2SignedOutDesync",
+]);
+const ALERT_WINDOW_MS = 15 * 60 * 1000;
+const ALERT_THRESHOLD = 8; // error events in the window ⇒ email (2-user baseline is ~0-2/day; a real incident bursts)
+const ALERT_THROTTLE_MS = 60 * 60 * 1000; // at most 1 email/hour — an incident can't flood the inbox
+const ALERT_SENT_KEY = "alert:last-email";
+
+/** The write-time of a reverse-time `diag:` key (see handleTelemetryIngest) — lets the spike scan
+ *  filter by age from the KEY alone, so a quiet tick costs one KV list and ZERO record reads. */
+function diagKeyTime(name: string): number {
+	const inv = Number(name.split(":")[1]);
+	return Number.isFinite(inv) ? 1e15 - inv : 0;
+}
+
+async function checkErrorSpike(env: Env): Promise<void> {
+	const cfg = env as unknown as { RESEND_API_KEY?: string; ALERT_EMAIL?: string };
+	if (!cfg.RESEND_API_KEY || !cfg.ALERT_EMAIL) return; // not set up yet → no-op
+	const last = await env.FEED_TAGS.get(ALERT_SENT_KEY);
+	if (last && Date.now() - Number(last) < ALERT_THROTTLE_MS) return;
+
+	const cutoff = Date.now() - ALERT_WINDOW_MS;
+	const list = await env.FEED_TAGS.list({ prefix: "diag:", limit: 60 }); // reverse-time → newest first
+	const recent = list.keys.filter((k) => diagKeyTime(k.name) >= cutoff);
+	if (recent.length === 0) return;
+
+	let count = 0;
+	const samples: string[] = [];
+	for (const k of recent) {
+		const raw = await env.FEED_TAGS.get(k.name);
+		if (!raw) continue;
+		let rec: { app?: string; events?: { kind?: string; detail?: string }[] };
+		try {
+			rec = JSON.parse(raw) as typeof rec;
+		} catch {
+			continue;
+		}
+		for (const e of rec.events ?? []) {
+			if (e.kind && ALERT_ERROR_KINDS.has(e.kind)) {
+				count++;
+				if (samples.length < 6) samples.push(`${rec.app ?? "?"}: ${e.kind} — ${e.detail ?? ""}`);
+			}
+		}
+	}
+	if (count < ALERT_THRESHOLD) return;
+
+	// Mark BEFORE sending (a Resend hiccup shouldn't re-fire every 5 min for the same incident).
+	await env.FEED_TAGS.put(ALERT_SENT_KEY, String(Date.now()), { expirationTtl: 24 * 3600 });
+	const res = await fetch("https://api.resend.com/emails", {
+		method: "POST",
+		headers: { Authorization: `Bearer ${cfg.RESEND_API_KEY}`, "Content-Type": "application/json" },
+		body: JSON.stringify({
+			from: "NWSL App Alerts <onboarding@resend.dev>",
+			to: [cfg.ALERT_EMAIL],
+			subject: `NWSLApp: ${count} error events in the last 15 min`,
+			text:
+				`Telemetry error spike (threshold ${ALERT_THRESHOLD} in ${ALERT_WINDOW_MS / 60000} min).\n\n` +
+				`Recent samples:\n${samples.map((s) => `  • ${s}`).join("\n")}\n\n` +
+				`Where to look: GET /telemetry/recent (x-admin-key) · the in-app Diagnostics screen · ` +
+				`the Cloudflare dashboards (proxy + watcher).\n` +
+				`Throttled to at most one email per hour.`,
+		}),
+	});
+	console.log(res.ok ? `[alert] error-spike email sent (${count} events)` : `[alert] resend send failed: ${res.status}`);
 }
 
 /** Owner view of recent telemetry: `GET /telemetry/recent` (newest first), gated by the same
