@@ -515,6 +515,12 @@ export default {
 	async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
 		const url = new URL(request.url);
 
+		// Liveness probe: answer any HEAD with an empty 200. Uptime monitors (UptimeRobot's free
+		// tier only sends HEAD) otherwise hit the GET-only guard below and read 405 as "down" — a
+		// false alarm on a healthy Worker. HEAD = "are you there?", so a bare 200 is the correct
+		// reply; no route runs, no body.
+		if (request.method === "HEAD") return new Response(null, { status: 200 });
+
 		// Admin-only: run one Bracket engine tick on demand (the hourly cron does this
 		// automatically; this is for verification). Guarded by the BRACKET_ADMIN_KEY secret.
 		if (url.pathname === "/bracket/run") {
