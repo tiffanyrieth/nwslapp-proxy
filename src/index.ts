@@ -1628,7 +1628,10 @@ export function emitDiag(env: Env, ctx: ExecutionContext, kind: string, detail: 
 		events: [{ kind: kind.slice(0, 40), detail: detail.slice(0, 80), ts: Date.now() }],
 	};
 	console.log("telemetry", JSON.stringify(record));
-	const key = `diag:${1e15 - Date.now()}:${crypto.randomUUID().slice(0, 8)}`;
+	// SERVER diagnostics use a SEPARATE `sdiag:` prefix from client `/telemetry` (`diag:`) so the
+	// error-spike pager (checkErrorSpike) scans server errors ALONE — a fleet-scale client-telemetry
+	// flood can never bury them in the newest-N list window. The owner view (/telemetry/recent) merges both.
+	const key = `sdiag:${1e15 - Date.now()}:${crypto.randomUUID().slice(0, 8)}`;
 	ctx.waitUntil(env.FEED_TAGS.put(key, JSON.stringify(record), { expirationTtl: 60 * 60 * 24 * 30 }));
 }
 
@@ -3489,7 +3492,10 @@ async function checkErrorSpike(env: Env, ctx: ExecutionContext): Promise<void> {
 	if (last && Date.now() - Number(last) < ALERT_THROTTLE_MS) return;
 
 	const cutoff = Date.now() - ALERT_WINDOW_MS;
-	const list = await env.FEED_TAGS.list({ prefix: "diag:", limit: 60 }); // reverse-time → newest first
+	// Scan ONLY server-origin diagnostics (`sdiag:`), never the shared client `diag:` stream — otherwise a
+	// fleet-scale /telemetry flood fills the newest-60 window and buries the very server errors this pager
+	// exists to catch (per-IP rate-limiting can't cap a real multi-IP fleet). 60 is ample for server-only.
+	const list = await env.FEED_TAGS.list({ prefix: "sdiag:", limit: 60 }); // reverse-time → newest first
 	const recent = list.keys.filter((k) => diagKeyTime(k.name) >= cutoff);
 	if (recent.length === 0) return;
 
@@ -3553,8 +3559,18 @@ async function handleTelemetryRecent(request: Request, env: Env): Promise<Respon
 	if (!key || request.headers.get("x-admin-key") !== key) {
 		return new Response("forbidden", { status: 403 });
 	}
-	const list = await env.FEED_TAGS.list({ prefix: "diag:", limit: 100 });
-	const records = await Promise.all(list.keys.map((k) => env.FEED_TAGS.get(k.name)));
+	// Merge BOTH streams newest-first: server diagnostics (`sdiag:`) + client telemetry (`diag:`). They
+	// live under separate prefixes so the pager can scan server errors without client burial; the owner
+	// view still shows everything. (`diag:` prefix does NOT match `sdiag:` — no double-count.)
+	const [server, client] = await Promise.all([
+		env.FEED_TAGS.list({ prefix: "sdiag:", limit: 100 }),
+		env.FEED_TAGS.list({ prefix: "diag:", limit: 100 }),
+	]);
+	const names = [...server.keys, ...client.keys]
+		.sort((a, b) => diagKeyTime(b.name) - diagKeyTime(a.name)) // newest first
+		.slice(0, 100)
+		.map((k) => k.name);
+	const records = await Promise.all(names.map((n) => env.FEED_TAGS.get(n)));
 	const parsed = records.filter((s): s is string => s !== null).map((s) => JSON.parse(s));
 	return Response.json(parsed);
 }
