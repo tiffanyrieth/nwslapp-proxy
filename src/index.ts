@@ -776,7 +776,7 @@ export default {
 			// burst was found a day late. This is the PUSH channel.) Isolated: an alerting bug can
 			// never affect the bracket engine.
 			try {
-				await checkErrorSpike(env);
+				await checkErrorSpike(env, ctx);
 			} catch {
 				/* swallow — best-effort; next tick retries */
 			}
@@ -929,7 +929,12 @@ function chooseScoreboardTTL(body: ArrayBuffer): number {
 		const nearKickoff = events.some((event) => {
 			const state = event.status?.type?.state ?? (event.competitions ?? [])[0]?.status?.type?.state;
 			if (state !== "pre" || !event.date) return false;
-			const kickoff = Date.parse(event.date);
+			// Normalize ESPN's seconds-less timestamps ("…T17:00Z") before parsing, mirroring the
+			// watcher's fixtures.kickoffMs. (V8's Date.parse actually accepts "17:00Z" today, so this is
+			// parity + future-proofing on a live-transition-critical path — a silent parse miss here would
+			// cache at the 5-min default across kickoff and lag the live flip — not a current-format fix.)
+			const rawDate = /T\d{2}:\d{2}Z$/.test(event.date) ? event.date.replace("Z", ":00Z") : event.date;
+			const kickoff = Date.parse(rawDate);
 			if (!Number.isFinite(kickoff)) return false;
 			return now >= kickoff - 2 * 60 * 1000 && now <= kickoff + 45 * 60 * 1000;
 		});
@@ -1621,10 +1626,17 @@ export function emitDiag(env: Env, ctx: ExecutionContext, kind: string, detail: 
 		at: new Date().toISOString(),
 		app: "proxy",
 		os: "worker",
+		// UN-FORGEABLE server-origin marker: only emitDiag sets it. The error-spike pager counts ONLY
+		// origin:"server" records, so a spoofed client /telemetry POST (which never carries origin —
+		// handleTelemetryIngest copies only app/os/events from the body) can't trip the owner's alert.
+		origin: "server",
 		events: [{ kind: kind.slice(0, 40), detail: detail.slice(0, 80), ts: Date.now() }],
 	};
 	console.log("telemetry", JSON.stringify(record));
-	const key = `diag:${1e15 - Date.now()}:${crypto.randomUUID().slice(0, 8)}`;
+	// SERVER diagnostics use a SEPARATE `sdiag:` prefix from client `/telemetry` (`diag:`) so the
+	// error-spike pager (checkErrorSpike) scans server errors ALONE — a fleet-scale client-telemetry
+	// flood can never bury them in the newest-N list window. The owner view (/telemetry/recent) merges both.
+	const key = `sdiag:${1e15 - Date.now()}:${crypto.randomUUID().slice(0, 8)}`;
 	ctx.waitUntil(env.FEED_TAGS.put(key, JSON.stringify(record), { expirationTtl: 60 * 60 * 24 * 30 }));
 }
 
@@ -3329,8 +3341,23 @@ async function handleNationalTeams(ctx: ExecutionContext): Promise<Response> {
  *  with a 30-day TTL and logs it (visible in `wrangler tail`), so a field miss reaches the owner
  *  without a user report. Deliberately stores NO identifiers and NO client IP — App Store
  *  "Diagnostics" data, not linked to identity. Best-effort: malformed input is dropped, never 5xx. */
+/** Per-IP throttle for the two UNAUTHENTICATED ingest endpoints (/telemetry, /analytics) via the
+ *  native rate-limit binding (free, no KV cost). Returns true when the caller is OVER the limit and
+ *  should be 429'd. Keyed per bucket+IP so the two endpoints keep independent budgets. Fails OPEN if
+ *  the binding is absent (e.g. not yet deployed) — a config gap must never drop legit telemetry. */
+async function overIngestLimit(request: Request, env: Env, bucket: string): Promise<boolean> {
+	const limiter = env.INGEST_LIMITER;
+	if (!limiter) return false; // binding not configured → fail open (never block legit clients)
+	const ip = request.headers.get("cf-connecting-ip") ?? "unknown";
+	const { success } = await limiter.limit({ key: `${bucket}:${ip}` });
+	return !success;
+}
+
 async function handleTelemetryIngest(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
 	if (request.method !== "POST") return new Response("POST only", { status: 405 });
+	// Anonymous endpoint + one KV write per POST → cap per-IP so a flood can't exhaust the
+	// account-wide KV daily write budget (pre-launch security pass).
+	if (await overIngestLimit(request, env, "telemetry")) return new Response(null, { status: 429 });
 	let body: { app?: unknown; os?: unknown; events?: unknown };
 	try {
 		body = (await request.json()) as typeof body;
@@ -3387,6 +3414,7 @@ const ANALYTICS_EVENTS = new Set([
  *  in /telemetry/recent instead of silently zeroing the dashboard. */
 async function handleAnalyticsIngest(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
 	if (request.method !== "POST") return new Response("POST only", { status: 405 });
+	if (await overIngestLimit(request, env, "analytics")) return new Response(null, { status: 429 });
 	let body: { events?: unknown };
 	try {
 		body = (await request.json()) as typeof body;
@@ -3455,7 +3483,7 @@ function diagKeyTime(name: string): number {
 	return Number.isFinite(inv) ? 1e15 - inv : 0;
 }
 
-async function checkErrorSpike(env: Env): Promise<void> {
+async function checkErrorSpike(env: Env, ctx: ExecutionContext): Promise<void> {
 	const cfg = env as unknown as { RESEND_API_KEY?: string; ALERT_EMAIL?: string };
 	if (!cfg.RESEND_API_KEY || !cfg.ALERT_EMAIL) return; // not set up yet → no-op
 	// Config sanity (NO SILENT FAILURES): a common setup slip is pasting the API key into
@@ -3469,7 +3497,10 @@ async function checkErrorSpike(env: Env): Promise<void> {
 	if (last && Date.now() - Number(last) < ALERT_THROTTLE_MS) return;
 
 	const cutoff = Date.now() - ALERT_WINDOW_MS;
-	const list = await env.FEED_TAGS.list({ prefix: "diag:", limit: 60 }); // reverse-time → newest first
+	// Scan ONLY server-origin diagnostics (`sdiag:`), never the shared client `diag:` stream — otherwise a
+	// fleet-scale /telemetry flood fills the newest-60 window and buries the very server errors this pager
+	// exists to catch (per-IP rate-limiting can't cap a real multi-IP fleet). 60 is ample for server-only.
+	const list = await env.FEED_TAGS.list({ prefix: "sdiag:", limit: 60 }); // reverse-time → newest first
 	const recent = list.keys.filter((k) => diagKeyTime(k.name) >= cutoff);
 	if (recent.length === 0) return;
 
@@ -3478,12 +3509,16 @@ async function checkErrorSpike(env: Env): Promise<void> {
 	for (const k of recent) {
 		const raw = await env.FEED_TAGS.get(k.name);
 		if (!raw) continue;
-		let rec: { app?: string; events?: { kind?: string; detail?: string }[] };
+		let rec: { app?: string; origin?: string; events?: { kind?: string; detail?: string }[] };
 		try {
 			rec = JSON.parse(raw) as typeof rec;
 		} catch {
 			continue;
 		}
+		// Only PROXY-emitted diagnostics page the owner. Client POST /telemetry is unauthenticated and
+		// spoofable, and never carries the server-set `origin`, so counting it would let anyone trip the
+		// alert email. Client telemetry still lands in KV + the /telemetry/recent pull view — just no page.
+		if (rec.origin !== "server") continue;
 		for (const e of rec.events ?? []) {
 			if (!e.kind || !ALERT_ERROR_KINDS.has(e.kind)) continue;
 			// Expected third-party image flakiness (Instagram CDN URLs expire/rotate, YouTube & club
@@ -3529,8 +3564,18 @@ async function handleTelemetryRecent(request: Request, env: Env): Promise<Respon
 	if (!key || request.headers.get("x-admin-key") !== key) {
 		return new Response("forbidden", { status: 403 });
 	}
-	const list = await env.FEED_TAGS.list({ prefix: "diag:", limit: 100 });
-	const records = await Promise.all(list.keys.map((k) => env.FEED_TAGS.get(k.name)));
+	// Merge BOTH streams newest-first: server diagnostics (`sdiag:`) + client telemetry (`diag:`). They
+	// live under separate prefixes so the pager can scan server errors without client burial; the owner
+	// view still shows everything. (`diag:` prefix does NOT match `sdiag:` — no double-count.)
+	const [server, client] = await Promise.all([
+		env.FEED_TAGS.list({ prefix: "sdiag:", limit: 100 }),
+		env.FEED_TAGS.list({ prefix: "diag:", limit: 100 }),
+	]);
+	const names = [...server.keys, ...client.keys]
+		.sort((a, b) => diagKeyTime(b.name) - diagKeyTime(a.name)) // newest first
+		.slice(0, 100)
+		.map((k) => k.name);
+	const records = await Promise.all(names.map((n) => env.FEED_TAGS.get(n)));
 	const parsed = records.filter((s): s is string => s !== null).map((s) => JSON.parse(s));
 	return Response.json(parsed);
 }

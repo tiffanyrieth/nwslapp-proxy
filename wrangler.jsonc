@@ -14,6 +14,19 @@
 			"id": "3c1372c0f8174cdcb3e2e52ca5de14ad",
 		},
 	],
+	// Per-IP throttle for the two UNAUTHENTICATED ingest endpoints (POST /telemetry, /analytics) — the
+	// only anonymous writers. Without a cap, a flood of /telemetry POSTs (one KV write each) could
+	// exhaust the account-wide KV daily write budget and starve the watcher's live-match state on a
+	// game day (pre-launch security pass). Native binding = FREE, does NOT consume KV. Keyed per
+	// bucket+IP in code (overIngestLimit); `period` must be 10 or 60. namespace_id is an arbitrary
+	// per-worker id. Fails OPEN in code if absent, so this can deploy independently.
+	"ratelimits": [
+		{
+			"name": "INGEST_LIMITER",
+			"namespace_id": "1001",
+			"simple": { "limit": 20, "period": 60 },
+		},
+	],
 	// B3b — Instagram scrape → KV social snapshot, EVERY OTHER DAY at 12:00 UTC (~7am ET).
 	// Decoupled from user requests. LOAD-BALANCED (2026-07-05): clubs via Apify (~192
 	// items/run ≈ $0.86/mo, inside the free $5) + players via Bright Data (async trigger →
