@@ -929,7 +929,12 @@ function chooseScoreboardTTL(body: ArrayBuffer): number {
 		const nearKickoff = events.some((event) => {
 			const state = event.status?.type?.state ?? (event.competitions ?? [])[0]?.status?.type?.state;
 			if (state !== "pre" || !event.date) return false;
-			const kickoff = Date.parse(event.date);
+			// Normalize ESPN's seconds-less timestamps ("…T17:00Z") before parsing, mirroring the
+			// watcher's fixtures.kickoffMs. (V8's Date.parse actually accepts "17:00Z" today, so this is
+			// parity + future-proofing on a live-transition-critical path — a silent parse miss here would
+			// cache at the 5-min default across kickoff and lag the live flip — not a current-format fix.)
+			const rawDate = /T\d{2}:\d{2}Z$/.test(event.date) ? event.date.replace("Z", ":00Z") : event.date;
+			const kickoff = Date.parse(rawDate);
 			if (!Number.isFinite(kickoff)) return false;
 			return now >= kickoff - 2 * 60 * 1000 && now <= kickoff + 45 * 60 * 1000;
 		});
