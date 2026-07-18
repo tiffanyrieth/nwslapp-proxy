@@ -45,7 +45,10 @@ export interface BracketEnv {
   SUPABASE_SERVICE_ROLE_KEY: string;
   // Optional KV (the full Worker Env carries it) — backs NO-SILENT-FAILURES diag telemetry,
   // surfaced in the owner's GET /telemetry/recent. Best-effort; absent in pure unit contexts.
-  FEED_TAGS?: { put(key: string, value: string, options?: { expirationTtl?: number }): Promise<void> };
+  FEED_TAGS?: {
+    put(key: string, value: string, options?: { expirationTtl?: number }): Promise<void>;
+    get(key: string): Promise<string | null>;
+  };
 }
 
 const ESPN_SITE = "https://site.api.espn.com/apis/site/v2/sports/soccer/usa.nwsl";
@@ -758,8 +761,21 @@ async function tallyAndAdvance(env: BracketEnv, ed: EditionRow, now: number, con
     }
     seqByUser.set(uid, seq);
   }
-  await accumulateScores(env, ed.id, perUserPts, now);
-  await accumulateUserStats(env, ed.id, round, perUserCorrect, perUserTotal, seqByUser, now);
+  // Scoring (accumulateScores/UserStats) is ADDITIVE, so it must run EXACTLY once per round — even if a
+  // LATER write (the next-round matchup insert or the round-pointer advance) fails and the 5-min cron
+  // re-enters this SAME round (round_closes_at stays in the past until the advance succeeds). Gate it on
+  // a KV marker set BEFORE scoring: a re-entry then skips scoring and proceeds straight to the (now
+  // idempotent — see writeNextRound) advance, so points can never re-inflate. Marker-first means a rare
+  // failure mid-scoring UNDER-scores the round once (recoverable) instead of the old inflate-every-5-min-
+  // forever loop + PK-conflict wedge. FEED_TAGS is absent only in unit contexts (no cron, no re-entry) →
+  // plain scoring there.
+  const scoredKey = `bracket-scored:${ed.id}:${round}`;
+  const alreadyScored = env.FEED_TAGS ? (await env.FEED_TAGS.get(scoredKey)) !== null : false;
+  if (!alreadyScored) {
+    await env.FEED_TAGS?.put(scoredKey, String(now), { expirationTtl: 60 * 60 * 24 * 30 });
+    await accumulateScores(env, ed.id, perUserPts, now);
+    await accumulateUserStats(env, ed.id, round, perUserCorrect, perUserTotal, seqByUser, now);
+  }
   await sbPatch(env, "bracket_editions", `id=eq.${ed.id}`, { fan_count: new Set(votes.map((v) => v.user_id)).size });
 
   // Advance — or finish.
@@ -825,10 +841,14 @@ async function writeNextRound(
     await emitDiag(env, "bracketAdvanceEmpty", `${editionId} ${fromRound}→${nextCode}`);
     return `error: ${editionId} round ${fromRound} produced no next-round matchups`;
   }
-  await sbInsert(env, "bracket_matchups", next.map((m) => ({
+  // Idempotent on the PK (`id`): if a prior tally inserted these matchups but then FAILED to advance the
+  // round pointer, the 5-min cron re-enters and re-runs this. Upsert-on-`id` makes the re-run a no-op (the
+  // matchups are deterministic from the same closed-round votes) instead of the PK-conflict throw that
+  // used to wedge the edition (error swallowed by the cron → round never advanced).
+  await sbUpsert(env, "bracket_matchups", next.map((m) => ({
     id: `${editionId}-r${m.round}-s${m.slot}`, edition_id: editionId, round: m.round, slot: m.slot,
     entrant_a_id: m.aId, entrant_b_id: m.bId, points: m.points,
-  })));
+  })), "id");
   await sbPatch(env, "bracket_editions", `id=eq.${editionId}`, {
     current_round: nextCode, round_opened_at: new Date(now).toISOString(),
     round_closes_at: roundCloseISO(nextCode, now, config),
