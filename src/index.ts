@@ -3118,11 +3118,13 @@ async function handleKnowHer(url: URL, env: Env, ctx: ExecutionContext): Promise
 
 	const filtered = pool ? filterPoolByTeams(pool, teams) : { weekKey: "", season: 0, players: [] };
 	const hasPlayers = filtered.players.length > 0;
-	// Staleness telemetry (weekly-automation watchdog): in-season, a pool whose weekKey lags the
-	// current ISO week means the Monday generation run didn't land — the app keeps serving last
-	// week's players (deliberate graceful degradation), but that must be LOUD server-side, not
-	// invisible. Throttled to one diag/day via KV (cache misses recur every ~5 min all week).
-	if (pool && pool.weekKey !== isoWeekKey()) {
+	// Staleness telemetry (BIWEEKLY-automation watchdog): a KHG edition is live for 2 ISO weeks, so a
+	// pool stamped the current OR the immediately-previous ISO week is healthy. Only a pool ≥2 weeks
+	// behind means a biweekly generation run was missed — the app keeps serving the old players
+	// (deliberate graceful degradation), but that must be LOUD server-side. Throttled to one diag/day.
+	const currentWeek = isoWeekKey();
+	const prevWeek = isoWeekKey(new Date(Date.now() - 7 * 86_400_000));
+	if (pool && pool.weekKey !== currentWeek && pool.weekKey !== prevWeek) {
 		const month = new Date().getUTCMonth() + 1;
 		if (month >= 3 && month <= 11) {
 			ctx.waitUntil((async () => {
@@ -3130,7 +3132,7 @@ async function handleKnowHer(url: URL, env: Env, ctx: ExecutionContext): Promise
 				const last = Number(await env.FEED_TAGS.get(THROTTLE_KEY)) || 0;
 				if (Date.now() - last > 24 * 3600 * 1000) {
 					await env.FEED_TAGS.put(THROTTLE_KEY, String(Date.now()), { expirationTtl: 7 * 24 * 3600 });
-					emitDiag(env, ctx, "knowherStaleWeek", `serving ${pool.weekKey}, current ${isoWeekKey()}`);
+					emitDiag(env, ctx, "knowherStaleWeek", `serving ${pool.weekKey}, current ${currentWeek} (biweekly: prev ${prevWeek} also ok)`);
 				}
 			})());
 		}

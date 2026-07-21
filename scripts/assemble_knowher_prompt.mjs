@@ -70,6 +70,34 @@ export function isoWeekKey(date = new Date()) {
   return `${isoYear}-W${String(week).padStart(2, "0")}`;
 }
 
+/** Monotonic count of Mondays since the Unix epoch for `date`'s ISO week — a comparable week ordinal. */
+function mondayOrdinal(date) {
+  const u = new Date(Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), date.getUTCDate()));
+  const day = u.getUTCDay() || 7; // Mon=1 … Sun=7
+  u.setUTCDate(u.getUTCDate() - (day - 1)); // back to this week's Monday
+  return Math.round(u.getTime() / (7 * 86_400_000));
+}
+
+/** Biweekly cadence gate. Know Her Game runs on ALTERNATING ISO weeks (Season Weeks 1, 3, 5 …), sharing
+ *  the Fan Zone quiz slot with NWSL Trivia (Weeks 2, 4, 6 …) so only one quiz game generates content in a
+ *  given week. The anchor = the Monday of regular-season Week 1, set via the KHG_SEASON_ANCHOR env var
+ *  (e.g. "2026-03-23"). Returns true on a KHG week (even offset from the anchor). FAILS OPEN (weekly, with
+ *  a loud warning) when the anchor is unset/invalid, so a misconfig degrades to the old weekly cadence
+ *  rather than silently halting the game. Exported for the lock-step test. */
+export function isKnowHerWeek(now = new Date(), anchorRaw = process.env.KHG_SEASON_ANCHOR) {
+  if (!anchorRaw) {
+    console.error("⚠️  KHG_SEASON_ANCHOR unset — generating this week (fail-open to weekly). Set it to the Monday of regular-season Week 1 (e.g. 2026-03-23) for biweekly alternation.");
+    return true;
+  }
+  const anchor = new Date(`${anchorRaw}T00:00:00Z`);
+  if (Number.isNaN(anchor.getTime())) {
+    console.error(`⚠️  KHG_SEASON_ANCHOR="${anchorRaw}" is not a valid date — generating this week (fail-open).`);
+    return true;
+  }
+  const offset = mondayOrdinal(now) - mondayOrdinal(anchor);
+  return offset >= 0 && offset % 2 === 0; // Week 1 (offset 0) = KHG; odd offsets = NWSL Trivia weeks
+}
+
 /** One player block in the proven Rodman format:
  *  "- Name — Club (ABBR) — Position, #N — age A, Country — espnAthleteId X"
  *  "  YYYY season: … stats …" (keeper picks get a keeper stat line; absent bio fragments are dropped,
@@ -113,6 +141,12 @@ if (import.meta.url === pathToFileURL(process.argv[1] ?? "").href) {
 }
 
 async function main() {
+// Biweekly cadence: on a NWSL Trivia week, emit no prompt and exit cleanly — the routine no-ops and the
+// current 2-week KHG pool stays live. Checked BEFORE fetching 16 teams (no work on an off week).
+if (!isKnowHerWeek()) {
+  console.error("⏸  Not a Know Her Game week (NWSL Trivia's turn in the quiz slot) — no prompt emitted; the current 2-week pool stays live.");
+  process.exit(0);
+}
 const template = readFileSync(
   join(dirname(fileURLToPath(import.meta.url)), "knowher-weekly-TEMPLATE.md"),
   "utf8",

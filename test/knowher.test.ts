@@ -20,13 +20,24 @@ function p(athleteId: string, starts: number, minutes: number, over: Partial<Eli
 	};
 }
 
-test("gate: keeps anyone who played (starts ≥ 1 OR minutes > 0), drops the unplayed", () => {
+test("gate: starters always eligible; non-starters need ≥100 min; unplayed & sub-threshold drop", () => {
 	const out = rankEligible([
 		p("starter", 5, 400),
-		p("supersub", 0, 120), // 0 starts but has minutes → kept (season-tail tier)
+		p("starter-lowmin", 1, 80), // STARTED a match but <100 total min → still eligible (starters always in)
+		p("supersub", 0, 120), // 0 starts but ≥100 min → kept (season-tail tier)
+		p("filler", 0, 45), // 0 starts, <100 min → dropped (roster filler)
 		p("unplayed", 0, 0), // never played → dropped
 	]);
-	assert.deepEqual(out.map((x) => x.athleteId), ["starter", "supersub"]);
+	assert.deepEqual(out.map((x) => x.athleteId), ["starter", "starter-lowmin", "supersub"]);
+});
+
+test("100-minute threshold: exactly 100 stays, 99 drops (non-starters), a low-min starter stays", () => {
+	const out = rankEligible([
+		p("start-80", 2, 80), // started 2 → eligible despite <100 min
+		p("sub-99", 0, 99), // never started, just under the floor → dropped
+		p("sub-100", 0, 100), // never started, exactly 100 → kept
+	]);
+	assert.deepEqual(out.map((x) => x.athleteId), ["start-80", "sub-100"]);
 });
 
 test("ranking: starters (starts desc, then minutes desc) rank above supersubs", () => {
@@ -48,8 +59,8 @@ test("featured exclusion: excludeIds removes players from the pool", () => {
 });
 
 test("season-tail fallback emerges: once all starters are featured, the top pick is the highest-minutes supersub", () => {
-	const roster = [p("s1", 10, 900), p("s2", 7, 700), p("sub-hi", 0, 250), p("sub-lo", 0, 90)];
-	// Both starters featured → only supersubs remain, ranked by minutes.
+	const roster = [p("s1", 10, 900), p("s2", 7, 700), p("sub-hi", 0, 250), p("sub-lo", 0, 150)];
+	// Both starters featured → only the (≥100-min) supersubs remain, ranked by minutes.
 	const out = rankEligible(roster, new Set(["s1", "s2"]));
 	assert.deepEqual(out.map((x) => x.athleteId), ["sub-hi", "sub-lo"]);
 	assert.equal(pickWeeklyFeatured(out)?.athleteId, "sub-hi");
@@ -94,3 +105,22 @@ for (const [iso, want] of WEEK_CASES) {
 		assert.equal(mjsWeek(d), want, "scripts/assemble_knowher_prompt.mjs");
 	});
 }
+
+// ── Biweekly cadence gate (assembler self-gate) ─────────────────────────────────
+import { isKnowHerWeek } from "../scripts/assemble_knowher_prompt.mjs";
+
+test("isKnowHerWeek: alternates from the season anchor — Week 1 KHG, Week 2 Trivia, …", () => {
+	const anchor = "2026-03-23"; // Monday of regular-season Week 1
+	const mon = (n: number) => new Date(Date.UTC(2026, 2, 23) + n * 7 * 86_400_000);
+	assert.equal(isKnowHerWeek(mon(0), anchor), true, "Week 1 = KHG");
+	assert.equal(isKnowHerWeek(mon(1), anchor), false, "Week 2 = Trivia");
+	assert.equal(isKnowHerWeek(mon(2), anchor), true, "Week 3 = KHG");
+	assert.equal(isKnowHerWeek(mon(5), anchor), false, "Week 6 = Trivia");
+	assert.equal(isKnowHerWeek(new Date(Date.UTC(2026, 2, 26)), anchor), true, "any day within Week 1 is a KHG week");
+});
+
+test("isKnowHerWeek: pre-anchor weeks are off; unset/invalid anchor fails open to weekly", () => {
+	assert.equal(isKnowHerWeek(new Date(Date.UTC(2026, 2, 16)), "2026-03-23"), false, "the week before Week 1");
+	assert.equal(isKnowHerWeek(new Date(Date.UTC(2026, 5, 1)), undefined), true, "no anchor → generate (fail-open)");
+	assert.equal(isKnowHerWeek(new Date(Date.UTC(2026, 5, 1)), "not-a-date"), true, "bad anchor → generate (fail-open)");
+});
