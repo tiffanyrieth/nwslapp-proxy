@@ -10,11 +10,18 @@
 
   Usage: scripts/assemble_knowher_prompt.mjs strips this comment and substitutes the two placeholders —
   <<WEEK_KEY>> (ISO week, e.g. 2026-W29) and <<PLAYER_LIST>> (one block per team from /knowher/todo).
-  The assembled output IS the prompt; run it on a web-search-enabled Sonnet and POST the JSON to
+  The assembled output IS the prompt; run it on a web-search-enabled model and POST the JSON to
   /knowher/ingest (see scripts/knowher-weekly-routine.md). This file changes nothing live.
+
+  HUMAN-ONLY (2026-07-23): the model no longer writes the stat (`herGame`) questions. They are generated
+  in CODE from the same verified numbers shown below (scripts/knowher-stat-questions.mjs) and merged in by
+  scripts/inject_stat_questions.mjs before validation. A stat question's answer IS the number and its
+  distractors are just values around it — deriving that in code costs nothing, is consistently gettable
+  (the model kept producing minutes options a few apart, i.e. a mental-arithmetic test), and buys the
+  model's whole budget for the human questions, which is the only place it adds value.
 -->
 
-You're writing a ~10-question quiz **for each player below** for a **women's soccer fandom app**. This is NOT a
+You're writing the **human half** of a quiz **for each player below** for a **women's soccer fandom app**. This is NOT a
 stats app. The legacy sports apps are male-focused, stat-heavy, and when they cover women's sports they do a
 lazy cookie-cutter port. We're doing the opposite: the **Olympic approach** — tell me who she IS so I feel a
 connection and want to root for her. Female fans want a HYBRID that leans into **story and personality**, with
@@ -23,27 +30,35 @@ relatable detail like "she travels with her PS5" is gold).
 
 ## The players (verified 2026 stats — USE THESE NUMBERS, don't look stats up)
 
+The stats are here as CONTEXT for your reveal facts, not as material for questions — the system writes the
+stat questions itself from these exact numbers.
+
 <<PLAYER_LIST>>
 
-## What to produce PER PLAYER (~10 questions) — HUMAN-FIRST
+## What to produce PER PLAYER (8–9 questions) — HUMAN ONLY
 
-- **At LEAST 6 of the ~10 must be HUMAN / STORY questions** (`herStory` / `herWorld` / `trueOrFalse`):
+**Write ONLY human questions. Do NOT write any `herGame` / stat questions — the system automatically adds 2
+per player (goals, minutes, saves, and the like) from the verified numbers above.** Every question you write
+is a story question, so spend the whole budget there.
+
+- **All 8–9 must be HUMAN / STORY questions** (`herStory` / `herWorld` / `trueOrFalse`):
   personality, relatable quirks, life beyond soccer, origin story, career milestones. Most featured players
   have *tons* of these — but you have to SEARCH FOR PERSONALITY, not a résumé. Lead with terms like
   "<player> off the pitch / hobbies / fun facts / get to know / what she's like", NOT "<player> background"
   (that just returns draft position, college, and transfer fees — the stat-sheet trap). **Mine the official
   NWSL.com and her club's site** — their player Q&As, "get to know her" features, and her SIGNING-
   ANNOUNCEMENT story are gold-tier AND rich with the human detail you want (the PS5-in-the-suitcase kind).
-  Warm, surprising, makes-you-smile details. INTERLEAVE them throughout (never dump them at the end).
-- **At MOST ~4 stat/identity questions** (`herGame`), and make them THINK — MC options that are genuinely
-  CLOSE (e.g. minutes with several plausible 900-range options). NO gimmes ("what position?", "what's her
-  number?", "how many games has a star started?" → obviously ~all). A star's basic stats are boring.
-- ⚠️ **Coverage varies across 16 players — NEVER fabricate to hit the ratio.** Human-first is the target, but
-  a less-covered player (a backup keeper, a lower-profile international) may not have 6 clean, well-sourced
-  human facts. If so: use as many well-sourced human questions as genuinely exist, then fill the rest with
-  **genuinely-hard, non-gimme stat questions** (same THINK bar). A stretched or invented fun fact is a WORSE
-  failure than one extra hard stat question — better a 5-human/5-stat quiz that's all true than a 6th human
-  question you had to reach for. Doing fewer human questions for a thin-coverage player is fine; padding is not.
+  Warm, surprising, makes-you-smile details. VARY them throughout — don't cluster all the True/False
+  together, and don't save the single best fact for last. (The system weaves its 2 stat questions into your
+  run at the one-third and two-thirds marks, so you don't need to leave room for them.)
+- ⚠️ **Coverage varies across 16 players — NEVER fabricate to reach the count.** A less-covered player (a
+  backup keeper, a lower-profile international) may not have 8 clean, well-sourced *personality* facts. If so:
+  use as many as genuinely exist, then fill the rest with **verifiable CAREER / IDENTITY questions** — previous
+  clubs, college or youth club, how she arrived at this club (draft, transfer, signing), national-team caps or
+  a first call-up, a debut, an honor. Those are documented for every professional, still tell you who she is,
+  and are NOT stat questions (the system handles those). Make them THINK — no gimmes ("what position does she
+  play?", "what's her number?"). A stretched or invented fun fact is the WORST failure: a solid career question
+  beats a personality fact you had to reach for.
 
 ## THE FIVE-LAYER GUARDRAIL (every human question — non-negotiable)
 
@@ -72,14 +87,14 @@ she's dating or which relative is famous.
 - **Disambiguate:** confirm each fact is about THIS player (the correct NWSL player + her CURRENT club as
   listed above / her national team) — discard same-or-similar-name namesakes.
 - **Search budget (soft):** aim for **~5–6 searches per player**. Well-covered players won't need that
-  many; for a thin-coverage player, once you've spent ~5–6 and the well is dry, STOP — fall back to
-  genuinely-hard stat questions (per the coverage rule above) rather than hunting endlessly. A great
-  5-human/5-stat quiz beats grinding a dozen searches for a 6th reached-for fact.
+  many; for a thin-coverage player, once you've spent ~5–6 and the personality well is dry, STOP — fall back
+  to verifiable career/identity questions (per the coverage rule above) rather than hunting endlessly. A
+  solid career question beats grinding a dozen searches for one more reached-for fact.
 
 ## Format — fix the True/False trap
 
-- `category`: `herGame` / `herStory` / `herWorld` / `trueOrFalse`. MC = exactly 4 options; T/F = exactly 2
-  (`["True","False"]` in that order, so `correctIndex` 0 = True, 1 = False).
+- `category`: `herStory` / `herWorld` / `trueOrFalse` (never `herGame` — that's the system's). MC = exactly 4
+  options; T/F = exactly 2 (`["True","False"]` in that order, so `correctIndex` 0 = True, 1 = False).
 - A **single** fun fact must be an MC **"which of these has she actually done?"** — ONE true option among
   3–4 plausible-but-false ones (forces real knowledge). Do NOT make a lone fun fact a hyper-specific
   True/False ("True or false: she did <ultra-specific thing>") — the answer is obviously TRUE, a free
@@ -89,8 +104,11 @@ she's dating or which relative is famous.
   yourself writing "True or false: <impressive true achievement>" over and over (answer: True), STOP — that
   IS the banned obvious-true pattern; make the claim a believable-but-FALSE one, or convert it to an MC
   "which of these has she actually done?". A pool that is mostly-"True" will be REJECTED by the validator.
-- Each question: unique `id` (e.g. `"was-rodman-<slug>"`), a `prompt`, and a warm one-sentence `revealFact`
-  (the "learn"/delight payoff). **10–15 questions per player (aim ~10–11) — 10 is the FLOOR, not 8.** One player per team.
+- Each question: unique `id` (e.g. `"was-rodman-<slug>"` — always three parts, club-player-slug, so it can't
+  collide with the system's `was-stat-goals` ids), a `prompt`, and a warm one-sentence `revealFact` (the
+  "learn"/delight payoff). **8–9 questions per player — 8 is the FLOOR.** The system appends 2 stat questions,
+  so the published quiz lands at 10–11; a richer player may go to 13 (published 15). One player per team.
+  ⚠️ Fewer than 8 and the merged quiz falls under the app's 10-question floor and the whole run is rejected.
 - Also write a warm one-line `tagline` for each player.
 - **`jerseyNumber`:** take it from the player's line above (the `#N`). If a player's line shows no number
   (ESPN didn't have it), do ONE quick lookup of her current squad number and use that — a plain integer,

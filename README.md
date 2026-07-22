@@ -32,7 +32,10 @@ still calls those directly.
 (Mon 09:00 UTC) runs `scripts/knowher-weekly-routine.md` — it assembles the
 week's generation prompt via `scripts/assemble_knowher_prompt.mjs` (fills
 `scripts/knowher-weekly-TEMPLATE.md` from `GET /knowher/todo?team=`, one call
-per club), generates the 16-player quiz pool, dry-run validates
+per club), generates the 16-player quiz pool, injects the code-generated stat
+questions (`scripts/inject_stat_questions.mjs`, built by
+`scripts/knowher-stat-questions.mjs` from the same verified numbers — the model
+writes the HUMAN questions only), dry-run validates
 (`scripts/load_knowher.mjs --dry-run`), and publishes via
 **`POST /knowher/ingest`** (dedicated `KNOWHER_INGEST_KEY` secret, header
 `x-ingest-key`; validate → KV → featured-ledger mark, diags on every outcome).

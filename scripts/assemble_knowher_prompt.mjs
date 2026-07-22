@@ -16,7 +16,7 @@
 //
 // Node ≥ 18 (built-in fetch), zero dependencies — runnable by the weekly routine and by hand.
 
-import { readFileSync } from "node:fs";
+import { readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
@@ -25,6 +25,12 @@ const BASE = (() => {
   return i > -1 && process.argv[i + 1]
     ? process.argv[i + 1].replace(/\/$/, "")
     : "https://nwslapp-proxy.tiffany-rieth.workers.dev";
+})();
+
+// Where the stat sidecar lands (consumed by scripts/inject_stat_questions.mjs). Overridable for tests.
+const STATS_PATH = (() => {
+  const i = process.argv.indexOf("--stats");
+  return i > -1 && process.argv[i + 1] ? process.argv[i + 1] : "/tmp/knowher-stats.json";
 })();
 
 // The canonical 16 (matches src/index.ts TEAM list + DesignTeamColors in the app).
@@ -54,7 +60,9 @@ const POSITION_WORD = {
   D: "Defender", CB: "Defender", RB: "Defender", LB: "Defender", WB: "Defender", FB: "Defender",
   G: "Goalkeeper", GK: "Goalkeeper",
 };
-const isKeeper = (pos) => POSITION_WORD[pos] === "Goalkeeper";
+// Exported so scripts/knowher-stat-questions.mjs classifies keepers off the SAME position map (a second
+// copy would drift the moment ESPN adds a position code).
+export const isKeeper = (pos) => POSITION_WORD[pos] === "Goalkeeper";
 
 /** ISO-8601 week (Monday-start) as "YYYY-Www" — matches the app's KnowHerGameStore week parsing and
  *  the Mon–Sun window the pool's weekKey stamps. The ISO YEAR can differ from the calendar year at
@@ -161,6 +169,7 @@ const template = readFileSync(
 
 const blocks = [];
 const gaps = [];
+const statsByAthleteId = {};
 let season = null;
 
 for (const [abbr, clubName] of CLUBS) {
@@ -169,6 +178,10 @@ for (const [abbr, clubName] of CLUBS) {
     season ??= year;
     if (player) {
       blocks.push(playerBlock(clubName, abbr, year, player));
+      // Sidecar for the stat-question injector: the SAME verified numbers the prompt shows, keyed by
+      // athlete id so the merge can't mis-attach a player's stats. Written here because this is the only
+      // place the /knowher/todo payload exists — the model never echoes stats back.
+      statsByAthleteId[String(player.athleteId)] = { ...player, teamAbbr: abbr, season: year };
     } else {
       gaps.push(`${abbr}: no eligible pick (roster exhausted for the season, or upstream empty)`);
     }
@@ -186,6 +199,16 @@ if (blocks.length === 0) {
 if (gaps.length > 0) {
   console.error(`⚠️  Assembling with ${blocks.length}/16 teams — the missing teams keep last week's player in the app.`);
 }
+
+// Write the sidecar BEFORE the prompt: if the disk write fails, fail here rather than after the routine
+// has already spent a night generating against a prompt whose stat questions can never be injected.
+try {
+  writeFileSync(STATS_PATH, JSON.stringify(statsByAthleteId, null, 2));
+} catch (e) {
+  console.error(`❌ Could not write the stat sidecar to ${STATS_PATH} — ${e.message}. The stat questions are injected from this file, so generation would produce an incomplete pool. No prompt emitted.`);
+  process.exit(1);
+}
+console.error(`📊 Wrote stats for ${Object.keys(statsByAthleteId).length} players to ${STATS_PATH} (stat questions are generated in code, not by the model).`);
 
 const weekKey = isoWeekKey();
 process.stdout.write(
