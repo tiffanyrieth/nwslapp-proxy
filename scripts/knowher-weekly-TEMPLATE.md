@@ -29,8 +29,12 @@ relatable detail like "she travels with her PS5" is gold).
 
 - **At LEAST 6 of the ~10 must be HUMAN / STORY questions** (`herStory` / `herWorld` / `trueOrFalse`):
   personality, relatable quirks, life beyond soccer, origin story, career milestones. Most featured players
-  have *tons* of these — dig (Google "<player> fun facts", inside and outside soccer). Warm, surprising,
-  makes-you-smile details. INTERLEAVE them throughout (never dump them at the end).
+  have *tons* of these — but you have to SEARCH FOR PERSONALITY, not a résumé. Lead with terms like
+  "<player> off the pitch / hobbies / fun facts / get to know / what she's like", NOT "<player> background"
+  (that just returns draft position, college, and transfer fees — the stat-sheet trap). **Mine the official
+  NWSL.com and her club's site** — their player Q&As, "get to know her" features, and her SIGNING-
+  ANNOUNCEMENT story are gold-tier AND rich with the human detail you want (the PS5-in-the-suitcase kind).
+  Warm, surprising, makes-you-smile details. INTERLEAVE them throughout (never dump them at the end).
 - **At MOST ~4 stat/identity questions** (`herGame`), and make them THINK — MC options that are genuinely
   CLOSE (e.g. minutes with several plausible 900-range options). NO gimmes ("what position?", "what's her
   number?", "how many games has a star started?" → obviously ~all). A star's basic stats are boring.
@@ -60,6 +64,8 @@ she's dating or which relative is famous.
   Soccer Network, The Athletic, ESPN, Sports Illustrated, AP, Reuters, official NWSL / club /
   U.S. Soccer / Olympics.com / a player's own national federation, and major national outlets (NYT,
   Washington Post, People). A fact from any ONE of these is trusted — do NOT drop it for lack of a second source.
+  ⭐ **For PERSONALITY, the official NWSL.com and club sites are your best gold-tier well** — "get to know",
+  player Q&As, and signing-announcement features carry the warm/relatable detail a Wikipedia career summary never will.
 - **General web (anything not gold-tier):** needs ≥2 DISTINCT reputable domains that agree.
 - **NEVER:** fan wikis, gossip/tabloid, video-game DBs (futbin), retailer/sponsor pages, random YouTube/
   social, unsourced blogs. Only cite URLs you actually retrieved — if you can't verify, drop it.
@@ -79,9 +85,12 @@ she's dating or which relative is famous.
   True/False ("True or false: she did <ultra-specific thing>") — the answer is obviously TRUE, a free
   guess. BANNED.
 - Only use **True/False when some statements are plausibly FALSE** (a believable-but-untrue claim), so
-  "true" isn't automatic. Mix true and false answers across the T/F questions.
+  "true" isn't automatic. **Roughly HALF of your T/F answers across all players must be FALSE.** If you find
+  yourself writing "True or false: <impressive true achievement>" over and over (answer: True), STOP — that
+  IS the banned obvious-true pattern; make the claim a believable-but-FALSE one, or convert it to an MC
+  "which of these has she actually done?". A pool that is mostly-"True" will be REJECTED by the validator.
 - Each question: unique `id` (e.g. `"was-rodman-<slug>"`), a `prompt`, and a warm one-sentence `revealFact`
-  (the "learn"/delight payoff). 8–15 questions per player (aim ~10). One player per team.
+  (the "learn"/delight payoff). **10–15 questions per player (aim ~10–11) — 10 is the FLOOR, not 8.** One player per team.
 - Also write a warm one-line `tagline` for each player.
 - **`jerseyNumber`:** take it from the player's line above (the `#N`). If a player's line shows no number
   (ESPN didn't have it), do ONE quick lookup of her current squad number and use that — a plain integer,
