@@ -45,15 +45,29 @@ exact JSON shape to output. Honor every rule in it, including:
   16 parallel research agents multiplies the session's token cost ~16× for no quality gain, and the run
   is only as fast as the slowest straggler. Work through them sequentially, or in small groups of a few
   at a time — you have all night, so favor low token cost over wall-clock speed.
+- ⚠️ **BUILD THE POOL INCREMENTALLY — never emit all 16 players in one response.** The full pool is ~1,200
+  lines of JSON; writing it in a single message BLOWS the model's output-token cap (the first automated
+  run hit `exceeded the 32000 output token maximum` and, worse, reacted by trimming every player to the
+  bare-minimum question count). Instead, work in **batches of ~4 players**: research a batch, then WRITE
+  that batch's player objects to `/tmp/knowher-pool.json` — appending to the `players` array (start the
+  file with `{"weekKey":…,"season":…,"players":[` on the first batch, append objects each batch, close
+  `]}` at the end) — before moving to the next batch. No single response should carry more than ~4 players'
+  JSON. This removes the cap failure AND the pressure to shorten players.
 - **Respect the prompt's search budget** (~5–6 searches per player). For a thin-coverage player, once
   you've spent that, STOP hunting and fall back to hard stat questions — the prompt explicitly allows a
   5-human/5-stat quiz over a reached-for 6th fact. Don't grind endlessly on obscure players.
+- **Hit the quality bar as you write (the validator now enforces it — step 3):** aim for **~10 questions
+  per player** (10 is the floor, not 8), **≥6 human / ≤4 stat** questions, and **vary True/False answers**
+  (mix true AND false — a lone true fact belongs as an MC "which of these has she actually done?", never a
+  hyper-specific "true or false" that's an obvious yes). Writing to the bar the first time avoids a
+  regenerate.
 - **jerseyNumber:** use the number in the player's block. If a player's line has no `#N` (ESPN lacked
   it), do ONE quick lookup of her current squad number — don't turn it into a research detour, and never
   block the whole run on it.
 
-Save ONLY the JSON document (nothing around it) to `/tmp/knowher-pool.json`. Keep the per-player source
-list separately for your final report (it must NOT be inside the JSON).
+Build the JSON document incrementally as above until `/tmp/knowher-pool.json` holds ONLY the finished pool
+(nothing around it). Keep the per-player source list separately for your final report (it must NOT be inside
+the JSON).
 
 ### 3. Validate (server rules, no write)
 
@@ -61,9 +75,14 @@ list separately for your final report (it must NOT be inside the JSON).
 node scripts/load_knowher.mjs /tmp/knowher-pool.json --dry-run
 ```
 
+The validator checks BOTH JSON shape AND content quality (≥10 questions/player, ≥6 human / ≤4 stat, and a
+balanced mix of True/False answers — it fails a pool that's ~80% "True", the banned obvious-true pattern).
+`⚠️` lines are non-fatal warnings; `✗` lines fail.
 - Pass → proceed.
 - Fail → fix ONLY mechanical JSON-shape issues (e.g. a missing field name, an options-count slip) if the
-  fix is unambiguous; otherwise regenerate the offending player(s) per step 2 ONCE. If validation still
+  fix is unambiguous. For a **content-quality** `✗` (too few questions, too stat-heavy, too many "True"
+  T/F), regenerate the offending player(s) per step 2 ONCE — add human questions to reach ~10 and vary the
+  True/False answers; do NOT pad with junk. If validation still
   fails → **STOP**, publish nothing, report FAILURE with the validator's exact error. Last week's
   content stays live automatically — a missed week is safe; a malformed publish is not.
 
