@@ -17,14 +17,15 @@ node scripts/assemble_knowher_prompt.mjs > /tmp/knowher-prompt.md
 ```
 
 Know Her Game runs **biweekly**, alternating the Fan Zone quiz slot with NWSL Trivia, so the assembler
-self-gates on season-week parity (anchor = the `KHG_SEASON_ANCHOR` env var — the Monday of regular-season
-Week 1, e.g. `2026-03-23`). Handle the THREE outcomes:
+self-gates on season-week parity (anchor = the committed `SEASON_ANCHOR` constant in
+`assemble_knowher_prompt.mjs` — the Monday of regular-season Week 1, `2026-03-09`; the `KHG_SEASON_ANCHOR`
+env var overrides it for tests. Bump the constant each new season). Handle the THREE outcomes:
 - **Exit 0, prompt file NON-EMPTY** → a KHG week: proceed. Capture any `⚠️ GAP` lines from stderr for the
   final report (a gap team keeps last week's player in the app — report it, don't fix it).
 - **Exit 0, prompt file EMPTY** (stderr: `⏸ Not a Know Her Game week`) → an off (NWSL Trivia) week. **STOP
   and report SUCCESS:** "off week — Trivia's turn; the current 2-week KHG pool stays live; nothing
-  generated." Do NOT proceed. (If `KHG_SEASON_ANCHOR` is unset the assembler warns + generates weekly as a
-  fail-safe — treat as a normal KHG week but flag the missing anchor in the report.)
+  generated." Do NOT proceed. (If the anchor were ever unset/invalid the assembler warns + generates weekly
+  as a fail-safe — treat as a normal KHG week but flag it in the report.)
 - **Exit 1** → **STOP** and report FAILURE (offseason or the proxy/ESPN is down; nothing to generate).
 - The assembled file is the complete, fine-tuned generation query. **Treat its wording as immutable** —
   do not edit, reorder, summarize, or "improve" it. It was tuned over many sessions and small wording

@@ -78,12 +78,18 @@ function mondayOrdinal(date) {
   return Math.round(u.getTime() / (7 * 86_400_000));
 }
 
+/** The Monday of regular-season Week 1 — the biweekly cadence anchor (Week 1 = Know Her Game). The 2026
+ *  season opened Fri 2026-03-13, so Week 1 is the week of Mon 2026-03-09. COMMITTED here (not an env var)
+ *  because the weekly Claude Routine runs this script from a repo checkout and its UI has no env-var field;
+ *  the `KHG_SEASON_ANCHOR` env var stays as a test/CI override. ⚠️ Bump this each new season. */
+export const SEASON_ANCHOR = "2026-03-09";
+
 /** Biweekly cadence gate. Know Her Game runs on ALTERNATING ISO weeks (Season Weeks 1, 3, 5 …), sharing
  *  the Fan Zone quiz slot with NWSL Trivia (Weeks 2, 4, 6 …) so only one quiz game generates content in a
- *  given week. The anchor = the Monday of regular-season Week 1, set via the KHG_SEASON_ANCHOR env var
- *  (e.g. "2026-03-23"). Returns true on a KHG week (even offset from the anchor). FAILS OPEN (weekly, with
- *  a loud warning) when the anchor is unset/invalid, so a misconfig degrades to the old weekly cadence
- *  rather than silently halting the game. Exported for the lock-step test. */
+ *  given week. The anchor = the Monday of regular-season Week 1 (`SEASON_ANCHOR`; env var overrides for
+ *  tests). Returns true on a KHG week (even offset from the anchor). FAILS OPEN (weekly, with a loud
+ *  warning) when the anchor is unset/invalid, so a misconfig degrades to the old weekly cadence rather
+ *  than silently halting the game. Exported for the lock-step test. */
 export function isKnowHerWeek(now = new Date(), anchorRaw = process.env.KHG_SEASON_ANCHOR) {
   if (!anchorRaw) {
     console.error("⚠️  KHG_SEASON_ANCHOR unset — generating this week (fail-open to weekly). Set it to the Monday of regular-season Week 1 (e.g. 2026-03-23) for biweekly alternation.");
@@ -142,8 +148,9 @@ if (import.meta.url === pathToFileURL(process.argv[1] ?? "").href) {
 
 async function main() {
 // Biweekly cadence: on a NWSL Trivia week, emit no prompt and exit cleanly — the routine no-ops and the
-// current 2-week KHG pool stays live. Checked BEFORE fetching 16 teams (no work on an off week).
-if (!isKnowHerWeek()) {
+// current 2-week KHG pool stays live. Checked BEFORE fetching 16 teams (no work on an off week). Anchor =
+// env override ?? the committed SEASON_ANCHOR (the routine has no env-var UI, so the constant is the source).
+if (!isKnowHerWeek(new Date(), process.env.KHG_SEASON_ANCHOR ?? SEASON_ANCHOR)) {
   console.error("⏸  Not a Know Her Game week (NWSL Trivia's turn in the quiz slot) — no prompt emitted; the current 2-week pool stays live.");
   process.exit(0);
 }
