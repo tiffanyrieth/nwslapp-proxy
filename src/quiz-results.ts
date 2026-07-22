@@ -25,14 +25,15 @@ const REVEAL_HIDDEN_TTL = 5 * 60; // trivia, still-open day: re-check every 5 mi
 const LIVE_TTL = 15 * 60; // in-flight edition: growing counts, cheap edge refresh
 const CLOSED_TTL = 24 * 3600; // a closed edition never changes
 
-/** True once a TRIVIA day-key ("YYYY-MM-DD") is in the past (UTC) — its window is over, so the
- *  community breakdown may be revealed. Know Her is always revealed (live weekly counts). Any
- *  unparseable key fails OPEN to revealed (better to show honest data than to hide it). */
-function isRevealed(game: string, editionKey: string, todayUTC: string): boolean {
-  if (game !== "trivia") return true;
-  const day = editionKey.slice(0, 10);
-  if (!/^\d{4}-\d{2}-\d{2}$/.test(day)) return true;
-  return day < todayUTC;
+/** Both games are ALWAYS revealed — the KHG live-community model (first responder sees "you're the
+ *  first", counts grow live; % appears at PERCENT_MIN_N). Trivia adopted it with the biweekly-round
+ *  rebuild (2026-07-23, app TriviaRoundView): its edition keys are now round keys ("2026-R08"), and
+ *  the old wait-for-the-day-to-close rule — reveal only once the "YYYY-MM-DD" key was past — is gone
+ *  with the daily model itself. Kept as a function (not deleted) so a future game CAN reinstate a
+ *  reveal gate in one place; legacy day-keyed trivia editions also just reveal (harmless, and their
+ *  rows age out via the retention cron). */
+function isRevealed(_game: string, _editionKey: string, _todayUTC: string): boolean {
+  return true;
 }
 
 type DistRow = { question_id: string; selected_index: number; is_correct: boolean; cnt: number };
@@ -131,9 +132,11 @@ export async function handleQuizResults(url: URL, env: QuizEnv, ctx: ExecutionCo
     questions,
   };
 
-  // Closed editions never change → long TTL; in-flight → short so counts grow.
-  const closed = game === "trivia"; // a revealed trivia day is by definition closed
-  const body = jsonResponse(payload, closed ? CLOSED_TTL : LIVE_TTL);
+  // Every edition is now served LIVE (growing counts) — under the round model there is no
+  // "closed by definition" moment at serve time for either game; the retention cron ends an
+  // edition's life instead. Short TTL keeps counts fresh; CLOSED_TTL is retained for a future
+  // explicit-close feature.
+  const body = jsonResponse(payload, LIVE_TTL);
   // Only cache once at least one fan has answered — don't pin an empty distribution.
   if (responders > 0) ctx.waitUntil(cache.put(cacheKey, body.clone()));
   return withStatus(body, "MISS");
