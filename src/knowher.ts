@@ -52,6 +52,7 @@ export interface KnowHerPlayer {
 export interface KnowHerPool {
   weekKey: string; // e.g. "2026-W27" — the Mon–Sun window this pool is live for
   season: number; // e.g. 2026
+  round?: number; // 1-based edition index this season, STAMPED server-side at publish — the picker's "Round N"
   players: KnowHerPlayer[]; // one featured player per team (never a team the user doesn't follow)
 }
 
@@ -263,6 +264,17 @@ export async function markFeatured(
   return doc.featured.length;
 }
 
+/** The 1-based ROUND number for `weekKey` this season = the count of DISTINCT weekKeys the ledger has
+ *  featured, including this one. Robust to a skipped/failed cycle (it counts editions actually PUBLISHED,
+ *  not elapsed weeks, so a missed Monday doesn't inflate the number). Idempotent: re-publishing the same
+ *  weekKey doesn't advance it. Stamped into the pool at publish for the picker's "Round N" display. */
+export async function roundNumberForWeek(env: KnowHerEnv, season: number, weekKey: string): Promise<number> {
+  const doc = (await env.FEED_TAGS.get(`${KNOWHER_FEATURED_PREFIX}${season}`, "json")) as FeaturedLedger | null;
+  const weeks = new Set((doc?.featured ?? []).map((f) => f.weekKey));
+  weeks.add(weekKey); // include this edition even before markFeatured runs
+  return weeks.size;
+}
+
 /** Remove one athleteId from the season ledger (operator fix for a mistaken feature). Returns true if it
  *  was present. */
 export async function unfeature(env: KnowHerEnv, season: number, athleteId: string): Promise<boolean> {
@@ -342,6 +354,9 @@ export async function publishKnowHerPool(
   } catch {
     /* leave espnTeamId unset; the watcher fails open + diags */
   }
+  // The 1-based edition index this season → the picker's "Round N". Derived from the ledger (distinct
+  // published weekKeys incl. this one) so a skipped cycle doesn't inflate it.
+  v.pool.round = await roundNumberForWeek(env, v.pool.season, v.pool.weekKey);
   await env.FEED_TAGS.put(KNOWHER_POOL_KEY, JSON.stringify(v.pool));
   const featuredThisSeason = await markFeatured(
     env, v.pool.season, v.pool.weekKey,
