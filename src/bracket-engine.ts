@@ -781,6 +781,16 @@ async function tallyAndAdvance(env: BracketEnv, ed: EditionRow, now: number, con
   // Advance — or finish.
   const finish = async (reason: string): Promise<string> => {
     await sbPatch(env, "bracket_editions", `id=eq.${ed.id}`, { is_active: false, round_closes_at: null, completed_at: new Date(now).toISOString() });
+    // The record book: stamp each player's FINAL RANK + FIELD SIZE, then prune older editions'
+    // ballot boxes (owner retention rule). Best-effort AFTER the completion write — a failure here
+    // must never wedge the close; the next operator /bracket/run can re-run it (both steps are
+    // idempotent: the stamp recomputes the same ranks, the prune finds nothing left to delete).
+    try {
+      await stampFinalRanks(env, ed.id, now);
+      await pruneOldEditionVotes(env, ed.id);
+    } catch (e) {
+      await emitDiag(env, "bracketFinalizeError", `${ed.id}: ${(e as Error).message}`);
+    }
     return `edition ${ed.id} complete — ${reason}`;
   };
   if (forceFinish) return await finish("closed by operator");
@@ -854,6 +864,37 @@ async function writeNextRound(
     round_closes_at: roundCloseISO(nextCode, now, config),
   });
   return `tallied round ${fromRound} (${fromCount} matchups) → opened round ${nextCode}`;
+}
+
+/** At edition close: rank every bracket_scores row (points desc; tie → earlier updated_at, i.e. the
+ *  player who reached the total first) and stamp final_rank + field_size onto each player's
+ *  bracket_user_edition_stats row. The one-row-per-user tables are tiny and kept FOREVER — this is
+ *  what lets "Your Stats" say "Finished #12 of 340" for every past edition, World-Cup-style, after
+ *  the per-vote detail is pruned. Idempotent: re-running recomputes identical ranks. */
+async function stampFinalRanks(env: BracketEnv, editionId: string, now: number): Promise<void> {
+  const scores = await sbGet<{ user_id: string; points: number; updated_at: string | null }[]>(
+    env, `bracket_scores?edition_id=eq.${editionId}&select=user_id,points,updated_at&order=points.desc,updated_at.asc`);
+  if (scores.length === 0) return;
+  const rows = scores.map((s, i) => ({
+    user_id: s.user_id, edition_id: editionId,
+    final_rank: i + 1, field_size: scores.length,
+    updated_at: new Date(now).toISOString(),
+  }));
+  // Upsert (not patch-per-user): one call, and a voter who somehow has a score but no stats row
+  // (shouldn't happen, but PK-safe) still gets their rank recorded.
+  await sbUpsert(env, "bracket_user_edition_stats", rows, "user_id,edition_id");
+}
+
+/** Owner retention rule: keep the ballot boxes (per-user bracket_votes) for the ACTIVE edition and
+ *  the just-completed one only — the previous edition stays fully browsable round-by-round (the
+ *  World Cup argument), older editions keep just their record book (scores + stats + stamped rank).
+ *  Runs at edition close, so no cron is needed for bracket data. */
+async function pruneOldEditionVotes(env: BracketEnv, justCompletedId: string): Promise<void> {
+  const editions = await sbGet<{ id: string }[]>(
+    env, `bracket_editions?is_active=eq.false&completed_at=not.is.null&id=neq.${justCompletedId}&select=id`);
+  for (const old of editions) {
+    await sbDelete(env, "bracket_votes", `edition_id=eq.${old.id}`);
+  }
 }
 
 /** Add this round's points onto each voter's per-edition score (PostgREST has no atomic +). */
