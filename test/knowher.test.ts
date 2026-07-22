@@ -107,7 +107,15 @@ for (const [iso, want] of WEEK_CASES) {
 }
 
 // ── Biweekly cadence gate (assembler self-gate) ─────────────────────────────────
-import { isKnowHerWeek } from "../scripts/assemble_knowher_prompt.mjs";
+import { isKnowHerWeek, SEASON_ANCHOR } from "../scripts/assemble_knowher_prompt.mjs";
+
+test("SEASON_ANCHOR: the committed anchor puts Week 1 (season opener week) on Know Her Game", () => {
+	// 2026 opener = Fri 2026-03-13 → Week 1 is the week of Mon 2026-03-09.
+	assert.equal(SEASON_ANCHOR, "2026-03-09");
+	assert.equal(isKnowHerWeek(new Date(Date.UTC(2026, 2, 9)), SEASON_ANCHOR), true, "Week 1 (Mar 9) = KHG");
+	assert.equal(isKnowHerWeek(new Date(Date.UTC(2026, 2, 13)), SEASON_ANCHOR), true, "opener day (Mar 13) is in Week 1");
+	assert.equal(isKnowHerWeek(new Date(Date.UTC(2026, 2, 16)), SEASON_ANCHOR), false, "Week 2 (Mar 16) = Trivia");
+});
 
 test("isKnowHerWeek: alternates from the season anchor — Week 1 KHG, Week 2 Trivia, …", () => {
 	const anchor = "2026-03-23"; // Monday of regular-season Week 1
