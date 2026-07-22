@@ -40,6 +40,8 @@ export interface KnowHerQuestion {
 export interface KnowHerPlayer {
   teamAbbreviation: string;
   espnAthleteId: string; // the app resolves the headshot via HeadshotStore from this id
+  espnTeamId?: string; // numeric ESPN team id, STAMPED server-side at publish (not from the AI) — lets the
+                       // match-watcher target this team's followers for the biweekly KHG push
   playerName: string;
   jerseyNumber: number;
   position: string;
@@ -50,6 +52,7 @@ export interface KnowHerPlayer {
 export interface KnowHerPool {
   weekKey: string; // e.g. "2026-W27" — the Mon–Sun window this pool is live for
   season: number; // e.g. 2026
+  round?: number; // 1-based edition index this season, STAMPED server-side at publish — the picker's "Round N"
   players: KnowHerPlayer[]; // one featured player per team (never a team the user doesn't follow)
 }
 
@@ -153,16 +156,25 @@ export interface EligiblePlayer {
   saves: number;
 }
 
+/** Minimum season minutes for a NON-STARTER to be eligible for Know Her Game. Starters (starts ≥ 1) are
+ *  always eligible regardless of minutes; this floor gates only the season-tail supersubs, filtering pure
+ *  roster filler (4th GKs, emergency call-ups, a one-off 10-minute cameo). Owner rule (2026-07-21). */
+export const KHG_MIN_MINUTES = 100;
+
 /** Pure ranking + gate + season-tail fallback (docs §4), split out so it's unit-testable without the
- *  network. The eligible pool = anyone who has PLAYED (starts ≥ 1 OR minutes > 0), minus already-featured
- *  ids. Ranked core-starters-first: starts desc, then minutes desc. This single ranking makes the
- *  "season-tail fallback" emerge for free — while any unfeatured STARTER remains it sorts to the top; once
- *  all starters are featured (removed via the ledger), the highest-minutes SUPERSUB (starts 0, minutes > 0)
- *  is next. Unplayed players (no minutes) drop out. The tiebreak is athleteId (NOT name → not A–Z, so no
- *  club/player is permanently buried); combined with once-per-season removal, that satisfies §4's
- *  "weekly-deterministic, fair" ordering without a separate week seed. */
+ *  network. The eligible pool = STARTERS (starts ≥ 1) always, PLUS non-starters with ≥ KHG_MIN_MINUTES
+ *  minutes, minus already-featured ids. Ranked core-starters-first: starts desc, then minutes desc. This
+ *  single ranking makes the "season-tail fallback" emerge for free — while any unfeatured STARTER remains
+ *  it sorts to the top; once all starters are featured (removed via the ledger), the highest-minutes
+ *  SUPERSUB (starts 0, minutes ≥ 100) is next. Sub-threshold / unplayed players drop out. DYNAMIC RE-ENTRY
+ *  is automatic: this runs on LIVE stats each cycle, so a returning-from-injury player who crosses 100' (or
+ *  makes a start) becomes eligible for the next edition. The tiebreak is athleteId (NOT name → not A–Z, so
+ *  no club/player is permanently buried); combined with once-per-season removal, that satisfies §4's
+ *  "deterministic, fair" ordering without a separate week seed. */
 export function rankEligible(players: EligiblePlayer[], excludeIds: Set<string> = new Set()): EligiblePlayer[] {
-  const eligible = players.filter((p) => !excludeIds.has(p.athleteId) && (p.starts >= 1 || p.minutes > 0));
+  const eligible = players.filter(
+    (p) => !excludeIds.has(p.athleteId) && (p.starts >= 1 || p.minutes >= KHG_MIN_MINUTES),
+  );
   eligible.sort((a, b) => b.starts - a.starts || b.minutes - a.minutes || (a.athleteId < b.athleteId ? -1 : 1));
   return eligible;
 }
@@ -252,6 +264,17 @@ export async function markFeatured(
   return doc.featured.length;
 }
 
+/** The 1-based ROUND number for `weekKey` this season = the count of DISTINCT weekKeys the ledger has
+ *  featured, including this one. Robust to a skipped/failed cycle (it counts editions actually PUBLISHED,
+ *  not elapsed weeks, so a missed Monday doesn't inflate the number). Idempotent: re-publishing the same
+ *  weekKey doesn't advance it. Stamped into the pool at publish for the picker's "Round N" display. */
+export async function roundNumberForWeek(env: KnowHerEnv, season: number, weekKey: string): Promise<number> {
+  const doc = (await env.FEED_TAGS.get(`${KNOWHER_FEATURED_PREFIX}${season}`, "json")) as FeaturedLedger | null;
+  const weeks = new Set((doc?.featured ?? []).map((f) => f.weekKey));
+  weeks.add(weekKey); // include this edition even before markFeatured runs
+  return weeks.size;
+}
+
 /** Remove one athleteId from the season ledger (operator fix for a mistaken feature). Returns true if it
  *  was present. */
 export async function unfeature(env: KnowHerEnv, season: number, athleteId: string): Promise<boolean> {
@@ -318,6 +341,22 @@ export async function publishKnowHerPool(
 ): Promise<{ ok: true; weekKey: string; playerCount: number; featuredThisSeason: number; note: string } | { error: string }> {
   const v = validateKnowHerPool(poolInput);
   if ("error" in v) return { error: v.error };
+  // Stamp each player's numeric ESPN team id (abbr→id via the shared teams map) so the match-watcher can
+  // target the team's followers for the biweekly KHG push without its own abbr→id table. Best-effort: a
+  // lookup miss just leaves espnTeamId undefined (the watcher skips that team + logs), never blocks publish.
+  try {
+    const teams = await fetchTeamAbbrs();
+    const idByAbbr = new Map(teams.map((t) => [t.abbr.toUpperCase(), String(t.id)]));
+    for (const p of v.pool.players) {
+      const id = idByAbbr.get(p.teamAbbreviation.toUpperCase());
+      if (id) p.espnTeamId = id;
+    }
+  } catch {
+    /* leave espnTeamId unset; the watcher fails open + diags */
+  }
+  // The 1-based edition index this season → the picker's "Round N". Derived from the ledger (distinct
+  // published weekKeys incl. this one) so a skipped cycle doesn't inflate it.
+  v.pool.round = await roundNumberForWeek(env, v.pool.season, v.pool.weekKey);
   await env.FEED_TAGS.put(KNOWHER_POOL_KEY, JSON.stringify(v.pool));
   const featuredThisSeason = await markFeatured(
     env, v.pool.season, v.pool.weekKey,
