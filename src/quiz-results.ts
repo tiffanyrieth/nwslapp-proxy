@@ -9,10 +9,12 @@
 // writes (the free tier's scarce limit is 1,000 KV writes/day, already near-capped by the
 // watcher on live Saturdays), and NOT a per-view live aggregation.
 //
-// REVEAL TIMING is HYBRID BY CADENCE (owner): Know Her (weekly) shows live, growing HONEST COUNTS
-// during the week; NWSL Trivia (daily) reveals only AFTER its day closes (next-day) so it can't be
-// spoiled. Percentages layer in once responders ≥ 25; below that, honest counts only (never a bare
-// "100%" for player #2). Raw per-user answers stay private — only aggregates are exposed.
+// REVEAL TIMING: both games show live, growing counts from the first responder (see isRevealed).
+// Percentages ALSO show from the first responder as of 2026-07-22 (owner ruling) — the app renders
+// them alongside the raw count ("67% · 2 of 3 fans nailed this"), so a small-N percentage can never
+// read as a bare unanchored "100%". The old rule withheld % below 25 responders, which meant the
+// launch-week players — the ones we most need to come back — never saw the panel's real shape.
+// Raw per-user answers stay private — only aggregates are exposed.
 
 interface QuizEnv {
   SUPABASE_URL?: string;
@@ -20,7 +22,13 @@ interface QuizEnv {
 }
 
 const GAMES = new Set(["trivia", "knowher"]);
-const PERCENT_MIN_N = 25; // show % only at/above this many responders (docs §11b)
+// Percentages show from the first responder (2026-07-22). `showPercent` stays IN the payload — the
+// app still reads it, and keeping the field lets a future game reinstate a threshold in one place.
+// ⚠️ Known consequence: an app build older than 2026-07-22 renders a STANDALONE "%" with no count
+// beside it, so on those builds a lone responder sees a bare "100%". Accepted — pre-launch the only
+// installs are the owner's, and this ships with the app change that pairs % with its count.
+// 1, not 0, so the flag can never be true for an empty edition.
+const PERCENT_MIN_N = 1;
 const REVEAL_HIDDEN_TTL = 5 * 60; // trivia, still-open day: re-check every 5 min so it flips soon after close
 const LIVE_TTL = 15 * 60; // in-flight edition: growing counts, cheap edge refresh
 const CLOSED_TTL = 24 * 3600; // a closed edition never changes

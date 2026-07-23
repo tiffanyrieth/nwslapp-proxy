@@ -86,6 +86,27 @@ npm run deploy       # → https://nwslapp-proxy.<subdomain>.workers.dev
 npx wrangler tail    # live request logs
 ```
 
+## Pre-launch Fan Zone test population (temporary)
+
+The Fan Zone's crowd-shaped surfaces — leaderboards, community answer splits, the Superfan tier
+ladder, the below-fold "You" row (unreachable under 100 players) — can't be designed against with one
+real user. `seed_test_fans.mjs` creates synthetic Supabase accounts under a reserved
+`@seed.nwslapp.test` domain that own **real** rows, so the app renders them exactly as it will render
+launch traffic. Bracket seeds **votes only** — the real engine derives the winners, splits, scores and
+ranks, so the production pipeline is what's being exercised.
+
+```bash
+export SUPABASE_URL=…  SUPABASE_SERVICE_ROLE_KEY=…   # dashboard → Settings → API
+node scripts/seed_test_fans.mjs --dry-run            # plan only, writes nothing
+node scripts/seed_test_fans.mjs --count 120          # seed
+node scripts/seed_test_fans.mjs --purge              # tear down (cascades everywhere)
+```
+
+⚠️ **These accounts rank on real leaderboards and count in real community aggregates — they must be
+gone before launch.** `npm run healthcheck` fails while any remain (`health_check_seed_accounts.mjs`),
+which is the only reason seeding the production project is safe. Purge, then re-run the bracket tally
+so `fan_count` reflects the real field.
+
 ## Stack
 
 Cloudflare Workers · TypeScript · Wrangler · Vitest. No KV/D1 — the Cache API
