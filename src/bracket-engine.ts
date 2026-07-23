@@ -1036,9 +1036,28 @@ async function bracketAdminOp(env: AdminEnv, op: string, body: Record<string, un
   switch (op) {
     case "state":
       return adminState(env);
-    case "setMode":
-      await setConfigValue(env, "mode", body.mode === "auto" ? "auto" : "manual");
-      return { ok: true };
+    case "setMode": {
+      const mode = body.mode === "auto" ? "auto" : "manual";
+      await setConfigValue(env, "mode", mode);
+      // The ACTIVE edition carries its OWN `mode` (stamped at creation, `writeEdition`), and
+      // `handleAuto` refuses to advance an edition whose own mode is "manual". Flipping only the
+      // global key therefore left an in-flight edition parked FOREVER — the switch appeared to work
+      // (the pill flipped to AUTO) while nothing ever advanced, which is exactly what this control
+      // exists to undo. Carry the mode onto the active edition too.
+      const active = await getActiveEdition(env);
+      if (!active) return { ok: true, mode };
+      const config = { ...(await getConfig(env)), mode } as BracketConfig;
+      const patch: Record<string, unknown> = {
+        mode,
+        // Auto starts the clock NOW (early/late window per the config) so the app shows a real
+        // countdown immediately rather than waiting for the next round. Manual clears the deadline,
+        // matching `pause` semantics: the round stays open until the operator advances it.
+        round_closes_at: roundCloseISO(active.current_round, Date.now(), config),
+      };
+      if (mode === "auto") patch.round_opened_at = new Date().toISOString();
+      await sbPatch(env, "bracket_editions", `id=eq.${active.id}`, patch);
+      return { ok: true, mode, edition: active.id, roundClosesAt: patch.round_closes_at };
+    }
     case "action": {
       const config = await getConfig(env);
       const active = await getActiveEdition(env);
