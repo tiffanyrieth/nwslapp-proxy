@@ -92,6 +92,29 @@ if (!dryRun && (!SUPABASE_URL || !SERVICE_KEY)) {
   fail("Set SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY (Supabase dashboard → Settings → API).");
 }
 
+// Preflight the key's SHAPE before any request. Without this, a masked/elided paste surfaces as
+// Node's "Cannot convert argument to a ByteString because the character at index 0 has a value of
+// 8230" — technically loud, but it names a UTF-16 code point instead of the actual problem. Same
+// family as the SIWA secret gotcha in CLAUDE.md (a trailing newline signing an invalid JWT):
+// credentials that LOOK pasted but carry stray characters.
+if (!dryRun) {
+  const bad = [...SERVICE_KEY].find((ch) => ch.codePointAt(0) > 126 || ch.codePointAt(0) < 32);
+  if (bad) {
+    fail(`SUPABASE_SERVICE_ROLE_KEY contains a non-ASCII character (${JSON.stringify(bad)}).\n` +
+      "  That usually means the MASKED form was copied — Supabase elides the key with '…' until you\n" +
+      "  click reveal. Open Settings → API → service_role, reveal it, and copy the full value\n" +
+      "  (starts with 'eyJ' or 'sb_', 200+ characters).");
+  }
+  if (SERVICE_KEY !== SERVICE_KEY.trim()) {
+    fail("SUPABASE_SERVICE_ROLE_KEY has leading/trailing whitespace — re-export it without the stray space/newline.");
+  }
+  if (!/^(eyJ|sb_)/.test(SERVICE_KEY)) {
+    fail(`SUPABASE_SERVICE_ROLE_KEY doesn't look like a Supabase key (starts "${SERVICE_KEY.slice(0, 3)}", length ${SERVICE_KEY.length}).\n` +
+      "  Expected a JWT ('eyJ…') or a secret key ('sb_…'). ⚠️ NOT the anon/publishable key — the\n" +
+      "  seeder creates auth users, which needs service_role.");
+  }
+}
+
 // ── Deterministic randomness ────────────────────────────────────────────────────
 // Seeded per-account so a re-run produces the SAME population — otherwise every run would reshuffle
 // the boards and you'd never be comparing like with like across design iterations.
