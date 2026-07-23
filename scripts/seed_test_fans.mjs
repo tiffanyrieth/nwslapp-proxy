@@ -506,6 +506,9 @@ async function runPurge() {
     if (++done % 25 === 0) console.log(`  …${done}/${users.length}`);
   }
   console.log(`✓ Purged ${done} accounts.`);
+  console.log("→ Revoke the temporary seed grants (teardown block at the bottom of");
+  console.log("   NWSLApp/supabase/migration_seed_grants.sql) — returns the service-role key");
+  console.log("   to the reach it had before seeding.");
   console.log("→ Re-run the bracket tally so fan_count/scores reflect the real field:");
   console.log('   curl -X POST -H "x-admin-key: $BRACKET_ADMIN_KEY" ' + `${PROXY_BASE}/bracket/run`);
 }
