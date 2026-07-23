@@ -117,6 +117,13 @@ function pick(rnd, arr) {
   return arr[Math.floor(rnd() * arr.length)];
 }
 
+/** Stable non-negative hash of a string — gives a question a fixed "difficulty" across all fans. */
+function hashCode(s) {
+  let h = 0;
+  for (let i = 0; i < s.length; i++) h = (Math.imul(31, h) + s.charCodeAt(i)) | 0;
+  return Math.abs(h);
+}
+
 // ── HTTP ────────────────────────────────────────────────────────────────────────
 
 function authHeaders(extra = {}) {
@@ -322,7 +329,12 @@ async function seedPredict(fans, ctx) {
   await upsert("prediction_scores", seasonRows, "user_id,team_abbreviation,season");
   await upsert("predict_round_scores", roundRows, "user_id,team_abbreviation,season,week");
   console.log(`  predict: ${seasonRows.length} season rows + ${roundRows.length} round rows across ${CLUBS.length} clubs`);
-  return seasonRows.length;
+  // Per-user contribution to the Superfan total, returned rather than read back: the numbers are
+  // already in hand, and a read-back would be an unbounded select whose failure would silently
+  // zero the Superfan rows (exactly what a stub run surfaced).
+  const byUser = new Map();
+  for (const r of seasonRows) byUser.set(r.user_id, (byUser.get(r.user_id) ?? 0) + r.points);
+  return byUser;
 }
 
 /** Fetch a quiz pool from the proxy so answers reference REAL question ids — an answer against an
@@ -340,43 +352,62 @@ async function seedQuiz(fans, ctx, game) {
   const round = game === "trivia" ? ctx.trivia : ctx.knowher;
   if (!round) {
     console.log(`  ${game}: SKIPPED — no round live yet (season week ${ctx.weekOffset})`);
-    return 0;
+    return new Map();
   }
 
-  // [editionKey, questions[]] pairs. Trivia = one slate per round; KHG = one edition per featured
-  // player, keyed {weekKey}-{TEAM}-{athleteId} (KnowHerGame.swift).
+  // [editionKey, questions[], answersPerFan] triples. `answersPerFan` is null = "answer them all".
   const editions = [];
   if (game === "trivia") {
     const pool = await fetchJSON(`${PROXY_BASE}/trivia`);
     const all = Array.isArray(pool) ? pool : (pool.questions ?? []);
-    if (!all.length) { console.log("  trivia: SKIPPED — empty pool"); return 0; }
-    // Mirrors TriviaViewModel.roundSelection: id-sorted, then paged by round. Approximated here —
-    // the exact slate only affects WHICH ids get answers, and extra ids are harmless.
-    const sorted = [...all].sort((a, b) => String(a.id).localeCompare(String(b.id)));
-    const page = ((round - 1) * 10) % Math.max(1, sorted.length);
-    editions.push([triviaEditionKey(round, ctx.season), sorted.slice(page, page + 10)]);
+    if (!all.length) { console.log("  trivia: SKIPPED — empty pool"); return new Map(); }
+    // ⚠️ We deliberately do NOT try to reproduce the app's exact round slate.
+    // `TriviaViewModel.roundSelection` shuffles the id-sorted pool with a seeded generator, and Swift's
+    // `shuffled(using:)` consumption pattern is stdlib-internal (Lemire bounded-random) — mirroring it
+    // in JS would couple this throwaway script to Swift stdlib internals and silently drift.
+    //
+    // Instead each fan answers a RANDOM 10 of the pool. That is correct where it matters:
+    //   • `quiz_summary.responders`  = distinct users            → exact
+    //   • `quiz_summary.avg_correct` = correct / distinct users  → out of 10, the right magnitude
+    //     (this is why we can't just answer the whole 41-question pool: the average would read ~20/10)
+    //   • per-question rows exist for EVERY question in the pool, so whichever 10 the app actually
+    //     renders, all of them have community data.
+    editions.push([triviaEditionKey(round, ctx.season), all, 10]);
   } else {
     const pool = await fetchJSON(`${PROXY_BASE}/knowher?teams=${CLUBS.join(",")}`);
     const weekKey = pool.weekKey ?? ctx.weekKey;
+    // A KHG edition IS its player's 10 questions and the app shows all of them, so answer all.
     for (const p of pool.players ?? []) {
       const key = `${weekKey}-${String(p.teamAbbreviation).toUpperCase()}-${p.espnAthleteId}`;
-      editions.push([key, p.questions ?? []]);
+      editions.push([key, p.questions ?? [], null]);
     }
-    if (!editions.length) { console.log("  knowher: SKIPPED — no featured players in the pool"); return 0; }
+    if (!editions.length) { console.log("  knowher: SKIPPED — no featured players in the pool"); return new Map(); }
   }
 
   const season = String(ctx.season);
   const rows = [];
-  for (const [editionKey, questions] of editions) {
+  for (const [editionKey, questions, answersPerFan] of editions) {
     if (!questions.length) continue;
     for (const fan of fans) {
       // Not everyone plays every edition — KHG especially is per-club.
       if (fan.rnd() < (game === "trivia" ? 0.35 : 0.72)) continue;
-      questions.forEach((q, qi) => {
+      // The subset this fan answered (all of them when answersPerFan is null).
+      let asked = questions;
+      if (answersPerFan && answersPerFan < questions.length) {
+        const idx = questions.map((_, i) => i);
+        for (let i = idx.length - 1; i > 0; i--) {           // Fisher-Yates on the fan's own stream
+          const j = Math.floor(fan.rnd() * (i + 1));
+          [idx[i], idx[j]] = [idx[j], idx[i]];
+        }
+        asked = idx.slice(0, answersPerFan).map((i) => questions[i]);
+      }
+      for (const q of asked) {
         const optionCount = Math.max(2, (q.options ?? []).length || 4);
         const correctIndex = Number.isInteger(q.correctIndex) ? q.correctIndex : 0;
-        // Per-question difficulty so some questions are near-universally right and some split.
-        const difficulty = 0.35 + ((qi * 37) % 50) / 100;
+        // Per-question difficulty, keyed on the question's IDENTITY — not its position in this fan's
+        // shuffled subset, which would give the same question a different difficulty per fan and
+        // average every bar back to the same height, defeating the point.
+        const difficulty = 0.35 + (hashCode(String(q.id)) % 50) / 100;
         const gotIt = fan.rnd() < difficulty;
         let selected = correctIndex;
         if (!gotIt) {
@@ -388,12 +419,16 @@ async function seedQuiz(fans, ctx, game) {
           question_id: String(q.id), selected_index: selected,
           is_correct: selected === correctIndex, season,
         });
-      });
+      }
     }
   }
   await upsert("quiz_answers", rows, "user_id,game,edition_key,question_id");
   console.log(`  ${game}: ${rows.length} answers across ${editions.length} edition(s), round ${round}`);
-  return rows.length;
+  // Correct answers per user — the game's contribution to the Superfan total (1 point each,
+  // matching GameCenterScores.superfanTotal).
+  const byUser = new Map();
+  for (const r of rows) if (r.is_correct) byUser.set(r.user_id, (byUser.get(r.user_id) ?? 0) + 1);
+  return byUser;
 }
 
 /** SUPERFAN — the cross-game season total the ranking reads.
@@ -470,22 +505,18 @@ async function main() {
     t.games += 1;
   };
 
+  // NOTE Bracket is absent from the Superfan sum on purpose: its points are derived by the ENGINE
+  // from the votes we seed, which happens later on the tally tick, so there is no honest number to
+  // add here. `superfan_scores` exists only for RANKING (docs/fan-zone.md §6) — the client computes
+  // and displays its own total — so a bracket-less server total costs nothing but a slightly lower
+  // rank, and inventing one would be the fabrication this whole approach avoids.
   if (wants("bracket")) await seedBracket(fans, ctx);
   if (wants("predict")) {
-    // Re-read what we wrote so Superfan sums the REAL rows rather than a parallel guess.
-    await seedPredict(fans, ctx);
-    const rows = await rest(`prediction_scores?season=eq.${ctx.season}&select=user_id,points`);
-    const byUser = new Map();
-    for (const r of rows ?? []) byUser.set(r.user_id, (byUser.get(r.user_id) ?? 0) + r.points);
-    for (const [uid, pts] of byUser) add(uid, pts);
+    for (const [uid, pts] of await seedPredict(fans, ctx)) add(uid, pts);
   }
   for (const game of ["trivia", "knowher"]) {
     if (!wants(game)) continue;
-    await seedQuiz(fans, ctx, game);
-    const rows = await rest(`quiz_answers?season=eq.${ctx.season}&game=eq.${game}&is_correct=eq.true&select=user_id`);
-    const byUser = new Map();
-    for (const r of rows ?? []) byUser.set(r.user_id, (byUser.get(r.user_id) ?? 0) + 1);
-    for (const [uid, correct] of byUser) add(uid, correct);
+    for (const [uid, correct] of await seedQuiz(fans, ctx, game)) add(uid, correct);
   }
   if (wants("superfan")) await seedSuperfan(fans, ctx, totals);
 
