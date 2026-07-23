@@ -92,22 +92,39 @@ if (!dryRun && (!SUPABASE_URL || !SERVICE_KEY)) {
   fail("Set SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY (Supabase dashboard → Settings → API).");
 }
 
-// Preflight the key's SHAPE before any request. Without this, a masked/elided paste surfaces as
-// Node's "Cannot convert argument to a ByteString because the character at index 0 has a value of
-// 8230" — technically loud, but it names a UTF-16 code point instead of the actual problem. Same
-// family as the SIWA secret gotcha in CLAUDE.md (a trailing newline signing an invalid JWT):
-// credentials that LOOK pasted but carry stray characters.
-if (!dryRun) {
-  const bad = [...SERVICE_KEY].find((ch) => ch.codePointAt(0) > 126 || ch.codePointAt(0) < 32);
+// Preflight BOTH credentials' shape before any request. Dashboards elide long values with '…' until
+// you click reveal, and a copy taken before revealing carries that character through. Un-guarded it
+// surfaces as Node internals — "Cannot convert argument to a ByteString … value of 8230" for a
+// header, "Failed to parse URL" for the base — both loud but neither naming the real mistake. Same
+// family as the SIWA secret gotcha in CLAUDE.md (a trailing newline signing an invalid JWT).
+
+/** The stray-character check both credentials share. `label` names the env var in the message. */
+function assertClean(value, label) {
+  const bad = [...value].find((ch) => ch.codePointAt(0) > 126 || ch.codePointAt(0) < 32);
   if (bad) {
-    fail(`SUPABASE_SERVICE_ROLE_KEY contains a non-ASCII character (${JSON.stringify(bad)}).\n` +
-      "  That usually means the MASKED form was copied — Supabase elides the key with '…' until you\n" +
-      "  click reveal. Open Settings → API → service_role, reveal it, and copy the full value\n" +
-      "  (starts with 'eyJ' or 'sb_', 200+ characters).");
+    fail(`${label} contains a non-ASCII character (${JSON.stringify(bad)}).\n` +
+      "  That usually means a MASKED/TRUNCATED value was copied — the dashboard elides long values\n" +
+      "  with '…' until you click reveal. Reveal it first, then copy the WHOLE value.");
   }
-  if (SERVICE_KEY !== SERVICE_KEY.trim()) {
-    fail("SUPABASE_SERVICE_ROLE_KEY has leading/trailing whitespace — re-export it without the stray space/newline.");
+  if (value !== value.trim()) {
+    fail(`${label} has leading/trailing whitespace — re-export it without the stray space/newline.`);
   }
+}
+
+if (!dryRun) {
+  assertClean(SUPABASE_URL, "SUPABASE_URL");
+  assertClean(SERVICE_KEY, "SUPABASE_SERVICE_ROLE_KEY");
+
+  try {
+    const u = new URL(SUPABASE_URL);
+    if (u.protocol !== "https:" && u.hostname !== "localhost") {
+      fail(`SUPABASE_URL must be https (got "${u.protocol}//").`);
+    }
+  } catch {
+    fail(`SUPABASE_URL isn't a valid URL: "${SUPABASE_URL}"\n` +
+      "  Expected exactly:  https://<project-ref>.supabase.co   (no path, no trailing characters)");
+  }
+
   if (!/^(eyJ|sb_)/.test(SERVICE_KEY)) {
     fail(`SUPABASE_SERVICE_ROLE_KEY doesn't look like a Supabase key (starts "${SERVICE_KEY.slice(0, 3)}", length ${SERVICE_KEY.length}).\n` +
       "  Expected a JWT ('eyJ…') or a secret key ('sb_…'). ⚠️ NOT the anon/publishable key — the\n" +
