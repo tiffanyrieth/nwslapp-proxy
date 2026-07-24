@@ -10,7 +10,7 @@ export const ADMIN_PAGE_HTML = `<!doctype html>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="robots" content="noindex,nofollow">
-<title>Bracket Battle — Admin</title>
+<title>The Bracket — Admin</title>
 <style>
   :root { color-scheme: dark; }
   body { margin: 0; padding: 16px; background:#111; color:#eee; font:14px/1.45 -apple-system,system-ui,sans-serif; }
@@ -36,7 +36,7 @@ export const ADMIN_PAGE_HTML = `<!doctype html>
 </style>
 </head>
 <body>
-<h1>Bracket Battle — Admin</h1>
+<h1>The Bracket — Admin</h1>
 <small>Operator-only. Nothing here is user-facing.</small>
 
 <div class="row" style="margin-top:10px">
