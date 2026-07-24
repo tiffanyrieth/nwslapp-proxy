@@ -458,6 +458,15 @@ async function writeEdition(
     id: `${ed.id}-r${m.round}-s${m.slot}`, edition_id: ed.id, round: m.round, slot: m.slot,
     entrant_a_id: m.aId, entrant_b_id: m.bId, points: m.points,
   })));
+  // A NEW edition is now live → the between-editions review window is over, so prune the previous
+  // edition's ballot boxes (owner retention rule 2026-07-24). Best-effort AFTER the new edition is
+  // committed — a failure must never wedge the start; lingering votes are harmless and the next start
+  // retries. The record book (scores + stats + stamped final ranks) is untouched.
+  try {
+    await pruneCompletedEditionVotes(env);
+  } catch (e) {
+    await emitDiag(env, "bracketPruneVotesError", `${ed.id}: ${(e as Error).message}`);
+  }
   return `generated ${ed.type} edition ${ed.id} (${used.length} entrants, ${structure.qualifyingCount} qualifying rounds, ${matchups.length} round-1 matchups)`;
 }
 
@@ -785,13 +794,13 @@ async function tallyAndAdvance(env: BracketEnv, ed: EditionRow, now: number, con
   // Advance — or finish.
   const finish = async (reason: string): Promise<string> => {
     await sbPatch(env, "bracket_editions", `id=eq.${ed.id}`, { is_active: false, round_closes_at: null, completed_at: new Date(now).toISOString() });
-    // The record book: stamp each player's FINAL RANK + FIELD SIZE, then prune older editions'
-    // ballot boxes (owner retention rule). Best-effort AFTER the completion write — a failure here
-    // must never wedge the close; the next operator /bracket/run can re-run it (both steps are
-    // idempotent: the stamp recomputes the same ranks, the prune finds nothing left to delete).
+    // The record book: stamp each player's FINAL RANK + FIELD SIZE. The per-user ballot boxes are
+    // DELIBERATELY NOT pruned here — a completed edition stays fully browsable round-by-round through the
+    // between-editions review window (owner rule 2026-07-24); the votes are pruned when the NEXT edition
+    // STARTS (see writeEdition → pruneCompletedEditionVotes). Best-effort AFTER the completion write — a
+    // failure here must never wedge the close; the next operator /bracket/run re-runs it idempotently.
     try {
       await stampFinalRanks(env, ed.id, now);
-      await pruneOldEditionVotes(env, ed.id);
     } catch (e) {
       await emitDiag(env, "bracketFinalizeError", `${ed.id}: ${(e as Error).message}`);
     }
@@ -889,13 +898,16 @@ async function stampFinalRanks(env: BracketEnv, editionId: string, now: number):
   await sbUpsert(env, "bracket_user_edition_stats", rows, "user_id,edition_id");
 }
 
-/** Owner retention rule: keep the ballot boxes (per-user bracket_votes) for the ACTIVE edition and
- *  the just-completed one only — the previous edition stays fully browsable round-by-round (the
- *  World Cup argument), older editions keep just their record book (scores + stats + stamped rank).
- *  Runs at edition close, so no cron is needed for bracket data. */
-async function pruneOldEditionVotes(env: BracketEnv, justCompletedId: string): Promise<void> {
+/** Owner retention rule (2026-07-24): keep the ballot boxes (per-user bracket_votes) for the CURRENT
+ *  edition AND the just-completed one all the way through the between-editions REVIEW window — a fan can
+ *  browse the finished bracket round-by-round, re-check their picks + per-matchup results — then prune it
+ *  the moment the NEXT edition STARTS. Called from writeEdition (edition start), NOT at close: it deletes
+ *  votes for EVERY completed edition (at start there is exactly one active edition — the new one — and it
+ *  has no `completed_at`, so it's never touched). The record book (scores + stats + stamped final ranks)
+ *  survives. Runs at edition start, so no cron is needed for bracket data. */
+async function pruneCompletedEditionVotes(env: BracketEnv): Promise<void> {
   const editions = await sbGet<{ id: string }[]>(
-    env, `bracket_editions?is_active=eq.false&completed_at=not.is.null&id=neq.${justCompletedId}&select=id`);
+    env, `bracket_editions?is_active=eq.false&completed_at=not.is.null&select=id`);
   for (const old of editions) {
     await sbDelete(env, "bracket_votes", `edition_id=eq.${old.id}`);
   }
