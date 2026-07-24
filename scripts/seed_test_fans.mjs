@@ -355,8 +355,13 @@ async function seedPredict(fans, ctx) {
       const perWeek = weeks.map(() => longTail(fan.rnd, 88));
       const total = perWeek.reduce((a, b) => a + b, 0);
       if (total === 0) continue;
+      // Batch 3: the board ranks by AVERAGE per match. Each scored week = one predicted match here, so
+      // `matches` is the count of non-zero weeks and `avg_points` = total / matches (0-88). Without these
+      // the migration defaults them to 0 and every seed fan would rank last on the average board.
+      const matches = perWeek.filter((p) => p > 0).length;
       seasonRows.push({
-        user_id: fan.id, team_abbreviation: club, season, display_name: fan.name, points: total,
+        user_id: fan.id, team_abbreviation: club, season, display_name: fan.name,
+        points: total, matches, avg_points: matches > 0 ? total / matches : 0,
       });
       weeks.forEach((week, i) => {
         if (perWeek[i] === 0) return;
