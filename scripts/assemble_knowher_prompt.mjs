@@ -78,8 +78,10 @@ export function isoWeekKey(date = new Date()) {
   return `${isoYear}-W${String(week).padStart(2, "0")}`;
 }
 
-/** Monotonic count of Mondays since the Unix epoch for `date`'s ISO week — a comparable week ordinal. */
-function mondayOrdinal(date) {
+/** Monotonic count of Mondays since the Unix epoch for `date`'s ISO week — a comparable week ordinal.
+ *  Exported so seed_test_fans.mjs derives round numbers from THIS implementation rather than its own
+ *  copy: the round number is an edition-key component, and a second copy is a silent drift hazard. */
+export function mondayOrdinal(date) {
   const u = new Date(Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), date.getUTCDate()));
   const day = u.getUTCDay() || 7; // Mon=1 … Sun=7
   u.setUTCDate(u.getUTCDate() - (day - 1)); // back to this week's Monday

@@ -897,14 +897,45 @@ async function pruneOldEditionVotes(env: BracketEnv, justCompletedId: string): P
   }
 }
 
-/** Add this round's points onto each voter's per-edition score (PostgREST has no atomic +). */
+/** How many user ids to put in one `id=in.(...)` filter. PostgREST takes the filter in the URL, so an
+ *  unchunked list is an unbounded URL — at launch scale that's a request no gateway will accept. */
+const PROFILE_LOOKUP_CHUNK = 200;
+
+/** display_name for a set of users, chunked. Returns a partial map: a user with no profile row (or a
+ *  failed chunk) simply isn't in it, and the caller leaves that row's name alone. */
+async function displayNamesFor(env: BracketEnv, userIds: string[]): Promise<Map<string, string>> {
+  const names = new Map<string, string>();
+  for (let i = 0; i < userIds.length; i += PROFILE_LOOKUP_CHUNK) {
+    const chunk = userIds.slice(i, i + PROFILE_LOOKUP_CHUNK);
+    const rows = await sbGet<{ id: string; display_name: string | null }[]>(
+      env, `profiles?id=in.(${chunk.join(",")})&select=id,display_name`);
+    for (const r of rows) if (r.display_name) names.set(r.id, r.display_name);
+  }
+  return names;
+}
+
+/** Add this round's points onto each voter's per-edition score (PostgREST has no atomic +).
+ *
+ *  Also stamps `display_name`. NOTHING wrote that column before 2026-07-22 — not this engine, not the
+ *  app (which only ever READS bracket_scores; the table is service-role write) — so every rival on the
+ *  leaderboard rendered as the `?? "Fan"` fallback in BracketService.leaderboard. Invisible while the
+ *  board had one player, because the user's own row is spliced in from local state with their real name. */
 async function accumulateScores(env: BracketEnv, editionId: string, perUserPts: Map<string, number>, now: number): Promise<void> {
   if (perUserPts.size === 0) return;
-  const existing = await sbGet<{ user_id: string; points: number }[]>(
-    env, `bracket_scores?edition_id=eq.${editionId}&select=user_id,points`);
+  const existing = await sbGet<{ user_id: string; points: number; display_name: string | null }[]>(
+    env, `bracket_scores?edition_id=eq.${editionId}&select=user_id,points,display_name`);
   const base = new Map(existing.map((s) => [s.user_id, s.points]));
+  const priorName = new Map(existing.map((s) => [s.user_id, s.display_name]));
+  const names = await displayNamesFor(env, [...perUserPts.keys()]);
+  // EVERY row carries the same keys: PostgREST rejects a batch whose objects differ in shape, so
+  // display_name can't be conditionally omitted. Falling back to the name already on the row means a
+  // user whose profile lookup missed keeps the name an earlier round stamped, instead of being wiped.
   const rows = [...perUserPts.entries()].map(([user_id, add]) => ({
-    user_id, edition_id: editionId, points: (base.get(user_id) ?? 0) + add, updated_at: new Date(now).toISOString(),
+    user_id,
+    edition_id: editionId,
+    points: (base.get(user_id) ?? 0) + add,
+    display_name: names.get(user_id) ?? priorName.get(user_id) ?? null,
+    updated_at: new Date(now).toISOString(),
   }));
   await sbUpsert(env, "bracket_scores", rows, "user_id,edition_id");
 }
@@ -1005,9 +1036,28 @@ async function bracketAdminOp(env: AdminEnv, op: string, body: Record<string, un
   switch (op) {
     case "state":
       return adminState(env);
-    case "setMode":
-      await setConfigValue(env, "mode", body.mode === "auto" ? "auto" : "manual");
-      return { ok: true };
+    case "setMode": {
+      const mode = body.mode === "auto" ? "auto" : "manual";
+      await setConfigValue(env, "mode", mode);
+      // The ACTIVE edition carries its OWN `mode` (stamped at creation, `writeEdition`), and
+      // `handleAuto` refuses to advance an edition whose own mode is "manual". Flipping only the
+      // global key therefore left an in-flight edition parked FOREVER — the switch appeared to work
+      // (the pill flipped to AUTO) while nothing ever advanced, which is exactly what this control
+      // exists to undo. Carry the mode onto the active edition too.
+      const active = await getActiveEdition(env);
+      if (!active) return { ok: true, mode };
+      const config = { ...(await getConfig(env)), mode } as BracketConfig;
+      const patch: Record<string, unknown> = {
+        mode,
+        // Auto starts the clock NOW (early/late window per the config) so the app shows a real
+        // countdown immediately rather than waiting for the next round. Manual clears the deadline,
+        // matching `pause` semantics: the round stays open until the operator advances it.
+        round_closes_at: roundCloseISO(active.current_round, Date.now(), config),
+      };
+      if (mode === "auto") patch.round_opened_at = new Date().toISOString();
+      await sbPatch(env, "bracket_editions", `id=eq.${active.id}`, patch);
+      return { ok: true, mode, edition: active.id, roundClosesAt: patch.round_closes_at };
+    }
     case "action": {
       const config = await getConfig(env);
       const active = await getActiveEdition(env);
