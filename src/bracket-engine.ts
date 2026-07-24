@@ -22,6 +22,7 @@ import {
   buildMergedRound,
   roundOf64Entrants,
   planStructure,
+  cumulativeMatchups,
   nextCodeIn,
   isQualifying,
   isEarlyRound,
@@ -774,7 +775,10 @@ async function tallyAndAdvance(env: BracketEnv, ed: EditionRow, now: number, con
   if (!alreadyScored) {
     await env.FEED_TAGS?.put(scoredKey, String(now), { expirationTtl: 60 * 60 * 24 * 30 });
     await accumulateScores(env, ed.id, perUserPts, now);
-    await accumulateUserStats(env, ed.id, round, perUserCorrect, perUserTotal, seqByUser, now);
+    // The accuracy denominator is the edition STRUCTURE through this round (every matchup of every tallied
+    // round), NOT the user's own pick count — so a skipped round counts as zeros, not an exclusion.
+    const structureDenom = cumulativeMatchups(ed.pool_size ?? 64, round);
+    await accumulateUserStats(env, ed.id, round, perUserCorrect, perUserTotal, seqByUser, now, structureDenom);
   }
   await sbPatch(env, "bracket_editions", `id=eq.${ed.id}`, { fan_count: new Set(votes.map((v) => v.user_id)).size });
 
@@ -947,17 +951,22 @@ async function accumulateScores(env: BracketEnv, editionId: string, perUserPts: 
 async function accumulateUserStats(
   env: BracketEnv, editionId: string, round: number,
   perUserCorrect: Map<string, number>, perUserTotal: Map<string, number>,
-  seqByUser: Map<string, boolean[]>, now: number,
+  seqByUser: Map<string, boolean[]>, now: number, structureDenom: number,
 ): Promise<void> {
-  if (perUserTotal.size === 0) return;
   interface StatRow { user_id: string; correct_picks: number; total_picks: number; best_round: number | null; best_round_correct: number; best_round_total: number; current_streak: number; longest_streak: number; }
   const existing = await sbGet<StatRow[]>(
     env, `bracket_user_edition_stats?edition_id=eq.${editionId}&select=user_id,correct_picks,total_picks,best_round,best_round_correct,best_round_total,current_streak,longest_streak`);
   const prevById = new Map(existing.map((s) => [s.user_id, s]));
-  const rows = [...perUserTotal.keys()].map((uid) => {
+  // Participants = everyone who has EVER played this edition (existing rows) UNION this round's voters. A
+  // prior participant who skipped this round still has their denominator grow (a missed round = zeros),
+  // which is what makes accuracy edition-wide rather than "only the rounds I bothered to vote in".
+  const participants = new Set<string>([...prevById.keys(), ...perUserTotal.keys()]);
+  if (participants.size === 0) return;
+  const rows = [...participants].map((uid) => {
     const prev = prevById.get(uid);
-    const rc = perUserCorrect.get(uid) ?? 0;
+    const rc = perUserCorrect.get(uid) ?? 0;   // 0 for a non-voter this round
     const rt = perUserTotal.get(uid) ?? 0;
+    // Best single round (by the user's OWN accuracy that round — their picks, not the structure denom).
     let best_round = prev?.best_round ?? null;
     let brc = prev?.best_round_correct ?? 0;
     let brt = prev?.best_round_total ?? 0;
@@ -966,7 +975,7 @@ async function accumulateUserStats(
       const bestAcc = brt > 0 ? brc / brt : -1;
       if (thisAcc > bestAcc) { best_round = round; brc = rc; brt = rt; }
     }
-    // Fold this round's picks (slot order) onto the carried current streak.
+    // Fold this round's picks (slot order) onto the carried current streak (a non-voter's empty seq is a no-op).
     let current = prev?.current_streak ?? 0;
     let longest = prev?.longest_streak ?? 0;
     for (const correct of seqByUser.get(uid) ?? []) {
@@ -976,7 +985,9 @@ async function accumulateUserStats(
     return {
       user_id: uid, edition_id: editionId,
       correct_picks: (prev?.correct_picks ?? 0) + rc,
-      total_picks: (prev?.total_picks ?? 0) + rt,
+      // The edition-STRUCTURE denominator through this round (SET, not accumulated) — every matchup of
+      // every tallied round, so skipped rounds count as zeros. Matches the app's client-side calc.
+      total_picks: structureDenom,
       best_round, best_round_correct: brc, best_round_total: brt,
       current_streak: current, longest_streak: longest,
       updated_at: new Date(now).toISOString(),
