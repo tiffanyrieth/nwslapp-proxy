@@ -338,6 +338,7 @@ async function seedPredict(fans, ctx) {
   const season = String(ctx.season);
   const seasonRows = [];
   const roundRows = [];
+  const byUser = new Map();   // per-fan {correct, attempted} for the Superfan accuracy economy
   // The soccer weeks a round board can show. `predict_round_scores` is pruned at ~28 days, so
   // seeding older weeks would be swept by the retention cron — 4 weeks is what stays visible.
   const weeks = [ctx.weekOffset - 3, ctx.weekOffset - 2, ctx.weekOffset - 1, ctx.weekOffset]
@@ -354,8 +355,13 @@ async function seedPredict(fans, ctx) {
       const perWeek = weeks.map(() => longTail(fan.rnd, 88));
       const total = perWeek.reduce((a, b) => a + b, 0);
       if (total === 0) continue;
+      // Batch 3: the board ranks by AVERAGE per match. Each scored week = one predicted match here, so
+      // `matches` is the count of non-zero weeks and `avg_points` = total / matches (0-88). Without these
+      // the migration defaults them to 0 and every seed fan would rank last on the average board.
+      const matches = perWeek.filter((p) => p > 0).length;
       seasonRows.push({
-        user_id: fan.id, team_abbreviation: club, season, display_name: fan.name, points: total,
+        user_id: fan.id, team_abbreviation: club, season, display_name: fan.name,
+        points: total, matches, avg_points: matches > 0 ? total / matches : 0,
       });
       weeks.forEach((week, i) => {
         if (perWeek[i] === 0) return;
@@ -363,17 +369,22 @@ async function seedPredict(fans, ctx) {
           user_id: fan.id, team_abbreviation: club, season, week,
           display_name: fan.name, points: perWeek[i],
         });
+        // Each scored week = one predicted match (11 slots). Exact correctPlayers isn't recoverable from
+        // points alone, so ESTIMATE it: points ≈ correctPlayers×3 + bonuses, so /8 is a rough monotonic
+        // proxy (capped at 11) — good enough for a seed accuracy spread.
+        const est = Math.min(11, Math.round(perWeek[i] / 8));
+        const u = byUser.get(fan.id) ?? { correct: 0, attempted: 0 };
+        u.correct += est; u.attempted += 11;
+        byUser.set(fan.id, u);
       });
     }
   }
   await upsert("prediction_scores", seasonRows, "user_id,team_abbreviation,season");
   await upsert("predict_round_scores", roundRows, "user_id,team_abbreviation,season,week");
   console.log(`  predict: ${seasonRows.length} season rows + ${roundRows.length} round rows across ${CLUBS.length} clubs`);
-  // Per-user contribution to the Superfan total, returned rather than read back: the numbers are
-  // already in hand, and a read-back would be an unbounded select whose failure would silently
-  // zero the Superfan rows (exactly what a stub run surfaced).
-  const byUser = new Map();
-  for (const r of seasonRows) byUser.set(r.user_id, (byUser.get(r.user_id) ?? 0) + r.points);
+  // Per-user {correct, attempted} for the Superfan accuracy economy (accumulated above from the per-week
+  // points), returned rather than read back — a read-back would be an unbounded select whose failure would
+  // silently zero the Superfan rows.
   return byUser;
 }
 
@@ -464,30 +475,56 @@ async function seedQuiz(fans, ctx, game) {
   }
   await upsert("quiz_answers", rows, "user_id,game,edition_key,question_id");
   console.log(`  ${game}: ${rows.length} answers across ${editions.length} edition(s), round ${round}`);
-  // Correct answers per user — the game's contribution to the Superfan total (1 point each,
-  // matching GameCenterScores.superfanTotal).
+  // Per-user {correct, attempted} for the Superfan accuracy economy (KHG/Trivia accuracy = correct/attempted).
   const byUser = new Map();
-  for (const r of rows) if (r.is_correct) byUser.set(r.user_id, (byUser.get(r.user_id) ?? 0) + 1);
+  for (const r of rows) {
+    const u = byUser.get(r.user_id) ?? { correct: 0, attempted: 0 };
+    u.attempted += 1;
+    if (r.is_correct) u.correct += 1;
+    byUser.set(r.user_id, u);
+  }
   return byUser;
 }
 
-/** SUPERFAN — the cross-game season total the ranking reads.
- *  Derived by summing what we actually wrote for each fan, because the app computes its own total
- *  client-side: an independently-invented server number would disagree with the per-game breakdown
- *  on screen and read as a bug. */
-async function seedSuperfan(fans, ctx, totals) {
+/** SUPERFAN — the cross-game 0–100 ACCURACY score the ranking + tier ladder read (Competitive Redesign).
+ *  Each game contributes accuracy × 25, derived from the per-game correct/attempted COUNTS we actually
+ *  seeded (predict estimated, KHG/Trivia exact). BRACKET is 0 here on purpose — its accuracy is
+ *  engine-derived from the seeded votes at TALLY time, not knowable when this runs (same reason the old
+ *  additive total excluded it; the bracket board still gets real crowd data from the tally). The per-game
+ *  count columns are written so the numbers back the derived total; `tier` mirrors SuperfanTier.forScore. */
+function superfanContribution(correct, attempted) {
+  return attempted > 0 ? Math.min(25, (correct / attempted) * 25) : 0;
+}
+function superfanTier(score) {
+  if (score >= 75) return "mvp";
+  if (score >= 50) return "allStar";
+  if (score >= 25) return "rising";
+  return "fan";
+}
+async function seedSuperfan(fans, ctx, counts) {
   const season = String(ctx.season);
   const rows = [];
   for (const fan of fans) {
-    const t = totals.get(fan.id);
-    if (!t || t.total <= 0 || t.games < 1) continue;
+    const c = counts.get(fan.id);
+    if (!c) continue;
+    const games = [c.predictT, c.khgT, c.triviaT].filter((t) => t > 0).length;   // bracket 0 → not counted
+    const total = Math.min(100, Math.round(
+      superfanContribution(c.predictC, c.predictT)
+      + superfanContribution(c.khgC, c.khgT)
+      + superfanContribution(c.triviaC, c.triviaT)));
+    if (total <= 0 || games < 1) continue;
     rows.push({
-      user_id: fan.id, season, total: t.total, games_played: t.games, display_name: fan.name,
+      user_id: fan.id, season, display_name: fan.name, total, games_played: games, tier: superfanTier(total),
+      predict_correct: c.predictC, predict_total: c.predictT,
+      bracket_correct: 0, bracket_total: 0,
+      khg_correct: c.khgC, khg_total: c.khgT,
+      trivia_correct: c.triviaC, trivia_total: c.triviaT,
+      trivia_streak: 0,
     });
   }
   await upsert("superfan_scores", rows, "user_id,season");
   const qualifying = rows.filter((r) => r.games_played >= 2).length;
-  console.log(`  superfan: ${rows.length} rows (${qualifying} qualifying, i.e. ≥2 games)`);
+  console.log(`  superfan: ${rows.length} rows (${qualifying} qualifying ≥2 games; tiers ${rows.filter(r=>r.tier==="rising").length}R/${rows.filter(r=>r.tier==="allStar").length}A/${rows.filter(r=>r.tier==="mvp").length}M)`);
   return rows.length;
 }
 
@@ -539,29 +576,28 @@ async function main() {
   await upsert("profiles", fans.map((f) => ({ id: f.id, display_name: f.name, name_is_custom: true })), "id");
   console.log(`  profiles: ${fans.length} rows`);
 
-  // Track each fan's contribution so the Superfan total agrees with the per-game numbers.
-  const totals = new Map(fans.map((f) => [f.id, { total: 0, games: 0 }]));
-  const add = (userId, points) => {
-    const t = totals.get(userId);
-    if (!t) return;
-    t.total += points;
-    t.games += 1;
-  };
+  // Track each fan's per-game correct/attempted counts → the Superfan 0–100 accuracy economy.
+  const counts = new Map(fans.map((f) => [f.id, { predictC:0, predictT:0, khgC:0, khgT:0, triviaC:0, triviaT:0 }]));
 
-  // NOTE Bracket is absent from the Superfan sum on purpose: its points are derived by the ENGINE
-  // from the votes we seed, which happens later on the tally tick, so there is no honest number to
-  // add here. `superfan_scores` exists only for RANKING (docs/fan-zone.md §6) — the client computes
-  // and displays its own total — so a bracket-less server total costs nothing but a slightly lower
-  // rank, and inventing one would be the fabrication this whole approach avoids.
+  // NOTE Bracket is absent from the Superfan accuracy counts on purpose: its accuracy is derived by the
+  // ENGINE from the votes we seed, which happens later on the tally tick, so there is no honest number to
+  // add here. `superfan_scores` exists only for RANKING (docs/fan-zone.md §6) — a bracket-less server score
+  // costs nothing but a slightly lower rank, and inventing one would be the fabrication this approach avoids.
   if (wants("bracket")) await seedBracket(fans, ctx);
   if (wants("predict")) {
-    for (const [uid, pts] of await seedPredict(fans, ctx)) add(uid, pts);
+    for (const [uid, ca] of await seedPredict(fans, ctx)) {
+      const c = counts.get(uid); if (c) { c.predictC += ca.correct; c.predictT += ca.attempted; }
+    }
   }
   for (const game of ["trivia", "knowher"]) {
     if (!wants(game)) continue;
-    for (const [uid, correct] of await seedQuiz(fans, ctx, game)) add(uid, correct);
+    for (const [uid, ca] of await seedQuiz(fans, ctx, game)) {
+      const c = counts.get(uid); if (!c) continue;
+      if (game === "trivia") { c.triviaC += ca.correct; c.triviaT += ca.attempted; }
+      else { c.khgC += ca.correct; c.khgT += ca.attempted; }
+    }
   }
-  if (wants("superfan")) await seedSuperfan(fans, ctx, totals);
+  if (wants("superfan")) await seedSuperfan(fans, ctx, counts);
 
   console.log("\n✓ Seeded.");
   if (wants("bracket")) {

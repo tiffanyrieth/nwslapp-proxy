@@ -305,6 +305,27 @@ export function planStructure(poolCount: number): BracketStructure {
   return { size, qualifyingCount: q, rounds, entrySeeds };
 }
 
+/** Matchups in a round: qualifying (negative code) is always 32; a main round is entrants ÷ 2.
+ *  Mirrors the app's `BracketRound.matchupCount`. */
+export function matchupCount(code: number): number {
+  return code < 0 ? 32 : code / 2;
+}
+
+/** The edition-STRUCTURE accuracy denominator through `uptoRound` (inclusive): the total matchups across
+ *  every round that plays at or before it, in play order. This is the fix for the "100% accuracy with 4
+ *  points" bug — a player's accuracy denominator is every matchup of every TALLIED round, so rounds they
+ *  skipped count as zeros (they don't get to exclude them). Mirrors the app's
+ *  `BracketScoring.talliedMatchupDenominator` so the leaderboard's displayed accuracy matches the
+ *  Superfan calc. Pure — unit-tested. */
+export function cumulativeMatchups(poolCount: number, uptoRound: number): number {
+  let sum = 0;
+  for (const r of planStructure(poolCount).rounds) {
+    sum += matchupCount(r);
+    if (r === uptoRound) break;
+  }
+  return sum;
+}
+
 /** The round code that follows `code` in a structure, or null after the Final. Works for
  *  qualifying codes and main rounds alike (drives both generation and the app's flow). */
 export function nextCodeIn(structure: BracketStructure, code: number): number | null {
