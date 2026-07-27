@@ -10,6 +10,7 @@
 		"cf-typegen": "wrangler types",
 		"load-trivia": "node scripts/load_trivia.mjs",
 		"load-knowher": "node scripts/load_knowher.mjs",
+		"backfill-knowher-ledger": "node scripts/backfill_knowher_ledger.mjs",
 		"healthcheck": "node scripts/health_check_club_news.mjs && node scripts/health_check_roster.mjs && node scripts/health_check_summary.mjs && node scripts/health_check_weather.mjs && node scripts/health_check_bracket.mjs && node scripts/health_check_knowher.mjs && node scripts/health_check_account_delete.mjs && node scripts/health_check_apple_auth.mjs && node scripts/health_check_seed_accounts.mjs",
 		"seed-fans": "node scripts/seed_test_fans.mjs",
 		"healthcheck:seed": "node scripts/health_check_seed_accounts.mjs",

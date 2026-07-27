@@ -25,9 +25,17 @@
 // validate→KV→markFeatured path. This script remains for --dry-run VALIDATION (the weekly
 // routine uses exactly that) and manual emergency restores.
 //
+// That warning used to be a comment only, and the comment lost: 2026-W27 was published through
+// here during testing, its 16 players never reached the ledger, and Trinity Rodman was picked
+// again in 2026-W31. So the KV write is now GUARDED — it refuses unless you pass
+// --allow-ledger-bypass, and points you at POST /knowher/ingest instead. Repair a gap that
+// already happened with scripts/backfill_knowher_ledger.mjs.
+//
 // USAGE:
-//   node scripts/load_knowher.mjs [path]            # validate + upload (default: knowher-pool.json)
-//   node scripts/load_knowher.mjs [path] --dry-run  # validate + print summary only, no upload
+//   node scripts/load_knowher.mjs [path] --dry-run  # validate + print summary only (the safe default)
+//   node scripts/load_knowher.mjs [path]            # validate, then REFUSE to write (see guard below)
+//   node scripts/load_knowher.mjs [path] --allow-ledger-bypass   # emergency restore; ledger NOT updated
+//   (default path: knowher-pool.json)
 //
 
 import { readFileSync } from "node:fs";
@@ -145,6 +153,10 @@ export function validatePool(doc) {
 if (import.meta.url === pathToFileURL(process.argv[1] ?? "").href) {
   const args = process.argv.slice(2);
   const dryRun = args.includes("--dry-run");
+  // The KV-direct write skips markFeatured (see LEDGER BYPASS above), so it must be asked for
+  // explicitly. Validation (--dry-run) stays the default, unflagged path — that's what the
+  // weekly routine runs.
+  const allowBypass = args.includes("--allow-ledger-bypass");
   const path = args.find((a) => !a.startsWith("--")) ?? "knowher-pool.json";
 
   let doc;
@@ -170,6 +182,29 @@ if (import.meta.url === pathToFileURL(process.argv[1] ?? "").href) {
     console.log("Dry run — not uploading.");
     process.exit(0);
   }
+
+  // ⚠️ GUARD (added after 2026-W27 shipped via this path and never reached the featured ledger:
+  // Trinity Rodman was re-picked in W31 because she was still "eligible"). A KV-direct write
+  // publishes content WITHOUT marking anyone featured, so the once-per-season rotation stalls
+  // and players repeat. Refuse by default; make the operator opt in and then repair the ledger.
+  if (!allowBypass) {
+    console.error(`\n✗ REFUSING to write to KV — this path SKIPS the featured ledger.\n`);
+    console.error(`  Writing ${doc.weekKey} here publishes the content but leaves its ${doc.players.length} players`);
+    console.error(`  ELIGIBLE, so /knowher/todo will pick them again in a later edition.\n`);
+    console.error(`  Publish through the ONE path that updates the ledger instead:`);
+    console.error(`    curl -sS -X POST "$PROXY_BASE/knowher/ingest" \\`);
+    console.error(`      -H "x-ingest-key: $INGEST_KEY" -H "Content-Type: application/json" \\`);
+    console.error(`      --data @${path}`);
+    console.error(`  …or paste it into GET /knowher/admin.\n`);
+    console.error(`  If you genuinely need the KV-direct write (emergency restore of a pool whose`);
+    console.error(`  players are ALREADY on the ledger), re-run with --allow-ledger-bypass, then`);
+    console.error(`  reconcile with:  node scripts/backfill_knowher_ledger.mjs ${path}\n`);
+    process.exit(1);
+  }
+
+  console.error(`\n⚠️  --allow-ledger-bypass: writing KV directly. markFeatured will NOT run, so this`);
+  console.error(`   pool's players stay eligible. Follow up with:`);
+  console.error(`     node scripts/backfill_knowher_ledger.mjs ${path}\n`);
 
   console.log(`Uploading to KV ${KV_BINDING}/${KV_KEY} (--remote)…`);
   try {
