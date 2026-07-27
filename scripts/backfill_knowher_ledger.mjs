@@ -22,9 +22,16 @@
 // ⚠️ Adding an entry makes that player INELIGIBLE for the rest of the season. To undo, use the
 // admin `unfeature` op (POST /knowher/admin/api) — it removes one athleteId from the ledger.
 //
+// --remove INVERTS the operation: it takes the pool's players OFF the ledger, returning them to
+// eligibility. Use it when an edition's CONTENT is being discarded and regenerated — otherwise those
+// players stay spent for the season on a quiz nobody will ever see. (Precedent: 2026-W31 was generated
+// by a downgraded model and had to be redone; its 15 players had to come back to the pool first.)
+// Removal does NOT touch the live pool — re-publishing is what replaces the content.
+//
 // USAGE:
 //   node scripts/backfill_knowher_ledger.mjs [poolPath] --dry-run   # preview the diff, no write
 //   node scripts/backfill_knowher_ledger.mjs [poolPath]             # merge + write to KV
+//   node scripts/backfill_knowher_ledger.mjs [poolPath] --remove    # take these players OFF the ledger
 //   node scripts/backfill_knowher_ledger.mjs pool.json --week 2026-W27 --season 2026
 //                                                                   # override the stamps
 // Default poolPath: knowher-pool.json
@@ -41,6 +48,7 @@ const FEATURED_PREFIX = "knowher:featured:"; // + season — mirrors KNOWHER_FEA
 
 const args = process.argv.slice(2);
 const dryRun = args.includes("--dry-run");
+const remove = args.includes("--remove");
 const flagValue = (name) => {
   const i = args.indexOf(name);
   return i >= 0 ? args[i + 1] : undefined;
@@ -109,31 +117,53 @@ try {
   }
 }
 
-// --- Merge (idempotent, first weekKey wins) -----------------------------------
+// --- Merge (idempotent, first weekKey wins) / or Remove -----------------------
 const seen = new Map(ledger.featured.map((f) => [String(f.athleteId), f]));
-const added = [];
-const skipped = [];
-for (const entry of incoming) {
-  const prior = seen.get(entry.athleteId);
-  if (prior) {
-    skipped.push({ ...entry, priorWeek: prior.weekKey });
-    continue;
+const changed = [];  // added, or removed
+const untouched = [];
+if (remove) {
+  const drop = new Set(incoming.map((e) => e.athleteId));
+  const byId = new Map(incoming.map((e) => [e.athleteId, e]));
+  const before = ledger.featured.length;
+  ledger.featured = ledger.featured.filter((f) => !drop.has(String(f.athleteId)));
+  for (const e of incoming) {
+    const prior = seen.get(e.athleteId);
+    if (prior) changed.push({ ...e, priorWeek: prior.weekKey });
+    else untouched.push(e);
   }
-  const { playerName, ...record } = entry; // playerName is for the console only, not the ledger
-  ledger.featured.push(record);
-  seen.set(entry.athleteId, record);
-  added.push(entry);
+  void byId; void before;
+} else {
+  for (const entry of incoming) {
+    const prior = seen.get(entry.athleteId);
+    if (prior) {
+      untouched.push({ ...entry, priorWeek: prior.weekKey });
+      continue;
+    }
+    const { playerName, ...record } = entry; // playerName is for the console only, not the ledger
+    ledger.featured.push(record);
+    seen.set(entry.athleteId, record);
+    changed.push(entry);
+  }
 }
 
 // --- Report -------------------------------------------------------------------
-console.log(`\nLedger backfill — ${KEY} (${existed ? "existing" : "NEW"}) from ${poolPath} [${weekKey}]\n`);
-for (const a of added) console.log(`  + ${a.teamAbbr.padEnd(4)} ${a.playerName.padEnd(24)} id=${a.athleteId}`);
-for (const s of skipped) console.log(`  · ${s.teamAbbr.padEnd(4)} ${s.playerName.padEnd(24)} id=${s.athleteId} — already on the ledger (${s.priorWeek}), left as-is`);
-console.log(`\n  ${added.length} added, ${skipped.length} already present → ledger size ${ledger.featured.length}`);
+const verb = remove ? "REMOVAL" : "backfill";
+console.log(`\nLedger ${verb} — ${KEY} (${existed ? "existing" : "NEW"}) from ${poolPath} [${weekKey}]\n`);
+for (const a of changed) {
+  console.log(remove
+    ? `  − ${a.teamAbbr.padEnd(4)} ${a.playerName.padEnd(24)} id=${a.athleteId} — removed (was ${a.priorWeek}); ELIGIBLE again`
+    : `  + ${a.teamAbbr.padEnd(4)} ${a.playerName.padEnd(24)} id=${a.athleteId}`);
+}
+for (const s of untouched) {
+  console.log(remove
+    ? `  · ${s.teamAbbr.padEnd(4)} ${s.playerName.padEnd(24)} id=${s.athleteId} — not on the ledger, nothing to remove`
+    : `  · ${s.teamAbbr.padEnd(4)} ${s.playerName.padEnd(24)} id=${s.athleteId} — already on the ledger (${s.priorWeek}), left as-is`);
+}
+console.log(`\n  ${changed.length} ${remove ? "removed" : "added"}, ${untouched.length} unchanged → ledger size ${ledger.featured.length}`);
 console.log(`  distinct editions on the ledger: ${new Set(ledger.featured.map((f) => f.weekKey)).size} (this is the picker's "Round N")\n`);
 
-if (added.length === 0) {
-  console.log("Nothing to add — ledger already covers this pool. No write.\n");
+if (changed.length === 0) {
+  console.log(`Nothing to ${remove ? "remove" : "add"}. No write.\n`);
   process.exit(0);
 }
 if (dryRun) {
@@ -152,5 +182,7 @@ try {
 } finally {
   try { unlinkSync(tmp); } catch { /* best effort */ }
 }
-console.log(`\n✓ Ledger updated — those ${added.length} player(s) are now ineligible for the rest of season ${season}.`);
+console.log(remove
+  ? `\n✓ Ledger updated — those ${changed.length} player(s) are ELIGIBLE again for season ${season}. Re-publishing an edition that features them will re-record them.`
+  : `\n✓ Ledger updated — those ${changed.length} player(s) are now ineligible for the rest of season ${season}.`);
 console.log(`  Verify: npx wrangler kv key get "${KEY}" --binding ${KV_BINDING} --remote\n`);
