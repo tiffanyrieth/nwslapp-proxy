@@ -475,7 +475,7 @@ const KNOWHER_ADMIN_HTML = `<!doctype html>
 <h2>Eligible players (roster-learning: played this season, not yet featured)</h2>
 <div class="row"><input id="team" placeholder="team abbr e.g. WAS" style="width:160px"><button onclick="eligible()">Look up</button></div>
 <div id="elig" class="card muted">—</div>
-<small class="muted">Starters (starts ≥ 1) rank first; season-tail supersubs (0 starts, minutes &gt; 0) follow. Already-featured players are excluded.</small>
+<small class="muted">Starters (starts ≥ 1) rank first; season-tail supersubs (0 starts, minutes ≥ 100) follow. Already-featured players are excluded — once per season, no repeats.</small>
 
 <h2>Un-feature a player (fix a mistake)</h2>
 <small>Removes an athleteId from this season's featured ledger so they're pickable again.</small>
