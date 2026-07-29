@@ -23,7 +23,15 @@
 //   node scripts/health_check_predict_community.mjs http://localhost:8787 # against wrangler dev
 
 const BASE = (process.argv[2] || process.env.PROXY_BASE || "https://nwslapp-proxy.tiffany-rieth.workers.dev").replace(/\/$/, "");
-const ESPN_SCOREBOARD = "https://site.api.espn.com/apis/site/v2/sports/soccer/usa.nwsl/scoreboard?limit=500";
+// ⚠️ A DATE RANGE, not the default window. The default scoreboard usually holds only upcoming
+// fixtures, so the post-close REVEAL assertion — the half that proves the gate opens, not just that
+// it shuts — would silently WARN-and-skip on most days. A check whose main positive assertion rarely
+// runs isn't a gate. Look back two weeks so a finished match is essentially always in scope.
+const today = new Date();
+const back = new Date(today.getTime() - 14 * 24 * 3600 * 1000);
+const fmt = (d) => d.toISOString().slice(0, 10).replace(/-/g, "");
+const ESPN_SCOREBOARD =
+	`https://site.api.espn.com/apis/site/v2/sports/soccer/usa.nwsl/scoreboard?limit=500&dates=${fmt(back)}-${fmt(today)}`;
 const CLOSE_LEAD_MS = 2 * 3600 * 1000;
 
 async function scoreboardEvents() {
@@ -81,7 +89,7 @@ if (!sealed) {
 // ── 2. A finished fixture must reveal ────────────────────────────────────────────────────────
 const finished = events.filter((e) => e.state === "post").sort((a, b) => b.kickoff - a.kickoff)[0];
 if (!finished) {
-	record("WARN", "post-close reveal", "no finished fixture on the scoreboard — reveal not exercised");
+	record("WARN", "post-close reveal", "NO finished fixture in a 14-day window — the reveal half of the gate went UNTESTED");
 } else {
 	const { status, body } = await ask([`${finished.id}:${finished.team}:1`]);
 	const f = body?.fixtures?.[0];
