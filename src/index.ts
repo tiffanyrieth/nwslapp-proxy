@@ -34,6 +34,7 @@ import {
 	type KnowHerEnv,
 } from "./knowher.ts";
 import { handleQuizResults } from "./quiz-results.ts";
+import { handlePredictCommunity } from "./predict-community.ts";
 import { handleWeather } from "./weather.ts";
 import { handlePlayoffOverride } from "./playoff-override.ts";
 import {
@@ -716,6 +717,25 @@ export default {
 		if (url.pathname === "/quiz-results") {
 			return handleQuizResults(url, env as unknown as { SUPABASE_URL?: string; SUPABASE_SERVICE_ROLE_KEY?: string }, ctx);
 		}
+		if (url.pathname === "/predict/community") {
+			// Predict the XI community pick distribution. This route is the DEADLINE GATE — it
+			// refuses to serve per-player percentages before kickoff − 2h, because readable
+			// percentages during picking would flatten the very distribution the feature needs.
+			// Kickoff comes from this worker's OWN edge-cached /summary (same closure as /weather;
+			// only the immutable header date is read, so no `w=near` and no extra ESPN load).
+			const getSummary = async (eventId: string) => {
+				const summaryUrl = new URL(`/summary?event=${eventId}`, url);
+				const resp = await proxyAndCache(summaryUrl, ESPN_SUMMARY, chooseSummaryTTL, ctx);
+				return resp.ok ? ((await resp.json()) as never) : null;
+			};
+			return handlePredictCommunity(
+				url,
+				env as unknown as { SUPABASE_URL?: string; SUPABASE_SERVICE_ROLE_KEY?: string },
+				ctx,
+				getSummary,
+				emitDiag as never,
+			);
+		}
 		if (url.pathname === "/headshots") {
 			return handleHeadshots(url, env, ctx);
 		}
@@ -750,7 +770,7 @@ export default {
 		}
 
 		return new Response(
-			"Not found. This proxy serves GET /scoreboard, /summary, /weather, /team-videos, /feed, /spotlight, /trivia, /knowher, /knowher/eligible, /knowher/todo, /quiz-results, /headshots, /crest, /crest/manifest, /roster, /national-teams, /playoff-override, and POST /telemetry, /analytics.",
+			"Not found. This proxy serves GET /scoreboard, /summary, /weather, /team-videos, /feed, /spotlight, /trivia, /knowher, /knowher/eligible, /knowher/todo, /quiz-results, /predict/community, /headshots, /crest, /crest/manifest, /roster, /national-teams, /playoff-override, and POST /telemetry, /analytics.",
 			{ status: 404 },
 		);
 	},
