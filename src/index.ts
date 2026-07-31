@@ -27,6 +27,20 @@ import {
 	type BracketEnv,
 } from "./bracket-engine.ts";
 import { buildHeadshotMap, handleHeadshots, normalizeName } from "./headshots.ts";
+import { adminAuthed, adminRealm } from "./admin-auth.ts";
+import { ADMIN_PORTAL_HTML } from "./admin-portal.ts";
+import {
+	runRosterTruth,
+	readRosterTruthReport,
+	readOverrides,
+	writeOverrides,
+	applyOverrides,
+	activeOverrides,
+	overrideExpiry,
+	OVERRIDE_TTL_DAYS,
+	type OverrideMap,
+	type RosterOverride,
+} from "./roster-truth.ts";
 import {
 	handleKnowHerAdmin,
 	computeEligiblePlayers,
@@ -573,6 +587,13 @@ export default {
 			}
 		}
 
+		// The single operator portal: GET /admin (tabbed shell) + POST /admin/roster (its ops).
+		// Same HTTP Basic realm as the Bracket/KHG panels, so the browser authenticates once for
+		// the whole origin and the iframed tabs inherit it. Registered above the GET-only guard.
+		if (url.pathname === "/admin" || url.pathname === "/admin/roster") {
+			return handleAdminPortal(request, env, ctx);
+		}
+
 		// POST telemetry ingest must be registered BEFORE the GET-only guard below.
 		if (url.pathname === "/telemetry") {
 			return handleTelemetryIngest(request, env, ctx);
@@ -815,6 +836,19 @@ export default {
 				await buildHeadshotMap(env);
 			} catch {
 				/* swallow — next weekly run retries; the stale map stays serving */
+			}
+			return;
+		}
+		// Nightly → OBSERVE-MODE roster verification (ESPN × NWSL). Writes a report + diags and
+		// changes nothing users see. Nightly rather than weekly because the cost is identical
+		// (~36 fetches either way) and ESPN breakage should surface in hours, not up to six days.
+		// ⚠️ This explicit branch is REQUIRED: the fall-through below runs the Apify social scrape,
+		// so a new cron string without a branch would silently trigger paid scraping every night.
+		if (controller.cron === "0 8 * * *") {
+			try {
+				await runRosterTruth(env, (events) => emitDiagBatch(env, ctx, events));
+			} catch (e) {
+				emitDiag(env, ctx, "rosterTruthRunFail", (e as Error).message.slice(0, 80));
 			}
 			return;
 		}
@@ -1664,6 +1698,111 @@ export function emitDiag(env: Env, ctx: ExecutionContext, kind: string, detail: 
 	// flood can never bury them in the newest-N list window. The owner view (/telemetry/recent) merges both.
 	const key = `sdiag:${1e15 - Date.now()}:${crypto.randomUUID().slice(0, 8)}`;
 	ctx.waitUntil(env.FEED_TAGS.put(key, JSON.stringify(record), { expirationTtl: 60 * 60 * 24 * 30 }));
+}
+
+/** Many events, ONE KV write. For a job that produces a burst of findings at once (the nightly
+ *  roster verification emits one event per failing gate across 16 clubs) — a put per finding would
+ *  blow the invocation's subrequest budget and burn the free-tier daily write allowance.
+ *
+ *  `checkErrorSpike` already iterates `record.events`, so a batch of N countable kinds contributes N
+ *  toward the alert threshold. That is deliberate: one club failing a gate is 1–2 events and stays
+ *  quiet, while a contamination or a deleted club fails many at once and pages. */
+export function emitDiagBatch(env: Env, ctx: ExecutionContext, events: { kind: string; detail: string }[]): void {
+	if (events.length === 0) return;
+	const ts = Date.now();
+	const record = {
+		at: new Date().toISOString(),
+		app: "proxy",
+		os: "worker",
+		origin: "server",
+		events: events.slice(0, 20).map((e) => ({ kind: e.kind.slice(0, 40), detail: e.detail.slice(0, 80), ts })),
+	};
+	console.log("telemetry", JSON.stringify(record));
+	const key = `sdiag:${1e15 - ts}:${crypto.randomUUID().slice(0, 8)}`;
+	ctx.waitUntil(env.FEED_TAGS.put(key, JSON.stringify(record), { expirationTtl: 60 * 60 * 24 * 30 }));
+}
+
+// ── Operator portal (GET /admin + POST /admin/roster) ────────────────────────────
+
+/** The tabbed portal shell and the Roster tab's ops. Bracket + Know Her Game keep their own
+ *  handlers and URLs untouched — the shell iframes them (see src/admin-portal.ts for why). */
+async function handleAdminPortal(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
+	const key = (env as unknown as { BRACKET_ADMIN_KEY?: string }).BRACKET_ADMIN_KEY;
+	if (!adminAuthed(request, key)) {
+		return new Response("Authentication required.", {
+			status: 401,
+			headers: { "WWW-Authenticate": adminRealm("NWSLApp Admin") },
+		});
+	}
+	const url = new URL(request.url);
+	if (request.method === "GET" && url.pathname === "/admin") {
+		return new Response(ADMIN_PORTAL_HTML, { headers: { "Content-Type": "text/html; charset=utf-8" } });
+	}
+	if (request.method !== "POST") {
+		return new Response("Method not allowed. Use POST.", { status: 405, headers: { Allow: "POST" } });
+	}
+
+	let body: Record<string, unknown> = {};
+	try {
+		body = (await request.json()) as Record<string, unknown>;
+	} catch {
+		/* {} */
+	}
+
+	try {
+		const op = String(body.op ?? "");
+		const now = Date.now();
+
+		// Every op returns the SAME payload shape so the page just re-renders from the response —
+		// no partial client-side state to drift out of sync with KV.
+		const respond = async () => {
+			const [report, overrides] = await Promise.all([readRosterTruthReport(env), readOverrides(env)]);
+			return Response.json({ report, overrides, ttlDays: OVERRIDE_TTL_DAYS });
+		};
+
+		if (op === "state") return await respond();
+
+		if (op === "run") {
+			await runRosterTruth(env, (events) => emitDiagBatch(env, ctx, events));
+			return await respond();
+		}
+
+		if (op === "setOverride") {
+			const id = String(body.espnAthleteId ?? "");
+			if (!id) return Response.json({ error: "espnAthleteId required" }, { status: 400 });
+			const overrides = await readOverrides(env);
+			const pos = body.position ? (String(body.position) as RosterOverride["position"]) : undefined;
+			const jersey = body.jersey == null ? undefined : Number(body.jersey);
+			overrides[id] = {
+				espnAthleteId: id,
+				playerName: String(body.playerName ?? id),
+				teamAbbr: String(body.teamAbbr ?? ""),
+				...(pos ? { position: pos } : {}),
+				...(Number.isFinite(jersey) ? { jersey } : {}),
+				setAt: new Date(now).toISOString(),
+				expiresAt: overrideExpiry(now),
+			};
+			await writeOverrides(env, overrides);
+			emitDiag(env, ctx, "rosterOverrideSet", `${id} ${pos ?? ""}${jersey != null ? `#${jersey}` : ""}`.slice(0, 60));
+			return await respond();
+		}
+
+		if (op === "renewOverride" || op === "removeOverride") {
+			const id = String(body.espnAthleteId ?? "");
+			const overrides: OverrideMap = await readOverrides(env);
+			if (!overrides[id]) return Response.json({ error: "no such override" }, { status: 404 });
+			if (op === "removeOverride") delete overrides[id];
+			else overrides[id] = { ...overrides[id], setAt: new Date(now).toISOString(), expiresAt: overrideExpiry(now) };
+			await writeOverrides(env, overrides);
+			emitDiag(env, ctx, op === "removeOverride" ? "rosterOverrideRemoved" : "rosterOverrideRenewed", id);
+			return await respond();
+		}
+
+		return Response.json({ error: `unknown op "${op}"` }, { status: 400 });
+	} catch (e) {
+		const err = e as Error;
+		return Response.json({ error: `${err.message ?? err}` }, { status: 500 });
+	}
 }
 
 /** Normalize any ISO-ish date to "YYYY-MM-DDTHH:MM:SSZ" — no fractional seconds,
@@ -3503,6 +3642,11 @@ const ALERT_ERROR_KINDS = new Set([
 	// real at 2026-W31 when ESPN briefly returned an empty Orlando roster and the edition shipped
 	// 15 teams — it was diagnosable only after the fact because nothing paged on it.
 	"rosterContinuityRefused", "knowherTodoEmpty",
+	// Nightly verification. A gate failure is one event per failing club-gate, all in ONE batched
+	// record — so a single club blip stays under ALERT_THRESHOLD and is report-only, while a
+	// contamination or a deleted club fails many gates at once and pages. Severity scales with
+	// blast radius for free. Per-player diffs (positions, erasures) deliberately do NOT page.
+	"rosterTruthGateFail", "rosterTruthRunFail",
 ]);
 const ALERT_WINDOW_MS = 15 * 60 * 1000;
 const ALERT_THRESHOLD = 8; // error events in the window ⇒ email (2-user baseline is ~0-2/day; a real incident bursts)
@@ -3783,6 +3927,23 @@ async function handleRoster(url: URL, env: Env, ctx: ExecutionContext): Promise<
 		/* KV read failure → treat as no cache (fails open: step 2 bootstraps, step 3 serves live) */
 	}
 
+	// Owner rulings outrank both feeds. Applied to whatever we end up serving (live OR cached), and
+	// applied AFTER the cache write below, so the stored last-known-good stays raw ESPN — an override
+	// is a presentation-time correction, never something baked into the archive.
+	let overrides: OverrideMap = {};
+	try {
+		overrides = await readOverrides(env);
+	} catch {
+		/* fail open: no overrides is exactly today's behaviour */
+	}
+	const serve = (body: unknown, asOf: string | null): Response => {
+		const { body: patched, applied } = applyOverrides(body, overrides, Date.now());
+		if (applied.length > 0) {
+			emitDiag(env, ctx, "rosterOverrideApplied", `${id} n=${applied.length} ${applied.slice(0, 3).join(",")}`);
+		}
+		return rosterResponse(patched, asOf);
+	};
+
 	// 2. Plausible squad → serve verbatim (no marker), and refresh last-known-good ONLY if the
 	//    payload is continuous with what we already trusted. A wholesale-substituted roster is
 	//    plausibly sized, so without this check it would overwrite the good copy on the first
@@ -3798,7 +3959,7 @@ async function handleRoster(url: URL, env: Env, ctx: ExecutionContext): Promise<
 			// ROSTER_CACHE_TTL — or delete the key to force a re-bootstrap (see docs/backend.md).
 			emitDiag(env, ctx, "rosterContinuityRefused", `${id} overlap=${Math.round(overlap * 100)}% live=${liveCount}`);
 		}
-		return rosterResponse(live, null);
+		return serve(live, null);
 	}
 
 	// 3. Implausibly small (or upstream failed) → fall back to last-known-good if it's fuller.
@@ -3811,12 +3972,12 @@ async function handleRoster(url: URL, env: Env, ctx: ExecutionContext): Promise<
 	});
 	if (decision === "cached" && cached) {
 		emitDiag(env, ctx, "rosterStaleServe", `${id} live=${liveCount} cached=${cachedCount}`);
-		return rosterResponse(cached.body, cached.fetchedAt);
+		return serve(cached.body, cached.fetchedAt);
 	}
 	if (decision === "live-small") {
 		// Nothing better than the live (small) payload — serve it honestly (diag flags it).
 		emitDiag(env, ctx, "rosterImplausibleNoCache", `${id} live=${liveCount}`);
-		return rosterResponse(live, null);
+		return serve(live, null);
 	}
 	// No live payload AND no cache to fall back to → loud failure.
 	emitDiag(env, ctx, "rosterUnavailable", `${id} live=${liveCount} cached=${cachedCount}`);
