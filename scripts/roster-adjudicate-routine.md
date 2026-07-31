@@ -43,6 +43,24 @@ current-season and the club decides how it lists its own players.
   (forward/winger/striker). If the club lists a hybrid ("defender/midfielder") with no primary,
   DECLINE that item.
 
+### ⚠️ The transfer rule — a blank jersey means the position is suspect too
+
+**Every player in the `jerseys` list (ESPN has no number for her) is almost certainly a RECENT
+TRANSFER**, because a missing number is what a half-processed arrival looks like. When a player
+changes clubs two things move at once: she takes a new number if her old one is taken, AND her new
+coach may play her in a different role. Both feeds lag that, *together* — so for these players the
+two feeds can AGREE and still both be stale.
+
+So for every player in the `jerseys` list, read her club page for **BOTH her number and her
+position**, and post the position too whenever the club disagrees with what the feeds show — even
+though it was not flagged as a mismatch. This is the one case where you rule on something the todo
+list did not ask about.
+
+Proven case (2026-07-31): Ally Sentnor moved Kansas City → Angel City in the July window. ESPN had
+no number, the league feed still had her old **#21** and both feeds said **Forward**; Angel City's
+own page said **"midfielder #17"** — right on both counts, and the blank jersey was the only clue
+that her position needed checking too.
+
 ## 3. Post only what you resolved
 
 ```
@@ -52,7 +70,8 @@ curl -sS -X POST "https://nwslapp-proxy.tiffany-rieth.workers.dev/roster-truth/r
 ```
 
 - `source` is REQUIRED and must be the exact page you read the answer from (the server rejects
-  rulings without it). For a jersey item send `"jersey": 21` instead of `position`.
+  rulings without it). For a jersey item send `"jersey": 17`; you may send BOTH `position` and
+  `jersey` in one ruling (that is what the transfer rule above produces).
 - Post ONE batch at the end, not per-item.
 - The response lists `accepted` and `skipped` with reasons. `"owner pin in force"` skips are
   EXPECTED (the owner outranks you) — not failures.
