@@ -60,6 +60,19 @@ const REPORT_TTL = 60 * 60 * 24 * 30;
 const SEASON_KEY = "sdp-season-v1";
 const SEASON_TTL = 60 * 60 * 24 * 7;
 
+/** Per-club pass/fail from the latest run — the small key `/roster` consults at serve time
+ *  (tweak 2, owner-approved 2026-07-31). A club whose last verification FAILED is held on its
+ *  last-known-good copy until it passes again; healthy clubs keep serving live. 48h TTL is the
+ *  kill switch: if the cron dies the verdicts expire and serving falls open to live-first. */
+export const VERDICTS_KEY = "roster-truth-verdicts-v1";
+const VERDICTS_TTL = 60 * 60 * 48;
+
+export interface VerdictMap {
+	at: string;
+	/** Keyed by ESPN team id (the `?team=` param `/roster` receives). */
+	clubs: Record<string, { abbr: string; ok: boolean }>;
+}
+
 /** Owner rulings that outrank BOTH feeds. See `applyOverrides`. */
 export const OVERRIDES_KEY = "roster-truth:overrides";
 /** Overrides are kept well past expiry so the admin portal can still SHOW an expired ruling and
@@ -635,6 +648,7 @@ export async function runRosterTruth(env: RosterTruthEnv, emit: EmitBatch): Prom
 	const squads: SdpSquad[] = [];
 	const clubs: ClubReport[] = [];
 	const namesByClub: Record<string, string[]> = {};
+	const verdictClubs: VerdictMap["clubs"] = {};
 
 	await Promise.all(
 		espnTeams.map(async (t) => {
@@ -649,6 +663,8 @@ export async function runRosterTruth(env: RosterTruthEnv, emit: EmitBatch): Prom
 			]);
 
 			if (!espnRaw) {
+				// Unverified ≠ failed: a fetch blip must not hold a club on its cached copy.
+				verdictClubs[t.id] = { abbr: t.abbr, ok: true };
 				clubs.push({
 					abbr: t.abbr,
 					espnCount: -1,
@@ -666,13 +682,16 @@ export async function runRosterTruth(env: RosterTruthEnv, emit: EmitBatch): Prom
 			if (squad) squads.push(squad);
 			namesByClub[t.abbr] = espn.players.map((p) => p.name);
 
+			const gateB = gateShape(espn);
+			const gateC = gateContinuity(espn, squad, priorNames[t.abbr] ?? null);
+			verdictClubs[t.id] = { abbr: t.abbr, ok: gateB.ok && gateC.ok };
 			clubs.push({
 				abbr: t.abbr,
 				espnCount: espn.players.length,
 				sdpCount: squad?.players.length ?? -1,
 				verified: true,
-				gateB: gateShape(espn),
-				gateC: gateContinuity(espn, squad, priorNames[t.abbr] ?? null),
+				gateB,
+				gateC,
 				diffs: diffPlayers(espn, squad),
 			});
 		}),
@@ -688,6 +707,11 @@ export async function runRosterTruth(env: RosterTruthEnv, emit: EmitBatch): Prom
 			{ expirationTtl: SDP_SQUADS_TTL },
 		),
 		env.FEED_TAGS.put(REPORT_KEY, JSON.stringify(report), { expirationTtl: REPORT_TTL }),
+		env.FEED_TAGS.put(
+			VERDICTS_KEY,
+			JSON.stringify({ at: ranAt, clubs: verdictClubs } satisfies VerdictMap),
+			{ expirationTtl: VERDICTS_TTL },
+		),
 	]);
 
 	// ONE batched emit. Gate failures page (severity scales with blast radius: a single club is 1-2
@@ -712,6 +736,10 @@ export async function runRosterTruth(env: RosterTruthEnv, emit: EmitBatch): Prom
 /** Latest report for the admin portal. */
 export async function readRosterTruthReport(env: RosterTruthEnv): Promise<RosterTruthReport | null> {
 	return (await env.FEED_TAGS.get(REPORT_KEY, "json")) as RosterTruthReport | null;
+}
+
+export async function readVerdicts(env: RosterTruthEnv): Promise<VerdictMap | null> {
+	return (await env.FEED_TAGS.get(VERDICTS_KEY, "json")) as VerdictMap | null;
 }
 
 export async function readOverrides(env: RosterTruthEnv): Promise<OverrideMap> {
