@@ -71,9 +71,17 @@ import {
 
 // Forced-update version gate (served at GET /config). To force everyone onto a newer TestFlight
 // build, raise MIN_APP_BUILD (the integer the app compares against its CFBundleVersion) and redeploy.
-// MIN_APP_VERSION is the informational marketing string. minBuild=21 blocks builds 19 and 20 on deploy.
-const MIN_APP_VERSION = "0.4.2";
-const MIN_APP_BUILD = 21;
+// MIN_APP_VERSION is the informational marketing string.
+//
+// ⚠️ DEPLOY ORDER IS THE WHOLE RISK: raise this ONLY once the target build is LIVE AND INSTALLABLE on
+// TestFlight. Deploying ahead of the build walls every user below it — including the owner's own
+// device — with nowhere to go. It is a manual FLOOR and must never auto-track the latest build
+// (see docs/versioning.md).
+//
+// 2026-07-31: 21 → 31, the FIRST raise since introduction. Retires builds ≤30 (28 was known-broken);
+// until now the gate had never fired for anyone.
+const MIN_APP_VERSION = "0.4.5";
+const MIN_APP_BUILD = 31;
 
 const ESPN_SCOREBOARD =
 	"https://site.api.espn.com/apis/site/v2/sports/soccer/usa.nwsl/scoreboard";
