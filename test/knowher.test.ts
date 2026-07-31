@@ -132,3 +132,58 @@ test("isKnowHerWeek: pre-anchor weeks are off; unset/invalid anchor fails open t
 	assert.equal(isKnowHerWeek(new Date(Date.UTC(2026, 5, 1)), undefined), true, "no anchor → generate (fail-open)");
 	assert.equal(isKnowHerWeek(new Date(Date.UTC(2026, 5, 1)), "not-a-date"), true, "bad anchor → generate (fail-open)");
 });
+
+// ── Club completeness (server-side twin of the loader's check) ───────────────────
+// A published edition must cover all 16 clubs. 2026-W31 shipped 15 (ESPN briefly returned an
+// empty Orlando roster; the assembler is fail-open) and Pride fans opened the game to nothing.
+// The rule lives in BOTH validators because both are publish-adjacent: this one guards
+// /knowher/ingest + the admin paste, the loader's guards the routine's dry-run.
+
+import { clubCompletenessError, KNOWN_CLUB_ABBRS, validateKnowHerPool } from "../src/knowher.ts";
+
+test("clubCompletenessError: a complete pool is clean", () => {
+	assert.equal(clubCompletenessError([...KNOWN_CLUB_ABBRS]), null);
+	assert.equal(KNOWN_CLUB_ABBRS.length, 16);
+});
+
+test("clubCompletenessError: names the missing club (the W31 Orlando regression)", () => {
+	const msg = clubCompletenessError(KNOWN_CLUB_ABBRS.filter((a) => a !== "ORL"));
+	assert.ok(msg?.includes("missing 1 club(s): ORL"), msg ?? "expected an error");
+});
+
+test("clubCompletenessError: rejects an unknown abbreviation", () => {
+	const msg = clubCompletenessError([...KNOWN_CLUB_ABBRS.filter((a) => a !== "SEA"), "XYZ"]);
+	assert.ok(msg?.includes("unknown club(s) XYZ"), msg ?? "expected an error");
+});
+
+test("clubCompletenessError: case-insensitive on the caller's abbreviations", () => {
+	assert.equal(clubCompletenessError(KNOWN_CLUB_ABBRS.map((a) => a.toLowerCase())), null);
+});
+
+// The single-player admin frame must stay valid: `upsertPlayer` reuses the full validator on a
+// one-player pool to lint a pasted player, so completeness is opt-in, not automatic.
+const onePlayerFrame = {
+	weekKey: "2026-W30",
+	season: 2026,
+	players: [{
+		teamAbbreviation: "POR", espnAthleteId: "id-por", playerName: "Player POR",
+		jerseyNumber: 7, position: "Defender", tagline: "warm one-liner",
+		questions: Array.from({ length: 10 }, (_, i) => ({
+			id: `por-${i}`,
+			category: i < 4 ? "herGame" : "herStory",
+			prompt: `prompt ${i}`,
+			options: ["a", "b", "c", "d"],
+			correctIndex: 0,
+		})),
+	}],
+};
+
+test("validateKnowHerPool: a one-player frame passes by default (the upsertPlayer path)", () => {
+	const v = validateKnowHerPool(onePlayerFrame);
+	assert.ok(!("error" in v), "error" in v ? v.error : "");
+});
+
+test("validateKnowHerPool: the same frame FAILS with requireAllClubs (the publish path)", () => {
+	const v = validateKnowHerPool(onePlayerFrame, { requireAllClubs: true });
+	assert.ok("error" in v && v.error.includes("missing 15 club(s)"), JSON.stringify(v));
+});

@@ -35,7 +35,9 @@ function pool(players: ReturnType<typeof player>[]) {
 	return { weekKey: "2026-W30", season: 2026, players };
 }
 
-const ABBRS = ["WAS", "LA", "BAY", "BOS", "CHI", "DEN"];
+// All 16 clubs: a pool is only publishable when every club is represented, so the
+// content-quality fixtures below must be complete editions or they'd fail for the wrong reason.
+const ABBRS = ["LA", "BAY", "BOS", "CHI", "DEN", "GFC", "HOU", "KC", "NC", "ORL", "POR", "LOU", "SD", "SEA", "UTA", "WAS"];
 
 test("a healthy pool (10 Qs/player, mixed T/F) passes clean", () => {
 	const { errors, warnings } = validatePool(pool(ABBRS.map((a) => player(a, { human: 6, stat: 4, tfTrue: 1 }))));
@@ -68,4 +70,34 @@ test("a balanced True/False pool passes the ratio check", () => {
 	// Each player: 1 True + 1 False → 50% True.
 	const { errors } = validatePool(pool(ABBRS.map((a) => player(a, { human: 6, stat: 4, tfTrue: 1 }))));
 	assert.ok(!errors.some((e) => e.includes('"True"')), errors.join(" | "));
+});
+
+// ── Club completeness ────────────────────────────────────────────────────────────
+// The 2026-W31 regression: ESPN briefly served an empty Orlando roster, the fail-open assembler
+// shipped a 15-team pool, and Pride fans opened the game to nothing. Nothing failed, because no
+// validator asked whether all 16 clubs were present.
+
+test("a pool missing a club FAILS and names it (the 2026-W31 Orlando regression)", () => {
+	const short = ABBRS.filter((a) => a !== "ORL");
+	const { errors } = validatePool(pool(short.map((a) => player(a))));
+	assert.ok(errors.some((e) => e.includes("missing 1 club(s): ORL")), errors.join(" | "));
+});
+
+test("a pool missing several clubs names all of them", () => {
+	const short = ABBRS.filter((a) => a !== "POR" && a !== "ORL" && a !== "SEA");
+	const { errors } = validatePool(pool(short.map((a) => player(a))));
+	const msg = errors.join(" | ");
+	assert.ok(msg.includes("missing 3 club(s)"), msg);
+	for (const abbr of ["ORL", "POR", "SEA"]) assert.ok(msg.includes(abbr), msg);
+});
+
+test("an unknown club abbreviation FAILS (typo or stale abbr, not a real edition)", () => {
+	const withTypo = [...ABBRS.filter((a) => a !== "GFC"), "NJY"];
+	const { errors } = validatePool(pool(withTypo.map((a) => player(a))));
+	assert.ok(errors.some((e) => e.includes("unknown club(s) NJY")), errors.join(" | "));
+});
+
+test("a complete 16-club pool passes completeness", () => {
+	const { errors } = validatePool(pool(ABBRS.map((a) => player(a))));
+	assert.ok(!errors.some((e) => e.includes("club")), errors.join(" | "));
 });

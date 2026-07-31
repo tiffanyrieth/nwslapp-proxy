@@ -214,14 +214,18 @@ export async function fetchTeamAbbrs(): Promise<{ id: string; abbr: string }[]> 
     .filter((t) => t.id && t.abbr);
 }
 
-export async function fetchRoster(teamId: string, abbr: string): Promise<RosterPlayer[]> {
-  const json = await espnJSON<{
+/** ESPN roster JSON → RosterPlayer[]. Pure + exported so the last-known-good KV fallback can
+ *  reuse it: that cache stores ESPN's payload verbatim, so the same mapper decodes both. */
+export function mapEspnRosterAthletes(
+  json: {
     athletes?: {
       id?: string; displayName?: string; jersey?: string; position?: { abbreviation?: string };
       age?: number; citizenship?: string;
     }[];
-  }>(`${ESPN_SITE}/teams/${teamId}/roster`);
-  return (json.athletes ?? [])
+  } | null,
+  abbr: string,
+): RosterPlayer[] {
+  return (json?.athletes ?? [])
     .filter((a) => a.id && a.displayName)
     .map((a) => ({
       id: a.id!,
@@ -234,7 +238,65 @@ export async function fetchRoster(teamId: string, abbr: string): Promise<RosterP
     }));
 }
 
-const POSITION_GROUP: Record<string, "F" | "M" | "D" | "G"> = {
+export async function fetchRoster(teamId: string, abbr: string): Promise<RosterPlayer[]> {
+  const json = await espnJSON<Parameters<typeof mapEspnRosterAthletes>[0]>(
+    `${ESPN_SITE}/teams/${teamId}/roster`,
+  );
+  return mapEspnRosterAthletes(json, abbr);
+}
+
+/** A real NWSL squad is ~22–30; below this the payload is broken, not a small squad. Shared with
+ *  index.ts's /roster route so both guards agree on what "implausible" means. */
+export const ROSTER_GOOD_MIN = 16;
+
+/** `fetchRoster` with the same last-known-good safety net `/roster` has had since the Angel City
+ *  collapse. Without it these callers read ESPN raw: on 2026-07-30 ESPN served Portland as ONE
+ *  player and `/knowher/eligible?team=POR` returned zero, so a Know Her Game edition generated
+ *  that day would have silently shipped 15 teams — the same way Orlando was dropped at W31.
+ *
+ *  Reads the `roster:{espnTeamId}` record `handleRoster` maintains (ESPN's payload verbatim), so
+ *  no second cache and no extra ESPN traffic. Costs nothing on the healthy path: KV is touched
+ *  only when the live squad is implausible, which matters because the 5-minute bracket tick has
+ *  a 50-subrequest budget. Also swallows a per-team fetch failure that previously rejected the
+ *  whole `Promise.all` and emptied the entire pool. */
+export async function fetchRosterResilient(
+  env: BracketEnv,
+  teamId: string,
+  abbr: string,
+): Promise<RosterPlayer[]> {
+  let live: RosterPlayer[] = [];
+  try {
+    live = await fetchRoster(teamId, abbr);
+  } catch (e) {
+    await emitDiag(env, "rosterEngineFetchFail", `${abbr}: ${(e as Error).message.slice(0, 50)}`);
+  }
+  if (live.length >= ROSTER_GOOD_MIN) return live;
+
+  try {
+    const raw = await env.FEED_TAGS?.get(`roster:${teamId}`);
+    if (raw) {
+      // BracketEnv's KV shim has no "json" type param — parse the string ourselves.
+      const record = JSON.parse(raw) as { fetchedAt?: string; body?: unknown };
+      const cached = mapEspnRosterAthletes(
+        record.body as Parameters<typeof mapEspnRosterAthletes>[0],
+        abbr,
+      );
+      if (cached.length > live.length) {
+        await emitDiag(env, "rosterEngineFallback", `${abbr} live=${live.length} cached=${cached.length}`);
+        return cached;
+      }
+    }
+  } catch (e) {
+    await emitDiag(env, "rosterEngineCacheFail", `${abbr}: ${(e as Error).message.slice(0, 50)}`);
+  }
+  // Nothing better than what ESPN gave us — return it honestly (the diag above is the signal).
+  if (live.length > 0 && live.length < ROSTER_GOOD_MIN) {
+    await emitDiag(env, "rosterEngineSmallNoCache", `${abbr} live=${live.length}`);
+  }
+  return live;
+}
+
+export const POSITION_GROUP: Record<string, "F" | "M" | "D" | "G"> = {
   F: "F", CF: "F", ST: "F", S: "F", W: "F", RW: "F", LW: "F", FW: "F",
   M: "M", CM: "M", DM: "M", AM: "M", MF: "M",
   D: "D", CB: "D", RB: "D", LB: "D", WB: "D", FB: "D",
@@ -245,9 +307,12 @@ const POSITION_GROUP: Record<string, "F" | "M" | "D" | "G"> = {
  *  ROUND-ROBIN INTERLEAVE across teams (each club's players spread through the list, jersey
  *  order within a team) — this is both the same-team-spreading order AND the roster-depth
  *  fallback seeding when stat data is thin. No cap (the caller ranks + caps). 17 fetches. */
-async function rosterCandidates(group: "F" | "M" | "D" | "G" | null): Promise<RosterPlayer[]> {
+async function rosterCandidates(
+  env: BracketEnv,
+  group: "F" | "M" | "D" | "G" | null,
+): Promise<RosterPlayer[]> {
   const teams = await fetchTeamAbbrs();
-  const rosters = await Promise.all(teams.map((t) => fetchRoster(t.id, t.abbr)));
+  const rosters = await Promise.all(teams.map((t) => fetchRosterResilient(env, t.id, t.abbr)));
   const byTeam = rosters.map((r) =>
     r.filter((p) => group === null || POSITION_GROUP[p.position] === group)
       .sort((a, b) => (a.jersey ?? 999) - (b.jersey ?? 999)),
@@ -371,7 +436,7 @@ async function seedPool(
   env: BracketEnv, group: "F" | "M" | "D" | "G" | null, seedingStat: string, cap: number, config: BracketConfig, now: number,
 ): Promise<Entrant[]> {
   const year = new Date(now).getUTCFullYear();
-  const candidates = await rosterCandidates(group);
+  const candidates = await rosterCandidates(env, group);
   if (candidates.length === 0) return [];
 
   const score = new Map<string, number>();

@@ -12,7 +12,12 @@
 // writes KV `knowher-pool-v1`. The AUTO weekly generator is deferred (docs/know-her-game.md
 // §5); its pipe (eligibility, mode flag, admin) is built now so nothing gets retrofitted.
 
-import { fetchTeamAbbrs, fetchRoster, fetchStatsForMany } from "./bracket-engine.ts";
+import {
+  fetchTeamAbbrs,
+  fetchRosterResilient,
+  fetchStatsForMany,
+  type BracketEnv,
+} from "./bracket-engine.ts";
 import { adminAuthed, adminRealm } from "./admin-auth.ts";
 
 export const KNOWHER_POOL_KEY = "knowher-pool-v1"; // KV: the live pool document (this week's players)
@@ -56,10 +61,47 @@ export interface KnowHerPool {
   players: KnowHerPlayer[]; // one featured player per team (never a team the user doesn't follow)
 }
 
+/** The 16 NWSL clubs, by ESPN/NWSL abbreviation. A published Know Her Game edition must cover
+ *  EVERY club — the game promises each fan a player from their team, so a short pool means some
+ *  club's fans open the game to nothing. Expansion is a deliberate one-line change here and in
+ *  the `scripts/load_knowher.mjs` twin (same pattern as the NT competition slug lists). */
+export const KNOWN_CLUB_ABBRS = [
+  "LA", "BAY", "BOS", "CHI", "DEN", "GFC", "HOU", "KC",
+  "NC", "ORL", "POR", "LOU", "SD", "SEA", "UTA", "WAS",
+];
+
+/** Pool-completeness check: the edition must carry exactly one player per club, all 16.
+ *  Returns an error string, or null when the pool is complete.
+ *
+ *  This is the LAST-RESORT tripwire for the 2026-W31 failure: ESPN briefly returned an empty
+ *  Orlando roster, the fail-open assembler shipped a 15-team pool, and Pride fans opened the
+ *  game to nothing — because no validator ever asked "are all 16 clubs here?". The roster
+ *  fallback (`fetchRosterResilient`) should mean this never fires; if it does, blocking the
+ *  publish loudly beats shipping another silently-short edition. */
+export function clubCompletenessError(teamAbbrs: string[]): string | null {
+  const known = new Set(KNOWN_CLUB_ABBRS);
+  const seen = new Set(teamAbbrs.map((t) => t.toUpperCase()));
+  const unknown = [...seen].filter((t) => !known.has(t)).sort();
+  if (unknown.length > 0) {
+    return `unknown club(s) ${unknown.join(", ")} — expected the ${KNOWN_CLUB_ABBRS.length} NWSL clubs`;
+  }
+  const missing = KNOWN_CLUB_ABBRS.filter((t) => !seen.has(t));
+  if (missing.length > 0) {
+    return `pool is missing ${missing.length} club(s): ${missing.join(", ")} — an edition must cover all ${KNOWN_CLUB_ABBRS.length} clubs (a short pool leaves those fans with nothing to play)`;
+  }
+  return null;
+}
+
 /** Validate an unknown value against the pool schema. Returns the typed pool or a
  *  human-readable error. The SAME rules run in scripts/load_knowher.mjs (JS copy) and the
  *  admin pasteContent op, so bad content can never reach KV from either path. */
-export function validateKnowHerPool(raw: unknown): { pool: KnowHerPool } | { error: string } {
+export function validateKnowHerPool(
+  raw: unknown,
+  /** Whole-edition checks (currently club completeness). OFF for the admin `upsertPlayer` op,
+   *  which reuses this validator on a ONE-player frame to lint a single pasted player — that
+   *  frame is legitimately incomplete and must not be judged as an edition. */
+  opts: { requireAllClubs?: boolean } = {},
+): { pool: KnowHerPool } | { error: string } {
   const doc = raw as Partial<KnowHerPool> | null;
   if (!doc || typeof doc !== "object" || Array.isArray(doc)) return { error: "pool must be a JSON object" };
   if (typeof doc.weekKey !== "string" || !doc.weekKey.trim()) return { error: "missing/blank weekKey" };
@@ -102,6 +144,10 @@ export function validateKnowHerPool(raw: unknown): { pool: KnowHerPool } | { err
       }
       if (q.revealFact !== undefined && (typeof q.revealFact !== "string")) return { error: `${qat}: revealFact must be a string` };
     }
+  }
+  if (opts.requireAllClubs) {
+    const completeness = clubCompletenessError([...teamsSeen]);
+    if (completeness) return { error: completeness };
   }
   return { pool: doc as KnowHerPool };
 }
@@ -190,6 +236,7 @@ export function pickWeeklyFeatured(eligible: EligiblePlayer[]): EligiblePlayer |
  *  stat-fetch failure just excludes that player (never throws). Pass the season's featured ids to skip
  *  already-featured players. */
 export async function computeEligiblePlayers(
+  env: KnowHerEnv,
   teamAbbr: string,
   year: number,
   excludeIds: Set<string> = new Set(),
@@ -198,7 +245,10 @@ export async function computeEligiblePlayers(
   const teams = await fetchTeamAbbrs();
   const team = teams.find((t) => t.abbr === want);
   if (!team) return [];
-  const roster = await fetchRoster(team.id, team.abbr);
+  // Resilient (last-known-good KV fallback), not raw: an ESPN roster collapse here yields an
+  // EMPTY eligible pool, which the fail-open assembler ships as a silently short edition —
+  // exactly how Orlando vanished from 2026-W31, and how Portland would have vanished on 07-30.
+  const roster = await fetchRosterResilient(env as unknown as BracketEnv, team.id, team.abbr);
   const ids = roster.map((p) => p.id).filter((id) => !excludeIds.has(id));
   const stats = await fetchStatsForMany(ids, year);
 
@@ -339,7 +389,9 @@ export async function publishKnowHerPool(
   env: KnowHerEnv,
   poolInput: unknown,
 ): Promise<{ ok: true; weekKey: string; playerCount: number; featuredThisSeason: number; note: string } | { error: string }> {
-  const v = validateKnowHerPool(poolInput);
+  // requireAllClubs: this is the PUBLISH path (automated /knowher/ingest + admin paste), the
+  // only one that makes a pool live — so it's where a short edition has to be stopped.
+  const v = validateKnowHerPool(poolInput, { requireAllClubs: true });
   if ("error" in v) return { error: v.error };
   // Stamp each player's numeric ESPN team id (abbr→id via the shared teams map) so the match-watcher can
   // target the team's followers for the biweekly KHG push without its own abbr→id table. Best-effort: a
@@ -419,7 +471,7 @@ async function knowHerAdminOp(env: KnowHerEnv, op: string, body: Record<string, 
       const year = Number(body.year) || new Date().getUTCFullYear();
       // Exclude players already featured this season so the view shows who's still pickable.
       const featured = await readFeaturedIds(env, year);
-      const players = await computeEligiblePlayers(team, year, featured);
+      const players = await computeEligiblePlayers(env, team, year, featured);
       return { team, year, count: players.length, featuredThisSeason: featured.size, players };
     }
     case "unfeature": {

@@ -19,8 +19,14 @@
  * ESPN directly from the app.
  */
 
-import { runBracketTick, forceCloseActiveRound, handleBracketAdmin, type BracketEnv } from "./bracket-engine.ts";
-import { buildHeadshotMap, handleHeadshots } from "./headshots.ts";
+import {
+	runBracketTick,
+	forceCloseActiveRound,
+	handleBracketAdmin,
+	ROSTER_GOOD_MIN,
+	type BracketEnv,
+} from "./bracket-engine.ts";
+import { buildHeadshotMap, handleHeadshots, normalizeName } from "./headshots.ts";
 import {
 	handleKnowHerAdmin,
 	computeEligiblePlayers,
@@ -3223,7 +3229,7 @@ async function handleKnowHerEligible(url: URL, env: Env): Promise<Response> {
 	try {
 		const featured = await readFeaturedIds(env as unknown as KnowHerEnv, year);
 		featuredCount = featured.size;
-		players = await computeEligiblePlayers(team, year, featured);
+		players = await computeEligiblePlayers(env as unknown as KnowHerEnv, team, year, featured);
 	} catch {
 		return upstreamError();
 	}
@@ -3255,7 +3261,7 @@ async function handleKnowHerTodo(url: URL, env: Env, ctx: ExecutionContext): Pro
 	let player;
 	try {
 		const featured = await readFeaturedIds(env as unknown as KnowHerEnv, year);
-		const eligible = await computeEligiblePlayers(team, year, featured);
+		const eligible = await computeEligiblePlayers(env as unknown as KnowHerEnv, team, year, featured);
 		player = pickWeeklyFeatured(eligible);
 	} catch {
 		return upstreamError();
@@ -3492,6 +3498,11 @@ async function handleAnalyticsIngest(request: Request, env: Env, ctx: ExecutionC
 const ALERT_ERROR_KINDS = new Set([
 	"apiFailure", "parseError", "unexpectedEmpty", "staleServe",
 	"analyticsRpcFail", "metricKitDiagnostic", "tier2SignedOutDesync",
+	// Roster integrity. `rosterContinuityRefused` = a plausibly-sized ESPN payload that shares
+	// almost no players with the trusted copy (contamination-class). `knowherTodoEmpty` fired for
+	// real at 2026-W31 when ESPN briefly returned an empty Orlando roster and the edition shipped
+	// 15 teams — it was diagnosable only after the fact because nothing paged on it.
+	"rosterContinuityRefused", "knowherTodoEmpty",
 ]);
 const ALERT_WINDOW_MS = 15 * 60 * 1000;
 const ALERT_THRESHOLD = 8; // error events in the window ⇒ email (2-user baseline is ~0-2/day; a real incident bursts)
@@ -3651,7 +3662,8 @@ async function handleCrest(url: URL, env: Env, ctx: ExecutionContext): Promise<R
 // roster in KV and serve it (with an honest `proxyCachedAsOf` marker) when ESPN
 // comes back short — so the app stops over-relying on data ESPN doesn't prioritize.
 const ESPN_ROSTER = (id: string) => `https://site.api.espn.com/apis/site/v2/sports/soccer/usa.nwsl/teams/${id}/roster`;
-const ROSTER_GOOD_MIN = 16; // a real NWSL squad is ~22–26; below this is implausible, not a small squad
+// ROSTER_GOOD_MIN is imported from bracket-engine.ts — one definition, so this route and the
+// engine's resilient fetch can never disagree about what counts as an implausible squad.
 const ROSTER_CACHE_TTL = 60 * 60 * 24 * 90; // 90d last-known-good
 const ROSTER_EDGE_TTL = 60 * 60 * 6; // 6h upstream edge cache (fan-out); short so a healed roster recovers same-day
 
@@ -3681,6 +3693,48 @@ export function chooseRosterServe(opts: {
 	if (hasCached && cachedCount > liveCount) return "cached";
 	if (hasLive) return "live-small";
 	return "none";
+}
+
+/** Minimum share of the CACHED squad that must still appear in a new live payload before that
+ *  payload is allowed to replace the last-known-good copy. Measured 2026-07-30 across all 16
+ *  clubs: normal ESPN↔ESPN week-to-week churn keeps ≥90% of names, while a wholesale
+ *  contamination (another league's/sport's players, the failure that hit a sibling provider's
+ *  Bay FC entry) scores ~0%. 50% sits in the empty middle of that gap — far below real churn,
+ *  far above any substitution event. */
+export const ROSTER_CONTINUITY_MIN = 0.5;
+
+/** Normalized athlete display names from an ESPN roster body. Uses the headshot module's
+ *  `normalizeName` so accent/punctuation drift between two fetches ("Sveindís" vs "Sveindis")
+ *  can never masquerade as squad churn. */
+export function rosterNames(body: unknown): string[] {
+	const athletes = (body as { athletes?: { displayName?: string }[] })?.athletes;
+	if (!Array.isArray(athletes)) return [];
+	return athletes
+		.map((a) => normalizeName(a?.displayName ?? ""))
+		.filter((n) => n.length > 0);
+}
+
+/** Pure decision: may a plausibly-sized live payload REPLACE the last-known-good cache?
+ *
+ *  This exists because the size floor alone can't tell a real squad from a well-formed wrong
+ *  one. A contaminated roster of ~25 players passes `ROSTER_GOOD_MIN`, so before this guard the
+ *  very first request would overwrite the good copy with garbage — the fallback destroying
+ *  itself at exactly the moment it's needed. Continuity asks the question size can't: are these
+ *  still broadly the same people?
+ *
+ *  Note this gates the WRITE only. The live payload is still served (honestly) either way —
+ *  refusing to serve on a heuristic would risk hiding a real roster. */
+export function rosterCacheRefreshDecision(
+	liveBody: unknown,
+	cachedBody: unknown | null,
+): { refresh: boolean; overlap: number } {
+	const cached = rosterNames(cachedBody);
+	// Nothing to compare against (first fetch, expired cache) → accept and bootstrap.
+	if (cached.length === 0) return { refresh: true, overlap: 1 };
+	const live = new Set(rosterNames(liveBody));
+	const kept = cached.filter((n) => live.has(n)).length;
+	const overlap = kept / cached.length;
+	return { refresh: overlap >= ROSTER_CONTINUITY_MIN, overlap };
 }
 
 /** Serialize a roster body. When served from the last-known-good cache, inject a top-level
@@ -3720,20 +3774,34 @@ async function handleRoster(url: URL, env: Env, ctx: ExecutionContext): Promise<
 		emitDiag(env, ctx, "rosterUpstreamThrew", `${id}: ${(e as Error).message.slice(0, 40)}`);
 	}
 
-	// 2. Plausible squad → refresh last-known-good, serve verbatim (no marker).
-	if (liveCount >= ROSTER_GOOD_MIN) {
-		const record: RosterCacheRecord = { fetchedAt: new Date().toISOString(), body: live };
-		ctx.waitUntil(env.FEED_TAGS.put(kvKey, JSON.stringify(record), { expirationTtl: ROSTER_CACHE_TTL }));
-		return rosterResponse(live, null);
-	}
-
-	// 3. Implausibly small (or upstream failed) → fall back to last-known-good if it's fuller.
+	// Read the last-known-good once, up front: step 2 needs it to decide whether the live
+	// payload may REPLACE it, and step 3 needs it as the fallback body.
 	let cached: RosterCacheRecord | null = null;
 	try {
 		cached = (await env.FEED_TAGS.get(kvKey, "json")) as RosterCacheRecord | null;
 	} catch {
-		/* KV read failure → treat as no cache, fall through */
+		/* KV read failure → treat as no cache (fails open: step 2 bootstraps, step 3 serves live) */
 	}
+
+	// 2. Plausible squad → serve verbatim (no marker), and refresh last-known-good ONLY if the
+	//    payload is continuous with what we already trusted. A wholesale-substituted roster is
+	//    plausibly sized, so without this check it would overwrite the good copy on the first
+	//    request and then be served for as long as ESPN held it.
+	if (liveCount >= ROSTER_GOOD_MIN) {
+		const { refresh, overlap } = rosterCacheRefreshDecision(live, cached?.body ?? null);
+		if (refresh) {
+			const record: RosterCacheRecord = { fetchedAt: new Date().toISOString(), body: live };
+			ctx.waitUntil(env.FEED_TAGS.put(kvKey, JSON.stringify(record), { expirationTtl: ROSTER_CACHE_TTL }));
+		} else {
+			// Loud: this is contamination-class, not routine churn. The cache keeps its prior
+			// (trusted) copy. If the CACHED copy is ever the bad one, it self-expires at
+			// ROSTER_CACHE_TTL — or delete the key to force a re-bootstrap (see docs/backend.md).
+			emitDiag(env, ctx, "rosterContinuityRefused", `${id} overlap=${Math.round(overlap * 100)}% live=${liveCount}`);
+		}
+		return rosterResponse(live, null);
+	}
+
+	// 3. Implausibly small (or upstream failed) → fall back to last-known-good if it's fuller.
 	const cachedCount = cached ? athleteCount(cached.body) : -1;
 	const decision = chooseRosterServe({
 		hasLive: live != null,

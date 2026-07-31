@@ -56,6 +56,30 @@ const TARGET_HUMAN_QUESTIONS = 6;
 const TF_MIN_SAMPLE = 6;        // only judge the True/False balance once the pool has this many T/F
 const TF_TRUE_MAX_RATIO = 0.65; // > this share of T/F answering "True" ⇒ the banned "obviously-true" pattern
 
+// The 16 NWSL clubs. TWIN of KNOWN_CLUB_ABBRS in src/knowher.ts — expansion changes BOTH.
+// A published edition must cover every club: 2026-W31 shipped 15 teams (ESPN briefly returned an
+// empty Orlando roster, the assembler is fail-open) and Pride fans opened the game to nothing,
+// because no validator asked whether all 16 were present. This is that missing question.
+const KNOWN_CLUB_ABBRS = [
+  "LA", "BAY", "BOS", "CHI", "DEN", "GFC", "HOU", "KC",
+  "NC", "ORL", "POR", "LOU", "SD", "SEA", "UTA", "WAS",
+];
+
+/** Pool-completeness check — twin of `clubCompletenessError` in src/knowher.ts. */
+export function clubCompletenessError(teamAbbrs) {
+  const known = new Set(KNOWN_CLUB_ABBRS);
+  const seen = new Set(teamAbbrs.map((t) => t.toUpperCase()));
+  const unknown = [...seen].filter((t) => !known.has(t)).sort();
+  if (unknown.length > 0) {
+    return `unknown club(s) ${unknown.join(", ")} — expected the ${KNOWN_CLUB_ABBRS.length} NWSL clubs`;
+  }
+  const missing = KNOWN_CLUB_ABBRS.filter((t) => !seen.has(t));
+  if (missing.length > 0) {
+    return `pool is missing ${missing.length} club(s): ${missing.join(", ")} — an edition must cover all ${KNOWN_CLUB_ABBRS.length} clubs (a short pool leaves those fans with nothing to play)`;
+  }
+  return null;
+}
+
 /**
  * Validate a pool document. Pure: returns { errors, warnings } instead of exiting, so the CLI
  * wrapper AND the unit tests share one code path. `errors` non-empty ⇒ do not publish.
@@ -137,6 +161,11 @@ export function validatePool(doc) {
     else if (human < TARGET_HUMAN_QUESTIONS) warn(`${at}: ${human} human questions (aim ≥ ${TARGET_HUMAN_QUESTIONS})`);
     if (playerTf >= 3 && playerTfTrue === playerTf) warn(`${at}: all ${playerTf} True/False answers are "True" — vary them (some plausibly FALSE), a lone true fact should be an MC "which has she actually done?"`);
   });
+
+  // Every club must be represented — the dry-run is the routine's gate, so a short pool must
+  // FAIL here (the routine then regenerates) rather than reach a publish path.
+  const completeness = clubCompletenessError([...teamsSeen]);
+  if (completeness) fail(completeness);
 
   // Pool-level True/False balance — the banned "hyper-specific claim, obviously True" pattern
   if (tfTotal >= TF_MIN_SAMPLE) {
