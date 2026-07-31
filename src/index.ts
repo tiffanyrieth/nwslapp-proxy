@@ -32,6 +32,7 @@ import { ADMIN_PORTAL_HTML } from "./admin-portal.ts";
 import {
 	runRosterTruth,
 	readRosterTruthReport,
+	readVerdicts,
 	readOverrides,
 	writeOverrides,
 	applyOverrides,
@@ -3881,6 +3882,30 @@ export function rosterCacheRefreshDecision(
 	return { refresh: overlap >= ROSTER_CONTINUITY_MIN, overlap };
 }
 
+/** Pure serve/refresh plan for the GOOD path (live payload ≥ ROSTER_GOOD_MIN) — tweak 2,
+ *  owner-approved 2026-07-31. Two signals can demote a plausibly-SIZED payload:
+ *
+ *  - `continuityOk=false` — the live payload shares <50% of its players with the trusted copy.
+ *    This is the real-time contamination shield: before this, a wrong-humans roster was refused
+ *    the CACHE but still SERVED (paged, yet on screen). Now users keep the trusted copy.
+ *  - `verdictOk=false` — the nightly ESPN×NWSL verification failed this club (contamination the
+ *    50% bar can't see, keeper-count disagreement, …). Held on last-known-good until it passes;
+ *    up to ~24h stale for THAT club only, which the owner accepted over serving wrong data.
+ *
+ *  Fail-open by construction: no cache to fall back on, or no/expired verdict ⇒ exactly the old
+ *  behavior. The cache is never refreshed from a payload either signal distrusts. */
+export function goodPathPlan(opts: {
+	continuityOk: boolean;
+	verdictOk: boolean;
+	hasCached: boolean;
+}): { serve: "live" | "cached"; refreshCache: boolean } {
+	const { continuityOk, verdictOk, hasCached } = opts;
+	if (hasCached && (!continuityOk || !verdictOk)) return { serve: "cached", refreshCache: false };
+	// No cached copy: live is all there is — serve it, but only ARCHIVE it if nothing distrusts it
+	// (seeding the fallback with suspect data would poison the very net we fall back on).
+	return { serve: "live", refreshCache: continuityOk && verdictOk };
+}
+
 /** Serialize a roster body. When served from the last-known-good cache, inject a top-level
  *  `proxyCachedAsOf` so the app can show an honest "Roster as of <date>" indicator. */
 export function rosterResponse(body: unknown, cachedAsOf: string | null): Response {
@@ -3944,21 +3969,36 @@ async function handleRoster(url: URL, env: Env, ctx: ExecutionContext): Promise<
 		return rosterResponse(patched, asOf);
 	};
 
-	// 2. Plausible squad → serve verbatim (no marker), and refresh last-known-good ONLY if the
-	//    payload is continuous with what we already trusted. A wholesale-substituted roster is
-	//    plausibly sized, so without this check it would overwrite the good copy on the first
-	//    request and then be served for as long as ESPN held it.
+	// 2. Plausible squad → decide what to SERVE and whether the payload may become the new
+	//    last-known-good. Two distrust signals (see goodPathPlan): the real-time continuity check,
+	//    and the nightly ESPN×NWSL verification verdict. Either one holds users on the trusted
+	//    cached copy (honest marker) instead of showing suspect data.
 	if (liveCount >= ROSTER_GOOD_MIN) {
-		const { refresh, overlap } = rosterCacheRefreshDecision(live, cached?.body ?? null);
-		if (refresh) {
+		const { refresh: continuityOk, overlap } = rosterCacheRefreshDecision(live, cached?.body ?? null);
+
+		let verdictOk = true;
+		try {
+			const verdicts = await readVerdicts(env);
+			const v = verdicts?.clubs?.[id];
+			if (v && !v.ok) verdictOk = false;
+		} catch {
+			/* fail open — no verdict is not a verdict against */
+		}
+
+		const plan = goodPathPlan({ continuityOk, verdictOk, hasCached: cached != null });
+		if (!continuityOk) {
+			// Loud: contamination-class, not routine churn. If the CACHED copy is ever the bad one,
+			// it self-expires at ROSTER_CACHE_TTL — or delete the key (see docs/backend.md).
+			emitDiag(env, ctx, "rosterContinuityRefused", `${id} overlap=${Math.round(overlap * 100)}% live=${liveCount}`);
+		} else if (!verdictOk && plan.serve === "cached") {
+			// Quiet-ish: the nightly gate failure already paged; this just records each hold.
+			emitDiag(env, ctx, "rosterVerdictHold", `${id} live=${liveCount} held on cached`);
+		}
+		if (plan.refreshCache) {
 			const record: RosterCacheRecord = { fetchedAt: new Date().toISOString(), body: live };
 			ctx.waitUntil(env.FEED_TAGS.put(kvKey, JSON.stringify(record), { expirationTtl: ROSTER_CACHE_TTL }));
-		} else {
-			// Loud: this is contamination-class, not routine churn. The cache keeps its prior
-			// (trusted) copy. If the CACHED copy is ever the bad one, it self-expires at
-			// ROSTER_CACHE_TTL — or delete the key to force a re-bootstrap (see docs/backend.md).
-			emitDiag(env, ctx, "rosterContinuityRefused", `${id} overlap=${Math.round(overlap * 100)}% live=${liveCount}`);
 		}
+		if (plan.serve === "cached" && cached) return serve(cached.body, cached.fetchedAt);
 		return serve(live, null);
 	}
 

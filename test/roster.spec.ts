@@ -138,3 +138,32 @@ describe("/roster route guard", () => {
 		expect(res.status).toBe(400);
 	});
 });
+
+// Tweak 2 (owner-approved 2026-07-31): the good path can now DEMOTE a plausibly-sized live
+// payload to the trusted cached copy — in real time when continuity fails (contamination was
+// previously paged but still shown), and for up to ~24h when the nightly ESPN×NWSL verification
+// failed the club. Fail-open: no cache or no verdict reproduces the old behavior exactly.
+import { goodPathPlan } from "../src/index";
+
+describe("goodPathPlan", () => {
+	it("healthy: serves live and refreshes the archive", () => {
+		expect(goodPathPlan({ continuityOk: true, verdictOk: true, hasCached: true }))
+			.toEqual({ serve: "live", refreshCache: true });
+	});
+	it("contamination day-of: serves the trusted copy, never archives the suspect payload", () => {
+		expect(goodPathPlan({ continuityOk: false, verdictOk: true, hasCached: true }))
+			.toEqual({ serve: "cached", refreshCache: false });
+	});
+	it("nightly verdict failed: holds the club on its last-known-good until it passes", () => {
+		expect(goodPathPlan({ continuityOk: true, verdictOk: false, hasCached: true }))
+			.toEqual({ serve: "cached", refreshCache: false });
+	});
+	it("fails open with no cache: serves live (all there is) but refuses to seed the archive", () => {
+		expect(goodPathPlan({ continuityOk: true, verdictOk: false, hasCached: false }))
+			.toEqual({ serve: "live", refreshCache: false });
+	});
+	it("bootstrap: no cache and nothing distrusts the payload — serve and archive", () => {
+		expect(goodPathPlan({ continuityOk: true, verdictOk: true, hasCached: false }))
+			.toEqual({ serve: "live", refreshCache: true });
+	});
+});
