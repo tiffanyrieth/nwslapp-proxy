@@ -148,6 +148,10 @@ export interface PlayerDiffs {
 	espnOnly: { espnAthleteId: string; name: string; jersey: number | null }[];
 	/** Fuller/Heaps/Spaanstra class: the league still lists her with real minutes, ESPN does not. */
 	sdpOnlyWithMinutes: { name: string; jersey: string | null; minutes: number }[];
+	/** Almost certainly ONE person the two feeds spell differently — paired because they wear the
+	 *  same number for the same club. Split out so they stop being double-counted as an erasure
+	 *  AND an addition. See `pairNameVariances`. */
+	likelyNameVariances: { espnAthleteId: string; espnName: string; sdpName: string; jersey: string }[];
 }
 
 export interface ClubReport {
@@ -173,6 +177,7 @@ export interface RosterTruthReport {
 		missingJerseys: number;
 		espnOnly: number;
 		sdpOnlyWithMinutes: number;
+		likelyNameVariances: number;
 	};
 	/** Per-club normalized ESPN names — the next run's night-over-night continuity baseline. */
 	espnNames: Record<string, string[]>;
@@ -359,15 +364,25 @@ export function diffPlayers(espn: EspnTeamRoster, sdp: SdpSquad | null): PlayerD
 		missingJerseys: [],
 		espnOnly: [],
 		sdpOnlyWithMinutes: [],
+		likelyNameVariances: [],
 	};
 	if (!sdp) return diffs;
 
-	// Match ESPN → SDP by any name form. Ambiguity (two SDP players sharing a key) is skipped
-	// rather than guessed — a wrong join would manufacture a mismatch out of nothing.
+	// Match ESPN → SDP by any name form. Ambiguity (two DIFFERENT SDP players sharing a key) is
+	// skipped rather than guessed — a wrong join would manufacture a mismatch out of nothing.
+	//
+	// ⚠️ The identity check on `guid` is load-bearing, not defensive: a player's own name forms
+	// frequently normalize to the SAME string (Temwa Chawinga's shortName IS her full name; Izzy
+	// Rodriguez's shirtName is; Lorena's shortName and shirtName are both "Lorena"). Treating that
+	// as a collision made ~50 players unmatchable, and because an unmatched SDP player looks exactly
+	// like one ESPN dropped, they all surfaced as fake "erased by ESPN" findings on the first run.
 	const byKey = new Map<string, SdpSquadPlayer | null>();
 	const put = (k: string, p: SdpSquadPlayer) => {
 		if (!k) return;
-		byKey.set(k, byKey.has(k) ? null : p); // null marks "ambiguous"
+		const cur = byKey.get(k);
+		if (cur === undefined) byKey.set(k, p); // first sighting
+		else if (cur && cur.guid !== p.guid) byKey.set(k, null); // genuinely two people → unusable
+		// same player again, or already-null: leave as is
 	};
 	for (const p of sdp.players) {
 		put(p.name, p);
@@ -398,13 +413,65 @@ export function diffPlayers(espn: EspnTeamRoster, sdp: SdpSquad | null): PlayerD
 		}
 	}
 
-	for (const p of sdp.players) {
-		if (matched.has(p.guid)) continue;
+	const unmatchedSdp = sdp.players.filter((p) => !matched.has(p.guid));
+
+	// Pair up the leftovers that are really ONE person spelled two ways, before either side is
+	// reported. Without this the same human appears twice — as an ESPN addition AND as a league
+	// erasure — which is half the noise on a real run.
+	const { variances, espnOnly, sdpOnly } = pairNameVariances(diffs.espnOnly, unmatchedSdp);
+	diffs.likelyNameVariances = variances;
+	diffs.espnOnly = espnOnly;
+	for (const p of sdpOnly) {
 		if (p.minutes >= SDP_ERASURE_MIN_MINUTES) {
 			diffs.sdpOnlyWithMinutes.push({ name: p.display, jersey: p.jersey, minutes: p.minutes });
 		}
 	}
 	return diffs;
+}
+
+/** Pair unmatched ESPN players with unmatched league players **by shirt number**.
+ *
+ *  Within one squad a number identifies a person, so a leftover on each side wearing the same
+ *  number is overwhelmingly a spelling difference rather than one arrival plus one departure.
+ *  Verified against all 16 clubs on 2026-07-30 — this rule pairs every known variance and
+ *  mis-pairs none, because a genuinely erased player (Fuller #47, Heaps #10, Spaanstra #30) has no
+ *  same-numbered counterpart on the ESPN side:
+ *      Maitane #77 = Maitane López · Mary Hardin #18 = Cate Hardin · Lizbeth Ovalle #13 =
+ *      Jacqueline Ovalle · Amelia Van Zanten #16 = Amelia Donna Van Zanten · Sam Meza #20 =
+ *      Samantha Meza · Paige Monaghan #4 = Paige Cronin (married name) · Nicki Hernández #20 =
+ *      Nicolette Hernández
+ *  Players with no number can't be paired this way and stay on their own side — correctly, since
+ *  Bethi (a real signing with no number yet) must keep showing up as an ESPN-only addition. */
+export function pairNameVariances(
+	espnOnly: PlayerDiffs["espnOnly"],
+	sdpUnmatched: SdpSquadPlayer[],
+): {
+	variances: PlayerDiffs["likelyNameVariances"];
+	espnOnly: PlayerDiffs["espnOnly"];
+	sdpOnly: SdpSquadPlayer[];
+} {
+	const variances: PlayerDiffs["likelyNameVariances"] = [];
+	const usedSdp = new Set<string>();
+	const usedEspn = new Set<string>();
+
+	for (const e of espnOnly) {
+		if (e.jersey == null) continue;
+		const hit = sdpUnmatched.find((s) => !usedSdp.has(s.guid) && s.jersey != null && Number(s.jersey) === e.jersey);
+		if (!hit) continue;
+		usedSdp.add(hit.guid);
+		usedEspn.add(e.espnAthleteId);
+		variances.push({
+			espnAthleteId: e.espnAthleteId,
+			espnName: e.name,
+			sdpName: hit.display,
+			jersey: String(e.jersey),
+		});
+	}
+	return {
+		variances,
+		espnOnly: espnOnly.filter((e) => !usedEspn.has(e.espnAthleteId)),
+		sdpOnly: sdpUnmatched.filter((s) => !usedSdp.has(s.guid)),
+	};
 }
 
 export function assembleReport(args: {
@@ -431,6 +498,7 @@ export function assembleReport(args: {
 			missingJerseys: sum((c) => c.diffs.missingJerseys.length),
 			espnOnly: sum((c) => c.diffs.espnOnly.length),
 			sdpOnlyWithMinutes: sum((c) => c.diffs.sdpOnlyWithMinutes.length),
+			likelyNameVariances: sum((c) => c.diffs.likelyNameVariances.length),
 		},
 		espnNames,
 	};
@@ -568,7 +636,7 @@ export async function runRosterTruth(env: RosterTruthEnv, emit: EmitBatch): Prom
 					verified: false,
 					gateB: { ok: true, failures: [] },
 					gateC: { ok: true, failures: [], sdpOverlap: 1, priorOverlap: null },
-					diffs: { positionMismatches: [], missingJerseys: [], espnOnly: [], sdpOnlyWithMinutes: [] },
+					diffs: { positionMismatches: [], missingJerseys: [], espnOnly: [], sdpOnlyWithMinutes: [], likelyNameVariances: [] },
 				});
 				return;
 			}

@@ -169,6 +169,17 @@ function render(d) {
     h += '</table>';
   }
 
+  // One person, two spellings — paired by shirt number so she stops being counted twice.
+  const nv = rep.clubs.flatMap((c) => (c.diffs.likelyNameVariances || []).map((p) => ({ ...p, abbr: c.abbr })));
+  h += '<h2>Same player, different spelling (' + nv.length + ')</h2>';
+  h += '<div class="note">Paired because they wear the same number for the same club. Mononyms and legal-vs-known names are everywhere in this league (Debinha, Lorena, Ary Borges), and one is a marriage. Nothing to do — listed so you can see they were understood, not missed.</div>';
+  if (!nv.length) h += '<p class="muted small">None.</p>';
+  else {
+    h += '<table><tr><th>Club</th><th>#</th><th>ESPN</th><th>NWSL</th></tr>';
+    for (const p of nv) h += '<tr><td>' + esc(p.abbr) + '</td><td class="muted">' + esc(p.jersey) + '</td><td>' + esc(p.espnName) + '</td><td>' + esc(p.sdpName) + '</td></tr>';
+    h += '</table>';
+  }
+
   // Missing jerseys the league can fill.
   const mj = rep.clubs.flatMap((c) => c.diffs.missingJerseys.map((p) => ({ ...p, abbr: c.abbr })));
   h += '<h2>No shirt number on ESPN (' + mj.length + ')</h2>';

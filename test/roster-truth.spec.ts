@@ -5,6 +5,7 @@ import {
 	gateShape,
 	gateContinuity,
 	diffPlayers,
+	pairNameVariances,
 	overlapRatio,
 	sdpNameIndex,
 	assembleReport,
@@ -112,7 +113,7 @@ describe("gateShape (Gate B)", () => {
 		expect(gateShape(healthy()).ok).toBe(true);
 	});
 
-	it("FAILS the live Portland collapse — 1 athlete, 0 keepers", () => {
+	it("FAILS the live Portland collapse - 1 athlete, 0 keepers", () => {
 		const por = espn("POR", [{ id: "d", name: "Daiane", jersey: 34, pos: "D" }]);
 		const r = gateShape(por);
 		expect(r.ok).toBe(false);
@@ -171,7 +172,7 @@ describe("gateContinuity (Gate C)", () => {
 		expect(r.sdpOverlap).toBe(1);
 	});
 
-	it("FAILS wholesale contamination — a plausible squad of entirely different humans", () => {
+	it("FAILS wholesale contamination - a plausible squad of entirely different humans", () => {
 		// This is the case no size or shape check can see: 20 players, 3 keepers, unique numbers.
 		const contaminated = espn(
 			"GFC",
@@ -277,6 +278,31 @@ describe("diffPlayers (Gate D)", () => {
 		expect(d.sdpOnlyWithMinutes).toHaveLength(0);
 	});
 
+	it("matches a player whose own name forms are identical (the self-collision regression)", () => {
+		// Real shapes: Temwa Chawinga's shortName IS her full name; Izzy Rodriguez's shirtName is;
+		// Lorena's shortName and shirtName are both "Lorena". Treating a player's repeated name
+		// form as a collision nulled her out of the index, and every such player then looked
+		// exactly like someone ESPN had erased — ~50 false "missing from ESPN" rows on run one.
+		const e = espn("KC", [
+			{ id: "temwa", name: "Temwa Chawinga", pos: "F" },
+			{ id: "izzy", name: "Izzy Rodriguez", pos: "D" },
+			{ id: "lorena", name: "Lorena", pos: "G" },
+		]);
+		const s: SdpSquad = {
+			teamAbbr: "KC",
+			teamGuid: "g",
+			teamName: "KC",
+			players: [
+				{ guid: "g1", name: norm("Temwa Chawinga"), short: norm("Temwa Chawinga"), shirt: "", display: "Temwa Chawinga", jersey: "6", role: "F", minutes: 770, games: 10 },
+				{ guid: "g2", name: norm("Izzy Rodriguez"), short: norm("I. Rodriguez"), shirt: norm("Izzy Rodriguez"), display: "Izzy Rodriguez", jersey: "18", role: "D", minutes: 1495, games: 17 },
+				{ guid: "g3", name: norm("Lorena da Silva Leite"), short: norm("Lorena"), shirt: norm("Lorena"), display: "Lorena da Silva Leite", jersey: "23", role: "G", minutes: 1080, games: 12 },
+			],
+		};
+		const d = diffPlayers(e, s);
+		expect(d.sdpOnlyWithMinutes).toEqual([]); // none of them was erased
+		expect(d.espnOnly).toEqual([]);
+	});
+
 	it("makes no claim when a name is ambiguous across two league records", () => {
 		const e = espn("NC", [{ id: "x", name: "Same Name", pos: "M" }]);
 		const s = sdp("NC", [
@@ -290,7 +316,38 @@ describe("diffPlayers (Gate D)", () => {
 
 	it("returns empty diffs when the league feed is unavailable", () => {
 		const d = diffPlayers(healthy(), null);
-		expect(d).toEqual({ positionMismatches: [], missingJerseys: [], espnOnly: [], sdpOnlyWithMinutes: [] });
+		expect(d).toEqual({ positionMismatches: [], missingJerseys: [], espnOnly: [], sdpOnlyWithMinutes: [], likelyNameVariances: [] });
+	});
+
+	it("pairs a name variance instead of double-counting her as an erasure AND an addition", () => {
+		// Lizbeth Ovalle (ESPN) and Jacqueline Ovalle (NWSL) are one person wearing #13.
+		const e = espn("ORL", [{ id: "ovalle", name: "Lizbeth Ovalle", jersey: 13, pos: "F" }]);
+		const s = sdp("ORL", [{ name: "Jacqueline Ovalle", jersey: "13", role: "F", minutes: 705 }]);
+		const d = diffPlayers(e, s);
+		expect(d.likelyNameVariances).toEqual([
+			{ espnAthleteId: "ovalle", espnName: "Lizbeth Ovalle", sdpName: "Jacqueline Ovalle", jersey: "13" },
+		]);
+		expect(d.espnOnly).toHaveLength(0);
+		expect(d.sdpOnlyWithMinutes).toHaveLength(0);
+	});
+
+	it("does NOT pair a genuine erasure — nobody on the ESPN side wears her number", () => {
+		const e = espn("BAY", [{ id: "x", name: "Someone Else", jersey: 3, pos: "M" }]);
+		const s = sdp("BAY", [
+			{ name: "Someone Else", jersey: "3", role: "M" },
+			{ name: "Kennedy Fuller", jersey: "47", role: "M", minutes: 1119 },
+		]);
+		const d = diffPlayers(e, s);
+		expect(d.likelyNameVariances).toHaveLength(0);
+		expect(d.sdpOnlyWithMinutes.map((p) => p.name)).toEqual(["Kennedy Fuller"]);
+	});
+
+	it("keeps a numberless new signing as an ESPN-only addition (Bethi must not be paired away)", () => {
+		const e = espn("WAS", [{ id: "bethi", name: "Melissa Bethi", jersey: null, pos: "M" }]);
+		const s = sdp("WAS", [{ name: "Someone With 8", jersey: "8", role: "M", minutes: 500 }]);
+		const d = diffPlayers(e, s);
+		expect(d.likelyNameVariances).toHaveLength(0);
+		expect(d.espnOnly.map((p) => p.name)).toEqual(["Melissa Bethi"]);
 	});
 });
 
@@ -310,6 +367,7 @@ describe("assembleReport", () => {
 				missingJerseys: [],
 				espnOnly: [],
 				sdpOnlyWithMinutes: [],
+				likelyNameVariances: [],
 			},
 		});
 		const r = assembleReport({
@@ -398,5 +456,47 @@ describe("overrides", () => {
 	it("survives a malformed body without throwing", () => {
 		expect(applyOverrides(null, pin(), NOW).body).toBeNull();
 		expect(applyOverrides({ athletes: "nope" }, pin(), NOW).applied).toEqual([]);
+	});
+});
+
+describe("pairNameVariances", () => {
+	const sdpP = (display: string, jersey: string | null, guid: string, minutes = 100) => ({
+		guid, name: norm(display), short: "", shirt: "", display, jersey, role: "M" as const, minutes, games: 1,
+	});
+
+	it("pairs each real 2026-07-30 variance and leaves the genuine erasures alone", () => {
+		const espnOnly = [
+			{ espnAthleteId: "1", name: "Maitane", jersey: 77 },
+			{ espnAthleteId: "2", name: "Mary Hardin", jersey: 18 },
+			{ espnAthleteId: "3", name: "Sam Meza", jersey: 20 },
+			{ espnAthleteId: "4", name: "Paige Monaghan", jersey: 4 },
+			{ espnAthleteId: "5", name: "Melissa Bethi", jersey: null }, // real signing, no number yet
+		];
+		const sdpUnmatched = [
+			sdpP("Maitane López", "77", "a"),
+			sdpP("Cate Hardin", "18", "b"),
+			sdpP("Samantha Meza", "20", "c"),
+			sdpP("Paige Cronin", "4", "d"),
+			sdpP("Lindsey Heaps", "10", "e", 180), // genuinely erased by ESPN
+		];
+		const r = pairNameVariances(espnOnly, sdpUnmatched);
+		expect(r.variances).toHaveLength(4);
+		expect(r.variances.map((v) => v.sdpName)).toEqual(["Maitane López", "Cate Hardin", "Samantha Meza", "Paige Cronin"]);
+		expect(r.espnOnly.map((e) => e.name)).toEqual(["Melissa Bethi"]);
+		expect(r.sdpOnly.map((s) => s.display)).toEqual(["Lindsey Heaps"]);
+	});
+
+	it("never consumes one league record for two ESPN players", () => {
+		const r = pairNameVariances(
+			[{ espnAthleteId: "1", name: "A", jersey: 9 }, { espnAthleteId: "2", name: "B", jersey: 9 }],
+			[sdpP("Only One", "9", "z")],
+		);
+		expect(r.variances).toHaveLength(1);
+		expect(r.espnOnly).toHaveLength(1);
+	});
+
+	it("ignores league records with no number", () => {
+		const r = pairNameVariances([{ espnAthleteId: "1", name: "A", jersey: 9 }], [sdpP("No Number", null, "z")]);
+		expect(r.variances).toHaveLength(0);
 	});
 });
