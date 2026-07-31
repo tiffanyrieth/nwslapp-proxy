@@ -7,14 +7,21 @@
 //
 // Self-contained on purpose (like bracket-engine.ts): index.ts imports only the two entry
 // points — `buildHeadshotMap` (cron + admin POST /headshots/run) and `handleHeadshots`
-// (GET /headshots). The NWSL side comes from the public, no-auth SDP JSON API
+// (GET /headshots). `roster-truth.ts` additionally imports the SDP/join PRIMITIVES
+// (`SDP`, `guidOf`, `normalizeName`, `currentNwslSeasonId`, `fetchNwslTeamAbbrs`) so the
+// roster cross-check joins ESPN↔NWSL exactly the way this module already does — a second
+// copy of the normalization would silently drift and break the join.
+// The NWSL side comes from the public, no-auth SDP JSON API
 // (api-sdp.nwslsoccer.com); the ESPN side from the same /teams + /roster endpoints the
 // bracket engine uses. Matching is by normalized full name, disambiguated by team — the only
 // join, since the two providers share no player id (see Guardrails in the handoff).
 
 // ── Data sources ──────────────────────────────────────────────────────────────
 
-const SDP = "https://api-sdp.nwslsoccer.com/v1/nwsl/football";
+// Exported for `roster-truth.ts`, which cross-checks ESPN rosters against the same SDP
+// feed using the same season/team resolution and the same name-join semantics — the join
+// this module has proven at ~98% for months. One source of truth, not a second copy.
+export const SDP = "https://api-sdp.nwslsoccer.com/v1/nwsl/football";
 const ESPN_SITE = "https://site.api.espn.com/apis/site/v2/sports/soccer/usa.nwsl";
 
 const MAP_KEY = "headshot-map-v1"; // KV: { [espnAthleteId]: nwslGuid }
@@ -24,14 +31,14 @@ const META_KEY = "headshots:meta"; // KV: build stats for an at-a-glance health 
 const HEADSHOTS_TTL = 6 * 3600; // 6h edge cache — the map changes ~weekly (cron) at most
 
 // `playerId`/`teamId` arrive as `nwsl::Football_Player::{32-hex guid}`; we want the guid.
-function guidOf(compoundId: string): string {
+export function guidOf(compoundId: string): string {
 	return compoundId.split("::").pop() ?? "";
 }
 
 // Strip accents + punctuation, lowercase, collapse spaces — so "Lo'eau LaBonta" and
 // "Loeau LaBonta", or "Sveindís" and "Sveindis", compare equal. Name is the only join key
 // between ESPN and NWSL, so normalization is the whole ballgame.
-function normalizeName(s: string): string {
+export function normalizeName(s: string): string {
 	return s
 		.normalize("NFD")
 		.replace(/[̀-ͯ]/g, "") // combining diacritics
@@ -53,7 +60,7 @@ interface NwslPlayer {
 // Resolve the current NWSL season id: /competitions → the entry literally named "NWSL"
 // (the regular-season league, not Challenge Cup / Fall Series / etc.) → its seasons, newest
 // by start date. Resolved dynamically so the yearly rollover needs no code change.
-async function currentNwslSeasonId(): Promise<string> {
+export async function currentNwslSeasonId(): Promise<string> {
 	const comps = (await (await fetch(`${SDP}/competitions`)).json()) as {
 		competitions?: { competitionId?: string; name?: string }[];
 	};
@@ -72,7 +79,7 @@ async function currentNwslSeasonId(): Promise<string> {
 
 // teamId → abbreviation (acronymName, e.g. "WAS"), so each player's team resolves to the
 // same abbreviation key the app and ESPN use.
-async function fetchNwslTeamAbbrs(seasonId: string): Promise<Map<string, string>> {
+export async function fetchNwslTeamAbbrs(seasonId: string): Promise<Map<string, string>> {
 	const json = (await (await fetch(`${SDP}/seasons/${seasonId}/teams`)).json()) as {
 		teams?: { teamId?: string; acronymName?: string }[];
 	};
