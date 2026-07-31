@@ -217,6 +217,111 @@ export interface RosterOverride {
 	note?: string;
 	setAt: string; // ISO
 	expiresAt: string; // ISO
+	/** Set by the weekly adjudication routine, never by the portal's pin buttons. An auto ruling
+	 *  may replace another auto ruling but NEVER an owner pin — the owner outranks the robot. */
+	auto?: boolean;
+	/** Citation URL — the club roster page (or fallback source) the ruling was read from. Makes
+	 *  every pin defensible: "Defender, per denversummitfc.com/…, checked <date>". REQUIRED on
+	 *  auto rulings; optional on owner pins. */
+	source?: string;
+}
+
+/** One ruling from the weekly adjudication routine. The routine only posts what it could resolve
+ *  from an authoritative page — an unresolved mismatch is simply not posted (declining is free). */
+export interface AutoRuling {
+	espnAthleteId: string;
+	playerName: string;
+	teamAbbr: string;
+	position?: Group;
+	jersey?: number;
+	source: string;
+}
+
+const VALID_GROUPS = new Set<string>(["G", "D", "M", "F"]);
+
+/** Apply a batch of auto rulings to the override map. Pure — the endpoint wires KV around it.
+ *
+ *  Server-side rules (enforced HERE, not trusted to the routine's prompt):
+ *  - a ruling without a SOURCE URL is rejected (an unsupported pin is worse than the mismatch);
+ *  - an owner pin is never overwritten (auto may only replace auto);
+ *  - position must be one of G/D/M/F; jersey a non-negative integer; one of the two required;
+ *  - structurally, rulings can only CORRECT a listed player — membership is untouchable because
+ *    `applyOverrides` can never add or remove anyone. */
+export function applyAutoRulings(
+	overrides: OverrideMap,
+	rulings: AutoRuling[],
+	now: number,
+): { next: OverrideMap; accepted: string[]; skipped: { espnAthleteId: string; reason: string }[] } {
+	const next: OverrideMap = { ...overrides };
+	const accepted: string[] = [];
+	const skipped: { espnAthleteId: string; reason: string }[] = [];
+
+	for (const r of rulings) {
+		const id = String(r?.espnAthleteId ?? "");
+		if (!id) {
+			skipped.push({ espnAthleteId: "?", reason: "missing espnAthleteId" });
+			continue;
+		}
+		if (typeof r.source !== "string" || !/^https?:\/\//.test(r.source)) {
+			skipped.push({ espnAthleteId: id, reason: "missing/invalid source URL" });
+			continue;
+		}
+		const hasPos = r.position != null;
+		const hasJersey = r.jersey != null;
+		if (!hasPos && !hasJersey) {
+			skipped.push({ espnAthleteId: id, reason: "no position or jersey" });
+			continue;
+		}
+		if (hasPos && !VALID_GROUPS.has(String(r.position))) {
+			skipped.push({ espnAthleteId: id, reason: `invalid position "${r.position}"` });
+			continue;
+		}
+		if (hasJersey && (!Number.isInteger(r.jersey) || (r.jersey as number) < 0)) {
+			skipped.push({ espnAthleteId: id, reason: `invalid jersey "${r.jersey}"` });
+			continue;
+		}
+		const existing = next[id];
+		if (existing && !existing.auto && Date.parse(existing.expiresAt) > now) {
+			skipped.push({ espnAthleteId: id, reason: "owner pin in force — not overwritten" });
+			continue;
+		}
+		next[id] = {
+			espnAthleteId: id,
+			playerName: String(r.playerName ?? id),
+			teamAbbr: String(r.teamAbbr ?? ""),
+			...(hasPos ? { position: r.position } : {}),
+			...(hasJersey ? { jersey: r.jersey } : {}),
+			setAt: new Date(now).toISOString(),
+			expiresAt: overrideExpiry(now),
+			auto: true,
+			source: r.source,
+		};
+		accepted.push(id);
+	}
+	return { next, accepted, skipped };
+}
+
+/** The routine's work list: open position/jersey mismatches with NO active override. Pure. */
+export function pendingAdjudications(
+	report: RosterTruthReport | null,
+	overrides: OverrideMap,
+	now: number,
+): {
+	positions: (PositionMismatch & { teamAbbr: string })[];
+	jerseys: { espnAthleteId: string; name: string; teamAbbr: string; sdpJersey: string }[];
+} {
+	const active = activeOverrides(overrides, now);
+	const positions: (PositionMismatch & { teamAbbr: string })[] = [];
+	const jerseys: { espnAthleteId: string; name: string; teamAbbr: string; sdpJersey: string }[] = [];
+	for (const c of report?.clubs ?? []) {
+		for (const m of c.diffs.positionMismatches) {
+			if (!active[m.espnAthleteId]) positions.push({ ...m, teamAbbr: c.abbr });
+		}
+		for (const j of c.diffs.missingJerseys) {
+			if (!active[j.espnAthleteId]) jerseys.push({ ...j, teamAbbr: c.abbr });
+		}
+	}
+	return { positions, jerseys };
 }
 
 export type OverrideMap = Record<string, RosterOverride>;

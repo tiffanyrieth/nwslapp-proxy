@@ -6,6 +6,8 @@ import {
 	gateContinuity,
 	diffPlayers,
 	pairNameVariances,
+	applyAutoRulings,
+	pendingAdjudications,
 	overlapRatio,
 	sdpNameIndex,
 	assembleReport,
@@ -523,5 +525,105 @@ describe("goalkeeper count is judged against the league, not a constant", () => 
 
 	it("tolerates a one-keeper difference — routine when a feed retains a departure", () => {
 		expect(gateContinuity(squadOf(4), leagueOf(3), null).ok).toBe(true);
+	});
+});
+
+describe("applyAutoRulings — the server-side rules the routine's prompt is NOT trusted with", () => {
+	const NOW = Date.parse("2026-07-31T12:00:00.000Z");
+	const rule = (over: Partial<import("../src/roster-truth").AutoRuling> = {}) => ({
+		espnAthleteId: "girelli", playerName: "Cristiana Girelli", teamAbbr: "BAY",
+		position: "F" as const, source: "https://bayfc.com/roster/cristiana-girelli/", ...over,
+	});
+
+	it("accepts a cited ruling and stamps auto + source + 90d expiry", () => {
+		const { next, accepted, skipped } = applyAutoRulings({}, [rule()], NOW);
+		expect(accepted).toEqual(["girelli"]);
+		expect(skipped).toEqual([]);
+		expect(next.girelli).toMatchObject({ position: "F", auto: true, source: rule().source });
+		expect(Date.parse(next.girelli.expiresAt) - NOW).toBe(90 * 86400000);
+	});
+
+	it("REJECTS a ruling without a source URL — an unsupported pin is worse than the mismatch", () => {
+		const { accepted, skipped } = applyAutoRulings({}, [rule({ source: "" }), rule({ source: "club website" })], NOW);
+		expect(accepted).toEqual([]);
+		expect(skipped).toHaveLength(2);
+		expect(skipped[0].reason).toContain("source");
+	});
+
+	it("NEVER overwrites an owner pin — the owner outranks the robot", () => {
+		const owner: import("../src/roster-truth").OverrideMap = {
+			girelli: { espnAthleteId: "girelli", playerName: "Cristiana Girelli", teamAbbr: "BAY",
+				position: "M", setAt: "", expiresAt: overrideExpiry(NOW) },
+		};
+		const { next, accepted, skipped } = applyAutoRulings(owner, [rule()], NOW);
+		expect(accepted).toEqual([]);
+		expect(skipped[0].reason).toContain("owner pin");
+		expect(next.girelli.position).toBe("M"); // untouched
+	});
+
+	it("may replace an EXPIRED owner pin and another auto ruling", () => {
+		const stale: import("../src/roster-truth").OverrideMap = {
+			girelli: { espnAthleteId: "girelli", playerName: "x", teamAbbr: "BAY",
+				position: "M", setAt: "", expiresAt: new Date(NOW - 1000).toISOString() },
+			sonis: { espnAthleteId: "sonis", playerName: "Janine Sonis", teamAbbr: "DEN",
+				position: "F", auto: true, source: "https://old", setAt: "", expiresAt: overrideExpiry(NOW) },
+		};
+		const { accepted, next } = applyAutoRulings(stale, [
+			rule(),
+			rule({ espnAthleteId: "sonis", playerName: "Janine Sonis", teamAbbr: "DEN", position: "D", source: "https://www.denversummitfc.com/club/roster/janine-sonis/" }),
+		], NOW);
+		expect(accepted.sort()).toEqual(["girelli", "sonis"]);
+		expect(next.sonis.position).toBe("D");
+	});
+
+	it("rejects invalid positions and jerseys; requires one of the two", () => {
+		const { accepted, skipped } = applyAutoRulings({}, [
+			rule({ position: "X" as never }),
+			rule({ espnAthleteId: "a", position: undefined, jersey: -2 }),
+			rule({ espnAthleteId: "b", position: undefined }),
+			rule({ espnAthleteId: "sentnor", position: undefined, jersey: 21, source: "https://angelcity.com/roster" }),
+		], NOW);
+		expect(accepted).toEqual(["sentnor"]);
+		expect(skipped).toHaveLength(3);
+	});
+});
+
+describe("pendingAdjudications", () => {
+	const NOW = Date.parse("2026-07-31T12:00:00.000Z");
+	const report = {
+		ranAt: "", seasonId: "", gateA: { ok: true, failures: [] }, espnNames: {},
+		summary: {} as never,
+		clubs: [{
+			abbr: "BAY", espnCount: 28, sdpCount: 30, verified: true,
+			gateB: { ok: true, failures: [] },
+			gateC: { ok: true, failures: [], sdpOverlap: 1, priorOverlap: null },
+			diffs: {
+				positionMismatches: [{ espnAthleteId: "girelli", name: "Cristiana Girelli", espn: "M" as const, sdp: "F" as const, minutes: 694 }],
+				missingJerseys: [{ espnAthleteId: "reale", name: "Lilly Reale", sdpJersey: "2" }],
+				espnOnly: [], sdpOnlyWithMinutes: [], likelyNameVariances: [],
+			},
+		}],
+	};
+
+	it("lists open mismatches and excludes anything already overridden", () => {
+		const none = pendingAdjudications(report as never, {}, NOW);
+		expect(none.positions).toHaveLength(1);
+		expect(none.jerseys).toHaveLength(1);
+		const pinned = pendingAdjudications(report as never, {
+			girelli: { espnAthleteId: "girelli", playerName: "x", teamAbbr: "BAY", position: "F", setAt: "", expiresAt: overrideExpiry(NOW) },
+		}, NOW);
+		expect(pinned.positions).toHaveLength(0);
+		expect(pinned.jerseys).toHaveLength(1); // jersey item unaffected by the position pin? same id would clear it; different id stays
+	});
+
+	it("an EXPIRED override puts the item back on the list (the self-closing loop)", () => {
+		const lapsed = pendingAdjudications(report as never, {
+			girelli: { espnAthleteId: "girelli", playerName: "x", teamAbbr: "BAY", position: "F", setAt: "", expiresAt: new Date(NOW - 1).toISOString() },
+		}, NOW);
+		expect(lapsed.positions).toHaveLength(1);
+	});
+
+	it("handles a null report (no run yet)", () => {
+		expect(pendingAdjudications(null, {}, NOW)).toEqual({ positions: [], jerseys: [] });
 	});
 });
