@@ -39,6 +39,11 @@
 		//   auto tally + advance / rotate). Cheap: reads config + the active edition and
 		//   acts only on a state change.
 		// weekly Mon 09:00 UTC → rebuild the NWSL↔ESPN player-headshot map.
-		"crons": ["0 12 */2 * *", "*/5 * * * *", "0 9 * * 1"],
+		// ⚠️ EVERY cron string needs a matching `if (controller.cron === …)` branch in scheduled()
+		// (src/index.ts). The final branch is an UNGUARDED fall-through that runs the paid Apify
+		// social scrape, so an unmatched cron silently triggers scraping on that schedule.
+		// social (2-daily) · bracket engine + error-spike (5-min) · headshot map (weekly Mon)
+		// · roster verification (nightly 08:00 UTC)
+		"crons": ["0 12 */2 * *", "*/5 * * * *", "0 9 * * 1", "0 8 * * *"],
 	},
 }
