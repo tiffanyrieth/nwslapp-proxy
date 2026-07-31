@@ -203,11 +203,14 @@ function render(d) {
   h += '<div class="note">A pin outranks both feeds for ' + d.ttlDays + ' days. It expires on purpose: a permanent pin becomes an invisible lie the day the fact genuinely changes. Expiry is safe because the nightly check keeps running — if the feeds still disagree when a pin lapses, the row reappears above.</div>';
   if (!all.length) h += '<p class="muted small">None.</p>';
   else {
-    h += '<table><tr><th>Player</th><th>Club</th><th>Pinned to</th><th>Status</th><th></th></tr>';
+    h += '<table><tr><th>Player</th><th>Club</th><th>Pinned to</th><th>By</th><th>Status</th><th></th></tr>';
     for (const o of all) {
       const daysLeft = Math.ceil((Date.parse(o.expiresAt) - now) / 86400000);
       const val = o.position ? o.position : (o.jersey != null ? "#" + o.jersey : "—");
-      h += '<tr><td>' + esc(o.playerName) + '</td><td>' + esc(o.teamAbbr) + '</td><td>' + esc(val) + '</td><td>' +
+      const by = o.auto
+        ? '<span class="pill warn">auto</span>' + (o.source ? ' <a class="small" href="' + esc(o.source) + '" target="_blank" rel="noopener">source</a>' : '')
+        : '<span class="pill">you</span>' + (o.source ? ' <a class="small" href="' + esc(o.source) + '" target="_blank" rel="noopener">source</a>' : '');
+      h += '<tr><td>' + esc(o.playerName) + '</td><td>' + esc(o.teamAbbr) + '</td><td>' + esc(val) + '</td><td>' + by + '</td><td>' +
         (daysLeft > 0 ? '<span class="pill ok">' + daysLeft + 'd left</span>' : '<span class="pill warn">expired</span>') +
         '</td><td><button class="act" data-renew="' + esc(o.espnAthleteId) + '">Renew</button> ' +
         '<button class="act danger" data-remove="' + esc(o.espnAthleteId) + '">Remove</button></td></tr>';

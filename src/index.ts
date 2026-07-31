@@ -38,9 +38,12 @@ import {
 	applyOverrides,
 	activeOverrides,
 	overrideExpiry,
+	applyAutoRulings,
+	pendingAdjudications,
 	OVERRIDE_TTL_DAYS,
 	type OverrideMap,
 	type RosterOverride,
+	type AutoRuling,
 } from "./roster-truth.ts";
 import {
 	handleKnowHerAdmin,
@@ -586,6 +589,13 @@ export default {
 				const err = e as Error;
 				return new Response(`headshots build error: ${err.message}\n${err.stack ?? ""}\n`, { status: 500 });
 			}
+		}
+
+		// Weekly adjudication routine (dedicated key, same blast-radius logic as KNOWHER_INGEST_KEY:
+		// the routine holds ONLY this, so a leak exposes one narrow feature that rotates alone).
+		// GET /roster-truth/todo = the open mismatches; POST /roster-truth/rulings = cited pins.
+		if (url.pathname === "/roster-truth/todo" || url.pathname === "/roster-truth/rulings") {
+			return handleAdjudication(request, env, ctx);
 		}
 
 		// The single operator portal: GET /admin (tabbed shell) + POST /admin/roster (its ops).
@@ -1721,6 +1731,53 @@ export function emitDiagBatch(env: Env, ctx: ExecutionContext, events: { kind: s
 	console.log("telemetry", JSON.stringify(record));
 	const key = `sdiag:${1e15 - ts}:${crypto.randomUUID().slice(0, 8)}`;
 	ctx.waitUntil(env.FEED_TAGS.put(key, JSON.stringify(record), { expirationTtl: 60 * 60 * 24 * 30 }));
+}
+
+// ── Weekly adjudication (GET /roster-truth/todo + POST /roster-truth/rulings) ────
+
+/** The routine's two endpoints. Auth = `x-adjudicate-key` == ROSTER_ADJUDICATE_KEY (a dedicated
+ *  secret — deliberately NOT BRACKET_ADMIN_KEY). The hard rules live in `applyAutoRulings`, not
+ *  in the routine's prompt: no source → rejected; an owner pin is never overwritten; positions
+ *  and jerseys only (membership is structurally untouchable via applyOverrides). */
+async function handleAdjudication(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
+	const key = (env as unknown as { ROSTER_ADJUDICATE_KEY?: string }).ROSTER_ADJUDICATE_KEY;
+	if (!key || request.headers.get("x-adjudicate-key") !== key) {
+		return new Response("forbidden", { status: 403 });
+	}
+	const url = new URL(request.url);
+	const now = Date.now();
+
+	if (url.pathname === "/roster-truth/todo") {
+		if (request.method !== "GET") return new Response("use GET", { status: 405 });
+		const [report, overrides] = await Promise.all([readRosterTruthReport(env), readOverrides(env)]);
+		const pending = pendingAdjudications(report, overrides, now);
+		return Response.json({
+			reportRanAt: report?.ranAt ?? null,
+			...pending,
+			counts: { positions: pending.positions.length, jerseys: pending.jerseys.length },
+		});
+	}
+
+	// POST /roster-truth/rulings
+	if (request.method !== "POST") return new Response("use POST", { status: 405 });
+	let body: { rulings?: AutoRuling[] } = {};
+	try {
+		body = (await request.json()) as typeof body;
+	} catch {
+		return Response.json({ error: "invalid JSON" }, { status: 400 });
+	}
+	if (!Array.isArray(body.rulings)) return Response.json({ error: "rulings must be an array" }, { status: 400 });
+	if (body.rulings.length > 40) return Response.json({ error: "too many rulings (max 40)" }, { status: 400 });
+
+	const overrides = await readOverrides(env);
+	const { next, accepted, skipped } = applyAutoRulings(overrides, body.rulings, now);
+	if (accepted.length > 0) await writeOverrides(env, next);
+	// One batched diag — visible in telemetry, deliberately not paged (this is routine maintenance).
+	emitDiagBatch(env, ctx, [
+		{ kind: "rosterAutoRuling", detail: `accepted=${accepted.length} skipped=${skipped.length}` },
+		...accepted.slice(0, 10).map((id) => ({ kind: "rosterAutoRulingSet", detail: id })),
+	]);
+	return Response.json({ ok: true, accepted, skipped, ttlDays: OVERRIDE_TTL_DAYS });
 }
 
 // ── Operator portal (GET /admin + POST /admin/roster) ────────────────────────────
