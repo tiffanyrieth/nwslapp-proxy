@@ -43,6 +43,23 @@ current-season and the club decides how it lists its own players.
   (forward/winger/striker). If the club lists a hybrid ("defender/midfielder") with no primary,
   DECLINE that item.
 
+### ⚠️ What is NOT a reason to decline
+
+**A player's famous career position conflicting with her club's current listing is not ambiguity —
+it is the entire point.** Roles change when players move or when a coach sees them differently, and
+that change is exactly what both feeds are slow to reflect. If the club page states a position
+plainly, post it, however surprising.
+
+Observed on the first run (2026-07-31): the routine declined **Mina Tanaka** (a celebrated Japanese
+international *striker* whom Utah lists "#11 • Midfielder") and **Cece Delzer** (described as
+forward-or-midfielder everywhere; Utah lists "#5 • Forward"). Both club pages were clear and both
+were resolvable — the hesitation came from career reputation, not from the source. Compare Janine
+Sonis: career forward, listed **Defender** by Denver, and the club was right.
+
+**Decline only when the SOURCE fails you** — the club page is unreachable, the player is not on it,
+it lists a hybrid with no primary role, or two authoritative pages contradict each other. Never
+because the answer is unexpected.
+
 ### ⚠️ The transfer rule — a blank jersey means the position is suspect too
 
 **Every player in the `jerseys` list (ESPN has no number for her) is almost certainly a RECENT
