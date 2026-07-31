@@ -121,13 +121,15 @@ describe("gateShape (Gate B)", () => {
 		expect(r.failures.join(" ")).toMatch(/0 goalkeepers/);
 	});
 
-	it("FAILS the Spirit's five-goalkeeper incident but ALLOWS four", () => {
+	it("only rejects an IMPOSSIBLE keeper count — 5 is real (Louisville), 0 is not", () => {
 		const mk = (gk: number) =>
-			espn("WAS", Array.from({ length: 20 }, (_, i) => ({ id: `a${i}`, name: `P ${i}`, jersey: i + 1, pos: i < gk ? "G" : "D" })));
-		// WAS legitimately carried 4 keepers on 2026-07-30 — the threshold must not flag reality.
+			espn("LOU", Array.from({ length: 20 }, (_, i) => ({ id: `a${i}`, name: `P ${i}`, jersey: i + 1, pos: i < gk ? "G" : "D" })));
+		// Louisville genuinely carries 5, listed identically by BOTH feeds. A count alone cannot
+		// separate that from the Spirit's fabricated 5 — gateContinuity asks the league instead.
 		expect(gateShape(mk(4)).ok).toBe(true);
-		expect(gateShape(mk(5)).ok).toBe(false);
+		expect(gateShape(mk(5)).ok).toBe(true);
 		expect(gateShape(mk(0)).ok).toBe(false);
+		expect(gateShape(mk(7)).ok).toBe(false);
 	});
 
 	it("FAILS on duplicate shirt numbers, ignoring players with none", () => {
@@ -164,7 +166,9 @@ describe("overlapRatio + the shortName index", () => {
 
 describe("gateContinuity (Gate C)", () => {
 	const roster = healthy();
-	const matching = sdp("WAS", roster.players.map((p) => ({ name: p.display })));
+	// Mirror the ESPN positions: the league fixture must be a plausible twin, or the keeper
+	// cross-check correctly objects that one side has 3 goalkeepers and the other none.
+	const matching = sdp("WAS", roster.players.map((p) => ({ name: p.display, role: p.group as string })));
 
 	it("passes when the squads are the same people", () => {
 		const r = gateContinuity(roster, matching, null);
@@ -498,5 +502,26 @@ describe("pairNameVariances", () => {
 	it("ignores league records with no number", () => {
 		const r = pairNameVariances([{ espnAthleteId: "1", name: "A", jersey: 9 }], [sdpP("No Number", null, "z")]);
 		expect(r.variances).toHaveLength(0);
+	});
+});
+
+describe("goalkeeper count is judged against the league, not a constant", () => {
+	const squadOf = (gk: number, abbr = "LOU") =>
+		espn(abbr, Array.from({ length: 20 }, (_, i) => ({ id: `a${i}`, name: `P ${i}`, jersey: i + 1, pos: i < gk ? "G" : "D" })));
+	const leagueOf = (gk: number, abbr = "LOU") =>
+		sdp(abbr, Array.from({ length: 20 }, (_, i) => ({ name: `P ${i}`, role: i < gk ? "G" : "D" })));
+
+	it("accepts a deep keeper corps when both feeds agree (Louisville's real 5)", () => {
+		expect(gateContinuity(squadOf(5), leagueOf(5), null).ok).toBe(true);
+	});
+
+	it("FAILS when ESPN alone claims 5 and the league says 3 (the Spirit incident)", () => {
+		const r = gateContinuity(squadOf(5, "WAS"), leagueOf(3, "WAS"), null);
+		expect(r.ok).toBe(false);
+		expect(r.failures.join(" ")).toContain("5 goalkeepers on ESPN vs 3");
+	});
+
+	it("tolerates a one-keeper difference — routine when a feed retains a departure", () => {
+		expect(gateContinuity(squadOf(4), leagueOf(3), null).ok).toBe(true);
 	});
 });

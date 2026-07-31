@@ -71,7 +71,16 @@ const OVERRIDES_TTL = 60 * 60 * 24 * 365;
 const SQUAD_MIN = 16; // below this the payload is broken, not a small squad
 const SQUAD_MAX = 34; // above this something has merged two clubs
 const GK_MIN = 1;
-const GK_MAX = 4; // WAS legitimately carried 4 on 2026-07-30; the Spirit's bad "5 keepers" is the floor of implausible
+/** ⚠️ A raw keeper COUNT cannot detect the "5 goalkeepers" failure, and the first live run proved
+ *  it: Louisville genuinely carries 5, listed identically by BOTH feeds (Bloomer, Roque, Sekany,
+ *  Floyd, Prohaska), while the Spirit's bad 5 was fabrication. Same number, opposite meanings.
+ *  So the single-payload bound is only what is physically impossible; the real test is
+ *  `GK_DISAGREE_MIN` below, which asks the league rather than a constant. */
+const GK_MAX = 6;
+/** ESPN vs league keeper-count gap that means something is wrong. The Spirit incident was ESPN 5
+ *  against a true 3 — a gap of 2. Deep-squad differences of 1 are routine (one feed retains a
+ *  departed keeper) and must not cry wolf. */
+const GK_DISAGREE_MIN = 2;
 /** Measured ESPN↔SDP name overlap is 93–100% with the shortName index; contamination scores ~0%.
  *  0.80 sits below every real club and far above any substitution event. */
 const SDP_OVERLAP_MIN = 0.8;
@@ -344,6 +353,17 @@ export function gateContinuity(
 	const sdpOverlap = sdp ? overlapRatio(names, sdpNameIndex(sdp)) : 1;
 	if (sdp && sdpOverlap < SDP_OVERLAP_MIN) {
 		failures.push(`only ${Math.round(sdpOverlap * 100)}% of the ESPN squad is known to the league feed`);
+	}
+
+	// Keeper count judged against the LEAGUE, not a constant — see GK_MAX. Louisville's real 5 and
+	// the Spirit's fabricated 5 are indistinguishable by count; they differ in whether the league
+	// agrees. Both feeds saying 5 is a deep keeper corps; ESPN alone saying 5 is the bug.
+	if (sdp) {
+		const espnGk = espn.players.filter((p) => p.group === "G").length;
+		const sdpGk = sdp.players.filter((p) => p.role === "G").length;
+		if (Math.abs(espnGk - sdpGk) >= GK_DISAGREE_MIN) {
+			failures.push(`${espnGk} goalkeepers on ESPN vs ${sdpGk} in the league feed`);
+		}
 	}
 
 	let priorOverlap: number | null = null;
