@@ -119,7 +119,24 @@ const scoreboardUpstream = (slug: string) =>
 const LIVE_TTL = 30; // a match is in progress — keep scores/lineups fresh
 const SCOREBOARD_DEFAULT_TTL = 300; // fixture list barely changes between matches
 const SUMMARY_DEFAULT_TTL = 3600; // 1hr — safe fallback when summary state can't be read
-const IMMUTABLE_TTL = 31536000; // 1yr — a finished match's data is final, cache ~forever
+const IMMUTABLE_TTL = 31536000; // 1yr — a SETTLED, COMPLETE match's data is final (see chooseSummaryTTL)
+// A settled match whose record is still filling in (attendance lands hours-to-days late for some
+// venues). Long enough to be nearly free, short enough that the number appears the same day.
+const SUMMARY_PENDING_TTL = 21600; // 6h
+// Past this, stop waiting for a missing field and treat the record as complete. Most NT matches
+// never report attendance at all, and without a bound they'd re-fetch every 6h forever.
+const SUMMARY_PENDING_MAX_AGE_MS = 14 * 24 * 60 * 60 * 1000; // 14d
+// What we tell the CLIENT to cache, regardless of the (much longer) edge TTL. A device that pins a
+// summary for a year is unreachable: no server-side fix can reach it, because the device never even
+// asks. The edge still absorbs the load — a client revalidation is an edge HIT, not an ESPN fetch.
+const CLIENT_MAX_TTL = 3600; // 1h
+// ⚠️ CACHE-KEY EPOCH — bump to orphan every cached summary/scoreboard on deploy. The Cache API is
+// PER-COLO, so a Worker can only delete from the colo that happened to serve its own request, and
+// `workers.dev` has no zone to purge through the Cloudflare API. Changing the KEY invalidates
+// globally instead, at the cost of one re-fetch per distinct URL. Bumped to 2 on 2026-07-31 to
+// evict summaries frozen mid-suspension by the `post`-means-final bug below (WAS @ UTA sat pinned
+// at 23' with attendance 0 for a year, 1.9 days in when it was found).
+const CACHE_EPOCH = "2";
 const TEAM_VIDEOS_TTL = 3600; // 1hr — a club's recent uploads change at most a few times/day
 
 const YT_API = "https://www.googleapis.com/youtube/v3";
@@ -899,13 +916,17 @@ async function proxyAndCache(
 	bustUpstream = false,
 ): Promise<Response> {
 	// Cache key = the incoming URL (query string included), so different
-	// `dates`/`limit` or `event` values are cached independently.
+	// `dates`/`limit` or `event` values are cached independently — plus CACHE_EPOCH, which is
+	// how we invalidate globally (see its comment; the Cache API can't be purged per-colo).
+	// ESPN never sees this: the upstream URL is rebuilt from `url.search` below.
 	const cache = caches.default;
-	const cacheKey = new Request(url.toString(), { method: "GET" });
+	const keyURL = new URL(url.toString());
+	keyURL.searchParams.set("_e", CACHE_EPOCH);
+	const cacheKey = new Request(keyURL.toString(), { method: "GET" });
 
 	const hit = await cache.match(cacheKey);
 	if (hit) {
-		return withCacheStatus(hit, "HIT");
+		return withCacheStatus(withClientTTL(hit), "HIT");
 	}
 
 	// MISS — forward to ESPN, preserving the incoming query string verbatim.
@@ -931,11 +952,13 @@ async function proxyAndCache(
 			headers: { Accept: "application/json" },
 		});
 	} catch {
-		return (await serveStale(cache, cacheKey)) ?? upstreamError();
+		const stale = await serveStale(cache, cacheKey);
+		return stale ? withClientTTL(stale) : upstreamError();
 	}
 
 	if (!espnResponse.ok) {
-		return (await serveStale(cache, cacheKey)) ?? upstreamError(espnResponse.status);
+		const stale = await serveStale(cache, cacheKey);
+		return stale ? withClientTTL(stale) : upstreamError(espnResponse.status);
 	}
 
 	// Read the body once as bytes so we can both cache it and return it
@@ -950,11 +973,30 @@ async function proxyAndCache(
 	);
 	headers.set("Cache-Control", `public, max-age=${ttl}`);
 
-	// Store a copy in the edge cache (don't block the response on the write).
+	// Store a copy in the edge cache (don't block the response on the write). The EDGE entry keeps
+	// the full `ttl`; only the client-facing copy is capped.
 	const toCache = new Response(body, { status: 200, headers });
 	ctx.waitUntil(cache.put(cacheKey, toCache.clone()));
 
-	return withCacheStatus(toCache, "MISS");
+	return withCacheStatus(withClientTTL(toCache), "MISS");
+}
+
+/**
+ * Cap what the CLIENT is told to cache, WITHOUT shortening the edge entry's own TTL.
+ *
+ * ⚠️ Why this exists: a device that caches a response for a year is beyond our reach — no
+ * server-side fix can correct it, because the device never asks again. That's not theoretical;
+ * `URLSession.shared` honours `max-age`, and we were handing out `max-age=31536000` on match
+ * summaries, so the frozen WAS @ UTA copy would have outlived the server fix on any phone that
+ * had opened it. Revalidating hourly costs a Worker request but almost never an ESPN fetch (the
+ * edge entry is still valid and answers the revalidation), so correctness here is nearly free.
+ */
+function withClientTTL(response: Response, cap = CLIENT_MAX_TTL): Response {
+	const current = Number(/max-age=(\d+)/.exec(response.headers.get("Cache-Control") ?? "")?.[1]);
+	if (!Number.isFinite(current) || current <= cap) return response;
+	const out = new Response(response.body, response);
+	out.headers.set("Cache-Control", `public, max-age=${cap}`);
+	return out;
 }
 
 /** Return a clone of `response` with an `X-Proxy-Cache` status header set. */
@@ -1023,29 +1065,81 @@ function chooseScoreboardTTL(body: ArrayBuffer): number {
 	}
 }
 
+/** `post` statuses that mean "play stopped but the RESULT IS NOT SETTLED". Mirrors the watcher's
+ *  set in `nwslapp-match-watcher/src/events.ts` — keep the two in sync. */
+const NON_FINAL_POST_STATUSES = new Set([
+	"STATUS_SUSPENDED",
+	"STATUS_POSTPONED",
+	"STATUS_DELAYED",
+	"STATUS_CANCELED",
+	"STATUS_CANCELLED",
+	"STATUS_ABANDONED",
+]);
+/** Of those, the ones play can RESUME from within the hour — worth polling at live cadence. */
+const RESUMABLE_POST_STATUSES = new Set([
+	"STATUS_SUSPENDED",
+	"STATUS_DELAYED",
+]);
+
 /**
  * Summary TTL: one match, so the state lives at a single path —
  * `header.competitions[0].status.type.state` (NOT the scoreboard's
- * `events[].status…`). Finished matches never change → cache ~forever; live →
- * 30s; future → once-daily BUT capped at kickoff (see `preKickoffTTL`) so a
- * pre-kickoff shell can't be served stale through the whole live game. Parse
- * failure → safe 1hr default.
+ * `events[].status…`). Live → 30s; future → once-daily BUT capped at kickoff (see
+ * `preKickoffTTL`) so a pre-kickoff shell can't be served stale through the whole live game.
+ * Parse failure → safe 1hr default.
+ *
+ * ⚠️ `post` DOES NOT MEAN FINISHED, and caching it as if it does is uniquely destructive here:
+ * unlike the scoreboard (which self-corrects on the next poll) a year-long TTL FREEZES the match
+ * permanently. Live-proven 2026-07-31 on WAS @ UTA: suspended for weather at 23', cached at that
+ * instant for a year, and 1.9 days later the app was still showing a 23-minute play-by-play and
+ * attendance 0 while ESPN had the full 90'+7' and 9,538. The scoreboard healed on resume; the
+ * summary could not, because nothing ever asked ESPN again. So "settled" is checked exactly the
+ * way the app (`Event.isFinalResult`) and the watcher (`isUnfinishedPost`) check it, FAIL-OPEN:
+ * only positive evidence of non-completion downgrades the TTL.
+ *
+ * ⚠️ And settled is NOT the same as COMPLETE. Attendance arrives late at some venues — hours,
+ * occasionally days (verified 2026-07-31: GFC @ BAY was a normal final with attendance still 0
+ * two days on). An immutable cache means a number that lands on Tuesday is never seen. So a
+ * settled-but-incomplete record re-checks every 6h, and only becomes immutable once the field is
+ * actually there — the same "write-once, but only when it's real" rule the kickoff-weather cache
+ * uses. Bounded by SUMMARY_PENDING_MAX_AGE_MS: most NT matches never report attendance at all,
+ * and an unbounded wait would re-fetch those every 6h forever.
  */
-export function chooseSummaryTTL(body: ArrayBuffer): number {
+export function chooseSummaryTTL(body: ArrayBuffer, now: number = Date.now()): number {
 	try {
 		const json = JSON.parse(new TextDecoder().decode(body)) as {
 			header?: {
 				competitions?: Array<{
 					date?: string;
-					status?: { type?: { state?: string } };
+					status?: { type?: { state?: string; name?: string; completed?: boolean } };
 				}>;
 			};
+			gameInfo?: { attendance?: number };
 		};
 		const competition = json.header?.competitions?.[0];
-		const state = competition?.status?.type?.state;
-		switch (state) {
-			case "post":
-				return IMMUTABLE_TTL;
+		const type = competition?.status?.type;
+		switch (type?.state) {
+			case "post": {
+				const namedNonFinal = !!type.name && NON_FINAL_POST_STATUSES.has(type.name);
+				if (type.completed === false || namedNonFinal) {
+					// Not settled. Step DOWN to the hourly tier only when the name explicitly says
+					// this won't restart (postponed/canceled/abandoned) — those would otherwise hold a
+					// permanent 30s hot path, and they still can't be immutable because the page can
+					// gain a rescheduled date. Anything else unsettled — including `completed: false`
+					// under a name we don't recognise or one that looks final — stays at live cadence:
+					// we don't know why it stopped, and being wrong in that direction costs one fetch
+					// per 30s, while being wrong the other way freezes the match (WAS @ UTA).
+					const resumable = !namedNonFinal || RESUMABLE_POST_STATUSES.has(type.name!);
+					return resumable ? LIVE_TTL : SUMMARY_DEFAULT_TTL;
+				}
+				// Settled. Immutable only once the record is complete — or old enough that whatever
+				// is missing is never coming.
+				if ((json.gameInfo?.attendance ?? 0) > 0) return IMMUTABLE_TTL;
+				const kickoff = competition?.date ? Date.parse(competition.date) : NaN;
+				const giveUp =
+					Number.isFinite(kickoff) && now - kickoff > SUMMARY_PENDING_MAX_AGE_MS;
+				return giveUp ? IMMUTABLE_TTL : SUMMARY_PENDING_TTL;
+			}
 			case "in":
 				return LIVE_TTL;
 			case "pre":
