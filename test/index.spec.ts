@@ -63,9 +63,78 @@ describe("chooseSummaryTTL", () => {
 		new TextEncoder().encode(JSON.stringify(obj)).buffer;
 	const summaryWithState = (state: string, date?: string) =>
 		encode({ header: { competitions: [{ date, status: { type: { state } } }] } });
+	/** A settled `post` summary with a real kickoff date and an optional attendance figure. */
+	const finished = (opts: { attendance?: number; kickoff?: string } = {}) =>
+		encode({
+			header: {
+				competitions: [
+					{
+						date: opts.kickoff ?? new Date(Date.now() - 3 * 3600 * 1000).toISOString(),
+						status: { type: { state: "post", name: "STATUS_FULL_TIME", completed: true } },
+					},
+				],
+			},
+			gameInfo: { attendance: opts.attendance ?? 0 },
+		});
+	/** A `post` summary that is NOT settled — the suspended/postponed class. */
+	const unfinished = (name: string, completed = false) =>
+		encode({
+			header: {
+				competitions: [
+					{
+						date: new Date(Date.now() - 3600 * 1000).toISOString(),
+						status: { type: { state: "post", name, completed } },
+					},
+				],
+			},
+			gameInfo: { attendance: 0 },
+		});
 
-	it("caches finished matches ~forever (post -> 1yr)", () => {
-		expect(chooseSummaryTTL(summaryWithState("post"))).toBe(31536000);
+	it("caches a settled match with a COMPLETE record ~forever (post + attendance -> 1yr)", () => {
+		expect(chooseSummaryTTL(finished({ attendance: 9538 }))).toBe(31536000);
+	});
+
+	// ⚠️ The WAS @ UTA freeze, 2026-07-31. `post` + completed:false meant "suspended for weather at
+	// 23'", and a 1yr TTL pinned that snapshot: 1.9 days later the app still showed a 23-minute
+	// play-by-play and attendance 0 while ESPN had the full 90'+7' and 9,538. Nothing self-heals a
+	// year-long cache, because nothing ever asks again.
+	it("never treats an UNSETTLED post as final — a suspended match stays at live cadence", () => {
+		expect(chooseSummaryTTL(unfinished("STATUS_SUSPENDED"))).toBe(30);
+		expect(chooseSummaryTTL(unfinished("STATUS_DELAYED"))).toBe(30);
+	});
+
+	it("trusts completed:false even when the status name looks final", () => {
+		expect(chooseSummaryTTL(unfinished("STATUS_FULL_TIME", false))).toBe(30);
+	});
+
+	it("doesn't give a non-resumable post a permanent 30s hot path, but won't pin it either", () => {
+		// Postponed/canceled/abandoned won't restart within the hour, so live cadence would burn
+		// fetches forever — but the page can still change (a rescheduled date), so not immutable.
+		for (const name of ["STATUS_POSTPONED", "STATUS_CANCELED", "STATUS_ABANDONED"]) {
+			expect(chooseSummaryTTL(unfinished(name))).toBe(3600);
+		}
+	});
+
+	// ⚠️ Settled is not the same as COMPLETE. Verified live 2026-07-31: GFC @ BAY was a normal
+	// final with attendance still 0 two days later. Pinning it for a year means the number that
+	// lands on Tuesday is never seen by anyone.
+	it("re-checks a settled match whose attendance hasn't landed yet (6h, not 1yr)", () => {
+		expect(chooseSummaryTTL(finished({ attendance: 0 }))).toBe(21600);
+	});
+
+	it("stops waiting after 14 days — most NT matches never report attendance at all", () => {
+		const old = new Date(Date.now() - 20 * 86400 * 1000).toISOString();
+		expect(chooseSummaryTTL(finished({ attendance: 0, kickoff: old }))).toBe(31536000);
+		// Just inside the window it is still worth another look.
+		const recent = new Date(Date.now() - 10 * 86400 * 1000).toISOString();
+		expect(chooseSummaryTTL(finished({ attendance: 0, kickoff: recent }))).toBe(21600);
+	});
+
+	it("evaluates the 14-day bound against the injected clock, not the wall clock", () => {
+		const kickoff = "2026-07-01T00:00:00Z";
+		const body = finished({ attendance: 0, kickoff });
+		expect(chooseSummaryTTL(body, Date.parse("2026-07-05T00:00:00Z"))).toBe(21600);
+		expect(chooseSummaryTTL(body, Date.parse("2026-07-20T00:00:00Z"))).toBe(31536000);
 	});
 
 	it("caches live matches briefly (in -> 30s)", () => {
