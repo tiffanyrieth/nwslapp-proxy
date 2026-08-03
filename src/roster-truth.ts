@@ -110,6 +110,47 @@ const SDP_ERASURE_MIN_MINUTES = 90;
  *  mismatch simply reappears in the next report instead of regressing in silence. */
 export const OVERRIDE_TTL_DAYS = 90;
 
+// ── Matchday jerseys — THE THIRD SOURCE, and the best one ────────────────────────
+//
+// WHY (2026-08-03, Khyah Harper). ESPN's roster field is the app's jersey source and it is often
+// BLANK for a recent signing; SDP's `bibNumber` can't be trusted either (rule 3 above — duplicates
+// on 12/16 clubs, and it lags a transfer by 1-3 weeks). That leaves a real dispute nothing on-feed
+// can settle, so it goes to the weekly adjudication routine and gets answered from a club website.
+//
+// But a MATCH LINEUP carries the number the player actually wore. `/summary` → `rosters[]` lists
+// every matchday squad member, starter AND substitute, with her jersey. We already fetch and cache
+// that payload for Predict, Match Detail and the watcher's lineup push, so this source is free.
+//
+// The specimen: Harper transferred Gotham → Houston on 2026-07-28. ESPN had jersey `null`; SDP said
+// 34 — which was also her OLD Gotham number, so "the feed is just lagging the transfer" was a
+// perfectly reasonable read, and wrong. She dressed for Houston on 08-02 wearing 34. The lineup had
+// the answer ~32h before the routine ran, and settles it in a way neither roster feed nor a
+// plausibility argument can.
+//
+// RANKING: matchday > ESPN roster field > SDP bibNumber. A number a player was actually listed
+// under on a teamsheet outranks any squad-list field.
+//
+// LIMIT (deliberate, stated rather than hidden): this can only answer for players who have DRESSED.
+// Someone who has never made a matchday squad still falls through to the routine — which is the
+// right trade, because an unused player's number is also the one that matters least.
+
+/** How far back to look for a matchday squad. Three weeks spans several matchdays for every club
+ *  while staying short enough that a mid-season number change isn't answered from stale data. */
+const MATCHDAY_WINDOW_DAYS = 21;
+/** Hard cap on `/summary` fetches per run.
+ *
+ *  ⚠️ THIS NUMBER IS A BUDGET, NOT A PREFERENCE. The free plan allows **50 subrequests per
+ *  invocation** and the verification run already budgets ~39 (16 clubs × 2 feeds + setup + KV ops —
+ *  see `docs/stress-testing.md`). So the ceiling here is 50 − 39 − 1 (the scoreboard) = 10, and
+ *  taking all 10 would sit exactly ON the limit, where one extra KV op starts failing whole runs.
+ *  Six leaves real margin and still spans about a week of fixtures.
+ *
+ *  It costs little in practice: the loop stops the moment every question is answered (both live
+ *  2026-08-03 specimens took TWO), and anything unresolved simply falls through to the weekly
+ *  routine exactly as before — degrading, never breaking. Raising this means re-checking the
+ *  arithmetic above first; a 17th club would also eat into it. */
+const MATCHDAY_MAX_SUMMARIES = 6;
+
 // ── Types ────────────────────────────────────────────────────────────────────────
 
 export type Group = "G" | "D" | "M" | "F";
@@ -322,6 +363,161 @@ export function pendingAdjudications(
 		}
 	}
 	return { positions, jerseys };
+}
+
+// ── Matchday jersey extraction (pure) ────────────────────────────────────────────
+
+/** One `/summary` payload, only the shape we read. */
+interface SummaryPayload {
+	rosters?: {
+		team?: { abbreviation?: string };
+		roster?: { jersey?: string | number | null; athlete?: { id?: string; displayName?: string } }[];
+	}[];
+}
+
+/** One scoreboard event, only the shape we read. */
+export interface ScoreboardEvent {
+	id?: string;
+	date?: string;
+	competitions?: { competitors?: { team?: { abbreviation?: string } }[] }[];
+}
+
+export interface MatchdayJersey {
+	jersey: number;
+	teamAbbr: string;
+	/** ISO kickoff of the match this was read from — later wins on conflict. */
+	date: string;
+	/** Citation, satisfying `applyAutoRulings`'s source-URL rule. */
+	source: string;
+}
+
+/** athleteId → jersey, from ONE match summary. Pure.
+ *
+ *  Both sides of the match are read: a jersey is a fact about the player regardless of which club
+ *  we were asking about. Entries without an id or a numeric jersey are skipped rather than
+ *  guessed — a blank on a teamsheet means the same thing as a blank on a roster. */
+export function jerseysFromSummary(
+	summary: SummaryPayload | null,
+	eventId: string,
+	date: string,
+): Map<string, MatchdayJersey> {
+	const out = new Map<string, MatchdayJersey>();
+	const source = `${ESPN_SITE}/summary?event=${eventId}`;
+	for (const side of summary?.rosters ?? []) {
+		const teamAbbr = (side.team?.abbreviation ?? "").toUpperCase();
+		for (const entry of side.roster ?? []) {
+			const id = String(entry.athlete?.id ?? "");
+			if (!id) continue;
+			const raw = entry.jersey;
+			if (raw == null || raw === "") continue;
+			const jersey = Number(raw);
+			if (!Number.isInteger(jersey) || jersey < 0) continue;
+			out.set(id, { jersey, teamAbbr, date, source });
+		}
+	}
+	return out;
+}
+
+/** Which matches to spend a `/summary` fetch on. Pure.
+ *
+ *  NEWEST FIRST, because a number can change and the most recent teamsheet is the current truth —
+ *  and because the newest match is also the one most likely to include a just-signed player. Only
+ *  matches involving a club we have a question about are considered; everything else is spend for
+ *  nothing. Capped so the nightly run can't blow its subrequest budget on a busy fortnight. */
+export function pickMatchdayEvents(
+	events: ScoreboardEvent[],
+	clubs: Set<string>,
+	max = MATCHDAY_MAX_SUMMARIES,
+): { id: string; date: string }[] {
+	return (events ?? [])
+		.filter((e) => {
+			if (!e.id) return false;
+			const abbrs = (e.competitions?.[0]?.competitors ?? [])
+				.map((c) => (c.team?.abbreviation ?? "").toUpperCase());
+			return abbrs.some((a) => clubs.has(a));
+		})
+		.map((e) => ({ id: String(e.id), date: String(e.date ?? "") }))
+		.sort((a, b) => (a.date < b.date ? 1 : a.date > b.date ? -1 : 0))
+		.slice(0, max);
+}
+
+/** Merge a match's jerseys into the running map, newest-wins. Pure. */
+export function mergeMatchdayJerseys(
+	into: Map<string, MatchdayJersey>,
+	from: Map<string, MatchdayJersey>,
+): Map<string, MatchdayJersey> {
+	for (const [id, v] of from) {
+		const prev = into.get(id);
+		if (!prev || prev.date < v.date) into.set(id, v);
+	}
+	return into;
+}
+
+/** Turn resolvable pending jersey questions into rulings. Pure.
+ *
+ *  ⚠️ It rules on the JERSEY ONLY. Position is a separate question with separate evidence, and
+ *  collapsing the two is exactly how the 2026-08-03 Harper writeup let a well-sourced position
+ *  carry an unsourced number. A teamsheet is authoritative about the shirt and says nothing about
+ *  whether she is a forward.
+ *
+ *  A player whose matchday jersey ALREADY equals what SDP proposed still produces a ruling: the
+ *  point is not that the two disagree, it's that ESPN is blank and the teamsheet can fill it with
+ *  something better than a guess. */
+export function matchdayRulings(
+	pending: { espnAthleteId: string; name: string; teamAbbr: string }[],
+	jerseys: Map<string, MatchdayJersey>,
+): { rulings: AutoRuling[]; unresolved: string[] } {
+	const rulings: AutoRuling[] = [];
+	const unresolved: string[] = [];
+	for (const p of pending) {
+		const hit = jerseys.get(p.espnAthleteId);
+		if (!hit) {
+			unresolved.push(p.espnAthleteId);
+			continue;
+		}
+		rulings.push({
+			espnAthleteId: p.espnAthleteId,
+			playerName: p.name,
+			teamAbbr: p.teamAbbr,
+			jersey: hit.jersey,
+			source: hit.source,
+		});
+	}
+	return { rulings, unresolved };
+}
+
+/** Answer as many open jersey questions as recent teamsheets can. Fetches only when there is
+ *  something to answer, so a clean night costs ZERO subrequests.
+ *
+ *  `fetchJson` is injected so the orchestration is testable without network. */
+export async function resolveJerseysFromMatchday(
+	pending: { espnAthleteId: string; name: string; teamAbbr: string }[],
+	now: number,
+	fetchJson: <T>(url: string) => Promise<T | null> = getJSON,
+): Promise<{ rulings: AutoRuling[]; unresolved: string[]; matchesRead: number }> {
+	if (!pending.length) return { rulings: [], unresolved: [], matchesRead: 0 };
+
+	const clubs = new Set(pending.map((p) => p.teamAbbr.toUpperCase()));
+	const end = new Date(now);
+	const start = new Date(now - MATCHDAY_WINDOW_DAYS * 24 * 60 * 60 * 1000);
+	const stamp = (d: Date) => d.toISOString().slice(0, 10).replace(/-/g, "");
+	const board = await fetchJson<{ events?: ScoreboardEvent[] }>(
+		`${ESPN_SITE}/scoreboard?dates=${stamp(start)}-${stamp(end)}&limit=200`,
+	);
+
+	const targets = pickMatchdayEvents(board?.events ?? [], clubs);
+	let jerseys = new Map<string, MatchdayJersey>();
+	let matchesRead = 0;
+	// Sequential, newest first, and it STOPS as soon as every question is answered — the common
+	// case is one fetch. Parallelising would spend the whole cap every time for no gain.
+	for (const t of targets) {
+		const summary = await fetchJson<SummaryPayload>(`${ESPN_SITE}/summary?event=${t.id}`);
+		matchesRead++;
+		jerseys = mergeMatchdayJerseys(jerseys, jerseysFromSummary(summary, t.id, t.date));
+		if (pending.every((p) => jerseys.has(p.espnAthleteId))) break;
+	}
+
+	return { ...matchdayRulings(pending, jerseys), matchesRead };
 }
 
 export type OverrideMap = Record<string, RosterOverride>;
@@ -819,6 +1015,30 @@ export async function runRosterTruth(env: RosterTruthEnv, emit: EmitBatch): Prom
 		),
 	]);
 
+	// Answer what recent teamsheets can, BEFORE the weekly routine ever sees it. Best-effort by
+	// construction: a failure here must never fail the verification run, which has already been
+	// written above. Costs zero subrequests on a night with nothing pending.
+	let matchdayResolved = 0;
+	let matchdayRead = 0;
+	try {
+		const now = Date.parse(ranAt);
+		const overrides = await readOverrides(env);
+		const pending = pendingAdjudications(report, overrides, now);
+		if (pending.jerseys.length) {
+			const { rulings, matchesRead } = await resolveJerseysFromMatchday(pending.jerseys, now);
+			matchdayRead = matchesRead;
+			if (rulings.length) {
+				const { next, accepted } = applyAutoRulings(overrides, rulings, now);
+				if (accepted.length) {
+					await writeOverrides(env, next);
+					matchdayResolved = accepted.length;
+				}
+			}
+		}
+	} catch (e) {
+		emit([{ kind: "rosterTruthRunFail", detail: `matchday ${(e as Error).message.slice(0, 60)}` }]);
+	}
+
 	// ONE batched emit. Gate failures page (severity scales with blast radius: a single club is 1-2
 	// events and stays under the alert threshold, while a contamination or a deleted team fails many
 	// clubs at once and crosses it). The summary is a breadcrumb and never pages.
@@ -831,7 +1051,8 @@ export async function runRosterTruth(env: RosterTruthEnv, emit: EmitBatch): Prom
 	const s = report.summary;
 	events.push({
 		kind: "rosterTruthSummary",
-		detail: `${s.clubsVerified}/16 ok, ${s.positionMismatches} pos, ${s.espnOnly} espnOnly, ${s.sdpOnlyWithMinutes} erased`,
+		detail: `${s.clubsVerified}/16 ok, ${s.positionMismatches} pos, ${s.espnOnly} espnOnly, `
+			+ `${s.sdpOnlyWithMinutes} erased, matchday ${matchdayResolved} fixed/${matchdayRead} read`,
 	});
 	emit(events.slice(0, 20));
 
