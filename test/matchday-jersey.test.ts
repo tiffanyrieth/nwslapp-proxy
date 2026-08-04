@@ -97,10 +97,11 @@ test("respects the fetch cap — it is the subrequest BUDGET, not a preference",
 		id: `e${i}`, date: `2026-07-${String(i + 1).padStart(2, "0")}T00:00Z`,
 		competitions: [{ competitors: [{ team: { abbreviation: "HOU" } }] }],
 	}));
-	// 6, because the verification run already spends ~39 of the free plan's 50 per-invocation
-	// subrequests and the scoreboard costs 1. Raising it without redoing that arithmetic starts
-	// failing whole nightly runs.
-	assert.equal(pickMatchdayEvents(events, new Set(["HOU"])).length, 6);
+	// 4 (MATCHDAY_MAX_SUMMARIES): the verification run spends ~40 of the free plan's 50 per-invocation
+	// subrequests (32 club fetches + setup + 3 KV writes), and the matchday block adds readOverrides +
+	// scoreboard + summaries + writeOverrides. 4 keeps a ~3 margin; 6 sat at ~49/50. Raising it means
+	// redoing that arithmetic or a busy night fails the WHOLE run.
+	assert.equal(pickMatchdayEvents(events, new Set(["HOU"])).length, 4);
 	assert.equal(pickMatchdayEvents(events, new Set(["HOU"]), 3).length, 3);
 });
 
