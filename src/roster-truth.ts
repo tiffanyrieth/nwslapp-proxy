@@ -139,17 +139,18 @@ export const OVERRIDE_TTL_DAYS = 90;
 const MATCHDAY_WINDOW_DAYS = 21;
 /** Hard cap on `/summary` fetches per run.
  *
- *  ⚠️ THIS NUMBER IS A BUDGET, NOT A PREFERENCE. The free plan allows **50 subrequests per
- *  invocation** and the verification run already budgets ~39 (16 clubs × 2 feeds + setup + KV ops —
- *  see `docs/stress-testing.md`). So the ceiling here is 50 − 39 − 1 (the scoreboard) = 10, and
- *  taking all 10 would sit exactly ON the limit, where one extra KV op starts failing whole runs.
- *  Six leaves real margin and still spans about a week of fixtures.
- *
- *  It costs little in practice: the loop stops the moment every question is answered (both live
- *  2026-08-03 specimens took TWO), and anything unresolved simply falls through to the weekly
- *  routine exactly as before — degrading, never breaking. Raising this means re-checking the
- *  arithmetic above first; a 17th club would also eat into it. */
-const MATCHDAY_MAX_SUMMARIES = 6;
+ *  ⚠️ THIS NUMBER IS A BUDGET, NOT A PREFERENCE, and the earlier arithmetic here understated it.
+ *  The free plan allows **50 subrequests per invocation**. The verification run itself spends ~40
+ *  (16 clubs × 2 feeds = 32, + setup, + **3** KV writes: SDP_SQUADS / REPORT / VERDICTS). The
+ *  matchday block then adds, worst case: `readOverrides` (1 KV read) + the scoreboard (1) + up to
+ *  MAX summaries + `writeOverrides` (1 KV write). So at MAX = N the run's worst case is ~40 + 3 + N.
+ *  At the old N = 6 that is ~49 — margin of ~1, not the "~4" the old comment claimed, and a
+ *  season-cache miss or a 17th club would tip it over 50 and fail the WHOLE nightly run.
+ *  N = 4 restores a ~3 margin. The cost is negligible: the loop stops the moment every question is
+ *  answered (both live 2026-08-03 specimens took TWO), and anything unresolved falls through to the
+ *  weekly routine — degrading across nights, never breaking. Re-check this arithmetic before raising
+ *  it or adding a 17th club. */
+const MATCHDAY_MAX_SUMMARIES = 4;
 
 // ── Types ────────────────────────────────────────────────────────────────────────
 
@@ -326,12 +327,23 @@ export function applyAutoRulings(
 			skipped.push({ espnAthleteId: id, reason: "owner pin in force — not overwritten" });
 			continue;
 		}
+		// ⚠️ CARRY FORWARD an IN-FORCE auto override's fields. This object REPLACES `existing`, so
+		// without this a jersey-only ruling (position unset) landing on a player who already has an
+		// auto POSITION override would DROP the position — and `pendingAdjudications` then suppresses
+		// her position mismatch for the full 90 days, because any active override hides it from the
+		// work list. New signings are exactly the cohort with both a blank jersey AND a wrong
+		// position, so the nightly matchday jersey pass makes that collision recurring. Preserving
+		// the in-force position (and vice versa for jersey) keeps both corrections alive; an EXPIRED
+		// override is not carried, so it correctly re-adjudicates.
+		const inForce = existing && existing.auto && Date.parse(existing.expiresAt) > now ? existing : undefined;
+		const position = r.position ?? inForce?.position;
+		const jersey = r.jersey ?? inForce?.jersey;
 		next[id] = {
 			espnAthleteId: id,
-			playerName: String(r.playerName ?? id),
-			teamAbbr: String(r.teamAbbr ?? ""),
-			...(hasPos ? { position: r.position } : {}),
-			...(hasJersey ? { jersey: r.jersey } : {}),
+			playerName: String(r.playerName ?? inForce?.playerName ?? id),
+			teamAbbr: String(r.teamAbbr ?? inForce?.teamAbbr ?? ""),
+			...(position != null ? { position } : {}),
+			...(jersey != null ? { jersey } : {}),
 			setAt: new Date(now).toISOString(),
 			expiresAt: overrideExpiry(now),
 			auto: true,
@@ -1017,7 +1029,9 @@ export async function runRosterTruth(env: RosterTruthEnv, emit: EmitBatch): Prom
 
 	// Answer what recent teamsheets can, BEFORE the weekly routine ever sees it. Best-effort by
 	// construction: a failure here must never fail the verification run, which has already been
-	// written above. Costs zero subrequests on a night with nothing pending.
+	// written above. On a night with nothing pending this spends just ONE KV read (`readOverrides`,
+	// which is needed to compute `pending`) and no fetches; only a night with an open jersey question
+	// spends the scoreboard + summaries + the write.
 	let matchdayResolved = 0;
 	let matchdayRead = 0;
 	try {

@@ -586,6 +586,52 @@ describe("applyAutoRulings — the server-side rules the routine's prompt is NOT
 		expect(accepted).toEqual(["sentnor"]);
 		expect(skipped).toHaveLength(3);
 	});
+
+	it("a JERSEY-only ruling PRESERVES an in-force auto position override (not drops it)", () => {
+		// ⚠️ The nightly matchday jersey pass resolves jerseys for the exact cohort — new signings —
+		// that also tend to carry a wrong ESPN position the weekly routine already corrected. A
+		// jersey-only ruling REPLACES the override object, so without a field carry-forward it would
+		// wipe the position, and pendingAdjudications would then hide that mismatch for 90 days.
+		const existing: import("../src/roster-truth").OverrideMap = {
+			harper: { espnAthleteId: "harper", playerName: "Khyah Harper", teamAbbr: "HOU",
+				position: "F", auto: true, source: "https://www.houstondynamofc.com/houstondash/roster/",
+				setAt: "", expiresAt: overrideExpiry(NOW) },
+		};
+		const { next, accepted } = applyAutoRulings(existing, [
+			rule({ espnAthleteId: "harper", playerName: "Khyah Harper", teamAbbr: "HOU",
+				position: undefined, jersey: 34,
+				source: "https://site.api.espn.com/apis/site/v2/sports/soccer/usa.nwsl/summary?event=401853959" }),
+		], NOW);
+		expect(accepted).toEqual(["harper"]);
+		expect(next.harper.jersey).toBe(34);          // the new fact landed
+		expect(next.harper.position).toBe("F");        // and the position survived
+	});
+
+	it("a POSITION-only ruling PRESERVES an in-force jersey, and both are symmetric", () => {
+		const existing: import("../src/roster-truth").OverrideMap = {
+			p: { espnAthleteId: "p", playerName: "P", teamAbbr: "BAY",
+				jersey: 7, auto: true, source: "https://x", setAt: "", expiresAt: overrideExpiry(NOW) },
+		};
+		const { next } = applyAutoRulings(existing, [
+			rule({ espnAthleteId: "p", playerName: "P", teamAbbr: "BAY", position: "M", jersey: undefined }),
+		], NOW);
+		expect(next.p.position).toBe("M");
+		expect(next.p.jersey).toBe(7);
+	});
+
+	it("an EXPIRED auto override is NOT carried forward — it re-adjudicates", () => {
+		const stale: import("../src/roster-truth").OverrideMap = {
+			p: { espnAthleteId: "p", playerName: "P", teamAbbr: "BAY",
+				position: "F", auto: true, source: "https://old",
+				setAt: "", expiresAt: new Date(NOW - 1000).toISOString() },
+		};
+		const { next } = applyAutoRulings(stale, [
+			rule({ espnAthleteId: "p", playerName: "P", teamAbbr: "BAY", position: undefined, jersey: 9,
+				source: "https://x" }),
+		], NOW);
+		expect(next.p.jersey).toBe(9);
+		expect(next.p.position).toBeUndefined();       // stale position dropped, mismatch re-surfaces
+	});
 });
 
 describe("pendingAdjudications", () => {
