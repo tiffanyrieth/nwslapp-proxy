@@ -249,6 +249,13 @@ const CLUB_NEWS: Record<string, ClubNewsSource> = {
 const BROWSER_UA =
 	"Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36";
 
+// ⚠️ ESPN bot rule (observed 2026-08-04): ESPN's site.api endpoints began returning 403 to requests
+// with NO User-Agent OR a browser-style UA, while accepting honest HTTP-client UAs. Our ESPN JSON
+// fetches had sent no UA since the proxy's first commit — a latent gap ESPN's change exposed, taking
+// the whole scoreboard/schedule down. `okhttp/4.9.0` (a real Android HTTP-client UA) returned 200 in
+// testing where empty/browser/CFNetwork-spoof UAs got 403. If ESPN later blocks this too, rotate it.
+const ESPN_UA = "okhttp/4.9.0";
+
 // Bluesky AT Protocol PUBLIC API (keyless, no auth) — backs the Feed's
 // reporter/league/team posts (and the team voices merged onto Home).
 const BSKY_PUBLIC = "https://public.api.bsky.app/xrpc";
@@ -949,7 +956,7 @@ async function proxyAndCache(
 	let espnResponse: Response;
 	try {
 		espnResponse = await fetch(upstream.toString(), {
-			headers: { Accept: "application/json" },
+			headers: { "User-Agent": ESPN_UA, Accept: "application/json" },
 		});
 	} catch {
 		const stale = await serveStale(cache, cacheKey);
@@ -3634,7 +3641,7 @@ async function handleNationalTeams(ctx: ExecutionContext): Promise<Response> {
 			try {
 				const res = await fetch(
 					`https://site.api.espn.com/apis/site/v2/sports/soccer/${slug}/teams`,
-					{ headers: { "User-Agent": "Mozilla/5.0 Chrome/120" } },
+					{ headers: { "User-Agent": ESPN_UA } },
 				);
 				if (!res.ok) return;
 				const data = (await res.json()) as {
@@ -4089,7 +4096,7 @@ async function handleRoster(url: URL, env: Env, ctx: ExecutionContext): Promise<
 	let liveCount = -1;
 	try {
 		const r = await fetch(ESPN_ROSTER(id), {
-			headers: { Accept: "application/json" },
+			headers: { "User-Agent": ESPN_UA, Accept: "application/json" },
 			cf: { cacheEverything: true, cacheTtlByStatus: { "200-299": ROSTER_EDGE_TTL, "404": 0, "500-599": 0 } },
 		});
 		if (r.ok) {
@@ -4262,7 +4269,7 @@ async function buildSpotlightCards(teams: string[], env: Env, ctx: ExecutionCont
  *  scoreboard fetch. Scans both competitors of every event; keeps the latest by date. */
 async function recentEventByTeam(year: number, wanted: Set<string>): Promise<Map<string, string>> {
 	const r = await fetch(`${ESPN_SCOREBOARD}?dates=${year}0101-${year}1231&limit=500`, {
-		headers: { Accept: "application/json" },
+		headers: { "User-Agent": ESPN_UA, Accept: "application/json" },
 	});
 	if (!r.ok) throw new Error(`scoreboard ${r.status}`);
 	const json = (await r.json()) as {
@@ -4290,7 +4297,7 @@ async function recentEventByTeam(year: number, wanted: Set<string>): Promise<Map
 
 /** One match's two team rosters from the summary endpoint. */
 async function fetchSummaryRosters(eventId: string): Promise<SummaryRoster[]> {
-	const r = await fetch(`${ESPN_SUMMARY}?event=${eventId}`, { headers: { Accept: "application/json" } });
+	const r = await fetch(`${ESPN_SUMMARY}?event=${eventId}`, { headers: { "User-Agent": ESPN_UA, Accept: "application/json" } });
 	if (!r.ok) throw new Error(`summary ${r.status}`);
 	const json = (await r.json()) as { rosters?: SummaryRoster[] };
 	return json.rosters ?? [];
@@ -4320,7 +4327,7 @@ export function pickWeekly(pool: SummaryRosterPlayer[], abbr: string, weekNum: n
 async function fetchAthleteSeasonStats(id: string, year: number): Promise<SpotlightStats | null> {
 	try {
 		const r = await fetch(`${ESPN_CORE}/seasons/${year}/types/1/athletes/${id}/statistics`, {
-			headers: { Accept: "application/json" },
+			headers: { "User-Agent": ESPN_UA, Accept: "application/json" },
 		});
 		if (!r.ok) return null;
 		const json = (await r.json()) as {
@@ -4346,7 +4353,7 @@ async function fetchAthleteSeasonStats(id: string, year: number): Promise<Spotli
  *  for anyone who came off the bench. Best-effort → {}. */
 async function fetchAthleteBio(id: string): Promise<{ age?: number; nationality?: string; position?: string }> {
 	try {
-		const r = await fetch(`${ESPN_CORE}/athletes/${id}`, { headers: { Accept: "application/json" } });
+		const r = await fetch(`${ESPN_CORE}/athletes/${id}`, { headers: { "User-Agent": ESPN_UA, Accept: "application/json" } });
 		if (!r.ok) return {};
 		const json = (await r.json()) as { age?: number; citizenship?: string; position?: { name?: string } };
 		return {
