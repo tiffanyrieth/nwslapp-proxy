@@ -54,6 +54,7 @@ export const ADMIN_PORTAL_HTML = `<!doctype html>
 <header><h1>NWSLApp — Admin</h1></header>
 <nav>
   <button class="on" data-tab="roster">Roster</button>
+  <button data-tab="status">Status</button>
   <button data-tab="bracket">The Bracket</button>
   <button data-tab="knowher">Know Her Game</button>
 </nav>
@@ -67,6 +68,7 @@ export const ADMIN_PORTAL_HTML = `<!doctype html>
   <div id="body"></div>
 </div>
 
+<div class="panel" id="status"><iframe data-src="/admin/status" title="Status"></iframe></div>
 <div class="panel" id="bracket"><iframe data-src="/bracket/admin" title="The Bracket admin"></iframe></div>
 <div class="panel" id="knowher"><iframe data-src="/knowher/admin" title="Know Her Game admin"></iframe></div>
 
@@ -75,13 +77,17 @@ const $ = (s) => document.querySelector(s);
 const esc = (s) => String(s ?? "").replace(/[&<>"]/g, (c) => ({ "&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;" }[c]));
 
 // Tabs. Iframes load LAZILY on first view so opening the portal doesn't spin up the
-// Bracket panel's polling before you've asked for it.
+// Bracket panel's polling before you've asked for it. EXCEPTION: the Status tab RELOADS on
+// every click (cache-busted) so it re-runs its live health check each time you open it.
 for (const b of document.querySelectorAll("nav button")) {
   b.onclick = () => {
     for (const x of document.querySelectorAll("nav button")) x.classList.toggle("on", x === b);
     for (const p of document.querySelectorAll(".panel")) p.classList.toggle("on", p.id === b.dataset.tab);
     const f = document.querySelector("#" + b.dataset.tab + " iframe");
-    if (f && !f.src) f.src = f.dataset.src;
+    if (f) {
+      if (b.dataset.tab === "status") f.src = f.dataset.src + "?t=" + Date.now(); // always re-run the check
+      else if (!f.src) f.src = f.dataset.src;                                     // others lazy-load once
+    }
   };
 }
 
