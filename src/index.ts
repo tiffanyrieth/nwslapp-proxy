@@ -196,6 +196,7 @@ const TEAM_SEED_VIDEO: Record<string, string> = {
 type ClubNewsSource =
 	| { kind: "rss"; url: string }
 	| { kind: "index"; url: string; articlePath: string }
+	| { kind: "api"; url: string } // a club JSON news API (e.g. NC's SDP dapi) → items mapped directly
 	| { kind: "fallback" };
 
 const CLUB_NEWS: Record<string, ClubNewsSource> = {
@@ -215,12 +216,14 @@ const CLUB_NEWS: Record<string, ClubNewsSource> = {
 	// host, dated via microdata (<meta itemprop="datePublished"> / <time>). Owner-flagged
 	// Jun 2026 (don't use /feed/).
 	DEN: { kind: "index", url: "https://www.denversummitfc.com/news/", articlePath: "/news/" },
-	// NC + POR are configured for their official index but currently auto-fall-back (NC's
-	// index lists only category links, not article slugs, in SSR HTML; thorns.com article
-	// pages carry no machine-readable date). The clubNewsFallback diag flags both — revisit
-	// if their sites expose article links / dates (then they promote to official with no
-	// config change).
-	NC: { kind: "index", url: "https://nccourage.com/news", articlePath: "/news/" },
+	// NC Courage is a Next.js/RSC site whose HTML carries NO article list (js-rendered), but its
+	// SDP `dapi` JSON API IS Worker-reachable and has everything inline → mapped directly by
+	// clubApiCards. (Found via the browser network tab, 2026-08; the /news HTML is a bot-shell.)
+	NC: { kind: "api", url: "https://www.nccourage.com/api/dapi/selection/latest-news" },
+	// POR (Portland/Webflow) is configured `index`, but LIVE it returns 0 and auto-falls-back to
+	// press: thorns.com serves the Worker's DATACENTER IP a JS-shell (no FinSweet data) even
+	// though residential IPs get the full SSR. So extractIndexDates works ONLY when fed the real
+	// HTML — POR needs the app-side device-IP fetch (dynamic fallback, Phase 2b), same as CHI.
 	POR: { kind: "index", url: "https://www.thorns.com/news", articlePath: "/news/" },
 	SEA: { kind: "index", url: "https://www.reignfc.com/news", articlePath: "/news/" },
 	// These three live on a shared PARENT domain under a club sub-path (owner-confirmed
@@ -230,18 +233,21 @@ const CLUB_NEWS: Record<string, ClubNewsSource> = {
 	UTA: { kind: "index", url: "https://www.rsl.com/utahroyals/news/", articlePath: "/utahroyals/news/" },
 	ORL: { kind: "index", url: "https://www.orlandocitysc.com/pride/news/", articlePath: "/pride/news/" },
 
-	// ── Outlet fallback (official site unusable → curated NWSL press, sourceType "news") ──
-	// GFC: gothamfc.com articles carry NO machine-readable date (no og:published / JSON-LD),
-	//      so they can't be dated/sorted reliably — press-sourced until they add one.
-	GFC: { kind: "fallback" },
-	// CHI: chicagostars.com/feed/ IS a valid, dated official WordPress RSS feed from a normal
-	// (residential) IP — but the Cloudflare Worker's datacenter IP still gets blocked/empty
-	// (re-tested Jun 30 2026: configured as `rss`, the Worker fetched 0 and auto-fell-back to
-	// press). So CHI stays on press fallback (sourceType "news") until the host stops blocking
-	// datacenter egress. Re-test by flipping to `{ kind: "rss", url: ".../feed/" }` + deploy.
-	CHI: { kind: "fallback" },
-	// BOS: brand-new Shopify site is JS-rendered with no feed (revisit when they add a news section).
-	BOS: { kind: "fallback" },
+	// GFC (Gotham/Sanity): article pages have NO machine date, but each index card shows a
+	// visible "August 2, 2026" that extractIndexDates reads → promoted from fallback to index
+	// (2026-08 audit — verified live).
+	GFC: { kind: "index", url: "https://www.gothamfc.com/news", articlePath: "/news/" },
+	// BOS (Boston/Shopify): Shopify auto-generates a per-blog Atom feed — the press blog is
+	// dated + structured (2026-08 audit — verified live). Promoted from fallback to rss.
+	BOS: { kind: "rss", url: "https://bostonlegacyfc.com/blogs/press.atom" },
+
+	// CHI: chicagostars.com/feed/ IS a valid dated WordPress RSS from a residential IP, but the
+	// Worker's datacenter IP is IP/ASN-blocked (BROWSER_UA doesn't help). Left as `rss` on
+	// PURPOSE: the Worker keeps trying (fails → press fallback), so the moment CHI stops blocking
+	// this auto-promotes to official with no change. Meanwhile the app's DEVICE-IP fallback
+	// (dynamic, Phase 2b) fetches this same feed from a residential IP and POSTs it to
+	// /club-news/normalize — so CHI followers get official news now, and it self-heals later.
+	CHI: { kind: "rss", url: "https://www.chicagostars.com/feed/" },
 };
 
 // A desktop-browser UA so article fetches get the full SSR'd HTML (with OG tags)
@@ -432,18 +438,14 @@ const NEWS_SCHEMA = {
 	required: ["verdicts"],
 };
 
-// Curated, API-VERIFIED Bluesky handles for the Feed (and the team voices merged
-// onto Home). Every handle was confirmed to currently return posts from the keyless
-// public AT-Proto API; dead/dormant candidates were dropped (GFC + BAY have no
-// active club account, DEN's is off-season-dormant — so 13 of 16 clubs). `kind`
-// drives layout + placement:
-//   reporter|league → blueskyReporter, placement "feed", isLeague true
-//   team            → blueskyTeam{Media,Text}, placement "both" (Home + Feed),
-//                     tagged with `abbr` (the app's club join key)
+// Curated, API-VERIFIED Bluesky handles for the Feed's reporters + league outlets.
+// Every handle was confirmed to currently return posts from the keyless public
+// AT-Proto API; dead/dormant candidates were dropped. All render as blueskyReporter,
+// placement "feed", isLeague true. (Club-official Bluesky was retired from the Feed
+// 2026-08 — the app's Clubs chip is gone; a club's Home voice is its IG/YT/news.)
 interface FeedHandle {
 	handle: string;
-	kind: "reporter" | "league" | "team";
-	abbr?: string;
+	kind: "reporter" | "league";
 }
 const FEED_HANDLES: FeedHandle[] = [
 	// Reporters / journalists (league-wide)
@@ -452,26 +454,21 @@ const FEED_HANDLES: FeedHandle[] = [
 	{ handle: "sandraherrera.bsky.social", kind: "reporter" },
 	{ handle: "pcattry.bsky.social", kind: "reporter" },
 	{ handle: "katiewhyatt.bsky.social", kind: "reporter" },
+	// Added 2026-08 audit — each verified active on the keyless AT-Proto API. Haiku still
+	// gates every post to NWSL + the reader's followed teams, so all-soccer writers (Rueter,
+	// Tannenwald) only surface on their NWSL/USWNT items.
+	{ handle: "scoutripley.bsky.social", kind: "reporter" }, // Claire Watkins (Just Women's Sports / The Late Sub)
+	{ handle: "jennatonelli.bsky.social", kind: "reporter" }, // Jenna Tonelli (SI / broadcast)
+	{ handle: "caitlinmurr.bsky.social", kind: "reporter" }, // Caitlin Murray (ESPN; "The National Team" author)
+	{ handle: "jeffrueter.bsky.social", kind: "reporter" }, // Jeff Rueter (The Athletic)
+	{ handle: "jtannenwald.bsky.social", kind: "reporter" }, // Jonathan Tannenwald (Philadelphia Inquirer)
+	{ handle: "girlssoccernetwork.bsky.social", kind: "reporter" }, // Girls Soccer Network (outlet)
 	// League / official outlets
 	{ handle: "nwslsoccer.com", kind: "league" },
 	{ handle: "equalizersoccer.bsky.social", kind: "league" },
 	{ handle: "nwslthisweek.bsky.social", kind: "league" },
 	{ handle: "nwslstat.bsky.social", kind: "league" },
 	{ handle: "allforxi.bsky.social", kind: "league" },
-	// Official club accounts (13 of 16 verified active)
-	{ handle: "angelcity.com", kind: "team", abbr: "LA" },
-	{ handle: "bostonlegacyfc.com", kind: "team", abbr: "BOS" },
-	{ handle: "chicagostars.com", kind: "team", abbr: "CHI" },
-	{ handle: "houstondash.com", kind: "team", abbr: "HOU" },
-	{ handle: "thekccurrent.bsky.social", kind: "team", abbr: "KC" },
-	{ handle: "racingloufc.com", kind: "team", abbr: "LOU" },
-	{ handle: "nccourage.com", kind: "team", abbr: "NC" },
-	{ handle: "orlpride.com", kind: "team", abbr: "ORL" },
-	{ handle: "thornsfc.com", kind: "team", abbr: "POR" },
-	{ handle: "sandiegowavefc.com", kind: "team", abbr: "SD" },
-	{ handle: "reignfc.com", kind: "team", abbr: "SEA" },
-	{ handle: "utahroyalsfc.com", kind: "team", abbr: "UTA" },
-	{ handle: "washingtonspirit.com", kind: "team", abbr: "WAS" },
 ];
 
 // ---------------------------------------------------------------------------
@@ -721,6 +718,11 @@ export default {
 		if (url.pathname === "/playoff-override") {
 			return handlePlayoffOverride(request, url, env as unknown as { FEED_TAGS: KVNamespace; BRACKET_ADMIN_KEY?: string });
 		}
+		// The device-IP club-news fallback POSTs residentially-fetched bytes here (Phase 2b) — a
+		// POST route, so it MUST precede the GET-only guard.
+		if (url.pathname === "/club-news/normalize") {
+			return handleClubNewsNormalize(request, url);
+		}
 
 		// All other routes are GET-only; reject early so the 405 is shared.
 		if (request.method !== "GET") {
@@ -768,6 +770,15 @@ export default {
 		}
 		if (url.pathname === "/feed") {
 			return handleFeed(url, env, ctx);
+		}
+		if (url.pathname === "/feed/players") {
+			return handlePlayerDirectory();
+		}
+		if (url.pathname === "/feed/validate-reporter") {
+			return handleValidateReporter(url, env, ctx);
+		}
+		if (url.pathname === "/club-news/sources") {
+			return handleClubNewsSources();
 		}
 		if (url.pathname === "/spotlight") {
 			return handleSpotlight(url, env, ctx);
@@ -1406,6 +1417,7 @@ async function clubNewsFor(abbr: string, env: Env, ctx: ExecutionContext): Promi
 	try {
 		if (src.kind === "rss") cards = await clubRssCards(abbr, src.url);
 		else if (src.kind === "index") cards = await clubIndexCards(abbr, src.url, src.articlePath);
+		else if (src.kind === "api") cards = await clubApiCards(abbr, src.url);
 		// kind === "fallback": handled by the outlet-fallback path below.
 	} catch {
 		cards = [];
@@ -1441,15 +1453,93 @@ async function clubNewsFor(abbr: string, env: Env, ctx: ExecutionContext): Promi
 	return cards;
 }
 
+/** GET /club-news/sources — each club's official news source (abbr, kind, url). Backs the app's
+ *  DYNAMIC device-IP fallback (Phase 2b): when the proxy returns no official news for a followed
+ *  club (a datacenter-IP block like CHI), the app looks up the club's URL here, fetches it from
+ *  the device's residential IP, and POSTs the bytes to /club-news/normalize. Only clubs with a
+ *  url (rss/index/api). */
+function handleClubNewsSources(): Response {
+	const sources = Object.entries(CLUB_NEWS)
+		.filter(([, s]) => "url" in s)
+		.map(([abbr, s]) => ({ abbr, kind: s.kind, url: (s as { url: string }).url }));
+	const headers = new Headers({ "Content-Type": "application/json" });
+	headers.set("Cache-Control", "public, max-age=3600");
+	return new Response(JSON.stringify(sources), { status: 200, headers });
+}
+
+/** POST /club-news/normalize?abbr=CHI — the device-IP fallback's brains. The app fetched the
+ *  club's RSS from a residential IP (bypassing the datacenter block) and POSTs the raw bytes; we
+ *  parse them into cards with the SAME logic the proxy uses. RSS-only today (the clean case that
+ *  covers CHI + any future RSS-blocked club); an index-blocked club (POR) needs per-article OG
+ *  which its own site also blocks, so it isn't supported here — it stays on press fallback. The
+ *  user's own device is the only caller and the cards land only in that user's feed. */
+async function handleClubNewsNormalize(request: Request, url: URL): Promise<Response> {
+	const abbr = (url.searchParams.get("abbr") ?? "").toUpperCase();
+	const src = CLUB_NEWS[abbr];
+	if (!src || (src.kind !== "rss" && src.kind !== "index")) return jsonResponse([], 200);
+	const body = await request.text();
+	if (!body || body.length > 900_000) return jsonResponse([], 200); // size-cap a hostile/huge POST
+	// No OG-enrich: the club's OWN pages are the very thing the Worker is blocked from, so an
+	// OG-scrape would just waste fetches on shells. Cards carry whatever's inline (RSS image / none).
+	const cards = src.kind === "rss"
+		? rssTextToClubCards(abbr, body)
+		: indexHtmlToClubCards(abbr, body, src.url, src.articlePath);
+	return jsonResponse(cards, 200);
+}
+
+/** Parse an already-fetched club NEWS INDEX (HTML) into cards — for the device-IP fallback on an
+ *  index-kind club that shells the Worker but SSRs the full page to a residential IP (POR/Webflow,
+ *  2026-08). Everything is in the index card: the article link + a TITLE-text anchor
+ *  (`<a href="/news/…">Title</a>`, ≥10 chars — the cover link holds an <img>, no text) + a hidden
+ *  FinSweet `fs-cmssort-field="date"` ISO (via extractIndexDates). No per-article fetch (the club's
+ *  article pages are Worker-blocked too). `sourceUrl` gives the origin for absolute links. */
+function indexHtmlToClubCards(abbr: string, html: string, sourceUrl: string, articlePath: string): NewsCard[] {
+	let origin = "";
+	try { origin = new URL(sourceUrl).origin; } catch { return []; }
+	const name = CLUB_SOCIAL[abbr]?.name ?? abbr;
+	const dates = extractIndexDates(html, articlePath);
+	const esc = articlePath.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+	const re = new RegExp(`<a\\b[^>]*href="(${esc}[^"?#]+)"[^>]*>\\s*([^<]{10,})\\s*</a>`, "gi");
+	const cards: NewsCard[] = [];
+	const seen = new Set<string>();
+	let m: RegExpExecArray | null;
+	while ((m = re.exec(html)) !== null) {
+		const path = m[1].replace(/\/$/, "");
+		if (seen.has(path)) continue;
+		seen.add(path);
+		const title = decodeBasicEntities(m[2]).replace(/\s+/g, " ").trim();
+		const timestamp = dates.get(path);
+		if (!title || !timestamp || isPlaceholderArticle(title)) continue;
+		cards.push(clubNewsCard(abbr, origin + path, title, undefined, name, undefined, timestamp, "club"));
+		if (cards.length >= CLUBNEWS_PER_CLUB) break;
+	}
+	return cards;
+}
+
+/** Decode the handful of HTML entities a scraped title actually carries. */
+function decodeBasicEntities(s: string): string {
+	return s
+		.replace(/&amp;/g, "&").replace(/&#0?39;/g, "'").replace(/&#8217;/g, "’")
+		.replace(/&quot;/g, '"').replace(/&#8211;/g, "–").replace(/&#8212;/g, "—")
+		.replace(/&lt;/g, "<").replace(/&gt;/g, ">");
+}
+
 /** Strategy: the club's own RSS/Atom feed → cards (structured, dated; no scraping). */
 async function clubRssCards(abbr: string, url: string): Promise<NewsCard[]> {
 	const r = await fetch(url, {
 		headers: { "User-Agent": BROWSER_UA, Accept: "application/rss+xml, application/xml, text/xml" },
 	});
 	if (!r.ok) return [];
+	return rssTextToClubCards(abbr, await r.text());
+}
+
+/** Parse an already-fetched RSS/Atom body into club cards. Split out from clubRssCards so the
+ *  device-fallback (POST /club-news/normalize) can reuse it on bytes the APP fetched from a
+ *  residential IP when the Worker's datacenter IP is blocked (e.g. CHI). */
+function rssTextToClubCards(abbr: string, xml: string): NewsCard[] {
 	const name = CLUB_SOCIAL[abbr]?.name ?? abbr;
 	const cards: NewsCard[] = [];
-	for (const it of parseOutletRSS(await r.text())) {
+	for (const it of parseOutletRSS(xml)) {
 		const timestamp = isoNoFraction(it.pubDate);
 		if (!timestamp) continue; // undatable → skip rather than fake "now"
 		if (isPlaceholderArticle(it.title)) continue; // stub-site default post → not real news
@@ -1465,13 +1555,17 @@ async function clubRssCards(abbr: string, url: string): Promise<NewsCard[]> {
 async function clubIndexCards(abbr: string, indexUrl: string, articlePath: string): Promise<NewsCard[]> {
 	const r = await fetch(indexUrl, { headers: { "User-Agent": BROWSER_UA, Accept: "text/html" } });
 	if (!r.ok) return [];
-	const links = extractArticleLinks(await r.text(), indexUrl, articlePath);
+	const html = await r.text();
+	const links = extractArticleLinks(html, indexUrl, articlePath);
+	// Fallback dates for platforms whose article pages carry no machine date but whose index
+	// cards do (Gotham/Sanity, Portland/Webflow) — empty for clubs that date off the article.
+	const indexDates = extractIndexDates(html, articlePath);
 	const name = CLUB_SOCIAL[abbr]?.name ?? abbr;
 	const built = await Promise.all(
 		links.map(async (link) => {
 			try {
 				const og = await fetchOG(link);
-				const timestamp = isoNoFraction(og.published);
+				const timestamp = isoNoFraction(og.published) ?? indexDates.get(new URL(link).pathname.replace(/\/$/, ""));
 				if (!og.title || !timestamp || isPlaceholderArticle(og.title)) return null;
 				return clubNewsCard(abbr, link, og.title, og.description, name, og.image, timestamp, "club");
 			} catch {
@@ -1480,6 +1574,32 @@ async function clubIndexCards(abbr: string, indexUrl: string, articlePath: strin
 		}),
 	);
 	return built.filter((c): c is NewsCard => c !== null).slice(0, CLUBNEWS_PER_CLUB);
+}
+
+/** Strategy: a club's JSON news API. NC Courage is a Next.js/RSC site whose HTML carries no
+ *  article list, but its SDP `dapi` endpoint (`/api/dapi/selection/latest-news`) returns clean
+ *  JSON that IS reachable from the Worker (unlike the bot-shell HTML), with everything inline:
+ *  `title`, `url`, `contentDate`, `summary`, and a `thumbnail.templateUrl` (a Cloudinary URL with
+ *  a `{formatInstructions}` size slot). Map items → cards directly; no per-article OG scrape. */
+async function clubApiCards(abbr: string, url: string): Promise<NewsCard[]> {
+	const r = await fetch(url, { headers: { "User-Agent": BROWSER_UA, Accept: "application/json" } });
+	if (!r.ok) return [];
+	const data = (await r.json()) as { items?: Array<Record<string, unknown>> };
+	const name = CLUB_SOCIAL[abbr]?.name ?? abbr;
+	const cards: NewsCard[] = [];
+	for (const it of data.items ?? []) {
+		if (typeof it.type === "string" && it.type !== "story") continue; // articles only, not photo/video widgets
+		const title = typeof it.title === "string" ? it.title : undefined;
+		const link = typeof it.url === "string" ? it.url : undefined;
+		const timestamp = isoNoFraction(typeof it.contentDate === "string" ? it.contentDate : undefined);
+		if (!title || !link || !timestamp || isPlaceholderArticle(title)) continue;
+		const summary = typeof it.summary === "string" ? it.summary : undefined;
+		const thumb = it.thumbnail as { templateUrl?: string; thumbnailUrl?: string } | undefined;
+		const image = thumb?.templateUrl?.replace("{formatInstructions}", "t_w_768") ?? thumb?.thumbnailUrl;
+		cards.push(clubNewsCard(abbr, link, title, summary, name, image, timestamp, "club"));
+		if (cards.length >= CLUBNEWS_PER_CLUB) break;
+	}
+	return cards;
 }
 
 /** Strategy / fallback: a club's recent news filtered from the curated NWSL outlet RSS
@@ -1605,6 +1725,59 @@ export function extractArticleLinks(html: string, indexUrl: string, articlePath:
 		if (seen.has(u)) continue;
 		seen.add(u);
 		out.push(u);
+	}
+	return out;
+}
+
+const MONTH_NUM: Record<string, number> = (() => {
+	const full = "january february march april may june july august september october november december".split(" ");
+	const m: Record<string, number> = {};
+	full.forEach((name, i) => {
+		m[name] = i + 1;
+		m[name.slice(0, 3)] = i + 1; // 3-letter abbreviations (Jul, Aug, Sept→sep)
+	});
+	m["sept"] = 9;
+	return m;
+})();
+
+/** The first publish date found in a chunk of index HTML, as a strict `…Z` datetime at
+ *  noon UTC (date-only sources have no time; noon keeps same-day ordering sane). Tries a
+ *  machine field first (Webflow/FinSweet hidden `fs-cmssort-field="date">2026-07-31`), then
+ *  a visible "August 2, 2026" / "Jul 31, 2026". Returns undefined if neither is present. */
+function firstIndexDate(block: string): string | undefined {
+	const iso = block.match(/fs-cmssort-field="date"[^>]*>\s*(20\d\d-\d\d-\d\d)/);
+	if (iso) return `${iso[1]}T12:00:00Z`;
+	const vis = block.match(/\b([A-Z][a-z]{2,8}) (\d{1,2}), (20\d\d)\b/);
+	if (vis) {
+		const mo = MONTH_NUM[vis[1].toLowerCase()];
+		if (mo) return `${vis[3]}-${String(mo).padStart(2, "0")}-${String(Number(vis[2])).padStart(2, "0")}T12:00:00Z`;
+	}
+	return undefined;
+}
+
+/** Map each index article link → its publish date, for platforms whose ARTICLE pages carry
+ *  no machine-readable date but whose INDEX cards do (Gotham's Sanity site shows a visible
+ *  date per card; Portland's Webflow/FinSweet grid carries a hidden ISO sort field). Keys are
+ *  the article PATHNAME (trailing slash stripped) to match `clubIndexCards`. Used ONLY as a
+ *  fallback when `fetchOG` finds no date, so it can't disturb clubs that date fine off their
+ *  article pages (their index carries neither pattern → empty map → no-op). Exported for tests. */
+export function extractIndexDates(html: string, articlePath: string): Map<string, string> {
+	const links: { pos: number; path: string }[] = [];
+	const seen = new Set<string>();
+	const esc = articlePath.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+	const re = new RegExp(`href="(${esc}[^"?#]+)"`, "gi");
+	let m: RegExpExecArray | null;
+	while ((m = re.exec(html)) !== null) {
+		const path = m[1].replace(/\/$/, "");
+		if (seen.has(path)) continue;
+		seen.add(path);
+		links.push({ pos: m.index, path });
+	}
+	const out = new Map<string, string>();
+	for (let i = 0; i < links.length; i++) {
+		const end = i + 1 < links.length ? links[i + 1].pos : Math.min(html.length, links[i].pos + 3000);
+		const d = firstIndexDate(html.slice(links[i].pos, end));
+		if (d) out.set(links[i].path, d);
 	}
 	return out;
 }
@@ -2349,6 +2522,21 @@ function normalizeTeams(raw: string | null): string[] {
 	].sort();
 }
 
+// Phase 3 "make it yours": a comma-separated, lowercased, de-duped handle/id list from a
+// query param (user-added Bluesky reporters via `handles`, followed player IG ids via
+// `players`). Sorted so the /feed cache key is stable regardless of the order the app sends.
+const MAX_USER_HANDLES = 20; // cap the per-request Bluesky fan-out a user can trigger
+function parseHandleList(raw: string | null): string[] {
+	return [
+		...new Set(
+			(raw ?? "")
+				.split(",")
+				.map((h) => h.trim().toLowerCase().replace(/^@/, ""))
+				.filter(Boolean),
+		),
+	].sort();
+}
+
 /** Sort built ContentCards newest-first by their ISO `timestamp` string. */
 function byTimestampDesc(a: unknown, b: unknown): number {
 	return ((a as Card).timestamp ?? "") < ((b as Card).timestamp ?? "") ? 1 : -1;
@@ -2389,10 +2577,20 @@ export function dedupeByContent(cards: unknown[]): unknown[] {
 // ---------------------------------------------------------------------------
 async function handleFeed(url: URL, env: Env, ctx: ExecutionContext): Promise<Response> {
 	const teams = normalizeTeams(url.searchParams.get("teams"));
+	// Phase 3 "make it yours": the user's added Bluesky reporter handles + followed player
+	// IG ids. Both personalize the feed and are folded into the cache key below.
+	const userHandles = parseHandleList(url.searchParams.get("handles")).slice(0, MAX_USER_HANDLES);
+	const userPlayers = new Set(parseHandleList(url.searchParams.get("players")));
 
 	const cache = caches.default;
 	const cacheUrl = new URL(url);
 	cacheUrl.searchParams.set("teams", teams.join(","));
+	// Normalize the personalization params into the cache key so one user's picks never
+	// leak into another's feed AND send-order variance doesn't fragment the cache.
+	if (userHandles.length) cacheUrl.searchParams.set("handles", userHandles.join(","));
+	else cacheUrl.searchParams.delete("handles");
+	if (userPlayers.size) cacheUrl.searchParams.set("players", [...userPlayers].sort().join(","));
+	else cacheUrl.searchParams.delete("players");
 	const cacheKey = new Request(cacheUrl.toString(), { method: "GET" });
 
 	const hit = await cache.match(cacheKey);
@@ -2406,31 +2604,40 @@ async function handleFeed(url: URL, env: Env, ctx: ExecutionContext): Promise<Re
 		// a total Bluesky outage.
 		const reporterHandles = FEED_HANDLES.filter((h) => h.kind === "reporter");
 		const leagueHandles = FEED_HANDLES.filter((h) => h.kind === "league");
-		const [rawReporters, rawLeague, teamCards, newsCards, social] = await Promise.all([
+		// Phase 3 "make it yours": the user's own-added Bluesky reporters, fetched alongside
+		// the curated set (per-handle failures isolated in blueskyCardsFor).
+		const userReporterHandles: FeedHandle[] = userHandles.map((h) => ({ handle: h, kind: "reporter" }));
+		const [rawReporters, rawLeague, rawUserReporters, newsCards, social] = await Promise.all([
 			buildBlueskyCards(reporterHandles),
 			buildBlueskyCards(leagueHandles),
-			buildTeamBlueskyCards(teams),
+			buildBlueskyCards(userReporterHandles),
 			// News (B1): per-outlet RSS → Haiku NWSL-gate + team-tag + followed-team
 			// filter → OG-enrich → newsArticle cards. Self-isolating; failures yield [].
 			buildNewsCards(teams, env, ctx),
-			// Social (B3b): the cron-built IG snapshot; here we take the player
-			// clips (placement "feed") routed to the followed teams. Club Bluesky is
-			// already in teamCards (now placement "feed" too).
+			// Social (B3b): the cron-built IG snapshot; here we take the player clips
+			// (placement "feed") for the followed teams PLUS the user's followed cross-team
+			// players. (Club-official Bluesky was retired from the Feed 2026-08.)
 			readSocialCards(env),
 		]);
 		// Reporter + league-outlet Bluesky carry no team tag of their own and post
 		// off-topic too → one Haiku pass gates relevance, team-tags, and filters to
-		// the followed teams (classifySocialBluesky). Club-official Bluesky (teamCards)
-		// and player IG (playerSocial) are trusted fast paths — already team-tagged,
-		// no Haiku. News is gated+filtered inside buildNewsCards.
+		// the followed teams (classifySocialBluesky). Player IG (playerSocial) is a
+		// trusted fast path — already team-tagged, no Haiku. News is gated+filtered
+		// inside buildNewsCards.
 		const socialBluesky = await classifySocialBluesky(
 			[...rawReporters, ...rawLeague],
 			teams,
 			env,
 			ctx,
 		);
-		const playerSocial = socialFor(social, teams, new Set(["feed"]));
-		cards = [...socialBluesky, ...teamCards, ...newsCards, ...playerSocial].sort(
+		// User-added reporters are NWSL-gated but NOT team-scoped — the user chose them, so
+		// keep every NWSL post (pass the full team set so decideFeedItem never drops a post
+		// just because its club isn't one the user follows).
+		const userReporterCards = rawUserReporters.length
+			? await classifySocialBluesky(rawUserReporters, [...NEWS_TEAM_ABBR_SET], env, ctx)
+			: [];
+		const playerSocial = socialFor(social, teams, new Set(["feed"]), userPlayers);
+		cards = [...socialBluesky, ...userReporterCards, ...newsCards, ...playerSocial].sort(
 			byTimestampDesc,
 		);
 		// Collapse identical-text duplicates (bot double-posts) BEFORE the cap, so a
@@ -2451,18 +2658,44 @@ async function handleFeed(url: URL, env: Env, ctx: ExecutionContext): Promise<Re
 	return withCacheStatus(toCache, "MISS");
 }
 
-/** Build cards for a set of Bluesky handles (per-handle failures isolated). */
-async function buildBlueskyCards(handles: FeedHandle[]): Promise<unknown[]> {
-	const per = await Promise.all(handles.map((h) => blueskyCardsFor(h)));
-	return per.flat();
+/** GET /feed/players — the DIRECTORY of the featured players (Phase 3 "Follow players").
+ *  The app only receives followed-team player cards on /feed, so it needs this to browse
+ *  them all + follow across team lines. Served from PLAYER_SOCIAL (the same pool the 6-month
+ *  routine keeps current) so it's always fresh and the app stays thin. `id` is the IG handle
+ *  — the stable key the app sends back in /feed's `players` param. */
+function handlePlayerDirectory(): Response {
+	const players = PLAYER_SOCIAL.map((p) => ({ id: p.ig, name: p.name, team: p.abbr }));
+	const headers = new Headers({ "Content-Type": "application/json" });
+	headers.set("Cache-Control", "public, max-age=3600"); // static until the next deploy
+	return new Response(JSON.stringify(players), { status: 200, headers });
 }
 
-/** A followed club's own Bluesky posts (placement "feed" — Feed "Social" only, as
- *  of B3b). Empty when no teams are requested or none have a curated handle. */
-async function buildTeamBlueskyCards(teams: string[]): Promise<unknown[]> {
-	if (teams.length === 0) return [];
-	const wanted = new Set(teams);
-	const handles = FEED_HANDLES.filter((h) => h.kind === "team" && h.abbr && wanted.has(h.abbr));
+/** GET /feed/validate-reporter?handle=… — Phase 3 "Add a reporter". Confirms a Bluesky
+ *  account resolves on the keyless API, and whether it has NWSL-relevant posts recently (the
+ *  same Haiku gate the feed uses, run over the full team set so any NWSL post counts — user-
+ *  added handles are never team-scoped). `found` = the account resolves; `hasNWSLPosts` = at
+ *  least one recent post survived the gate. Never throws to the caller — a bad handle returns
+ *  { found: false }. */
+async function handleValidateReporter(url: URL, env: Env, ctx: ExecutionContext): Promise<Response> {
+	const raw = url.searchParams.get("handle")?.trim().toLowerCase().replace(/^@/, "") ?? "";
+	if (!raw) return jsonResponse({ found: false }, 200);
+	let feed: BskyItem[];
+	try {
+		feed = await bskyAuthorFeed(raw, POSTS_PER_HANDLE);
+	} catch {
+		return jsonResponse({ found: false }, 200); // account doesn't resolve
+	}
+	const displayName = feed.find((it) => it.post?.author)?.post?.author?.displayName || raw;
+	const cards = feed
+		.filter((it) => !it.reason && it.post?.record?.text)
+		.map((it) => mapBskyPost(it.post as BskyPost, { handle: raw, kind: "reporter" }))
+		.filter(Boolean);
+	const kept = cards.length ? await classifySocialBluesky(cards, [...NEWS_TEAM_ABBR_SET], env, ctx) : [];
+	return jsonResponse({ found: true, displayName, handle: `@${raw}`, hasNWSLPosts: kept.length > 0 }, 200);
+}
+
+/** Build cards for a set of Bluesky handles (per-handle failures isolated). */
+async function buildBlueskyCards(handles: FeedHandle[]): Promise<unknown[]> {
 	const per = await Promise.all(handles.map((h) => blueskyCardsFor(h)));
 	return per.flat();
 }
@@ -2526,22 +2759,19 @@ function mapBskyPost(post: BskyPost, h: FeedHandle): unknown | null {
 
 	const rkey = uri.split("/").pop();
 	const image = extractBskyImage(post.embed);
-	const isTeam = h.kind === "team";
-	const layout = isTeam ? (image ? "blueskyTeamMedia" : "blueskyTeamText") : "blueskyReporter";
 
 	return {
 		id: `bsky-${rkey}`,
-		layout,
+		layout: "blueskyReporter",
 		platform: "bluesky",
-		// Source class for the app's Feed chips (Clubs · Reporters · …). Players come
-		// from the IG pipe; here it's club-official / reporter / league-outlet.
-		sourceType: isTeam ? "club" : h.kind === "league" ? "league" : "reporter",
-		// B3b: ALL Bluesky now lives in the Feed only (was "both" for team posts). The
-		// club's Home voice is its IG now; club Bluesky is its real-time/social
-		// voice → Feed "Social". teamAbbreviation still scopes a team post to followers.
+		// Source class for the app's Feed chips (Reporters · …). Players come from the
+		// IG pipe; here it's reporter / league-outlet (club-official Bluesky retired).
+		sourceType: h.kind === "league" ? "league" : "reporter",
+		// Reporters + league outlets are league-wide (no team tag of their own; Haiku
+		// team-tags + scopes them downstream). All Bluesky lives in the Feed only.
 		placement: "feed",
-		teamAbbreviation: isTeam ? h.abbr : undefined,
-		isLeague: !isTeam, // reporters + league outlets are league-wide
+		teamAbbreviation: undefined,
+		isLeague: true,
 		authorName: post.author?.displayName || handle,
 		handle: `@${handle}`,
 		bodyText: post.record?.text,
@@ -2995,16 +3225,27 @@ async function readSocialCards(env: Env): Promise<unknown[]> {
 
 /** Filter the social snapshot to the requested teams + the allowed placements
  *  (Home wants "home", Feed wants "feed"). */
-function socialFor(cards: unknown[], teams: string[], placements: Set<string>): unknown[] {
-	if (teams.length === 0) return [];
+export function socialFor(
+	cards: unknown[],
+	teams: string[],
+	placements: Set<string>,
+	extraPlayers: Set<string> = new Set(),
+): unknown[] {
+	if (teams.length === 0 && extraPlayers.size === 0) return [];
 	const wanted = new Set(teams);
-	return (cards as Array<{ teamAbbreviation?: string; placement?: string }>).filter(
-		(c) =>
-			!!c.placement &&
-			placements.has(c.placement) &&
-			!!c.teamAbbreviation &&
-			wanted.has(c.teamAbbreviation),
-	);
+	return (
+		cards as Array<{ teamAbbreviation?: string; placement?: string; handle?: string; sourceType?: string }>
+	).filter((c) => {
+		if (!c.placement || !placements.has(c.placement)) return false;
+		// A followed-team card…
+		if (c.teamAbbreviation && wanted.has(c.teamAbbreviation)) return true;
+		// …or a player the user follows across team lines (card `handle` is "@<ig>",
+		// matched against the followed player-id set, Phase 3).
+		if (extraPlayers.size > 0 && c.sourceType === "player" && c.handle) {
+			return extraPlayers.has(c.handle.replace(/^@/, "").toLowerCase());
+		}
+		return false;
+	});
 }
 
 /**

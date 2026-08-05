@@ -1,11 +1,37 @@
 import { describe, it, expect } from "vitest";
 import {
 	extractArticleLinks,
+	extractIndexDates,
 	isPlaceholderArticle,
 	extractJsonLdArticle,
 	decideFeedItem,
 	centersNonNWSLLeague,
+	socialFor,
 } from "../src/index";
+
+describe("socialFor — Phase 3 cross-team player follow", () => {
+	const cards = [
+		{ placement: "feed", sourceType: "player", teamAbbreviation: "WAS", handle: "@trinity_rodman" },
+		{ placement: "feed", sourceType: "player", teamAbbreviation: "SD", handle: "@naomi_girma" },
+		{ placement: "feed", sourceType: "player", teamAbbreviation: "POR", handle: "@sophiawilson" },
+		{ placement: "home", sourceType: "player", teamAbbreviation: "SD", handle: "@naomi_girma" }, // wrong placement
+	];
+	it("returns followed-team players, no extras", () => {
+		const out = socialFor(cards, ["SD"], new Set(["feed"])) as Array<{ handle: string }>;
+		expect(out.map((c) => c.handle)).toEqual(["@naomi_girma"]);
+	});
+	it("adds a cross-team followed player (matched by @ig handle) regardless of team", () => {
+		const out = socialFor(cards, ["SD"], new Set(["feed"]), new Set(["trinity_rodman"])) as Array<{ handle: string }>;
+		expect(out.map((c) => c.handle).sort()).toEqual(["@naomi_girma", "@trinity_rodman"]);
+	});
+	it("honors placement even for a followed cross-team player", () => {
+		const out = socialFor(cards, [], new Set(["feed"]), new Set(["naomi_girma"])) as Array<{ handle: string }>;
+		expect(out.map((c) => c.handle)).toEqual(["@naomi_girma"]); // the home-placement dup is excluded
+	});
+	it("empty teams + empty extras = nothing", () => {
+		expect(socialFor(cards, [], new Set(["feed"]))).toEqual([]);
+	});
+});
 
 describe("centersNonNWSLLeague — foreign-league relevance backstop", () => {
 	it("drops a post centering a non-NWSL league with no NWSL signal", () => {
@@ -62,6 +88,33 @@ describe("extractArticleLinks", () => {
 	it("dedupes", () => {
 		const dupes = links.filter((l) => l.endsWith("/news/match-day-thread-vs-courage"));
 		expect(dupes.length).toBe(1);
+	});
+});
+
+describe("extractIndexDates — dates from the index when article pages have none", () => {
+	it("reads a visible 'August 2, 2026' inside each card (Gotham/Sanity shape)", () => {
+		const html = `
+			<a href="/news/gotham-win"><img src="a.jpg"/><div class="date">August 2, 2026</div><h3>Gotham Win</h3></a>
+			<a href="/news/gotham-draw"><img src="b.jpg"/><div class="date">August 1, 2026</div><h3>Gotham Draw</h3></a>`;
+		const m = extractIndexDates(html, "/news/");
+		expect(m.get("/news/gotham-win")).toBe("2026-08-02T12:00:00Z");
+		expect(m.get("/news/gotham-draw")).toBe("2026-08-01T12:00:00Z");
+	});
+	it("reads a hidden FinSweet ISO sort field (Portland/Webflow shape) and abbreviated months", () => {
+		const html = `
+			<article><a href="/news/thorns-win">Cover</a><a href="/news/thorns-win">Learn More</a>
+				<div class="hidden"><div fs-cmssort-field="date" class="meta">2026-07-31</div></div>
+				<div class="meta">Jul 31, 2026</div></article>
+			<article><a href="/news/thorns-draw">Cover</a>
+				<div class="hidden"><div fs-cmssort-field="date" class="meta">2026-07-24</div></div></article>`;
+		const m = extractIndexDates(html, "/news/");
+		expect(m.get("/news/thorns-win")).toBe("2026-07-31T12:00:00Z");
+		expect(m.get("/news/thorns-draw")).toBe("2026-07-24T12:00:00Z");
+	});
+	it("omits an article with no extractable date, and ignores date-like image filenames", () => {
+		const html = `<a href="/news/no-date"><img src="hero-2026-08-15-crop.jpg"/><h3>No Date Here</h3></a>`;
+		const m = extractIndexDates(html, "/news/");
+		expect(m.has("/news/no-date")).toBe(false);
 	});
 });
 
