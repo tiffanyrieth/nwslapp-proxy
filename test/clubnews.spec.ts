@@ -6,7 +6,32 @@ import {
 	extractJsonLdArticle,
 	decideFeedItem,
 	centersNonNWSLLeague,
+	socialFor,
 } from "../src/index";
+
+describe("socialFor — Phase 3 cross-team player follow", () => {
+	const cards = [
+		{ placement: "feed", sourceType: "player", teamAbbreviation: "WAS", handle: "@trinity_rodman" },
+		{ placement: "feed", sourceType: "player", teamAbbreviation: "SD", handle: "@naomi_girma" },
+		{ placement: "feed", sourceType: "player", teamAbbreviation: "POR", handle: "@sophiawilson" },
+		{ placement: "home", sourceType: "player", teamAbbreviation: "SD", handle: "@naomi_girma" }, // wrong placement
+	];
+	it("returns followed-team players, no extras", () => {
+		const out = socialFor(cards, ["SD"], new Set(["feed"])) as Array<{ handle: string }>;
+		expect(out.map((c) => c.handle)).toEqual(["@naomi_girma"]);
+	});
+	it("adds a cross-team followed player (matched by @ig handle) regardless of team", () => {
+		const out = socialFor(cards, ["SD"], new Set(["feed"]), new Set(["trinity_rodman"])) as Array<{ handle: string }>;
+		expect(out.map((c) => c.handle).sort()).toEqual(["@naomi_girma", "@trinity_rodman"]);
+	});
+	it("honors placement even for a followed cross-team player", () => {
+		const out = socialFor(cards, [], new Set(["feed"]), new Set(["naomi_girma"])) as Array<{ handle: string }>;
+		expect(out.map((c) => c.handle)).toEqual(["@naomi_girma"]); // the home-placement dup is excluded
+	});
+	it("empty teams + empty extras = nothing", () => {
+		expect(socialFor(cards, [], new Set(["feed"]))).toEqual([]);
+	});
+});
 
 describe("centersNonNWSLLeague — foreign-league relevance backstop", () => {
 	it("drops a post centering a non-NWSL league with no NWSL signal", () => {

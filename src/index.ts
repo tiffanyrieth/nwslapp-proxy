@@ -763,6 +763,12 @@ export default {
 		if (url.pathname === "/feed") {
 			return handleFeed(url, env, ctx);
 		}
+		if (url.pathname === "/feed/players") {
+			return handlePlayerDirectory();
+		}
+		if (url.pathname === "/feed/validate-reporter") {
+			return handleValidateReporter(url, env, ctx);
+		}
 		if (url.pathname === "/spotlight") {
 			return handleSpotlight(url, env, ctx);
 		}
@@ -2400,6 +2406,21 @@ function normalizeTeams(raw: string | null): string[] {
 	].sort();
 }
 
+// Phase 3 "make it yours": a comma-separated, lowercased, de-duped handle/id list from a
+// query param (user-added Bluesky reporters via `handles`, followed player IG ids via
+// `players`). Sorted so the /feed cache key is stable regardless of the order the app sends.
+const MAX_USER_HANDLES = 20; // cap the per-request Bluesky fan-out a user can trigger
+function parseHandleList(raw: string | null): string[] {
+	return [
+		...new Set(
+			(raw ?? "")
+				.split(",")
+				.map((h) => h.trim().toLowerCase().replace(/^@/, ""))
+				.filter(Boolean),
+		),
+	].sort();
+}
+
 /** Sort built ContentCards newest-first by their ISO `timestamp` string. */
 function byTimestampDesc(a: unknown, b: unknown): number {
 	return ((a as Card).timestamp ?? "") < ((b as Card).timestamp ?? "") ? 1 : -1;
@@ -2440,10 +2461,20 @@ export function dedupeByContent(cards: unknown[]): unknown[] {
 // ---------------------------------------------------------------------------
 async function handleFeed(url: URL, env: Env, ctx: ExecutionContext): Promise<Response> {
 	const teams = normalizeTeams(url.searchParams.get("teams"));
+	// Phase 3 "make it yours": the user's added Bluesky reporter handles + followed player
+	// IG ids. Both personalize the feed and are folded into the cache key below.
+	const userHandles = parseHandleList(url.searchParams.get("handles")).slice(0, MAX_USER_HANDLES);
+	const userPlayers = new Set(parseHandleList(url.searchParams.get("players")));
 
 	const cache = caches.default;
 	const cacheUrl = new URL(url);
 	cacheUrl.searchParams.set("teams", teams.join(","));
+	// Normalize the personalization params into the cache key so one user's picks never
+	// leak into another's feed AND send-order variance doesn't fragment the cache.
+	if (userHandles.length) cacheUrl.searchParams.set("handles", userHandles.join(","));
+	else cacheUrl.searchParams.delete("handles");
+	if (userPlayers.size) cacheUrl.searchParams.set("players", [...userPlayers].sort().join(","));
+	else cacheUrl.searchParams.delete("players");
 	const cacheKey = new Request(cacheUrl.toString(), { method: "GET" });
 
 	const hit = await cache.match(cacheKey);
@@ -2457,15 +2488,19 @@ async function handleFeed(url: URL, env: Env, ctx: ExecutionContext): Promise<Re
 		// a total Bluesky outage.
 		const reporterHandles = FEED_HANDLES.filter((h) => h.kind === "reporter");
 		const leagueHandles = FEED_HANDLES.filter((h) => h.kind === "league");
-		const [rawReporters, rawLeague, newsCards, social] = await Promise.all([
+		// Phase 3 "make it yours": the user's own-added Bluesky reporters, fetched alongside
+		// the curated set (per-handle failures isolated in blueskyCardsFor).
+		const userReporterHandles: FeedHandle[] = userHandles.map((h) => ({ handle: h, kind: "reporter" }));
+		const [rawReporters, rawLeague, rawUserReporters, newsCards, social] = await Promise.all([
 			buildBlueskyCards(reporterHandles),
 			buildBlueskyCards(leagueHandles),
+			buildBlueskyCards(userReporterHandles),
 			// News (B1): per-outlet RSS → Haiku NWSL-gate + team-tag + followed-team
 			// filter → OG-enrich → newsArticle cards. Self-isolating; failures yield [].
 			buildNewsCards(teams, env, ctx),
-			// Social (B3b): the cron-built IG snapshot; here we take the player
-			// clips (placement "feed") routed to the followed teams. (Club-official
-			// Bluesky was retired from the Feed 2026-08 — the Clubs chip is gone.)
+			// Social (B3b): the cron-built IG snapshot; here we take the player clips
+			// (placement "feed") for the followed teams PLUS the user's followed cross-team
+			// players. (Club-official Bluesky was retired from the Feed 2026-08.)
 			readSocialCards(env),
 		]);
 		// Reporter + league-outlet Bluesky carry no team tag of their own and post
@@ -2479,8 +2514,14 @@ async function handleFeed(url: URL, env: Env, ctx: ExecutionContext): Promise<Re
 			env,
 			ctx,
 		);
-		const playerSocial = socialFor(social, teams, new Set(["feed"]));
-		cards = [...socialBluesky, ...newsCards, ...playerSocial].sort(
+		// User-added reporters are NWSL-gated but NOT team-scoped — the user chose them, so
+		// keep every NWSL post (pass the full team set so decideFeedItem never drops a post
+		// just because its club isn't one the user follows).
+		const userReporterCards = rawUserReporters.length
+			? await classifySocialBluesky(rawUserReporters, [...NEWS_TEAM_ABBR_SET], env, ctx)
+			: [];
+		const playerSocial = socialFor(social, teams, new Set(["feed"]), userPlayers);
+		cards = [...socialBluesky, ...userReporterCards, ...newsCards, ...playerSocial].sort(
 			byTimestampDesc,
 		);
 		// Collapse identical-text duplicates (bot double-posts) BEFORE the cap, so a
@@ -2499,6 +2540,42 @@ async function handleFeed(url: URL, env: Env, ctx: ExecutionContext): Promise<Re
 	const toCache = new Response(JSON.stringify(cards), { status: 200, headers });
 	ctx.waitUntil(cache.put(cacheKey, toCache.clone()));
 	return withCacheStatus(toCache, "MISS");
+}
+
+/** GET /feed/players — the DIRECTORY of the featured players (Phase 3 "Follow players").
+ *  The app only receives followed-team player cards on /feed, so it needs this to browse
+ *  them all + follow across team lines. Served from PLAYER_SOCIAL (the same pool the 6-month
+ *  routine keeps current) so it's always fresh and the app stays thin. `id` is the IG handle
+ *  — the stable key the app sends back in /feed's `players` param. */
+function handlePlayerDirectory(): Response {
+	const players = PLAYER_SOCIAL.map((p) => ({ id: p.ig, name: p.name, team: p.abbr }));
+	const headers = new Headers({ "Content-Type": "application/json" });
+	headers.set("Cache-Control", "public, max-age=3600"); // static until the next deploy
+	return new Response(JSON.stringify(players), { status: 200, headers });
+}
+
+/** GET /feed/validate-reporter?handle=… — Phase 3 "Add a reporter". Confirms a Bluesky
+ *  account resolves on the keyless API, and whether it has NWSL-relevant posts recently (the
+ *  same Haiku gate the feed uses, run over the full team set so any NWSL post counts — user-
+ *  added handles are never team-scoped). `found` = the account resolves; `hasNWSLPosts` = at
+ *  least one recent post survived the gate. Never throws to the caller — a bad handle returns
+ *  { found: false }. */
+async function handleValidateReporter(url: URL, env: Env, ctx: ExecutionContext): Promise<Response> {
+	const raw = url.searchParams.get("handle")?.trim().toLowerCase().replace(/^@/, "") ?? "";
+	if (!raw) return jsonResponse({ found: false }, 200);
+	let feed: BskyItem[];
+	try {
+		feed = await bskyAuthorFeed(raw, POSTS_PER_HANDLE);
+	} catch {
+		return jsonResponse({ found: false }, 200); // account doesn't resolve
+	}
+	const displayName = feed.find((it) => it.post?.author)?.post?.author?.displayName || raw;
+	const cards = feed
+		.filter((it) => !it.reason && it.post?.record?.text)
+		.map((it) => mapBskyPost(it.post as BskyPost, { handle: raw, kind: "reporter" }))
+		.filter(Boolean);
+	const kept = cards.length ? await classifySocialBluesky(cards, [...NEWS_TEAM_ABBR_SET], env, ctx) : [];
+	return jsonResponse({ found: true, displayName, handle: `@${raw}`, hasNWSLPosts: kept.length > 0 }, 200);
 }
 
 /** Build cards for a set of Bluesky handles (per-handle failures isolated). */
@@ -3032,16 +3109,27 @@ async function readSocialCards(env: Env): Promise<unknown[]> {
 
 /** Filter the social snapshot to the requested teams + the allowed placements
  *  (Home wants "home", Feed wants "feed"). */
-function socialFor(cards: unknown[], teams: string[], placements: Set<string>): unknown[] {
-	if (teams.length === 0) return [];
+export function socialFor(
+	cards: unknown[],
+	teams: string[],
+	placements: Set<string>,
+	extraPlayers: Set<string> = new Set(),
+): unknown[] {
+	if (teams.length === 0 && extraPlayers.size === 0) return [];
 	const wanted = new Set(teams);
-	return (cards as Array<{ teamAbbreviation?: string; placement?: string }>).filter(
-		(c) =>
-			!!c.placement &&
-			placements.has(c.placement) &&
-			!!c.teamAbbreviation &&
-			wanted.has(c.teamAbbreviation),
-	);
+	return (
+		cards as Array<{ teamAbbreviation?: string; placement?: string; handle?: string; sourceType?: string }>
+	).filter((c) => {
+		if (!c.placement || !placements.has(c.placement)) return false;
+		// A followed-team card…
+		if (c.teamAbbreviation && wanted.has(c.teamAbbreviation)) return true;
+		// …or a player the user follows across team lines (card `handle` is "@<ig>",
+		// matched against the followed player-id set, Phase 3).
+		if (extraPlayers.size > 0 && c.sourceType === "player" && c.handle) {
+			return extraPlayers.has(c.handle.replace(/^@/, "").toLowerCase());
+		}
+		return false;
+	});
 }
 
 /**
