@@ -196,6 +196,7 @@ const TEAM_SEED_VIDEO: Record<string, string> = {
 type ClubNewsSource =
 	| { kind: "rss"; url: string }
 	| { kind: "index"; url: string; articlePath: string }
+	| { kind: "api"; url: string } // a club JSON news API (e.g. NC's SDP dapi) → items mapped directly
 	| { kind: "fallback" };
 
 const CLUB_NEWS: Record<string, ClubNewsSource> = {
@@ -215,12 +216,14 @@ const CLUB_NEWS: Record<string, ClubNewsSource> = {
 	// host, dated via microdata (<meta itemprop="datePublished"> / <time>). Owner-flagged
 	// Jun 2026 (don't use /feed/).
 	DEN: { kind: "index", url: "https://www.denversummitfc.com/news/", articlePath: "/news/" },
-	// NC currently auto-falls-back: its Next.js index lists only category links (no article
-	// slugs) in SSR HTML, so extractArticleLinks finds nothing (js-only — headless/API TODO).
-	// POR (Portland/Webflow) now works via the INDEX-card date fallback: its article pages
-	// carry no machine date, but each grid card has a hidden `fs-cmssort-field="date"` ISO
-	// that extractIndexDates reads (2026-08 audit — verified live).
-	NC: { kind: "index", url: "https://nccourage.com/news", articlePath: "/news/" },
+	// NC Courage is a Next.js/RSC site whose HTML carries NO article list (js-rendered), but its
+	// SDP `dapi` JSON API IS Worker-reachable and has everything inline → mapped directly by
+	// clubApiCards. (Found via the browser network tab, 2026-08; the /news HTML is a bot-shell.)
+	NC: { kind: "api", url: "https://www.nccourage.com/api/dapi/selection/latest-news" },
+	// POR (Portland/Webflow) is configured `index`, but LIVE it returns 0 and auto-falls-back to
+	// press: thorns.com serves the Worker's DATACENTER IP a JS-shell (no FinSweet data) even
+	// though residential IPs get the full SSR. So extractIndexDates works ONLY when fed the real
+	// HTML — POR needs the app-side device-IP fetch (dynamic fallback, Phase 2b), same as CHI.
 	POR: { kind: "index", url: "https://www.thorns.com/news", articlePath: "/news/" },
 	SEA: { kind: "index", url: "https://www.reignfc.com/news", articlePath: "/news/" },
 	// These three live on a shared PARENT domain under a club sub-path (owner-confirmed
@@ -238,13 +241,13 @@ const CLUB_NEWS: Record<string, ClubNewsSource> = {
 	// dated + structured (2026-08 audit — verified live). Promoted from fallback to rss.
 	BOS: { kind: "rss", url: "https://bostonlegacyfc.com/blogs/press.atom" },
 
-	// ── Outlet fallback (official site unreachable → curated NWSL press, sourceType "news") ──
-	// CHI: chicagostars.com/feed/ IS a valid, dated official WordPress RSS feed from a normal
-	// (residential) IP — but the Cloudflare Worker's datacenter IP still gets blocked/empty
-	// (re-confirmed 2026-08: sending BROWSER_UA does NOT help → it's an IP/ASN block, not a UA
-	// block). Stays on press fallback until the app's device-IP fetch (Phase 2) can pull the
-	// real feed from a residential IP. Re-test by flipping to `{ kind: "rss", url: ".../feed/" }`.
-	CHI: { kind: "fallback" },
+	// CHI: chicagostars.com/feed/ IS a valid dated WordPress RSS from a residential IP, but the
+	// Worker's datacenter IP is IP/ASN-blocked (BROWSER_UA doesn't help). Left as `rss` on
+	// PURPOSE: the Worker keeps trying (fails → press fallback), so the moment CHI stops blocking
+	// this auto-promotes to official with no change. Meanwhile the app's DEVICE-IP fallback
+	// (dynamic, Phase 2b) fetches this same feed from a residential IP and POSTs it to
+	// /club-news/normalize — so CHI followers get official news now, and it self-heals later.
+	CHI: { kind: "rss", url: "https://www.chicagostars.com/feed/" },
 };
 
 // A desktop-browser UA so article fetches get the full SSR'd HTML (with OG tags)
@@ -715,6 +718,11 @@ export default {
 		if (url.pathname === "/playoff-override") {
 			return handlePlayoffOverride(request, url, env as unknown as { FEED_TAGS: KVNamespace; BRACKET_ADMIN_KEY?: string });
 		}
+		// The device-IP club-news fallback POSTs residentially-fetched bytes here (Phase 2b) — a
+		// POST route, so it MUST precede the GET-only guard.
+		if (url.pathname === "/club-news/normalize") {
+			return handleClubNewsNormalize(request, url);
+		}
 
 		// All other routes are GET-only; reject early so the 405 is shared.
 		if (request.method !== "GET") {
@@ -768,6 +776,9 @@ export default {
 		}
 		if (url.pathname === "/feed/validate-reporter") {
 			return handleValidateReporter(url, env, ctx);
+		}
+		if (url.pathname === "/club-news/sources") {
+			return handleClubNewsSources();
 		}
 		if (url.pathname === "/spotlight") {
 			return handleSpotlight(url, env, ctx);
@@ -1406,6 +1417,7 @@ async function clubNewsFor(abbr: string, env: Env, ctx: ExecutionContext): Promi
 	try {
 		if (src.kind === "rss") cards = await clubRssCards(abbr, src.url);
 		else if (src.kind === "index") cards = await clubIndexCards(abbr, src.url, src.articlePath);
+		else if (src.kind === "api") cards = await clubApiCards(abbr, src.url);
 		// kind === "fallback": handled by the outlet-fallback path below.
 	} catch {
 		cards = [];
@@ -1441,15 +1453,93 @@ async function clubNewsFor(abbr: string, env: Env, ctx: ExecutionContext): Promi
 	return cards;
 }
 
+/** GET /club-news/sources — each club's official news source (abbr, kind, url). Backs the app's
+ *  DYNAMIC device-IP fallback (Phase 2b): when the proxy returns no official news for a followed
+ *  club (a datacenter-IP block like CHI), the app looks up the club's URL here, fetches it from
+ *  the device's residential IP, and POSTs the bytes to /club-news/normalize. Only clubs with a
+ *  url (rss/index/api). */
+function handleClubNewsSources(): Response {
+	const sources = Object.entries(CLUB_NEWS)
+		.filter(([, s]) => "url" in s)
+		.map(([abbr, s]) => ({ abbr, kind: s.kind, url: (s as { url: string }).url }));
+	const headers = new Headers({ "Content-Type": "application/json" });
+	headers.set("Cache-Control", "public, max-age=3600");
+	return new Response(JSON.stringify(sources), { status: 200, headers });
+}
+
+/** POST /club-news/normalize?abbr=CHI — the device-IP fallback's brains. The app fetched the
+ *  club's RSS from a residential IP (bypassing the datacenter block) and POSTs the raw bytes; we
+ *  parse them into cards with the SAME logic the proxy uses. RSS-only today (the clean case that
+ *  covers CHI + any future RSS-blocked club); an index-blocked club (POR) needs per-article OG
+ *  which its own site also blocks, so it isn't supported here — it stays on press fallback. The
+ *  user's own device is the only caller and the cards land only in that user's feed. */
+async function handleClubNewsNormalize(request: Request, url: URL): Promise<Response> {
+	const abbr = (url.searchParams.get("abbr") ?? "").toUpperCase();
+	const src = CLUB_NEWS[abbr];
+	if (!src || (src.kind !== "rss" && src.kind !== "index")) return jsonResponse([], 200);
+	const body = await request.text();
+	if (!body || body.length > 900_000) return jsonResponse([], 200); // size-cap a hostile/huge POST
+	// No OG-enrich: the club's OWN pages are the very thing the Worker is blocked from, so an
+	// OG-scrape would just waste fetches on shells. Cards carry whatever's inline (RSS image / none).
+	const cards = src.kind === "rss"
+		? rssTextToClubCards(abbr, body)
+		: indexHtmlToClubCards(abbr, body, src.url, src.articlePath);
+	return jsonResponse(cards, 200);
+}
+
+/** Parse an already-fetched club NEWS INDEX (HTML) into cards — for the device-IP fallback on an
+ *  index-kind club that shells the Worker but SSRs the full page to a residential IP (POR/Webflow,
+ *  2026-08). Everything is in the index card: the article link + a TITLE-text anchor
+ *  (`<a href="/news/…">Title</a>`, ≥10 chars — the cover link holds an <img>, no text) + a hidden
+ *  FinSweet `fs-cmssort-field="date"` ISO (via extractIndexDates). No per-article fetch (the club's
+ *  article pages are Worker-blocked too). `sourceUrl` gives the origin for absolute links. */
+function indexHtmlToClubCards(abbr: string, html: string, sourceUrl: string, articlePath: string): NewsCard[] {
+	let origin = "";
+	try { origin = new URL(sourceUrl).origin; } catch { return []; }
+	const name = CLUB_SOCIAL[abbr]?.name ?? abbr;
+	const dates = extractIndexDates(html, articlePath);
+	const esc = articlePath.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+	const re = new RegExp(`<a\\b[^>]*href="(${esc}[^"?#]+)"[^>]*>\\s*([^<]{10,})\\s*</a>`, "gi");
+	const cards: NewsCard[] = [];
+	const seen = new Set<string>();
+	let m: RegExpExecArray | null;
+	while ((m = re.exec(html)) !== null) {
+		const path = m[1].replace(/\/$/, "");
+		if (seen.has(path)) continue;
+		seen.add(path);
+		const title = decodeBasicEntities(m[2]).replace(/\s+/g, " ").trim();
+		const timestamp = dates.get(path);
+		if (!title || !timestamp || isPlaceholderArticle(title)) continue;
+		cards.push(clubNewsCard(abbr, origin + path, title, undefined, name, undefined, timestamp, "club"));
+		if (cards.length >= CLUBNEWS_PER_CLUB) break;
+	}
+	return cards;
+}
+
+/** Decode the handful of HTML entities a scraped title actually carries. */
+function decodeBasicEntities(s: string): string {
+	return s
+		.replace(/&amp;/g, "&").replace(/&#0?39;/g, "'").replace(/&#8217;/g, "’")
+		.replace(/&quot;/g, '"').replace(/&#8211;/g, "–").replace(/&#8212;/g, "—")
+		.replace(/&lt;/g, "<").replace(/&gt;/g, ">");
+}
+
 /** Strategy: the club's own RSS/Atom feed → cards (structured, dated; no scraping). */
 async function clubRssCards(abbr: string, url: string): Promise<NewsCard[]> {
 	const r = await fetch(url, {
 		headers: { "User-Agent": BROWSER_UA, Accept: "application/rss+xml, application/xml, text/xml" },
 	});
 	if (!r.ok) return [];
+	return rssTextToClubCards(abbr, await r.text());
+}
+
+/** Parse an already-fetched RSS/Atom body into club cards. Split out from clubRssCards so the
+ *  device-fallback (POST /club-news/normalize) can reuse it on bytes the APP fetched from a
+ *  residential IP when the Worker's datacenter IP is blocked (e.g. CHI). */
+function rssTextToClubCards(abbr: string, xml: string): NewsCard[] {
 	const name = CLUB_SOCIAL[abbr]?.name ?? abbr;
 	const cards: NewsCard[] = [];
-	for (const it of parseOutletRSS(await r.text())) {
+	for (const it of parseOutletRSS(xml)) {
 		const timestamp = isoNoFraction(it.pubDate);
 		if (!timestamp) continue; // undatable → skip rather than fake "now"
 		if (isPlaceholderArticle(it.title)) continue; // stub-site default post → not real news
@@ -1484,6 +1574,32 @@ async function clubIndexCards(abbr: string, indexUrl: string, articlePath: strin
 		}),
 	);
 	return built.filter((c): c is NewsCard => c !== null).slice(0, CLUBNEWS_PER_CLUB);
+}
+
+/** Strategy: a club's JSON news API. NC Courage is a Next.js/RSC site whose HTML carries no
+ *  article list, but its SDP `dapi` endpoint (`/api/dapi/selection/latest-news`) returns clean
+ *  JSON that IS reachable from the Worker (unlike the bot-shell HTML), with everything inline:
+ *  `title`, `url`, `contentDate`, `summary`, and a `thumbnail.templateUrl` (a Cloudinary URL with
+ *  a `{formatInstructions}` size slot). Map items → cards directly; no per-article OG scrape. */
+async function clubApiCards(abbr: string, url: string): Promise<NewsCard[]> {
+	const r = await fetch(url, { headers: { "User-Agent": BROWSER_UA, Accept: "application/json" } });
+	if (!r.ok) return [];
+	const data = (await r.json()) as { items?: Array<Record<string, unknown>> };
+	const name = CLUB_SOCIAL[abbr]?.name ?? abbr;
+	const cards: NewsCard[] = [];
+	for (const it of data.items ?? []) {
+		if (typeof it.type === "string" && it.type !== "story") continue; // articles only, not photo/video widgets
+		const title = typeof it.title === "string" ? it.title : undefined;
+		const link = typeof it.url === "string" ? it.url : undefined;
+		const timestamp = isoNoFraction(typeof it.contentDate === "string" ? it.contentDate : undefined);
+		if (!title || !link || !timestamp || isPlaceholderArticle(title)) continue;
+		const summary = typeof it.summary === "string" ? it.summary : undefined;
+		const thumb = it.thumbnail as { templateUrl?: string; thumbnailUrl?: string } | undefined;
+		const image = thumb?.templateUrl?.replace("{formatInstructions}", "t_w_768") ?? thumb?.thumbnailUrl;
+		cards.push(clubNewsCard(abbr, link, title, summary, name, image, timestamp, "club"));
+		if (cards.length >= CLUBNEWS_PER_CLUB) break;
+	}
+	return cards;
 }
 
 /** Strategy / fallback: a club's recent news filtered from the curated NWSL outlet RSS
