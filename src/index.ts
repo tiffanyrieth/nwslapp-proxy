@@ -215,11 +215,11 @@ const CLUB_NEWS: Record<string, ClubNewsSource> = {
 	// host, dated via microdata (<meta itemprop="datePublished"> / <time>). Owner-flagged
 	// Jun 2026 (don't use /feed/).
 	DEN: { kind: "index", url: "https://www.denversummitfc.com/news/", articlePath: "/news/" },
-	// NC + POR are configured for their official index but currently auto-fall-back (NC's
-	// index lists only category links, not article slugs, in SSR HTML; thorns.com article
-	// pages carry no machine-readable date). The clubNewsFallback diag flags both — revisit
-	// if their sites expose article links / dates (then they promote to official with no
-	// config change).
+	// NC currently auto-falls-back: its Next.js index lists only category links (no article
+	// slugs) in SSR HTML, so extractArticleLinks finds nothing (js-only — headless/API TODO).
+	// POR (Portland/Webflow) now works via the INDEX-card date fallback: its article pages
+	// carry no machine date, but each grid card has a hidden `fs-cmssort-field="date"` ISO
+	// that extractIndexDates reads (2026-08 audit — verified live).
 	NC: { kind: "index", url: "https://nccourage.com/news", articlePath: "/news/" },
 	POR: { kind: "index", url: "https://www.thorns.com/news", articlePath: "/news/" },
 	SEA: { kind: "index", url: "https://www.reignfc.com/news", articlePath: "/news/" },
@@ -230,18 +230,21 @@ const CLUB_NEWS: Record<string, ClubNewsSource> = {
 	UTA: { kind: "index", url: "https://www.rsl.com/utahroyals/news/", articlePath: "/utahroyals/news/" },
 	ORL: { kind: "index", url: "https://www.orlandocitysc.com/pride/news/", articlePath: "/pride/news/" },
 
-	// ── Outlet fallback (official site unusable → curated NWSL press, sourceType "news") ──
-	// GFC: gothamfc.com articles carry NO machine-readable date (no og:published / JSON-LD),
-	//      so they can't be dated/sorted reliably — press-sourced until they add one.
-	GFC: { kind: "fallback" },
+	// GFC (Gotham/Sanity): article pages have NO machine date, but each index card shows a
+	// visible "August 2, 2026" that extractIndexDates reads → promoted from fallback to index
+	// (2026-08 audit — verified live).
+	GFC: { kind: "index", url: "https://www.gothamfc.com/news", articlePath: "/news/" },
+	// BOS (Boston/Shopify): Shopify auto-generates a per-blog Atom feed — the press blog is
+	// dated + structured (2026-08 audit — verified live). Promoted from fallback to rss.
+	BOS: { kind: "rss", url: "https://bostonlegacyfc.com/blogs/press.atom" },
+
+	// ── Outlet fallback (official site unreachable → curated NWSL press, sourceType "news") ──
 	// CHI: chicagostars.com/feed/ IS a valid, dated official WordPress RSS feed from a normal
 	// (residential) IP — but the Cloudflare Worker's datacenter IP still gets blocked/empty
-	// (re-tested Jun 30 2026: configured as `rss`, the Worker fetched 0 and auto-fell-back to
-	// press). So CHI stays on press fallback (sourceType "news") until the host stops blocking
-	// datacenter egress. Re-test by flipping to `{ kind: "rss", url: ".../feed/" }` + deploy.
+	// (re-confirmed 2026-08: sending BROWSER_UA does NOT help → it's an IP/ASN block, not a UA
+	// block). Stays on press fallback until the app's device-IP fetch (Phase 2) can pull the
+	// real feed from a residential IP. Re-test by flipping to `{ kind: "rss", url: ".../feed/" }`.
 	CHI: { kind: "fallback" },
-	// BOS: brand-new Shopify site is JS-rendered with no feed (revisit when they add a news section).
-	BOS: { kind: "fallback" },
 };
 
 // A desktop-browser UA so article fetches get the full SSR'd HTML (with OG tags)
@@ -452,6 +455,15 @@ const FEED_HANDLES: FeedHandle[] = [
 	{ handle: "sandraherrera.bsky.social", kind: "reporter" },
 	{ handle: "pcattry.bsky.social", kind: "reporter" },
 	{ handle: "katiewhyatt.bsky.social", kind: "reporter" },
+	// Added 2026-08 audit — each verified active on the keyless AT-Proto API. Haiku still
+	// gates every post to NWSL + the reader's followed teams, so all-soccer writers (Rueter,
+	// Tannenwald) only surface on their NWSL/USWNT items.
+	{ handle: "scoutripley.bsky.social", kind: "reporter" }, // Claire Watkins (Just Women's Sports / The Late Sub)
+	{ handle: "jennatonelli.bsky.social", kind: "reporter" }, // Jenna Tonelli (SI / broadcast)
+	{ handle: "caitlinmurr.bsky.social", kind: "reporter" }, // Caitlin Murray (ESPN; "The National Team" author)
+	{ handle: "jeffrueter.bsky.social", kind: "reporter" }, // Jeff Rueter (The Athletic)
+	{ handle: "jtannenwald.bsky.social", kind: "reporter" }, // Jonathan Tannenwald (Philadelphia Inquirer)
+	{ handle: "girlssoccernetwork.bsky.social", kind: "reporter" }, // Girls Soccer Network (outlet)
 	// League / official outlets
 	{ handle: "nwslsoccer.com", kind: "league" },
 	{ handle: "equalizersoccer.bsky.social", kind: "league" },
@@ -1465,13 +1477,17 @@ async function clubRssCards(abbr: string, url: string): Promise<NewsCard[]> {
 async function clubIndexCards(abbr: string, indexUrl: string, articlePath: string): Promise<NewsCard[]> {
 	const r = await fetch(indexUrl, { headers: { "User-Agent": BROWSER_UA, Accept: "text/html" } });
 	if (!r.ok) return [];
-	const links = extractArticleLinks(await r.text(), indexUrl, articlePath);
+	const html = await r.text();
+	const links = extractArticleLinks(html, indexUrl, articlePath);
+	// Fallback dates for platforms whose article pages carry no machine date but whose index
+	// cards do (Gotham/Sanity, Portland/Webflow) — empty for clubs that date off the article.
+	const indexDates = extractIndexDates(html, articlePath);
 	const name = CLUB_SOCIAL[abbr]?.name ?? abbr;
 	const built = await Promise.all(
 		links.map(async (link) => {
 			try {
 				const og = await fetchOG(link);
-				const timestamp = isoNoFraction(og.published);
+				const timestamp = isoNoFraction(og.published) ?? indexDates.get(new URL(link).pathname.replace(/\/$/, ""));
 				if (!og.title || !timestamp || isPlaceholderArticle(og.title)) return null;
 				return clubNewsCard(abbr, link, og.title, og.description, name, og.image, timestamp, "club");
 			} catch {
@@ -1605,6 +1621,59 @@ export function extractArticleLinks(html: string, indexUrl: string, articlePath:
 		if (seen.has(u)) continue;
 		seen.add(u);
 		out.push(u);
+	}
+	return out;
+}
+
+const MONTH_NUM: Record<string, number> = (() => {
+	const full = "january february march april may june july august september october november december".split(" ");
+	const m: Record<string, number> = {};
+	full.forEach((name, i) => {
+		m[name] = i + 1;
+		m[name.slice(0, 3)] = i + 1; // 3-letter abbreviations (Jul, Aug, Sept→sep)
+	});
+	m["sept"] = 9;
+	return m;
+})();
+
+/** The first publish date found in a chunk of index HTML, as a strict `…Z` datetime at
+ *  noon UTC (date-only sources have no time; noon keeps same-day ordering sane). Tries a
+ *  machine field first (Webflow/FinSweet hidden `fs-cmssort-field="date">2026-07-31`), then
+ *  a visible "August 2, 2026" / "Jul 31, 2026". Returns undefined if neither is present. */
+function firstIndexDate(block: string): string | undefined {
+	const iso = block.match(/fs-cmssort-field="date"[^>]*>\s*(20\d\d-\d\d-\d\d)/);
+	if (iso) return `${iso[1]}T12:00:00Z`;
+	const vis = block.match(/\b([A-Z][a-z]{2,8}) (\d{1,2}), (20\d\d)\b/);
+	if (vis) {
+		const mo = MONTH_NUM[vis[1].toLowerCase()];
+		if (mo) return `${vis[3]}-${String(mo).padStart(2, "0")}-${String(Number(vis[2])).padStart(2, "0")}T12:00:00Z`;
+	}
+	return undefined;
+}
+
+/** Map each index article link → its publish date, for platforms whose ARTICLE pages carry
+ *  no machine-readable date but whose INDEX cards do (Gotham's Sanity site shows a visible
+ *  date per card; Portland's Webflow/FinSweet grid carries a hidden ISO sort field). Keys are
+ *  the article PATHNAME (trailing slash stripped) to match `clubIndexCards`. Used ONLY as a
+ *  fallback when `fetchOG` finds no date, so it can't disturb clubs that date fine off their
+ *  article pages (their index carries neither pattern → empty map → no-op). Exported for tests. */
+export function extractIndexDates(html: string, articlePath: string): Map<string, string> {
+	const links: { pos: number; path: string }[] = [];
+	const seen = new Set<string>();
+	const esc = articlePath.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+	const re = new RegExp(`href="(${esc}[^"?#]+)"`, "gi");
+	let m: RegExpExecArray | null;
+	while ((m = re.exec(html)) !== null) {
+		const path = m[1].replace(/\/$/, "");
+		if (seen.has(path)) continue;
+		seen.add(path);
+		links.push({ pos: m.index, path });
+	}
+	const out = new Map<string, string>();
+	for (let i = 0; i < links.length; i++) {
+		const end = i + 1 < links.length ? links[i + 1].pos : Math.min(html.length, links[i].pos + 3000);
+		const d = firstIndexDate(html.slice(links[i].pos, end));
+		if (d) out.set(links[i].path, d);
 	}
 	return out;
 }

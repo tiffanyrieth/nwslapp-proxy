@@ -1,6 +1,7 @@
 import { describe, it, expect } from "vitest";
 import {
 	extractArticleLinks,
+	extractIndexDates,
 	isPlaceholderArticle,
 	extractJsonLdArticle,
 	decideFeedItem,
@@ -62,6 +63,33 @@ describe("extractArticleLinks", () => {
 	it("dedupes", () => {
 		const dupes = links.filter((l) => l.endsWith("/news/match-day-thread-vs-courage"));
 		expect(dupes.length).toBe(1);
+	});
+});
+
+describe("extractIndexDates — dates from the index when article pages have none", () => {
+	it("reads a visible 'August 2, 2026' inside each card (Gotham/Sanity shape)", () => {
+		const html = `
+			<a href="/news/gotham-win"><img src="a.jpg"/><div class="date">August 2, 2026</div><h3>Gotham Win</h3></a>
+			<a href="/news/gotham-draw"><img src="b.jpg"/><div class="date">August 1, 2026</div><h3>Gotham Draw</h3></a>`;
+		const m = extractIndexDates(html, "/news/");
+		expect(m.get("/news/gotham-win")).toBe("2026-08-02T12:00:00Z");
+		expect(m.get("/news/gotham-draw")).toBe("2026-08-01T12:00:00Z");
+	});
+	it("reads a hidden FinSweet ISO sort field (Portland/Webflow shape) and abbreviated months", () => {
+		const html = `
+			<article><a href="/news/thorns-win">Cover</a><a href="/news/thorns-win">Learn More</a>
+				<div class="hidden"><div fs-cmssort-field="date" class="meta">2026-07-31</div></div>
+				<div class="meta">Jul 31, 2026</div></article>
+			<article><a href="/news/thorns-draw">Cover</a>
+				<div class="hidden"><div fs-cmssort-field="date" class="meta">2026-07-24</div></div></article>`;
+		const m = extractIndexDates(html, "/news/");
+		expect(m.get("/news/thorns-win")).toBe("2026-07-31T12:00:00Z");
+		expect(m.get("/news/thorns-draw")).toBe("2026-07-24T12:00:00Z");
+	});
+	it("omits an article with no extractable date, and ignores date-like image filenames", () => {
+		const html = `<a href="/news/no-date"><img src="hero-2026-08-15-crop.jpg"/><h3>No Date Here</h3></a>`;
+		const m = extractIndexDates(html, "/news/");
+		expect(m.has("/news/no-date")).toBe(false);
 	});
 });
 
