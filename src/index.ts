@@ -435,18 +435,14 @@ const NEWS_SCHEMA = {
 	required: ["verdicts"],
 };
 
-// Curated, API-VERIFIED Bluesky handles for the Feed (and the team voices merged
-// onto Home). Every handle was confirmed to currently return posts from the keyless
-// public AT-Proto API; dead/dormant candidates were dropped (GFC + BAY have no
-// active club account, DEN's is off-season-dormant — so 13 of 16 clubs). `kind`
-// drives layout + placement:
-//   reporter|league → blueskyReporter, placement "feed", isLeague true
-//   team            → blueskyTeam{Media,Text}, placement "both" (Home + Feed),
-//                     tagged with `abbr` (the app's club join key)
+// Curated, API-VERIFIED Bluesky handles for the Feed's reporters + league outlets.
+// Every handle was confirmed to currently return posts from the keyless public
+// AT-Proto API; dead/dormant candidates were dropped. All render as blueskyReporter,
+// placement "feed", isLeague true. (Club-official Bluesky was retired from the Feed
+// 2026-08 — the app's Clubs chip is gone; a club's Home voice is its IG/YT/news.)
 interface FeedHandle {
 	handle: string;
-	kind: "reporter" | "league" | "team";
-	abbr?: string;
+	kind: "reporter" | "league";
 }
 const FEED_HANDLES: FeedHandle[] = [
 	// Reporters / journalists (league-wide)
@@ -470,20 +466,6 @@ const FEED_HANDLES: FeedHandle[] = [
 	{ handle: "nwslthisweek.bsky.social", kind: "league" },
 	{ handle: "nwslstat.bsky.social", kind: "league" },
 	{ handle: "allforxi.bsky.social", kind: "league" },
-	// Official club accounts (13 of 16 verified active)
-	{ handle: "angelcity.com", kind: "team", abbr: "LA" },
-	{ handle: "bostonlegacyfc.com", kind: "team", abbr: "BOS" },
-	{ handle: "chicagostars.com", kind: "team", abbr: "CHI" },
-	{ handle: "houstondash.com", kind: "team", abbr: "HOU" },
-	{ handle: "thekccurrent.bsky.social", kind: "team", abbr: "KC" },
-	{ handle: "racingloufc.com", kind: "team", abbr: "LOU" },
-	{ handle: "nccourage.com", kind: "team", abbr: "NC" },
-	{ handle: "orlpride.com", kind: "team", abbr: "ORL" },
-	{ handle: "thornsfc.com", kind: "team", abbr: "POR" },
-	{ handle: "sandiegowavefc.com", kind: "team", abbr: "SD" },
-	{ handle: "reignfc.com", kind: "team", abbr: "SEA" },
-	{ handle: "utahroyalsfc.com", kind: "team", abbr: "UTA" },
-	{ handle: "washingtonspirit.com", kind: "team", abbr: "WAS" },
 ];
 
 // ---------------------------------------------------------------------------
@@ -2475,23 +2457,22 @@ async function handleFeed(url: URL, env: Env, ctx: ExecutionContext): Promise<Re
 		// a total Bluesky outage.
 		const reporterHandles = FEED_HANDLES.filter((h) => h.kind === "reporter");
 		const leagueHandles = FEED_HANDLES.filter((h) => h.kind === "league");
-		const [rawReporters, rawLeague, teamCards, newsCards, social] = await Promise.all([
+		const [rawReporters, rawLeague, newsCards, social] = await Promise.all([
 			buildBlueskyCards(reporterHandles),
 			buildBlueskyCards(leagueHandles),
-			buildTeamBlueskyCards(teams),
 			// News (B1): per-outlet RSS → Haiku NWSL-gate + team-tag + followed-team
 			// filter → OG-enrich → newsArticle cards. Self-isolating; failures yield [].
 			buildNewsCards(teams, env, ctx),
 			// Social (B3b): the cron-built IG snapshot; here we take the player
-			// clips (placement "feed") routed to the followed teams. Club Bluesky is
-			// already in teamCards (now placement "feed" too).
+			// clips (placement "feed") routed to the followed teams. (Club-official
+			// Bluesky was retired from the Feed 2026-08 — the Clubs chip is gone.)
 			readSocialCards(env),
 		]);
 		// Reporter + league-outlet Bluesky carry no team tag of their own and post
 		// off-topic too → one Haiku pass gates relevance, team-tags, and filters to
-		// the followed teams (classifySocialBluesky). Club-official Bluesky (teamCards)
-		// and player IG (playerSocial) are trusted fast paths — already team-tagged,
-		// no Haiku. News is gated+filtered inside buildNewsCards.
+		// the followed teams (classifySocialBluesky). Player IG (playerSocial) is a
+		// trusted fast path — already team-tagged, no Haiku. News is gated+filtered
+		// inside buildNewsCards.
 		const socialBluesky = await classifySocialBluesky(
 			[...rawReporters, ...rawLeague],
 			teams,
@@ -2499,7 +2480,7 @@ async function handleFeed(url: URL, env: Env, ctx: ExecutionContext): Promise<Re
 			ctx,
 		);
 		const playerSocial = socialFor(social, teams, new Set(["feed"]));
-		cards = [...socialBluesky, ...teamCards, ...newsCards, ...playerSocial].sort(
+		cards = [...socialBluesky, ...newsCards, ...playerSocial].sort(
 			byTimestampDesc,
 		);
 		// Collapse identical-text duplicates (bot double-posts) BEFORE the cap, so a
@@ -2522,16 +2503,6 @@ async function handleFeed(url: URL, env: Env, ctx: ExecutionContext): Promise<Re
 
 /** Build cards for a set of Bluesky handles (per-handle failures isolated). */
 async function buildBlueskyCards(handles: FeedHandle[]): Promise<unknown[]> {
-	const per = await Promise.all(handles.map((h) => blueskyCardsFor(h)));
-	return per.flat();
-}
-
-/** A followed club's own Bluesky posts (placement "feed" — Feed "Social" only, as
- *  of B3b). Empty when no teams are requested or none have a curated handle. */
-async function buildTeamBlueskyCards(teams: string[]): Promise<unknown[]> {
-	if (teams.length === 0) return [];
-	const wanted = new Set(teams);
-	const handles = FEED_HANDLES.filter((h) => h.kind === "team" && h.abbr && wanted.has(h.abbr));
 	const per = await Promise.all(handles.map((h) => blueskyCardsFor(h)));
 	return per.flat();
 }
@@ -2595,22 +2566,19 @@ function mapBskyPost(post: BskyPost, h: FeedHandle): unknown | null {
 
 	const rkey = uri.split("/").pop();
 	const image = extractBskyImage(post.embed);
-	const isTeam = h.kind === "team";
-	const layout = isTeam ? (image ? "blueskyTeamMedia" : "blueskyTeamText") : "blueskyReporter";
 
 	return {
 		id: `bsky-${rkey}`,
-		layout,
+		layout: "blueskyReporter",
 		platform: "bluesky",
-		// Source class for the app's Feed chips (Clubs · Reporters · …). Players come
-		// from the IG pipe; here it's club-official / reporter / league-outlet.
-		sourceType: isTeam ? "club" : h.kind === "league" ? "league" : "reporter",
-		// B3b: ALL Bluesky now lives in the Feed only (was "both" for team posts). The
-		// club's Home voice is its IG now; club Bluesky is its real-time/social
-		// voice → Feed "Social". teamAbbreviation still scopes a team post to followers.
+		// Source class for the app's Feed chips (Reporters · …). Players come from the
+		// IG pipe; here it's reporter / league-outlet (club-official Bluesky retired).
+		sourceType: h.kind === "league" ? "league" : "reporter",
+		// Reporters + league outlets are league-wide (no team tag of their own; Haiku
+		// team-tags + scopes them downstream). All Bluesky lives in the Feed only.
 		placement: "feed",
-		teamAbbreviation: isTeam ? h.abbr : undefined,
-		isLeague: !isTeam, // reporters + league outlets are league-wide
+		teamAbbreviation: undefined,
+		isLeague: true,
 		authorName: post.author?.displayName || handle,
 		handle: `@${handle}`,
 		bodyText: post.record?.text,
