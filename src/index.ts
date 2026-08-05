@@ -633,6 +633,9 @@ export default {
 		if (url.pathname === "/admin" || url.pathname === "/admin/roster") {
 			return handleAdminPortal(request, env, ctx);
 		}
+		if (url.pathname === "/admin/status") {
+			return handleAdminStatus(request, env);
+		}
 
 		// POST telemetry ingest must be registered BEFORE the GET-only guard below.
 		if (url.pathname === "/telemetry") {
@@ -2066,6 +2069,186 @@ async function handleAdjudication(request: Request, env: Env, ctx: ExecutionCont
 
 /** The tabbed portal shell and the Roster tab's ops. Bracket + Know Her Game keep their own
  *  handlers and URLs untouched — the shell iframes them (see src/admin-portal.ts for why). */
+// ── Operator STATUS tab: an on-demand, at-a-glance health check (GET /admin/status) ───────────
+// Runs LIVE each time the tab is opened (the shell iframes it). Surfaces the fragile + silently-
+// failing surfaces so a broken club URL / dead reporter handle / ESPN outage / stale snapshot shows
+// as a colored row instead of quietly degrading. Complements the passive alerting (Resend spike
+// pager + healthchecks.io), it doesn't replace it. All checks run in parallel; ~a few seconds.
+
+type StatusCheck = { label: string; status: "ok" | "warn" | "fail" | "info"; detail: string };
+type StatusSection = { title: string; note?: string; checks: StatusCheck[] };
+
+const STATUS_DEVICE_FALLBACK = new Set(["CHI", "POR"]); // Worker-blocked; the app device-fetch fills them
+
+/** Run a club's OFFICIAL strategy directly — no cache, no press fallback — for the status grid. */
+async function clubOfficialCardsUncached(abbr: string): Promise<NewsCard[]> {
+	const src = CLUB_NEWS[abbr];
+	if (!src) return [];
+	try {
+		if (src.kind === "rss") return await clubRssCards(abbr, src.url);
+		if (src.kind === "index") return await clubIndexCards(abbr, src.url, src.articlePath);
+		if (src.kind === "api") return await clubApiCards(abbr, src.url);
+	} catch { /* → 0 cards below */ }
+	return [];
+}
+
+async function statusCheckClubNews(): Promise<StatusSection> {
+	const abbrs = Object.keys(CLUB_NEWS).sort();
+	const checks = await Promise.all(abbrs.map(async (abbr): Promise<StatusCheck> => {
+		const src = CLUB_NEWS[abbr];
+		if (src.kind === "fallback") return { label: abbr, status: "warn", detail: "press fallback only — no official source configured" };
+		const cards = await clubOfficialCardsUncached(abbr);
+		if (cards.length > 0) {
+			const newest = ((cards[0] as { timestamp?: string }).timestamp ?? "").slice(0, 10) || "?";
+			return { label: abbr, status: "ok", detail: `${cards.length} official · newest ${newest}` };
+		}
+		if (STATUS_DEVICE_FALLBACK.has(abbr)) return { label: abbr, status: "info", detail: "Worker-blocked → the app's device-fetch fills it (expected)" };
+		return { label: abbr, status: "warn", detail: `official source returned 0 → press fallback. CHECK THE URL: ${(src as { url?: string }).url ?? "—"}` };
+	}));
+	return {
+		title: "Club news — official source per club",
+		note: "🟡 = quietly on press fallback: a changed or broken club URL (the Houston-Dash case) shows here instead of failing silently. 🔵 = device-fallback club (expected).",
+		checks,
+	};
+}
+
+async function statusFetch(label: string, url: string, ua: string, ok: (d: unknown) => boolean, detail: (d: unknown) => string): Promise<StatusCheck> {
+	try {
+		const r = await fetch(url, { headers: { "User-Agent": ua, Accept: "application/json" } });
+		if (!r.ok) return { label, status: "fail", detail: `HTTP ${r.status}` };
+		const d = await r.json();
+		return ok(d) ? { label, status: "ok", detail: detail(d) } : { label, status: "warn", detail: "200 but empty / unexpected shape" };
+	} catch (e) {
+		return { label, status: "fail", detail: String((e as Error)?.message ?? e).slice(0, 90) };
+	}
+}
+
+async function statusCheckESPN(): Promise<StatusSection> {
+	const checks = await Promise.all([
+		statusFetch("Scoreboard", ESPN_SCOREBOARD, ESPN_UA, (d) => Array.isArray((d as { events?: unknown[] }).events), (d) => `${(d as { events?: unknown[] }).events?.length ?? 0} events`),
+		statusFetch("Standings", "https://site.api.espn.com/apis/v2/sports/soccer/usa.nwsl/standings", ESPN_UA, (d) => JSON.stringify(d).length > 200, () => "reachable"),
+		statusFetch("Teams", "https://site.api.espn.com/apis/site/v2/sports/soccer/usa.nwsl/teams", ESPN_UA, (d) => JSON.stringify(d).includes('"team"'), () => "reachable"),
+	]);
+	return { title: "ESPN core endpoints (the Aug-4 outage path)", note: "A scoreboard failure takes Home + Schedule dark and paged nobody last time — this catches it at a glance.", checks };
+}
+
+async function statusCheckFeedSources(): Promise<StatusSection> {
+	const bsky = FEED_HANDLES.filter((h) => h.kind === "reporter" || h.kind === "league");
+	const bskyChecks = await Promise.all(bsky.map(async (h): Promise<StatusCheck> => {
+		try {
+			const feed = await bskyAuthorFeed(h.handle, 3);
+			const posts = feed.filter((it) => !it.reason && it.post?.record?.text).length;
+			return posts > 0
+				? { label: h.handle, status: "ok", detail: `${posts} recent posts` }
+				: { label: h.handle, status: "warn", detail: "resolves but 0 recent posts — dormant?" };
+		} catch {
+			return { label: h.handle, status: "fail", detail: "does NOT resolve on the keyless API — dead/renamed?" };
+		}
+	}));
+	const rssChecks = await Promise.all(NEWS_FEEDS.map(async (f): Promise<StatusCheck> => {
+		try {
+			const r = await fetch(f.url, { headers: { "User-Agent": BROWSER_UA, Accept: "application/rss+xml, application/xml, text/xml" } });
+			if (!r.ok) return { label: f.source, status: "fail", detail: `HTTP ${r.status} · ${f.url}` };
+			const items = parseOutletRSS(await r.text()).length;
+			return items > 0 ? { label: f.source, status: "ok", detail: `${items} items` } : { label: f.source, status: "warn", detail: "reachable but 0 items" };
+		} catch (e) {
+			return { label: f.source, status: "fail", detail: String((e as Error)?.message ?? e).slice(0, 70) };
+		}
+	}));
+	return {
+		title: "Feed sources — reporters/league (Bluesky) + news (RSS)",
+		note: "A dead reporter handle or a 404'd feed silently vanishes from the Social tab; it shows here instead.",
+		checks: [...bskyChecks, ...rssChecks],
+	};
+}
+
+async function statusCheckIG(env: Env): Promise<StatusSection> {
+	const checks: StatusCheck[] = [];
+	for (const [label, k] of [["Players (Feed IG)", SOCIAL_PLAYER_KEY], ["Clubs (Home IG)", SOCIAL_CLUB_KEY]] as [string, string][]) {
+		const raw = await env.FEED_TAGS.get(k).catch(() => null);
+		if (!raw) {
+			checks.push({ label, status: "fail", detail: "snapshot MISSING (cron failed or KV expired → no IG on that tab)" });
+			continue;
+		}
+		let n = 0;
+		try {
+			const p = JSON.parse(raw) as unknown;
+			n = Array.isArray(p) ? p.length : Array.isArray((p as { instagram?: unknown[] }).instagram) ? (p as { instagram: unknown[] }).instagram.length : Object.keys(p as object).length;
+		} catch { /* keep 0 */ }
+		checks.push({ label, status: n > 0 ? "ok" : "warn", detail: `${n > 0 ? `${n} cards` : "present"} · ${Math.round(raw.length / 1024)}KB cached` });
+	}
+	return { title: "Instagram snapshot (cron-refreshed every other day)", note: "IG is the fragile scrape path; a stale/empty snapshot = no player/club IG until the next cron.", checks };
+}
+
+async function statusCheckErrors(env: Env): Promise<StatusSection> {
+	const list = await env.FEED_TAGS.list({ prefix: "sdiag:", limit: 120 });
+	const now = Date.now();
+	const DAY = 86_400_000, HOUR = 3_600_000;
+	let last24 = 0, lastHour = 0;
+	const recent: { kind: string; detail: string; ts: number }[] = [];
+	const records = await Promise.all(list.keys.slice(0, 40).map((k) => env.FEED_TAGS.get(k.name, "json").catch(() => null)));
+	for (const rec of records) {
+		const events = (rec as { events?: { kind: string; detail: string; ts: number }[] } | null)?.events;
+		if (!Array.isArray(events)) continue;
+		for (const e of events) {
+			const age = now - (e.ts ?? 0);
+			if (age <= DAY) { last24++; if (recent.length < 12) recent.push(e); }
+			if (age <= HOUR) lastHour++;
+		}
+	}
+	const status: StatusCheck["status"] = lastHour >= 8 ? "fail" : last24 > 20 ? "warn" : last24 > 0 ? "info" : "ok";
+	const checks: StatusCheck[] = [{
+		label: "Proxy diagnostics (sdiag)",
+		status,
+		detail: `${last24} events / 24h · ${lastHour} / last hour${lastHour >= 8 ? " ⚠️ SPIKE (pager threshold)" : ""}`,
+	}];
+	for (const e of recent) checks.push({ label: `  ${e.kind}`, status: "info", detail: e.detail });
+	return { title: "Recent proxy diagnostics (last 24h)", note: "The catch-all: every unexpected condition (fallback / API fail / parse / empty) logs here first.", checks };
+}
+
+function renderStatusPage(sections: StatusSection[]): string {
+	const dotColor: Record<string, string> = { ok: "#30d158", warn: "#ffd60a", fail: "#ff453a", info: "#5ac8fa" };
+	const esc = (x: string) => x.replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c] as string));
+	const body = sections.map((sec) => {
+		const rows = sec.checks.map((c) =>
+			`<tr><td class="d"><span class="dot" style="background:${dotColor[c.status] ?? "#888"}"></span></td>` +
+			`<td class="l">${esc(c.label)}</td><td class="det">${esc(c.detail)}</td></tr>`).join("");
+		return `<h2>${esc(sec.title)}</h2>${sec.note ? `<p class="note">${esc(sec.note)}</p>` : ""}<table>${rows}</table>`;
+	}).join("");
+	const all = sections.flatMap((s) => s.checks);
+	const nFail = all.filter((c) => c.status === "fail").length;
+	const nWarn = all.filter((c) => c.status === "warn").length;
+	const banner = nFail
+		? `<div class="banner fail">🔴 ${nFail} failing · ${nWarn} warning${nWarn === 1 ? "" : "s"}</div>`
+		: nWarn ? `<div class="banner warn">🟡 ${nWarn} warning${nWarn === 1 ? "" : "s"} — worth a look</div>`
+			: `<div class="banner ok">🟢 All clear</div>`;
+	return `<!doctype html><html><head><meta charset="utf-8"><meta name="color-scheme" content="dark"><style>
+body{background:#111;color:#eee;font:14px/1.55 -apple-system,system-ui,sans-serif;margin:0;padding:16px}
+h2{font-size:13px;color:#9ad;margin:20px 0 2px;border-bottom:1px solid #333;padding-bottom:4px;text-transform:uppercase;letter-spacing:.03em}
+table{border-collapse:collapse;width:100%} td{padding:3px 8px;vertical-align:top}
+td.d{width:16px} .dot{display:inline-block;width:11px;height:11px;border-radius:50%}
+td.l{font-weight:600;white-space:nowrap;color:#ddd} td.det{color:#9a9a9a}
+.note{color:#888;font-size:12px;margin:3px 0 6px} .banner{padding:9px 13px;border-radius:6px;font-weight:700;margin-bottom:6px}
+.banner.ok{background:#0c2a16;color:#30d158} .banner.warn{background:#2a2408;color:#ffd60a} .banner.fail{background:#2c0e0e;color:#ff6961}
+</style></head><body>${banner}<p class="note">Live check, run at page load — reopen the Status tab to re-run.</p>${body}</body></html>`;
+}
+
+/** GET /admin/status — the operator status/health tab (authed; iframed by the /admin shell). */
+async function handleAdminStatus(request: Request, env: Env): Promise<Response> {
+	const key = (env as unknown as { BRACKET_ADMIN_KEY?: string }).BRACKET_ADMIN_KEY;
+	if (!adminAuthed(request, key)) {
+		return new Response("Authentication required.", { status: 401, headers: { "WWW-Authenticate": adminRealm("NWSLApp Admin") } });
+	}
+	const sections = await Promise.all([
+		statusCheckClubNews(),
+		statusCheckESPN(),
+		statusCheckFeedSources(),
+		statusCheckIG(env),
+		statusCheckErrors(env),
+	]);
+	return new Response(renderStatusPage(sections), { headers: { "Content-Type": "text/html; charset=utf-8" } });
+}
+
 async function handleAdminPortal(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
 	const key = (env as unknown as { BRACKET_ADMIN_KEY?: string }).BRACKET_ADMIN_KEY;
 	if (!adminAuthed(request, key)) {
