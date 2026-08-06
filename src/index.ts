@@ -2202,15 +2202,39 @@ async function statusCheckESPN(): Promise<StatusSection> {
 	return { title: "ESPN core endpoints (the Aug-4 outage path)", note: "A scoreboard failure takes Home + Schedule dark and paged nobody last time — this catches it at a glance.", checks };
 }
 
+// Dormancy tiers for a Bluesky handle, keyed on the age of its most recent ORIGINAL post (reposts
+// don't count — they add nothing to the Social tab). 🔴 at >30d because the app's feed only shows
+// third-party posts within ~30d, so past that the handle is invisible in Social = a drop candidate.
+const BSKY_COOLING_MS = 14 * 86_400_000; // 🟢 → 🟡
+const BSKY_DORMANT_MS = 30 * 86_400_000; // 🟡 → 🔴 (matches the app's ~30d feed window)
+
+/** Age (ms) of the newest ORIGINAL post in a newest-first feed, or null if none found. */
+function latestOriginalAgeMs(feed: BskyItem[], now: number): number | null {
+	for (const it of feed) {
+		if (it.reason) continue; // repost — not this account's own content
+		const createdAt = it.post?.record?.createdAt;
+		if (!createdAt || !it.post?.record?.text) continue;
+		const t = Date.parse(createdAt);
+		if (!Number.isNaN(t)) return now - t; // first original hit = the most recent
+	}
+	return null;
+}
+
 async function statusCheckFeedSources(): Promise<StatusSection> {
+	const now = Date.now();
 	const bsky = FEED_HANDLES.filter((h) => h.kind === "reporter" || h.kind === "league");
 	const bskyChecks = await Promise.all(bsky.map(async (h): Promise<StatusCheck> => {
 		try {
-			const feed = await bskyAuthorFeed(h.handle, 3);
-			const posts = feed.filter((it) => !it.reason && it.post?.record?.text).length;
-			return posts > 0
-				? { label: h.handle, status: "ok", detail: `${posts} recent posts` }
-				: { label: h.handle, status: "warn", detail: "resolves but 0 recent posts — dormant?" };
+			const feed = await bskyAuthorFeed(h.handle, 15); // deeper sample so reposts don't mask an active handle
+			const age = latestOriginalAgeMs(feed, now);
+			if (age === null) {
+				return { label: h.handle, status: "fail", detail: feed.length === 0 ? "resolves but timeline is EMPTY" : "no original posts in last 15 items (repost-only?) — drop candidate" };
+			}
+			const days = Math.floor(age / 86_400_000);
+			const when = `last post ${days}d ago`;
+			if (age < BSKY_COOLING_MS) return { label: h.handle, status: "ok", detail: when };
+			if (age <= BSKY_DORMANT_MS) return { label: h.handle, status: "warn", detail: `${when} — cooling` };
+			return { label: h.handle, status: "fail", detail: `${when} — past the ~30d feed window, invisible in Social (drop candidate)` };
 		} catch {
 			return { label: h.handle, status: "fail", detail: "does NOT resolve on the keyless API — dead/renamed?" };
 		}
@@ -2227,7 +2251,7 @@ async function statusCheckFeedSources(): Promise<StatusSection> {
 	}));
 	return {
 		title: "Feed sources — reporters/league (Bluesky) + news (RSS)",
-		note: "A dead reporter handle or a 404'd feed silently vanishes from the Social tab; it shows here instead.",
+		note: "Bluesky handles tier on their last ORIGINAL post (reposts don't count): 🟢 <14d · 🟡 14–30d cooling · 🔴 >30d (past the app's feed window → invisible in Social, drop candidate) or dead handle. Catches less-active vs gone.",
 		checks: [...bskyChecks, ...rssChecks],
 	};
 }
