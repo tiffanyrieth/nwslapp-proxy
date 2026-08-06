@@ -2093,10 +2093,15 @@ async function handleAdjudication(request: Request, env: Env, ctx: ExecutionCont
 /** The tabbed portal shell and the Roster tab's ops. Bracket + Know Her Game keep their own
  *  handlers and URLs untouched — the shell iframes them (see src/admin-portal.ts for why). */
 // ── Operator STATUS tab: an on-demand, at-a-glance health check (GET /admin/status) ───────────
-// Runs LIVE each time the tab is opened (the shell iframes it). Surfaces the fragile + silently-
-// failing surfaces so a broken club URL / dead reporter handle / ESPN outage / stale snapshot shows
-// as a colored row instead of quietly degrading. Complements the passive alerting (Resend spike
-// pager + healthchecks.io), it doesn't replace it. All checks run in parallel; ~a few seconds.
+// Surfaces the fragile + silently-failing surfaces so a broken club URL / dead reporter handle /
+// ESPN outage / stale snapshot shows as a colored row instead of quietly degrading. Complements the
+// passive alerting (Resend spike pager + healthchecks.io), it doesn't replace it.
+//
+// ⚠️ SUBREQUEST BUDGET: Cloudflare caps fetch()+KV subrequests PER Worker invocation. Running every
+// check in one request blew that cap and made tail checks FALSELY fail. Two defenses: (1) the club
+// probe is LIGHT — one fetch/club, NO per-article OG enrich (that fan-out was the explosion); (2) the
+// page loads each SECTION in its own request (own budget) — the shell fetches /admin/status?section=…
+// per section and assembles them client-side.
 
 type StatusCheck = { label: string; status: "ok" | "warn" | "fail" | "info"; detail: string };
 type StatusSection = { title: string; note?: string; checks: StatusCheck[] };
@@ -2108,16 +2113,29 @@ const DEVICE_FALLBACK_CLUBS = new Set(["CHI", "POR"]);
 const clubDeviceHealthKey = (abbr: string) => `clubnews-devhealth-${abbr}`;
 type ClubDeviceHealth = { ok: boolean; count: number; at: number; error?: string };
 
-/** Run a club's OFFICIAL strategy directly — no cache, no press fallback — for the status grid. */
-async function clubOfficialCardsUncached(abbr: string): Promise<NewsCard[]> {
+/** LIGHT probe of a club's OFFICIAL source — ONE fetch, no per-article OG enrich (unlike the real
+ *  clubIndexCards, whose OG fan-out blows the subrequest budget). rss/api count inline cards; index
+ *  counts article LINKS on the SSR'd page — the "source alive / URL still valid" signal, which is all
+ *  the status grid needs (a moved URL → 0 links → 🟡, the Houston-Dash case). */
+async function clubOfficialProbe(abbr: string): Promise<{ count: number; newest: string }> {
 	const src = CLUB_NEWS[abbr];
-	if (!src) return [];
+	if (!src || !("url" in src)) return { count: 0, newest: "" };
+	const url = (src as { url: string }).url;
+	const newestOf = (cards: NewsCard[]) => ((cards[0] as { timestamp?: string })?.timestamp ?? "").slice(0, 10);
 	try {
-		if (src.kind === "rss") return await clubRssCards(abbr, src.url);
-		if (src.kind === "index") return await clubIndexCards(abbr, src.url, src.articlePath);
-		if (src.kind === "api") return await clubApiCards(abbr, src.url);
-	} catch { /* → 0 cards below */ }
-	return [];
+		if (src.kind === "rss") { const c = await clubRssCards(abbr, url); return { count: c.length, newest: newestOf(c) }; }
+		if (src.kind === "api") { const c = await clubApiCards(abbr, url); return { count: c.length, newest: newestOf(c) }; }
+		if (src.kind === "index") {
+			const r = await fetch(url, { headers: { "User-Agent": BROWSER_UA, Accept: "text/html" } });
+			if (!r.ok) return { count: 0, newest: `HTTP ${r.status}` };
+			const html = await r.text();
+			const path = (src as { articlePath: string }).articlePath;
+			const links = extractArticleLinks(html, url, path);
+			const dates = [...extractIndexDates(html, path).values()].sort();
+			return { count: links.length, newest: dates.length ? dates[dates.length - 1].slice(0, 10) : "" };
+		}
+	} catch { /* → 0 */ }
+	return { count: 0, newest: "" };
 }
 
 function ageLabel(ms: number): string {
@@ -2148,10 +2166,9 @@ async function statusCheckClubNews(env: Env): Promise<StatusSection> {
 	const checks = await Promise.all(abbrs.map(async (abbr): Promise<StatusCheck> => {
 		const src = CLUB_NEWS[abbr];
 		if (src.kind === "fallback") return { label: abbr, status: "warn", detail: "press fallback only — no official source configured" };
-		const cards = await clubOfficialCardsUncached(abbr);
-		if (cards.length > 0) {
-			const newest = ((cards[0] as { timestamp?: string }).timestamp ?? "").slice(0, 10) || "?";
-			return { label: abbr, status: "ok", detail: `${cards.length} official · newest ${newest}` };
+		const probe = await clubOfficialProbe(abbr);
+		if (probe.count > 0) {
+			return { label: abbr, status: "ok", detail: `${probe.count} article${probe.count === 1 ? "" : "s"}${probe.newest ? ` · newest ${probe.newest}` : ""}` };
 		}
 		// 0 official from the proxy: a KNOWN device-fallback club is verified via the app's beacon
 		// (so a URL move surfaces as 🔴/stale, not a masked 🔵); an UNKNOWN club is a real regression.
@@ -2239,7 +2256,7 @@ async function statusCheckErrors(env: Env): Promise<StatusSection> {
 	const DAY = 86_400_000, HOUR = 3_600_000;
 	let last24 = 0, lastHour = 0;
 	const recent: { kind: string; detail: string; ts: number }[] = [];
-	const records = await Promise.all(list.keys.slice(0, 40).map((k) => env.FEED_TAGS.get(k.name, "json").catch(() => null)));
+	const records = await Promise.all(list.keys.slice(0, 30).map((k) => env.FEED_TAGS.get(k.name, "json").catch(() => null)));
 	for (const rec of records) {
 		const events = (rec as { events?: { kind: string; detail: string; ts: number }[] } | null)?.events;
 		if (!Array.isArray(events)) continue;
@@ -2259,47 +2276,83 @@ async function statusCheckErrors(env: Env): Promise<StatusSection> {
 	return { title: "Recent proxy diagnostics (last 24h)", note: "The catch-all: every unexpected condition (fallback / API fail / parse / empty) logs here first.", checks };
 }
 
-function renderStatusPage(sections: StatusSection[]): string {
-	const dotColor: Record<string, string> = { ok: "#30d158", warn: "#ffd60a", fail: "#ff453a", info: "#5ac8fa" };
-	const esc = (x: string) => x.replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c] as string));
-	const body = sections.map((sec) => {
-		const rows = sec.checks.map((c) =>
-			`<tr><td class="d"><span class="dot" style="background:${dotColor[c.status] ?? "#888"}"></span></td>` +
-			`<td class="l">${esc(c.label)}</td><td class="det">${esc(c.detail)}</td></tr>`).join("");
-		return `<h2>${esc(sec.title)}</h2>${sec.note ? `<p class="note">${esc(sec.note)}</p>` : ""}<table>${rows}</table>`;
-	}).join("");
-	const all = sections.flatMap((s) => s.checks);
-	const nFail = all.filter((c) => c.status === "fail").length;
-	const nWarn = all.filter((c) => c.status === "warn").length;
-	const banner = nFail
-		? `<div class="banner fail">🔴 ${nFail} failing · ${nWarn} warning${nWarn === 1 ? "" : "s"}</div>`
-		: nWarn ? `<div class="banner warn">🟡 ${nWarn} warning${nWarn === 1 ? "" : "s"} — worth a look</div>`
-			: `<div class="banner ok">🟢 All clear</div>`;
+const statusEsc = (x: string) => x.replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c] as string));
+
+/** Render ONE section as an HTML fragment (the shell fetches these per section and injects them).
+ *  Dots carry their status as a CLASS so the shell can tally 🔴/🟡 across all sections client-side. */
+function renderStatusSection(sec: StatusSection): string {
+	const rows = sec.checks.map((c) =>
+		`<tr><td class="d"><span class="dot ${c.status}"></span></td>` +
+		`<td class="l">${statusEsc(c.label)}</td><td class="det">${statusEsc(c.detail)}</td></tr>`).join("");
+	return `<h2>${statusEsc(sec.title)}</h2>${sec.note ? `<p class="note">${statusEsc(sec.note)}</p>` : ""}<table>${rows}</table>`;
+}
+
+// The section registry — each runs in its OWN request (its own subrequest budget). Order = display order.
+const STATUS_SECTIONS: Record<string, { label: string; run: (env: Env) => Promise<StatusSection> }> = {
+	clubnews: { label: "Club news", run: (env) => statusCheckClubNews(env) },
+	espn: { label: "ESPN core", run: () => statusCheckESPN() },
+	feeds: { label: "Feed sources", run: () => statusCheckFeedSources() },
+	ig: { label: "Instagram", run: (env) => statusCheckIG(env) },
+	errors: { label: "Diagnostics", run: (env) => statusCheckErrors(env) },
+};
+
+function renderStatusShell(): string {
+	const names = Object.keys(STATUS_SECTIONS);
+	const labels: Record<string, string> = Object.fromEntries(names.map((n) => [n, STATUS_SECTIONS[n].label]));
+	const placeholders = names.map((n) => `<div class="sec" data-sec="${n}"><h2>${statusEsc(labels[n])}</h2><p class="note pending">checking…</p></div>`).join("");
 	return `<!doctype html><html><head><meta charset="utf-8"><meta name="color-scheme" content="dark"><style>
 body{background:#111;color:#eee;font:14px/1.55 -apple-system,system-ui,sans-serif;margin:0;padding:16px}
 h2{font-size:13px;color:#9ad;margin:20px 0 2px;border-bottom:1px solid #333;padding-bottom:4px;text-transform:uppercase;letter-spacing:.03em}
 table{border-collapse:collapse;width:100%} td{padding:3px 8px;vertical-align:top}
-td.d{width:16px} .dot{display:inline-block;width:11px;height:11px;border-radius:50%}
+td.d{width:16px} .dot{display:inline-block;width:11px;height:11px;border-radius:50%;background:#888}
+.dot.ok{background:#30d158} .dot.warn{background:#ffd60a} .dot.fail{background:#ff453a} .dot.info{background:#5ac8fa}
 td.l{font-weight:600;white-space:nowrap;color:#ddd} td.det{color:#9a9a9a}
-.note{color:#888;font-size:12px;margin:3px 0 6px} .banner{padding:9px 13px;border-radius:6px;font-weight:700;margin-bottom:6px}
+.note{color:#888;font-size:12px;margin:3px 0 6px} .note.pending{color:#5ac8fa}
+.banner{padding:9px 13px;border-radius:6px;font-weight:700;margin-bottom:6px;background:#1a1a1a;color:#9ad}
 .banner.ok{background:#0c2a16;color:#30d158} .banner.warn{background:#2a2408;color:#ffd60a} .banner.fail{background:#2c0e0e;color:#ff6961}
-</style></head><body>${banner}<p class="note">Live check, run at page load — reopen the Status tab to re-run.</p>${body}</body></html>`;
+</style></head><body>
+<div id="banner" class="banner">Running live checks…</div>
+<p class="note">Each section is checked live in its own request. Reopen the Status tab to re-run.</p>
+<div id="secs">${placeholders}</div>
+<script>
+const NAMES = ${JSON.stringify(names)};
+const LABELS = ${JSON.stringify(labels)};
+Promise.all(NAMES.map(async (name) => {
+  const el = document.querySelector('[data-sec="' + name + '"]');
+  try {
+    const r = await fetch('/admin/status?section=' + name + '&t=' + Date.now(), { credentials: 'same-origin' });
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    el.innerHTML = await r.text();
+  } catch (e) {
+    el.innerHTML = '<h2>' + LABELS[name] + '</h2><table><tr><td class="d"><span class="dot fail"></span></td>'
+      + '<td class="l">section</td><td class="det">failed to load: ' + String(e) + '</td></tr></table>';
+  }
+})).then(() => {
+  const fails = document.querySelectorAll('.dot.fail').length;
+  const warns = document.querySelectorAll('.dot.warn').length;
+  const b = document.getElementById('banner');
+  if (fails) { b.className = 'banner fail'; b.textContent = '🔴 ' + fails + ' failing · ' + warns + ' warning' + (warns === 1 ? '' : 's'); }
+  else if (warns) { b.className = 'banner warn'; b.textContent = '🟡 ' + warns + ' warning' + (warns === 1 ? '' : 's') + ' — worth a look'; }
+  else { b.className = 'banner ok'; b.textContent = '🟢 All clear'; }
+});
+</script></body></html>`;
 }
 
-/** GET /admin/status — the operator status/health tab (authed; iframed by the /admin shell). */
+/** GET /admin/status — the operator status/health tab (authed; iframed by the /admin shell).
+ *  No `section` → the shell (which fetches each section separately); `?section=NAME` → that one
+ *  section's fragment, run live in this request's own subrequest budget. */
 async function handleAdminStatus(request: Request, env: Env): Promise<Response> {
 	const key = (env as unknown as { BRACKET_ADMIN_KEY?: string }).BRACKET_ADMIN_KEY;
 	if (!adminAuthed(request, key)) {
 		return new Response("Authentication required.", { status: 401, headers: { "WWW-Authenticate": adminRealm("NWSLApp Admin") } });
 	}
-	const sections = await Promise.all([
-		statusCheckClubNews(env),
-		statusCheckESPN(),
-		statusCheckFeedSources(),
-		statusCheckIG(env),
-		statusCheckErrors(env),
-	]);
-	return new Response(renderStatusPage(sections), { headers: { "Content-Type": "text/html; charset=utf-8" } });
+	const section = new URL(request.url).searchParams.get("section");
+	if (section) {
+		const entry = STATUS_SECTIONS[section];
+		if (!entry) return new Response("unknown section", { status: 404 });
+		return new Response(renderStatusSection(await entry.run(env)), { headers: { "Content-Type": "text/html; charset=utf-8" } });
+	}
+	return new Response(renderStatusShell(), { headers: { "Content-Type": "text/html; charset=utf-8" } });
 }
 
 async function handleAdminPortal(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
