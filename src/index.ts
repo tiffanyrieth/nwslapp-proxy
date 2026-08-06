@@ -109,11 +109,19 @@ const SCOREBOARD_LEAGUES = new Set<string>([
 	"fifa.wwcq.ply",                  // FIFA Women's World Cup Qualifying — inter-confederation playoff
 	"fifa.w.concacaf.olympicsq",      // Concacaf Women's Olympic Qualifying
 	"global.pinatar_cup",             // Pinatar Cup (national-team invitational)
+	"global.w.finalissima",           // Women's Finalissima (Euro champ vs Copa América champ)
 	"concacaf.w.champions_cup",       // Concacaf W Champions Cup (CLUB: NWSL clubs vs Liga MX)
 	"usa.nwsl.cup",                   // NWSL Challenge Cup (CLUB: one annual NWSL-vs-NWSL match)
 ]);
 const scoreboardUpstream = (slug: string) =>
 	`https://site.api.espn.com/apis/site/v2/sports/soccer/${slug}/scoreboard`;
+// `/summary?league=<slug>` mirrors the scoreboard's allowlisted-league pattern (same set — every
+// slug we serve fixtures for can serve a match summary). NWSL stays the default so existing app
+// builds and the watcher's pre-2026-08 lineup poll keep working unchanged. The cache key already
+// forks per-league for free: proxyAndCache keys on the FULL incoming URL (query included), and
+// strips `league` from the forwarded search before ESPN sees it.
+const summaryUpstream = (slug: string) =>
+	`https://site.api.espn.com/apis/site/v2/sports/soccer/${slug}/summary`;
 
 // Cache TTLs (seconds).
 const LIVE_TTL = 30; // a match is in progress — keep scores/lineups fresh
@@ -768,8 +776,13 @@ export default {
 		if (url.pathname === "/summary") {
 			// Missing `?event=` isn't validated here — forwarded verbatim, letting
 			// ESPN return its own error, exactly as scoreboard doesn't police
-			// `dates`/`limit`.
-			return proxyAndCache(url, ESPN_SUMMARY, chooseSummaryTTL, ctx);
+			// `dates`/`limit`. `league` IS validated (allowlist — never forward an
+			// arbitrary slug into an ESPN URL), defaulting to NWSL for old callers.
+			const league = url.searchParams.get("league") ?? "usa.nwsl";
+			if (!SCOREBOARD_LEAGUES.has(league)) {
+				return new Response(`Unknown league "${league}".`, { status: 400 });
+			}
+			return proxyAndCache(url, summaryUpstream(league), chooseSummaryTTL, ctx);
 		}
 		if (url.pathname === "/team-videos") {
 			return handleTeamVideos(url, env, ctx);
@@ -4179,10 +4192,11 @@ const WOMENS_NT_FEEDS = [
 	// COMPETITIVE fixtures (not just friendlies) surface in the schedule + fire alerts.
 	"uefa.w.nations", "fifa.wworldq.uefa", "afc.w.asian.cup", "caf.w.nations",
 	"conmebol.america.femenina", "fifa.wwcq.ply", "fifa.w.concacaf.olympicsq", "global.pinatar_cup",
+	"global.w.finalissima",
 ];
 const NATIONAL_TEAMS_TTL = 24 * 3600;
 
-const NATIONAL_TEAMS_CV = "3"; // bump to drop the stale edge-cached directory after a feed change
+const NATIONAL_TEAMS_CV = "4"; // bump to drop the stale edge-cached directory after a feed change (4: +finalissima)
 async function handleNationalTeams(ctx: ExecutionContext): Promise<Response> {
 	const cacheKey = new Request(`https://nwslapp-proxy/national-teams?cv=${NATIONAL_TEAMS_CV}`, { method: "GET" });
 	const cache = caches.default;
