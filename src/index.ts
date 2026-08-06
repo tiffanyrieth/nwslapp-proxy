@@ -726,6 +726,9 @@ export default {
 		if (url.pathname === "/club-news/normalize") {
 			return handleClubNewsNormalize(request, url);
 		}
+		if (url.pathname === "/club-news/device-report") {
+			return handleClubNewsDeviceReport(request, env, ctx);
+		}
 
 		// All other routes are GET-only; reject early so the 405 is shared.
 		if (request.method !== "GET") {
@@ -1464,7 +1467,7 @@ async function clubNewsFor(abbr: string, env: Env, ctx: ExecutionContext): Promi
 function handleClubNewsSources(): Response {
 	const sources = Object.entries(CLUB_NEWS)
 		.filter(([, s]) => "url" in s)
-		.map(([abbr, s]) => ({ abbr, kind: s.kind, url: (s as { url: string }).url }));
+		.map(([abbr, s]) => ({ abbr, kind: s.kind, url: (s as { url: string }).url, deviceFallback: DEVICE_FALLBACK_CLUBS.has(abbr) }));
 	const headers = new Headers({ "Content-Type": "application/json" });
 	headers.set("Cache-Control", "public, max-age=3600");
 	return new Response(JSON.stringify(sources), { status: 200, headers });
@@ -1488,6 +1491,26 @@ async function handleClubNewsNormalize(request: Request, url: URL): Promise<Resp
 		? rssTextToClubCards(abbr, body)
 		: indexHtmlToClubCards(abbr, body, src.url, src.articlePath);
 	return jsonResponse(cards, 200);
+}
+
+/** POST /club-news/device-report — the app reports the RESULT of a device-IP club-news fetch so the
+ *  admin Status tab can verify the device-fallback clubs (CHI/POR). Without this a URL move on a
+ *  blocked club looks identical to the normal block (a masked 🔵); with it the beacon goes stale/🔴.
+ *  Body `{abbr, ok, count, error?}`. Open + best-effort (like /telemetry): informational, owner-only
+ *  display, one KV row per club (latest wins), 7-day TTL so a silent stop shows as stale. */
+async function handleClubNewsDeviceReport(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
+	let body: { abbr?: string; ok?: boolean; count?: number; error?: string };
+	try { body = await request.json(); } catch { return jsonResponse({ ok: false }, 400); }
+	const abbr = String(body.abbr ?? "").toUpperCase();
+	if (!DEVICE_FALLBACK_CLUBS.has(abbr)) return jsonResponse({ ok: false }, 400); // only the known device clubs
+	const record: ClubDeviceHealth = {
+		ok: body.ok === true,
+		count: Math.max(0, Math.min(500, Math.floor(Number(body.count) || 0))),
+		at: Date.now(),
+		error: typeof body.error === "string" ? body.error.slice(0, 200) : undefined,
+	};
+	ctx.waitUntil(env.FEED_TAGS.put(clubDeviceHealthKey(abbr), JSON.stringify(record), { expirationTtl: 7 * 24 * 3600 }));
+	return jsonResponse({ ok: true }, 200);
 }
 
 /** Parse an already-fetched club NEWS INDEX (HTML) into cards — for the device-IP fallback on an
@@ -2078,7 +2101,12 @@ async function handleAdjudication(request: Request, env: Env, ctx: ExecutionCont
 type StatusCheck = { label: string; status: "ok" | "warn" | "fail" | "info"; detail: string };
 type StatusSection = { title: string; note?: string; checks: StatusCheck[] };
 
-const STATUS_DEVICE_FALLBACK = new Set(["CHI", "POR"]); // Worker-blocked; the app device-fetch fills them
+// Clubs the Worker's datacenter IP is blocked from → the app device-fetches them from a residential
+// IP (Phase 2b). Their OFFICIAL health can only be verified from a device, so the app POSTs a beacon
+// (/club-news/device-report) and the Status tab reads it back (a URL move → 🔴 instead of a masked 🔵).
+const DEVICE_FALLBACK_CLUBS = new Set(["CHI", "POR"]);
+const clubDeviceHealthKey = (abbr: string) => `clubnews-devhealth-${abbr}`;
+type ClubDeviceHealth = { ok: boolean; count: number; at: number; error?: string };
 
 /** Run a club's OFFICIAL strategy directly — no cache, no press fallback — for the status grid. */
 async function clubOfficialCardsUncached(abbr: string): Promise<NewsCard[]> {
@@ -2092,7 +2120,30 @@ async function clubOfficialCardsUncached(abbr: string): Promise<NewsCard[]> {
 	return [];
 }
 
-async function statusCheckClubNews(): Promise<StatusSection> {
+function ageLabel(ms: number): string {
+	const h = ms / 3_600_000;
+	if (h < 1) return `${Math.max(1, Math.round(ms / 60_000))}m ago`;
+	if (h < 48) return `${Math.round(h)}h ago`;
+	return `${Math.round(h / 24)}d ago`;
+}
+
+/** The device-fallback health for one blocked club (CHI/POR), from the beacon the app POSTs. */
+async function deviceFallbackCheck(abbr: string, url: string | undefined, env: Env): Promise<StatusCheck> {
+	const raw = await env.FEED_TAGS.get(clubDeviceHealthKey(abbr)).catch(() => null);
+	if (!raw) return { label: abbr, status: "warn", detail: "device-fallback club — NO device check yet (open the app on a device to verify its URL)" };
+	let rec: ClubDeviceHealth;
+	try { rec = JSON.parse(raw) as ClubDeviceHealth; } catch { return { label: abbr, status: "warn", detail: "device-fallback club — unreadable beacon" }; }
+	const age = Date.now() - (rec.at ?? 0);
+	if (!rec.ok || rec.count <= 0) {
+		return { label: abbr, status: "fail", detail: `device-fetch got NOTHING (${ageLabel(age)}) — URL MOVED/blocked? ${rec.error ? `[${rec.error}] ` : ""}CHECK: ${url ?? "—"}` };
+	}
+	if (age > 3 * 24 * 3_600_000) {
+		return { label: abbr, status: "warn", detail: `verified via device but STALE (last ok ${ageLabel(age)}, ${rec.count} cards) — no recent device to re-check` };
+	}
+	return { label: abbr, status: "ok", detail: `verified via device: ${rec.count} cards (${ageLabel(age)})` };
+}
+
+async function statusCheckClubNews(env: Env): Promise<StatusSection> {
 	const abbrs = Object.keys(CLUB_NEWS).sort();
 	const checks = await Promise.all(abbrs.map(async (abbr): Promise<StatusCheck> => {
 		const src = CLUB_NEWS[abbr];
@@ -2102,12 +2153,14 @@ async function statusCheckClubNews(): Promise<StatusSection> {
 			const newest = ((cards[0] as { timestamp?: string }).timestamp ?? "").slice(0, 10) || "?";
 			return { label: abbr, status: "ok", detail: `${cards.length} official · newest ${newest}` };
 		}
-		if (STATUS_DEVICE_FALLBACK.has(abbr)) return { label: abbr, status: "info", detail: "Worker-blocked → the app's device-fetch fills it (expected)" };
+		// 0 official from the proxy: a KNOWN device-fallback club is verified via the app's beacon
+		// (so a URL move surfaces as 🔴/stale, not a masked 🔵); an UNKNOWN club is a real regression.
+		if (DEVICE_FALLBACK_CLUBS.has(abbr)) return deviceFallbackCheck(abbr, (src as { url?: string }).url, env);
 		return { label: abbr, status: "warn", detail: `official source returned 0 → press fallback. CHECK THE URL: ${(src as { url?: string }).url ?? "—"}` };
 	}));
 	return {
 		title: "Club news — official source per club",
-		note: "🟡 = quietly on press fallback: a changed or broken club URL (the Houston-Dash case) shows here instead of failing silently. 🔵 = device-fallback club (expected).",
+		note: "🟡 = quietly on press fallback: a changed/broken club URL (the Houston-Dash case) shows here instead of failing silently. Device-fallback clubs (CHI/POR) are verified from the app's beacon — 🔴 = its URL moved.",
 		checks,
 	};
 }
@@ -2240,7 +2293,7 @@ async function handleAdminStatus(request: Request, env: Env): Promise<Response> 
 		return new Response("Authentication required.", { status: 401, headers: { "WWW-Authenticate": adminRealm("NWSLApp Admin") } });
 	}
 	const sections = await Promise.all([
-		statusCheckClubNews(),
+		statusCheckClubNews(env),
 		statusCheckESPN(),
 		statusCheckFeedSources(),
 		statusCheckIG(env),
