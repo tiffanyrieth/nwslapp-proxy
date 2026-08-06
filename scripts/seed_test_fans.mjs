@@ -241,17 +241,21 @@ async function ensureAccounts(n) {
   }
   const fans = [];
   let created = 0;
+  // Display names must be globally unique now (profiles has a case-insensitive unique index, 2026-08-06):
+  // a re-seed that reused a name would fail the index. De-collide by suffixing a bumping number.
+  const usedNames = new Set();
   for (let i = 1; i <= n; i++) {
     let u = byIndex.get(i);
     if (!u) { u = await createSeedUser(i); created++; }
     const rnd = mulberry32(i * 7919);
-    fans.push({
-      index: i,
-      id: u.id,
-      email: u.email,
-      name: `${pick(rnd, NAME_FIRST)}${pick(rnd, NAME_LAST)}${i % 3 === 0 ? Math.floor(rnd() * 90 + 10) : ""}`,
-      rnd,
-    });
+    let name = `${pick(rnd, NAME_FIRST)}${pick(rnd, NAME_LAST)}${i % 3 === 0 ? Math.floor(rnd() * 90 + 10) : ""}`;
+    if (usedNames.has(name.toLowerCase())) {
+      let suffix = 2;
+      while (usedNames.has(`${name}${suffix}`.toLowerCase())) suffix++;
+      name = `${name}${suffix}`;
+    }
+    usedNames.add(name.toLowerCase());
+    fans.push({ index: i, id: u.id, email: u.email, name, rnd });
   }
   console.log(`  accounts: ${fans.length} total (${created} created, ${fans.length - created} reused)`);
   return fans;
