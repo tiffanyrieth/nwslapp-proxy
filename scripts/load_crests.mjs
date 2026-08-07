@@ -31,6 +31,23 @@ const OUT = 512; // px output canvas — sized so the crest ARTWORK below stays 
 const FILL = 0.84; // crest fills 84% of the canvas → a "modest" uniform margin (~8% each side),
 //                    consistent across all 16 (unlike ESPN's per-logo padding). Tune freely.
 
+// abbreviation → direct crest source URL for NON-NWSL clubs (Concacaf W Champions Cup field,
+// 2026-08-06). ESPN has crests only for the Liga MX sides; the others come from Concacaf's own
+// media CDN (the tournament-registered club logos — also used for Monterrey, whose Concacaf
+// version carries a white keyline that survives the app's dark surfaces where ESPN's doesn't).
+// ⚠️ Abbreviations share the `crest:{ABBR}` KV namespace with the NWSL set — audit before adding
+// (2026-08-06 audit: MON/PAC/AME/ALI/ALA/CFC/VAN vs the 16 NWSL keys = no collisions). Re-check
+// this map when a new Champions Cup season's field is announced.
+const FOREIGN_SOURCES = {
+	MON: "https://media-sdp.concacaf.com/clubLogos/8123aa3fa217490998c012706159f317.webp", // Monterrey (Rayadas)
+	PAC: "https://a.espncdn.com/i/teamlogos/soccer/500/22414.png",                          // Pachuca
+	AME: "https://a.espncdn.com/i/teamlogos/soccer/500/22415.png",                          // América
+	ALI: "https://media-sdp.concacaf.com/clubLogos/f455e5fd8a964489beae2e789733c1b3.webp", // Alianza Women (SLV)
+	ALA: "https://media-sdp.concacaf.com/clubLogos/e48c5c22855b475c94e9d7665bcddf38.webp", // LD Alajuelense (CRC)
+	CFC: "https://media-sdp.concacaf.com/clubLogos/30446fa52d3c41ae879da14f562f8f95.webp", // Chorrillo FC (PAN)
+	VAN: "https://media-sdp.concacaf.com/clubLogos/989a651349634e3faacee31da155c4df.webp", // Vancouver Rise FC Academy (CAN)
+};
+
 // abbreviation → NWSL team GUID (from the SDP /teams feed; acronymName == the app's abbr).
 const TEAM_GUIDS = {
 	CHI: "269e825b853f4b43a9d38390aa92bf6e", KC: "2c1699409ff84c9eb491aeaca3d3edde",
@@ -48,9 +65,10 @@ const dryRun = args.includes("--dry-run");
 const onlyIdx = args.indexOf("--only");
 const only = onlyIdx >= 0 ? (args[onlyIdx + 1] ?? "").toUpperCase() : null;
 
-const teams = Object.keys(TEAM_GUIDS).filter((a) => !only || a === only);
+const allAbbrs = [...Object.keys(TEAM_GUIDS), ...Object.keys(FOREIGN_SOURCES)];
+const teams = allAbbrs.filter((a) => !only || a === only);
 if (teams.length === 0) {
-	console.error(`✗ --only ${only}: not a known team (${Object.keys(TEAM_GUIDS).join(", ")})`);
+	console.error(`✗ --only ${only}: not a known team (${allAbbrs.join(", ")})`);
 	process.exit(1);
 }
 
@@ -64,7 +82,10 @@ const sourceURL = (guid) =>
 let ok = 0;
 for (const abbr of teams) {
 	try {
-		const res = await fetch(sourceURL(TEAM_GUIDS[abbr]), {
+		// NWSL clubs come from the NWSL SDP CDN by GUID; foreign clubs from their direct URL
+		// (ESPN CDN / Concacaf media). sharp normalizes SVG, PNG, and WebP sources alike.
+		const src_url = TEAM_GUIDS[abbr] ? sourceURL(TEAM_GUIDS[abbr]) : FOREIGN_SOURCES[abbr];
+		const res = await fetch(src_url, {
 			headers: { "User-Agent": "Mozilla/5.0 Chrome/120" },
 		});
 		if (!res.ok) throw new Error(`source ${res.status}`);
