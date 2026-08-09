@@ -263,12 +263,9 @@ const CLUB_NEWS: Record<string, ClubNewsSource> = {
 const BROWSER_UA =
 	"Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36";
 
-// ⚠️ ESPN bot rule (observed 2026-08-04): ESPN's site.api endpoints began returning 403 to requests
-// with NO User-Agent OR a browser-style UA, while accepting honest HTTP-client UAs. Our ESPN JSON
-// fetches had sent no UA since the proxy's first commit — a latent gap ESPN's change exposed, taking
-// the whole scoreboard/schedule down. `okhttp/4.9.0` (a real Android HTTP-client UA) returned 200 in
-// testing where empty/browser/CFNetwork-spoof UAs got 403. If ESPN later blocks this too, rotate it.
-const ESPN_UA = "okhttp/4.9.0";
+// ⚠️ ESPN bot rule: EVERY ESPN fetch needs the shared UA (ESPN 403s UA-less Worker fetches,
+// 2026-08-04) — the constant + full story live in espn-ua.ts so no module can miss it again.
+import { ESPN_UA } from "./espn-ua.ts";
 
 // Bluesky AT Protocol PUBLIC API (keyless, no auth) — backs the Feed's
 // reporter/league/team posts (and the team voices merged onto Home).

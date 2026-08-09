@@ -21,6 +21,8 @@
 // Exported for `roster-truth.ts`, which cross-checks ESPN rosters against the same SDP
 // feed using the same season/team resolution and the same name-join semantics — the join
 // this module has proven at ~98% for months. One source of truth, not a second copy.
+import { ESPN_HEADERS } from "./espn-ua.ts";
+
 export const SDP = "https://api-sdp.nwslsoccer.com/v1/nwsl/football";
 const ESPN_SITE = "https://site.api.espn.com/apis/site/v2/sports/soccer/usa.nwsl";
 
@@ -137,7 +139,7 @@ interface EspnPlayer {
 }
 
 async function fetchEspnTeams(): Promise<{ id: string; abbr: string }[]> {
-	const json = (await (await fetch(`${ESPN_SITE}/teams`)).json()) as {
+	const json = (await (await fetch(`${ESPN_SITE}/teams`, { headers: ESPN_HEADERS })).json()) as {
 		sports?: { leagues?: { teams?: { team?: { id?: string; abbreviation?: string } }[] }[] }[];
 	};
 	const teams = json.sports?.[0]?.leagues?.[0]?.teams ?? [];
@@ -147,7 +149,7 @@ async function fetchEspnTeams(): Promise<{ id: string; abbr: string }[]> {
 }
 
 async function fetchEspnRoster(teamId: string, abbr: string): Promise<EspnPlayer[]> {
-	const json = (await (await fetch(`${ESPN_SITE}/teams/${teamId}/roster`)).json()) as {
+	const json = (await (await fetch(`${ESPN_SITE}/teams/${teamId}/roster`, { headers: ESPN_HEADERS })).json()) as {
 		athletes?: { id?: string; displayName?: string }[];
 	};
 	return (json.athletes ?? [])

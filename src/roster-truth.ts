@@ -40,6 +40,7 @@ import {
 	fetchNwslTeamAbbrs,
 } from "./headshots.ts";
 import { POSITION_GROUP, mapEspnRosterAthletes, type RosterPlayer } from "./bracket-engine.ts";
+import { ESPN_HEADERS } from "./espn-ua.ts";
 
 const ESPN_SITE = "https://site.api.espn.com/apis/site/v2/sports/soccer/usa.nwsl";
 
@@ -858,7 +859,9 @@ const stat = (p: { stats?: { statsId?: string; statsValue?: number }[] }, id: st
 /** ⚠️ SINGLE-ATTEMPT ON PURPOSE — see the budget note on `runRosterTruth`. */
 async function getJSON<T>(url: string): Promise<T | null> {
 	try {
-		const r = await fetch(url, { headers: { Accept: "application/json" } });
+		// ESPN_HEADERS carries the mandatory UA — ESPN 403s UA-less Worker fetches (2026-08-04 rule;
+		// this helper was missed by that sweep and blanked the nightly verification on 8/07–8/08).
+		const r = await fetch(url, { headers: ESPN_HEADERS });
 		if (!r.ok) return null;
 		return (await r.json()) as T;
 	} catch {

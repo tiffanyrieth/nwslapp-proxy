@@ -38,6 +38,7 @@ import {
   type Matchup,
   type MatchupVotes,
 } from "./bracket.ts";
+import { ESPN_HEADERS } from "./espn-ua.ts";
 import { ADMIN_PAGE_HTML } from "./bracket-admin-page.ts";
 import { adminAuthed, adminRealm } from "./admin-auth.ts";
 
@@ -349,7 +350,7 @@ interface LeaderLine { goals: number; assists: number; saves: number }
 async function fetchLeaders(year: number): Promise<Record<string, LeaderLine>> {
   const map: Record<string, LeaderLine> = {};
   try {
-    const json = (await (await fetch(`${ESPN_CORE}/seasons/${year}/types/1/leaders`)).json()) as {
+    const json = (await (await fetch(`${ESPN_CORE}/seasons/${year}/types/1/leaders`, { headers: ESPN_HEADERS })).json()) as {
       categories?: { name?: string; leaders?: { value?: number; athlete?: { $ref?: string } }[] }[];
     };
     const want: Record<string, keyof LeaderLine> = {
@@ -373,7 +374,7 @@ async function fetchLeaders(year: number): Promise<Record<string, LeaderLine>> {
 /** One athlete's season stats, flattened to "category.statName" → value. */
 async function fetchAthleteStats(id: string, year: number): Promise<Record<string, number>> {
   const out: Record<string, number> = {};
-  const json = (await (await fetch(`${ESPN_CORE}/seasons/${year}/types/1/athletes/${id}/statistics`)).json()) as {
+  const json = (await (await fetch(`${ESPN_CORE}/seasons/${year}/types/1/athletes/${id}/statistics`, { headers: ESPN_HEADERS })).json()) as {
     splits?: { categories?: { name?: string; stats?: { name?: string; value?: number }[] }[] };
   };
   for (const cat of json.splits?.categories ?? []) {
