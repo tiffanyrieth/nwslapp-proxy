@@ -131,9 +131,13 @@ const IMMUTABLE_TTL = 31536000; // 1yr — a SETTLED, COMPLETE match's data is f
 // A settled match whose record is still filling in (attendance lands hours-to-days late for some
 // venues). Long enough to be nearly free, short enough that the number appears the same day.
 const SUMMARY_PENDING_TTL = 21600; // 6h
-// Past this, stop waiting for a missing field and treat the record as complete. Most NT matches
-// never report attendance at all, and without a bound they'd re-fetch every 6h forever.
+// Past this, slow the re-check from 6h to weekly — but NEVER pin a zero as immutable. The old
+// giveUp→IMMUTABLE promotion froze `attendance: 0` for a year on every match >14d old (the
+// frozen-attendance regression, found 2026-08-09). Most NT matches never report attendance at
+// all; the cold tier caps them at ~1 demand-driven fetch/week/colo, which is effectively free,
+// while a figure that lands late (or a zero frozen by a past bug) still heals within a week.
 const SUMMARY_PENDING_MAX_AGE_MS = 14 * 24 * 60 * 60 * 1000; // 14d
+const SUMMARY_PENDING_COLD_TTL = 604800; // 7d — settled, old, still incomplete: re-check weekly
 // What we tell the CLIENT to cache, regardless of the (much longer) edge TTL. A device that pins a
 // summary for a year is unreachable: no server-side fix can reach it, because the device never even
 // asks. The edge still absorbs the load — a client revalidation is an edge HIT, not an ESPN fetch.
@@ -143,8 +147,10 @@ const CLIENT_MAX_TTL = 3600; // 1h
 // `workers.dev` has no zone to purge through the Cloudflare API. Changing the KEY invalidates
 // globally instead, at the cost of one re-fetch per distinct URL. Bumped to 2 on 2026-07-31 to
 // evict summaries frozen mid-suspension by the `post`-means-final bug below (WAS @ UTA sat pinned
-// at 23' with attendance 0 for a year, 1.9 days in when it was found).
-const CACHE_EPOCH = "2";
+// at 23' with attendance 0 for a year, 1.9 days in when it was found). Bumped to 3 on 2026-08-09
+// to evict settled-zero summaries pinned IMMUTABLE by the 14-day give-up (and any re-pinned via
+// ESPN's own stale CDN before /summary busted upstream) — the frozen-attendance regression.
+const CACHE_EPOCH = "3";
 const TEAM_VIDEOS_TTL = 3600; // 1hr — a club's recent uploads change at most a few times/day
 
 const YT_API = "https://www.googleapis.com/youtube/v3";
@@ -779,7 +785,10 @@ export default {
 			if (!SCOREBOARD_LEAGUES.has(league)) {
 				return new Response(`Unknown league "${league}".`, { status: 400 });
 			}
-			return proxyAndCache(url, summaryUpstream(league), chooseSummaryTTL, ctx);
+			// bustUpstream: the pending-summary re-check (attendance still 0 after FT) only works if
+			// ESPN recomputes — its own CDN serves /summary stale just like /scoreboard, and an
+			// unbusted re-check can re-pin the FT-time zero for another 6h window indefinitely.
+			return proxyAndCache(url, summaryUpstream(league), chooseSummaryTTL, ctx, true);
 		}
 		if (url.pathname === "/team-videos") {
 			return handleTeamVideos(url, env, ctx);
@@ -822,7 +831,9 @@ export default {
 			// only the immutable header date is read, so no `w=near` and no extra ESPN load).
 			const getSummary = async (eventId: string) => {
 				const summaryUrl = new URL(`/summary?event=${eventId}`, url);
-				const resp = await proxyAndCache(summaryUrl, ESPN_SUMMARY, chooseSummaryTTL, ctx);
+				// bustUpstream matches the /summary route: this shares its edge cache key, so an
+				// unbusted MISS here would populate the shared cache with ESPN's CDN-stale copy.
+				const resp = await proxyAndCache(summaryUrl, ESPN_SUMMARY, chooseSummaryTTL, ctx, true);
 				return resp.ok ? ((await resp.json()) as never) : null;
 			};
 			return handlePredictCommunity(
@@ -857,7 +868,8 @@ export default {
 			// always a warm HIT. emitDiag is injected to keep weather.ts self-contained.
 			const getSummary = async (eventId: string) => {
 				const summaryUrl = new URL(`/summary?event=${eventId}`, url);
-				const resp = await proxyAndCache(summaryUrl, ESPN_SUMMARY, chooseSummaryTTL, ctx);
+				// bustUpstream matches the /summary route (shared edge cache key — see /predict/community).
+				const resp = await proxyAndCache(summaryUrl, ESPN_SUMMARY, chooseSummaryTTL, ctx, true);
 				return resp.ok ? ((await resp.json()) as never) : null;
 			};
 			return handleWeather(url, env, ctx, getSummary, emitDiag);
@@ -946,7 +958,9 @@ async function proxyAndCache(
 	// by /scoreboard: ESPN's own cache serves the full-season `dates=` query STALE for 25–47 min during
 	// live games (device-proven 2026-07-11 — a game stuck at `pre`/`HT`/`70'` while reality was 90'+),
 	// and only a query it hasn't cached forces a recompute. `_cb` is the same mechanism the watcher's
-	// VAR re-poll uses; every un-stuck moment that night came from exactly this poke.
+	// VAR re-poll uses; every un-stuck moment that night came from exactly this poke. Also used by
+	// /summary (2026-08-09): the pending-attendance re-check is pointless if ESPN's CDN answers it
+	// with the same stale FT-time snapshot — the zero just gets re-pinned every 6h window.
 	bustUpstream = false,
 ): Promise<Response> {
 	// Cache key = the incoming URL (query string included), so different
@@ -1136,8 +1150,10 @@ const RESUMABLE_POST_STATUSES = new Set([
  * two days on). An immutable cache means a number that lands on Tuesday is never seen. So a
  * settled-but-incomplete record re-checks every 6h, and only becomes immutable once the field is
  * actually there — the same "write-once, but only when it's real" rule the kickoff-weather cache
- * uses. Bounded by SUMMARY_PENDING_MAX_AGE_MS: most NT matches never report attendance at all,
- * and an unbounded wait would re-fetch those every 6h forever.
+ * uses. Past SUMMARY_PENDING_MAX_AGE_MS the re-check slows to weekly (SUMMARY_PENDING_COLD_TTL)
+ * — most NT matches never report attendance at all, and 6h forever would be wasteful — but an
+ * incomplete record is NEVER promoted to immutable: pinning a zero for a year is exactly the
+ * frozen-attendance regression (2026-08-09), and a weekly demand-driven re-check is nearly free.
  */
 export function chooseSummaryTTL(body: ArrayBuffer, now: number = Date.now()): number {
 	try {
@@ -1172,7 +1188,7 @@ export function chooseSummaryTTL(body: ArrayBuffer, now: number = Date.now()): n
 				const kickoff = competition?.date ? Date.parse(competition.date) : NaN;
 				const giveUp =
 					Number.isFinite(kickoff) && now - kickoff > SUMMARY_PENDING_MAX_AGE_MS;
-				return giveUp ? IMMUTABLE_TTL : SUMMARY_PENDING_TTL;
+				return giveUp ? SUMMARY_PENDING_COLD_TTL : SUMMARY_PENDING_TTL;
 			}
 			case "in":
 				return LIVE_TTL;
