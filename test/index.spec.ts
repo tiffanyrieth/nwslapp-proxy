@@ -122,9 +122,9 @@ describe("chooseSummaryTTL", () => {
 		expect(chooseSummaryTTL(finished({ attendance: 0 }))).toBe(21600);
 	});
 
-	it("stops waiting after 14 days — most NT matches never report attendance at all", () => {
+	it("slows to a weekly re-check after 14 days — most NT matches never report attendance at all", () => {
 		const old = new Date(Date.now() - 20 * 86400 * 1000).toISOString();
-		expect(chooseSummaryTTL(finished({ attendance: 0, kickoff: old }))).toBe(31536000);
+		expect(chooseSummaryTTL(finished({ attendance: 0, kickoff: old }))).toBe(604800);
 		// Just inside the window it is still worth another look.
 		const recent = new Date(Date.now() - 10 * 86400 * 1000).toISOString();
 		expect(chooseSummaryTTL(finished({ attendance: 0, kickoff: recent }))).toBe(21600);
@@ -134,7 +134,18 @@ describe("chooseSummaryTTL", () => {
 		const kickoff = "2026-07-01T00:00:00Z";
 		const body = finished({ attendance: 0, kickoff });
 		expect(chooseSummaryTTL(body, Date.parse("2026-07-05T00:00:00Z"))).toBe(21600);
-		expect(chooseSummaryTTL(body, Date.parse("2026-07-20T00:00:00Z"))).toBe(31536000);
+		expect(chooseSummaryTTL(body, Date.parse("2026-07-20T00:00:00Z"))).toBe(604800);
+	});
+
+	// ⚠️ The frozen-attendance regression, 2026-08-09: the old giveUp→IMMUTABLE promotion pinned
+	// `attendance: 0` for a YEAR on every settled match older than 14 days — combined with the
+	// epoch-2 back-catalogue refetch, "most games" froze at zero. An INCOMPLETE record must never
+	// become immutable, no matter how old; only a real attendance figure earns the 1yr pin.
+	it("never pins an incomplete (zero-attendance) record as immutable, at any age", () => {
+		for (const daysOld of [15, 30, 90, 400]) {
+			const kickoff = new Date(Date.now() - daysOld * 86400 * 1000).toISOString();
+			expect(chooseSummaryTTL(finished({ attendance: 0, kickoff }))).not.toBe(31536000);
+		}
 	});
 
 	it("caches live matches briefly (in -> 30s)", () => {
