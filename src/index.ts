@@ -138,6 +138,10 @@ const SUMMARY_PENDING_TTL = 21600; // 6h
 // while a figure that lands late (or a zero frozen by a past bug) still heals within a week.
 const SUMMARY_PENDING_MAX_AGE_MS = 14 * 24 * 60 * 60 * 1000; // 14d
 const SUMMARY_PENDING_COLD_TTL = 604800; // 7d — settled, old, still incomplete: re-check weekly
+// Last-known-good snapshot lifetime (recovery-ladder step 3, see proxyAndCache). 24h: long enough
+// to cover a full game day's ESPN outage, short enough that a rolled-over scoreboard window or a
+// long-dead entry can't be served a week later.
+const SNAPSHOT_TTL = 86400; // 24h
 // What we tell the CLIENT to cache, regardless of the (much longer) edge TTL. A device that pins a
 // summary for a year is unreachable: no server-side fix can reach it, because the device never even
 // asks. The edge still absorbs the load — a client revalidation is an edge HIT, not an ESPN fetch.
@@ -774,7 +778,7 @@ export default {
 			}
 			// bustUpstream: ESPN serves the full-season scoreboard STALE for tens of minutes during
 			// live games; force a recompute on every MISS so the app's 30s poll gets fresh data.
-			return proxyAndCache(url, scoreboardUpstream(league), chooseScoreboardTTL, ctx, true);
+			return proxyAndCache(url, scoreboardUpstream(league), chooseScoreboardTTL, ctx, env, true);
 		}
 		if (url.pathname === "/summary") {
 			// Missing `?event=` isn't validated here — forwarded verbatim, letting
@@ -788,7 +792,7 @@ export default {
 			// bustUpstream: the pending-summary re-check (attendance still 0 after FT) only works if
 			// ESPN recomputes — its own CDN serves /summary stale just like /scoreboard, and an
 			// unbusted re-check can re-pin the FT-time zero for another 6h window indefinitely.
-			return proxyAndCache(url, summaryUpstream(league), chooseSummaryTTL, ctx, true);
+			return proxyAndCache(url, summaryUpstream(league), chooseSummaryTTL, ctx, env, true);
 		}
 		if (url.pathname === "/team-videos") {
 			return handleTeamVideos(url, env, ctx);
@@ -833,7 +837,7 @@ export default {
 				const summaryUrl = new URL(`/summary?event=${eventId}`, url);
 				// bustUpstream matches the /summary route: this shares its edge cache key, so an
 				// unbusted MISS here would populate the shared cache with ESPN's CDN-stale copy.
-				const resp = await proxyAndCache(summaryUrl, ESPN_SUMMARY, chooseSummaryTTL, ctx, true);
+				const resp = await proxyAndCache(summaryUrl, ESPN_SUMMARY, chooseSummaryTTL, ctx, env, true);
 				return resp.ok ? ((await resp.json()) as never) : null;
 			};
 			return handlePredictCommunity(
@@ -869,7 +873,7 @@ export default {
 			const getSummary = async (eventId: string) => {
 				const summaryUrl = new URL(`/summary?event=${eventId}`, url);
 				// bustUpstream matches the /summary route (shared edge cache key — see /predict/community).
-				const resp = await proxyAndCache(summaryUrl, ESPN_SUMMARY, chooseSummaryTTL, ctx, true);
+				const resp = await proxyAndCache(summaryUrl, ESPN_SUMMARY, chooseSummaryTTL, ctx, env, true);
 				return resp.ok ? ((await resp.json()) as never) : null;
 			};
 			return handleWeather(url, env, ctx, getSummary, emitDiag);
@@ -945,14 +949,27 @@ export default {
 /**
  * The shared caching pass-through. Checks the edge cache, and on a MISS forwards
  * the incoming query string verbatim to `upstreamBase`, caches the bytes with a
- * TTL from `chooseTTL`, and returns them unchanged. On an upstream failure it
- * serves a stale copy if one exists, else a 502.
+ * TTL from `chooseTTL`, and returns them unchanged.
+ *
+ * On an upstream failure it walks a RECOVERY LADDER (2026-08-10 — ESPN 502s its live-window
+ * recomputes intermittently; a failed watcher tick delayed V2-LA goal pushes, owner-observed):
+ *   1. bust-enabled routes retry once WITHOUT `_cb` — ESPN's own cached copy is near-fresh for
+ *      windowed queries and beats any snapshot we could hold (diag: `espnRetryRecovered`, quiet);
+ *   2. a stale edge copy under the SAME key (useless for the watcher — its `_cb` URLs are
+ *      unique keys that never have one) (diag: `staleServe`, PAGES on a sustained burst);
+ *   3. the last-known-good SNAPSHOT: written on every successful bust-route fetch under a
+ *      normalized key (`_cb`/`w` stripped), so the watcher's busted polls and the app's clean
+ *      polls share it (diag: `staleServe`, pages; served with a 30s client TTL so devices
+ *      re-ask as soon as ESPN recovers);
+ *   4. else 502 (diag: `apiFailure`, pages) — before this ladder, upstream failures emitted NO
+ *      diagnostics at all: the pager was blind to an ESPN outage on the app's hottest routes.
  */
 async function proxyAndCache(
 	url: URL,
 	upstreamBase: string,
 	chooseTTL: (body: ArrayBuffer) => number,
 	ctx: ExecutionContext,
+	env: Env,
 	// When true, append a per-fetch `_cb` cache-buster to the UPSTREAM (ESPN) URL only — the edge
 	// cache key stays the clean incoming URL, so app traffic still collapses to ≤2 ESPN hits/min. Used
 	// by /scoreboard: ESPN's own cache serves the full-season `dates=` query STALE for 25–47 min during
@@ -990,23 +1007,60 @@ async function proxyAndCache(
 	// ESPN must never see it; the caller computes it because only the caller knows kickoff
 	// at request time (the proxy would need the body it hasn't fetched yet).
 	upstream.searchParams.delete("w");
-	// Force ESPN to recompute rather than serve its own stale cache (see bustUpstream). Cache-key
-	// unaffected — this param is added AFTER `cacheKey` was built from the clean incoming URL.
-	if (bustUpstream) upstream.searchParams.set("_cb", String(Date.now()));
 
-	let espnResponse: Response;
-	try {
-		espnResponse = await fetch(upstream.toString(), {
+	// `bust` appends `_cb` per-fetch so ESPN must recompute rather than serve its own stale cache
+	// (see bustUpstream). Cache-key unaffected — added AFTER `cacheKey` was built from the clean URL.
+	const fetchUpstream = (bust: boolean): Promise<Response> => {
+		const u = new URL(upstream.toString());
+		if (bust) u.searchParams.set("_cb", String(Date.now()));
+		return fetch(u.toString(), {
 			headers: { "User-Agent": ESPN_UA, Accept: "application/json" },
 		});
+	};
+
+	let espnResponse: Response | null = null;
+	try {
+		espnResponse = await fetchUpstream(bustUpstream);
 	} catch {
-		const stale = await serveStale(cache, cacheKey);
-		return stale ? withClientTTL(stale) : upstreamError();
+		espnResponse = null;
 	}
 
-	if (!espnResponse.ok) {
+	// Recovery ladder step 1 — the `_cb` recompute is what ESPN chokes on under live load, so an
+	// un-busted retry usually succeeds from ESPN's own cache: near-fresh for windowed queries,
+	// strictly better than any snapshot, and it un-blinds a watcher tick that would otherwise skip.
+	if (!espnResponse?.ok && bustUpstream) {
+		const firstFail = espnResponse ? String(espnResponse.status) : "threw";
+		try {
+			const retry = await fetchUpstream(false);
+			if (retry.ok) {
+				emitDiag(env, ctx, "espnRetryRecovered", `${url.pathname} upstream ${firstFail}`);
+				espnResponse = retry;
+			}
+		} catch {
+			// fall through to steps 2-4
+		}
+	}
+
+	if (!espnResponse?.ok) {
+		const failDetail = `${url.pathname} upstream ${espnResponse ? espnResponse.status : "threw"}`;
+		// Step 2 — stale copy under the same key (expired-but-not-evicted edge entry).
 		const stale = await serveStale(cache, cacheKey);
-		return stale ? withClientTTL(stale) : upstreamError(espnResponse.status);
+		if (stale) {
+			emitDiag(env, ctx, "staleServe", `${failDetail} — served stale`);
+			return withClientTTL(stale);
+		}
+		// Step 3 — the last-known-good snapshot (normalized key, see snapshotKeyURL). Short client
+		// TTL: a device must not pin outage-era data for the usual hour once ESPN recovers.
+		const snap = await cache.match(new Request(snapshotKeyURL(url), { method: "GET" }));
+		if (snap) {
+			emitDiag(env, ctx, "staleServe", `${failDetail} — served snapshot`);
+			const out = new Response(snap.body, snap);
+			out.headers.set("Cache-Control", "public, max-age=30");
+			return withCacheStatus(out, "STALE");
+		}
+		// Step 4 — nothing to serve. This is the only outcome the caller sees as an error.
+		emitDiag(env, ctx, "apiFailure", `${failDetail} (no fallback)`);
+		return upstreamError(espnResponse?.status);
 	}
 
 	// Read the body once as bytes so we can both cache it and return it
@@ -1026,7 +1080,38 @@ async function proxyAndCache(
 	const toCache = new Response(body, { status: 200, headers });
 	ctx.waitUntil(cache.put(cacheKey, toCache.clone()));
 
+	// Bust-enabled (ESPN-fragile) routes also refresh the last-known-good snapshot — the Cache API
+	// costs nothing per write (unlike KV's 1k/day free-tier budget) and is per-colo, which is fine:
+	// the watcher's every-minute polls keep ITS colo's snapshot warm, and that colo is exactly where
+	// its future failures will look.
+	if (bustUpstream) {
+		const snapHeaders = new Headers(headers);
+		snapHeaders.set("Cache-Control", `public, max-age=${SNAPSHOT_TTL}`);
+		ctx.waitUntil(
+			cache.put(
+				new Request(snapshotKeyURL(url), { method: "GET" }),
+				new Response(body, { status: 200, headers: snapHeaders }),
+			),
+		);
+	}
+
 	return withCacheStatus(withClientTTL(toCache), "MISS");
+}
+
+/**
+ * The last-known-good snapshot's cache key: the incoming URL with the per-fetch noise stripped —
+ * `_cb` (the watcher's cache-buster makes every busted URL unique, so busted polls could never
+ * share a cached entry) and `w` (the pre-kickoff window bucket) — plus the epoch and a `_snap`
+ * marker so it can never collide with the live entry. One snapshot per (route, league, dates,
+ * limit), shared by the watcher's busted polls and the app's clean ones.
+ */
+export function snapshotKeyURL(url: URL): string {
+	const k = new URL(url.toString());
+	k.searchParams.delete("_cb");
+	k.searchParams.delete("w");
+	k.searchParams.set("_e", CACHE_EPOCH);
+	k.searchParams.set("_snap", "1");
+	return k.toString();
 }
 
 /**

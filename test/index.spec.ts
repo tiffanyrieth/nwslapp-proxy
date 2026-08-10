@@ -7,6 +7,7 @@ import {
 import { describe, it, expect } from "vitest";
 import worker, {
 	chooseSummaryTTL,
+	snapshotKeyURL,
 	dedupeByContent,
 	parseOutletRSS,
 	appearedPlayers,
@@ -53,6 +54,32 @@ describe("nwslapp-proxy route guards", () => {
 		});
 		expect(response.status).toBe(405);
 		expect(response.headers.get("Allow")).toBe("GET");
+	});
+});
+
+// snapshotKeyURL is pure: it must collapse every per-fetch variant of a route URL (the watcher's
+// `_cb` busters, the app's `w=near` window bucket) onto ONE last-known-good key, or the snapshot
+// the watcher needs during an ESPN outage would have been written under a key nobody ever reads.
+describe("snapshotKeyURL", () => {
+	it("strips _cb and w so busted and clean polls share one snapshot", () => {
+		const clean = snapshotKeyURL(new URL("https://p.test/scoreboard?dates=20260810&limit=500"));
+		const busted = snapshotKeyURL(
+			new URL("https://p.test/scoreboard?dates=20260810&limit=500&_cb=1754838000000"),
+		);
+		const windowed = snapshotKeyURL(
+			new URL("https://p.test/scoreboard?dates=20260810&limit=500&w=near"),
+		);
+		expect(busted).toBe(clean);
+		expect(windowed).toBe(clean);
+		expect(clean).toContain("_snap=1");
+	});
+
+	it("keeps the params that legitimately fork the data (league/dates/event)", () => {
+		const a = snapshotKeyURL(new URL("https://p.test/summary?event=1"));
+		const b = snapshotKeyURL(new URL("https://p.test/summary?event=2"));
+		const c = snapshotKeyURL(new URL("https://p.test/summary?event=1&league=usa.1"));
+		expect(a).not.toBe(b);
+		expect(a).not.toBe(c);
 	});
 });
 
