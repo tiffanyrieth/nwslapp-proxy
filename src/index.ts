@@ -60,6 +60,7 @@ import {
 import { handleQuizResults } from "./quiz-results.ts";
 import { handlePredictCommunity } from "./predict-community.ts";
 import { handleWeather } from "./weather.ts";
+import { attendanceSweep, enrichSummaryAttendance, handleAdminAttendance } from "./attendance.ts";
 import { handlePlayoffOverride } from "./playoff-override.ts";
 import {
 	exchangeAuthorizationCode,
@@ -136,7 +137,11 @@ const SUMMARY_PENDING_TTL = 21600; // 6h
 // frozen-attendance regression, found 2026-08-09). Most NT matches never report attendance at
 // all; the cold tier caps them at ~1 demand-driven fetch/week/colo, which is effectively free,
 // while a figure that lands late (or a zero frozen by a past bug) still heals within a week.
-const SUMMARY_PENDING_MAX_AGE_MS = 14 * 24 * 60 * 60 * 1000; // 14d
+// 14d → 30d (owner 2026-08-11): ESPN's Aug-2026 attendance ingestion ran late/never for weeks,
+// so keep actively trying a full month. The attendanceSweep cron (attendance.ts) is the real
+// engine now — it probes proactively instead of waiting for a visitor — but the demand tier
+// keeps the same 30-day shape so the two mechanisms agree on what "still worth asking" means.
+const SUMMARY_PENDING_MAX_AGE_MS = 30 * 24 * 60 * 60 * 1000; // 30d
 const SUMMARY_PENDING_COLD_TTL = 604800; // 7d — settled, old, still incomplete: re-check weekly
 // Last-known-good snapshot lifetime (recovery-ladder step 3, see proxyAndCache). 24h: long enough
 // to cover a full game day's ESPN outage, short enough that a rolled-over scoreboard window or a
@@ -651,6 +656,17 @@ export default {
 		if (url.pathname === "/admin/status") {
 			return handleAdminStatus(request, env);
 		}
+		// Attendance backstop ops: the ledger + sweep state; `?sweep=1` forces a run.
+		if (url.pathname === "/admin/attendance") {
+			const adminKey = (env as unknown as { BRACKET_ADMIN_KEY?: string }).BRACKET_ADMIN_KEY;
+			if (!adminAuthed(request, adminKey)) {
+				return new Response("Authentication required.", {
+					status: 401, headers: { "WWW-Authenticate": adminRealm("NWSLApp Admin") },
+				});
+			}
+			return handleAdminAttendance(env, (kind, detail) => emitDiag(env, ctx, kind, detail),
+				url.searchParams.get("sweep") === "1");
+		}
 
 		// POST telemetry ingest must be registered BEFORE the GET-only guard below.
 		if (url.pathname === "/telemetry") {
@@ -792,7 +808,10 @@ export default {
 			// bustUpstream: the pending-summary re-check (attendance still 0 after FT) only works if
 			// ESPN recomputes — its own CDN serves /summary stale just like /scoreboard, and an
 			// unbusted re-check can re-pin the FT-time zero for another 6h window indefinitely.
-			return proxyAndCache(url, summaryUpstream(league), chooseSummaryTTL, ctx, env, true);
+			// enrich: the attendance-backstop ledger fills a settled match's missing crowd figure
+			// (attendance.ts — the one allowed pass-through mutation).
+			return proxyAndCache(url, summaryUpstream(league), chooseSummaryTTL, ctx, env, true,
+				(body) => enrichSummaryAttendance(env, url.searchParams.get("event"), body));
 		}
 		if (url.pathname === "/team-videos") {
 			return handleTeamVideos(url, env, ctx);
@@ -835,9 +854,11 @@ export default {
 			// only the immutable header date is read, so no `w=near` and no extra ESPN load).
 			const getSummary = async (eventId: string) => {
 				const summaryUrl = new URL(`/summary?event=${eventId}`, url);
-				// bustUpstream matches the /summary route: this shares its edge cache key, so an
-				// unbusted MISS here would populate the shared cache with ESPN's CDN-stale copy.
-				const resp = await proxyAndCache(summaryUrl, ESPN_SUMMARY, chooseSummaryTTL, ctx, env, true);
+				// bustUpstream + enrich match the /summary route: this shares its edge cache key, so
+				// a MISS here must populate the shared cache exactly as the route would (fresh ESPN
+				// bytes, attendance filled from the backstop ledger).
+				const resp = await proxyAndCache(summaryUrl, ESPN_SUMMARY, chooseSummaryTTL, ctx, env, true,
+					(body) => enrichSummaryAttendance(env, eventId, body));
 				return resp.ok ? ((await resp.json()) as never) : null;
 			};
 			return handlePredictCommunity(
@@ -872,8 +893,9 @@ export default {
 			// always a warm HIT. emitDiag is injected to keep weather.ts self-contained.
 			const getSummary = async (eventId: string) => {
 				const summaryUrl = new URL(`/summary?event=${eventId}`, url);
-				// bustUpstream matches the /summary route (shared edge cache key — see /predict/community).
-				const resp = await proxyAndCache(summaryUrl, ESPN_SUMMARY, chooseSummaryTTL, ctx, env, true);
+				// bustUpstream + enrich match the /summary route (shared edge cache key — see /predict/community).
+				const resp = await proxyAndCache(summaryUrl, ESPN_SUMMARY, chooseSummaryTTL, ctx, env, true,
+					(body) => enrichSummaryAttendance(env, eventId, body));
 				return resp.ok ? ((await resp.json()) as never) : null;
 			};
 			return handleWeather(url, env, ctx, getSummary, emitDiag);
@@ -912,6 +934,14 @@ export default {
 				await checkErrorSpike(env, ctx);
 			} catch {
 				/* swallow — best-effort; next tick retries */
+			}
+			// Attendance backstop: internally gated to ~every 6h (attendance-sweep:last), so this
+			// is a no-op on almost every tick. Isolated like the pager — a sweep bug can never
+			// affect the bracket engine or alerting.
+			try {
+				await attendanceSweep(env, (kind, detail) => emitDiag(env, ctx, kind, detail));
+			} catch {
+				/* swallow — best-effort; the next gated tick retries */
 			}
 			return;
 		}
@@ -979,6 +1009,12 @@ async function proxyAndCache(
 	// /summary (2026-08-09): the pending-attendance re-check is pointless if ESPN's CDN answers it
 	// with the same stale FT-time snapshot — the zero just gets re-pinned every 6h window.
 	bustUpstream = false,
+	// The ONE allowed body mutation on this pass-through (owner-approved 2026-08-11): the
+	// /summary route fills a settled match's missing attendance from the backstop ledger
+	// (enrichSummaryAttendance). Runs BEFORE chooseTTL, so a filled figure settles immutable
+	// and both the edge entry and the snapshot store the patched bytes. Anything else must
+	// leave this unset — the bytes-unchanged contract stands for every other route and field.
+	enrich?: (body: ArrayBuffer) => Promise<ArrayBuffer>,
 ): Promise<Response> {
 	// Cache key = the incoming URL (query string included), so different
 	// `dates`/`limit` or `event` values are cached independently — plus CACHE_EPOCH, which is
@@ -1064,8 +1100,10 @@ async function proxyAndCache(
 	}
 
 	// Read the body once as bytes so we can both cache it and return it
-	// unchanged. Peek at the JSON only to pick a TTL — the bytes are untouched.
-	const body = await espnResponse.arrayBuffer();
+	// unchanged (modulo the narrowly-scoped `enrich` hook above). Peek at the JSON only to
+	// pick a TTL.
+	let body = await espnResponse.arrayBuffer();
+	if (enrich) body = await enrich(body);
 	const ttl = chooseTTL(body);
 
 	const headers = new Headers();

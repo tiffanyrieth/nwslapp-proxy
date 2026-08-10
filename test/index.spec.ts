@@ -149,19 +149,21 @@ describe("chooseSummaryTTL", () => {
 		expect(chooseSummaryTTL(finished({ attendance: 0 }))).toBe(21600);
 	});
 
-	it("slows to a weekly re-check after 14 days — most NT matches never report attendance at all", () => {
-		const old = new Date(Date.now() - 20 * 86400 * 1000).toISOString();
+	it("slows to a weekly re-check after 30 days — most NT matches never report attendance at all", () => {
+		// 14d → 30d (owner 2026-08-11): ESPN's attendance ingestion ran late/never for weeks in
+		// Aug 2026 — keep the 6h tier actively asking for a full month.
+		const old = new Date(Date.now() - 35 * 86400 * 1000).toISOString();
 		expect(chooseSummaryTTL(finished({ attendance: 0, kickoff: old }))).toBe(604800);
 		// Just inside the window it is still worth another look.
-		const recent = new Date(Date.now() - 10 * 86400 * 1000).toISOString();
+		const recent = new Date(Date.now() - 20 * 86400 * 1000).toISOString();
 		expect(chooseSummaryTTL(finished({ attendance: 0, kickoff: recent }))).toBe(21600);
 	});
 
-	it("evaluates the 14-day bound against the injected clock, not the wall clock", () => {
+	it("evaluates the 30-day bound against the injected clock, not the wall clock", () => {
 		const kickoff = "2026-07-01T00:00:00Z";
 		const body = finished({ attendance: 0, kickoff });
-		expect(chooseSummaryTTL(body, Date.parse("2026-07-05T00:00:00Z"))).toBe(21600);
-		expect(chooseSummaryTTL(body, Date.parse("2026-07-20T00:00:00Z"))).toBe(604800);
+		expect(chooseSummaryTTL(body, Date.parse("2026-07-20T00:00:00Z"))).toBe(21600);
+		expect(chooseSummaryTTL(body, Date.parse("2026-08-05T00:00:00Z"))).toBe(604800);
 	});
 
 	// ⚠️ The frozen-attendance regression, 2026-08-09: the old giveUp→IMMUTABLE promotion pinned
