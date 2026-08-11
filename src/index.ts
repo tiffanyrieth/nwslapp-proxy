@@ -4272,7 +4272,11 @@ async function handleKnowHerTodo(url: URL, env: Env, ctx: ExecutionContext): Pro
 		const featured = await readFeaturedIds(env as unknown as KnowHerEnv, year);
 		const eligible = await computeEligiblePlayers(env as unknown as KnowHerEnv, team, year, featured);
 		player = pickWeeklyFeatured(eligible);
-	} catch {
+	} catch (e) {
+		// NO SILENT FAILURES: a bare upstreamError() here mislabeled a UA/403 bug in fetchTeamAbbrs as
+		// "ESPN down" for two days and sent the KHG cloud routine chasing a non-existent ESPN outage.
+		// Record the REAL error so the next incident is diagnosable from the sdiag: KV, not guessed.
+		emitDiag(env, ctx, "knowherTodoError", `team=${team}: ${e instanceof Error ? e.message : String(e)}`);
 		return upstreamError();
 	}
 	// No one left to feature. In-season (Mar–Nov) that's worth a loud signal; offseason it's expected.

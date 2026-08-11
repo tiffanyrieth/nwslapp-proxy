@@ -194,7 +194,10 @@ async function espnJSON<T>(url: string, tries = 3): Promise<T> {
   let lastErr: unknown;
   for (let i = 0; i < tries; i++) {
     try {
-      const r = await fetch(url);
+      // ESPN 403/blocks UA-less fetches from Cloudflare's network — every ESPN call MUST send ESPN_UA
+      // (project_espn_403_no_user_agent, 2026-08-04). This helper was the last one missed: bare fetch()
+      // here threw for all 16 teams and the generic catch in /knowher/todo mislabeled it "ESPN down".
+      const r = await fetch(url, { headers: ESPN_HEADERS });
       if (r.ok) return (await r.json()) as T;
       lastErr = new Error(`${url} → ${r.status}`);
     } catch (e) {
