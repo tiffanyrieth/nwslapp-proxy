@@ -17,6 +17,11 @@ import {
 	buildOpenMeteoUrl,
 	extractHour,
 	VENUE_COORDS,
+	withinForecastHorizon,
+	buildForecastUrl,
+	extractWindow,
+	nearestSunset,
+	FORECAST_MAX_DAYS,
 } from "../src/weather.ts";
 
 test("venueCoords resolves a known ESPN venue id and rejects unknown/empty", () => {
@@ -120,4 +125,117 @@ test("extractHour returns null when the temperature reading itself is null", () 
 		hourly: { time: ["2026-07-03T19:00"], temperature_2m: [null], weather_code: [3], is_day: [1] },
 	};
 	assert.equal(extractHour(payload, "2026-07-03T19:00"), null);
+});
+
+// ── Forecast mode (game-time weather strip) ──────────────────────────────────────
+
+test("withinForecastHorizon: future & inside 10 days only", () => {
+	const now = Date.parse("2026-08-11T12:00:00Z");
+	const inDays = (d) => now + d * 86_400_000;
+	assert.equal(withinForecastHorizon(inDays(3), now), true);
+	assert.equal(withinForecastHorizon(inDays(FORECAST_MAX_DAYS), now), true); // exactly 10d
+	assert.equal(withinForecastHorizon(inDays(11), now), false); // past the horizon
+	assert.equal(withinForecastHorizon(inDays(-1), now), false); // already in the past
+	assert.equal(withinForecastHorizon(now, now), false);        // "now" is not future
+});
+
+test("buildForecastUrl spans the window's UTC dates and requests the full field set", () => {
+	const coords = { lat: 38.8687, lon: -77.0126 };
+	const kickoff = Date.parse("2026-08-14T23:00:00Z"); // window +2h crosses into the 15th UTC
+	const url = buildForecastUrl(coords, kickoff);
+	assert.ok(url.startsWith("https://api.open-meteo.com/v1/forecast?"));
+	assert.match(url, /start_date=2026-08-14/);
+	assert.match(url, /end_date=2026-08-15/); // kickoff+2h = 01:00Z next day
+	for (const field of ["temperature_2m", "apparent_temperature", "weather_code", "is_day", "wind_speed_10m", "precipitation_probability"]) {
+		assert.match(url, new RegExp(field), `hourly has ${field}`);
+	}
+	assert.match(url, /daily=sunset/);
+	assert.match(url, /wind_speed_unit=mph/);
+	assert.doesNotMatch(url, /forecast_days/); // explicit dates, not a day block
+});
+
+test("extractWindow pulls the 4 window hours with kickoff at index 1", () => {
+	// Hours 6 PM..9 PM UTC on the match date; kickoff 7 PM.
+	const t = (h) => `2026-08-14T${String(h).padStart(2, "0")}:00`;
+	const payload = {
+		hourly: {
+			time: [t(17), t(18), t(19), t(20), t(21)],
+			temperature_2m: [80, 82, 84, 83, 81],
+			apparent_temperature: [85, 88, 90, 89, 86],
+			weather_code: [1, 2, 3, 3, 61],
+			is_day: [1, 1, 1, 0, 0],
+			wind_speed_10m: [5, 6, 7, 8, 9],
+			precipitation_probability: [0, 10, 20, 40, 60],
+		},
+	};
+	const w = extractWindow(payload, "2026-08-14T19:00"); // kickoff 7 PM
+	assert.equal(w.length, 4);
+	assert.equal(w[1].time, "2026-08-14T19:00Z"); // kickoff at index 1
+	assert.equal(w[0].tempF, 82); // kickoff −1h = 6 PM
+	assert.equal(w[1].tempF, 84);
+	assert.equal(w[1].feelsLikeF, 90);
+	assert.equal(w[2].precipPct, 40);
+	assert.equal(w[3].isDay, 0);
+	assert.equal(w[1].windMph, 7);
+});
+
+test("extractWindow handles a window crossing UTC midnight", () => {
+	const payload = {
+		hourly: {
+			time: ["2026-08-14T22:00", "2026-08-14T23:00", "2026-08-15T00:00", "2026-08-15T01:00"],
+			temperature_2m: [78, 77, 76, 75],
+			apparent_temperature: [78, 77, 76, 75],
+			weather_code: [0, 0, 0, 0],
+			is_day: [0, 0, 0, 0],
+			wind_speed_10m: [3, 3, 3, 3],
+			precipitation_probability: [0, 0, 0, 0],
+		},
+	};
+	const w = extractWindow(payload, "2026-08-14T23:00"); // kickoff 11 PM UTC
+	assert.equal(w.length, 4);
+	assert.equal(w[1].time, "2026-08-14T23:00Z");
+	assert.equal(w[3].time, "2026-08-15T01:00Z"); // +2h rolled the date
+});
+
+test("extractWindow returns null if any window hour is missing (no partial strip)", () => {
+	const payload = {
+		hourly: {
+			time: ["2026-08-14T18:00", "2026-08-14T19:00", "2026-08-14T20:00"], // missing 21:00
+			temperature_2m: [82, 84, 83],
+			apparent_temperature: [85, 90, 89],
+			weather_code: [2, 3, 3],
+			is_day: [1, 1, 0],
+			wind_speed_10m: [6, 7, 8],
+			precipitation_probability: [10, 20, 40],
+		},
+	};
+	assert.equal(extractWindow(payload, "2026-08-14T19:00"), null);
+	assert.equal(extractWindow({}, "2026-08-14T19:00"), null);
+	assert.equal(extractWindow(null, "2026-08-14T19:00"), null);
+});
+
+test("extractWindow tolerates missing optional fields (feels-like defaults to temp)", () => {
+	const t = (h) => `2026-08-14T${String(h).padStart(2, "0")}:00`;
+	const payload = {
+		hourly: {
+			time: [t(18), t(19), t(20), t(21)],
+			temperature_2m: [82, 84, 83, 81],
+			// no apparent_temperature / wind / precip arrays
+			weather_code: [2, 3, 3, 1],
+			is_day: [1, 1, 0, 0],
+		},
+	};
+	const w = extractWindow(payload, "2026-08-14T19:00");
+	assert.equal(w[1].feelsLikeF, 84); // falls back to actual temp
+	assert.equal(w[1].windMph, 0);
+	assert.equal(w[1].precipPct, 0);
+});
+
+test("nearestSunset picks the sunset closest to kickoff and returns a UTC instant", () => {
+	const payload = { daily: { sunset: ["2026-08-14T00:12", "2026-08-15T00:10"] } };
+	const kickoff = Date.parse("2026-08-14T23:00:00Z");
+	const s = nearestSunset(payload, kickoff);
+	assert.equal(s, "2026-08-15T00:10:00.000Z"); // the 15th's sunset is nearer to an 11 PM/14th kickoff
+	assert.equal(nearestSunset({}, kickoff), null);
+	assert.equal(nearestSunset({ daily: { sunset: [] } }, kickoff), null);
 });

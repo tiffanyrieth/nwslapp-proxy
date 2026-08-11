@@ -28,7 +28,10 @@
 // sites). An unknown id → honest `unknown-venue` + diag (no geocoding guess in v1; Open-Meteo's
 // free geocoding API is the documented v2 fallback). Open-Meteo's grid is ~1–2 km, so
 // coordinates only need to be within a few hundred meters of the pitch.
-export const VENUE_COORDS: Record<string, { lat: number; lon: number; name: string }> = {
+// `indoor: true` suppresses the game-time forecast card (a domed/roofed venue's outdoor forecast
+// is meaningless). ZERO venues are flagged today — every 2026 NWSL site is outdoor (PayPal Park has
+// no roof) — but the flag future-proofs a one-off/preseason indoor site per the design handoff.
+export const VENUE_COORDS: Record<string, { lat: number; lon: number; name: string; indoor?: boolean }> = {
 	"7604": { lat: 38.8687, lon: -77.0126, name: "Audi Field" },                                  // WAS
 	"9895": { lat: 39.1097, lon: -94.5735, name: "CPKC Stadium" },                                // KC
 	"6072": { lat: 37.3513, lon: -121.9250, name: "PayPal Park" },                                // BAY
@@ -53,7 +56,7 @@ export const VENUE_COORDS: Record<string, { lat: number; lon: number; name: stri
 	"10442": { lat: 40.7930, lon: -73.9215, name: "Icahn Stadium" },                              // 1-off
 };
 
-export function venueCoords(venueId: string | undefined | null): { lat: number; lon: number; name: string } | null {
+export function venueCoords(venueId: string | undefined | null): { lat: number; lon: number; name: string; indoor?: boolean } | null {
 	if (!venueId) return null;
 	return VENUE_COORDS[venueId] ?? null;
 }
@@ -129,6 +132,115 @@ export function buildOpenMeteoUrl(
 	return `https://archive-api.open-meteo.com/v1/archive?${common}&start_date=${date}&end_date=${date}`;
 }
 
+// ── FORECAST mode (upcoming matches) ─────────────────────────────────────────────
+// The game-time weather strip on a FUTURE match: the hourly forecast for the 4-hour game window
+// (kickoff −1h … kickoff +2h). Distinct from the historical stamp above in three ways: it fetches
+// the forward-looking forecast (more hourly fields: feels-like, wind, precip; plus daily sunset),
+// it is NOT immutable (a forecast changes run-to-run) so it is EDGE-cached with an 8h TTL rather
+// than written to KV, and it is bounded to a 10-day horizon.
+//
+// ⚠️ 10-DAY HORIZON, not Open-Meteo's 16-day max: model skill falls to ~65-80% by day 10 and the
+// 11-16 window (GFS territory for US venues) flip-flops between runs. A confident 4-hour strip that
+// far out would assert precision the forecast doesn't have — against the data-only design stance.
+export const FORECAST_MAX_DAYS = 10;
+export const FORECAST_HOURLY =
+	"temperature_2m,apparent_temperature,weather_code,is_day,wind_speed_10m,precipitation_probability";
+
+/** True when kickoff is in the future and inside the forecast horizon. */
+export function withinForecastHorizon(kickoffMs: number, nowMs: number): boolean {
+	const daysAhead = (kickoffMs - nowMs) / 86_400_000;
+	return daysAhead > 0 && daysAhead <= FORECAST_MAX_DAYS;
+}
+
+/**
+ * The Open-Meteo forecast URL for a match's game window. `start_date`/`end_date` span the UTC
+ * calendar dates the window touches (kickoff −1h … kickoff +2h can straddle a UTC midnight), so the
+ * hourly array is guaranteed to contain all four window hours plus the sunset for those dates.
+ * `forecast_days` is NOT used — explicit dates keep the payload to the 1-2 relevant days (~2KB),
+ * never the 10-day block.
+ */
+export function buildForecastUrl(coords: { lat: number; lon: number }, kickoffMs: number): string {
+	const dayOf = (ms: number) => new Date(ms).toISOString().slice(0, 10);
+	const start = dayOf(kickoffMs - 3_600_000); // window opens at kickoff −1h
+	const end = dayOf(kickoffMs + 2 * 3_600_000); // window closes at kickoff +2h
+	return (
+		`https://api.open-meteo.com/v1/forecast?latitude=${coords.lat}&longitude=${coords.lon}` +
+		`&hourly=${FORECAST_HOURLY}&daily=sunset&temperature_unit=fahrenheit&wind_speed_unit=mph&timezone=UTC` +
+		`&start_date=${start}&end_date=${end}`
+	);
+}
+
+/** One hour of the game-window forecast, as the app renders it. */
+export interface ForecastHour {
+	time: string; // "YYYY-MM-DDTHH:00Z"
+	tempF: number;
+	feelsLikeF: number;
+	weatherCode: number;
+	isDay: number;
+	windMph: number;
+	precipPct: number;
+}
+
+/** The four window hours (kickoff −1h, kickoff, +1h, +2h) pulled from a forecast payload, kickoff
+ *  at index 1. Returns null if any of the four hours is missing (a partial strip would be worse
+ *  than none). `isoKickoffHour` is the nearest-hour key from `kickoffHourUtc`. */
+export function extractWindow(payload: unknown, isoKickoffHour: string): ForecastHour[] | null {
+	const hourly = (payload as { hourly?: Record<string, unknown[]> })?.hourly;
+	if (!hourly || !Array.isArray(hourly.time)) return null;
+	const kickoffMs = Date.parse(`${isoKickoffHour}:00Z`);
+	if (Number.isNaN(kickoffMs)) return null;
+	const out: ForecastHour[] = [];
+	for (let offset = -1; offset <= 2; offset++) {
+		const key = kickoffHourUtc(new Date(kickoffMs + offset * 3_600_000).toISOString());
+		if (!key) return null;
+		const i = hourly.time.indexOf(key);
+		if (i < 0) return null;
+		const temp = hourly.temperature_2m?.[i];
+		const feels = hourly.apparent_temperature?.[i];
+		const code = hourly.weather_code?.[i];
+		const day = hourly.is_day?.[i];
+		const wind = hourly.wind_speed_10m?.[i];
+		const precip = hourly.precipitation_probability?.[i];
+		if (typeof temp !== "number" || Number.isNaN(temp)) return null;
+		out.push({
+			time: `${key}Z`,
+			tempF: Math.round(temp),
+			feelsLikeF: typeof feels === "number" ? Math.round(feels) : Math.round(temp),
+			weatherCode: typeof code === "number" ? code : -1,
+			isDay: typeof day === "number" ? day : 1,
+			windMph: typeof wind === "number" ? Math.round(wind) : 0,
+			precipPct: typeof precip === "number" ? precip : 0,
+		});
+	}
+	return out;
+}
+
+/** The sunset instant nearest the kickoff (Open-Meteo `daily.sunset` is a per-date array of local
+ *  ISO strings; we requested timezone=UTC so they're UTC instants). Picks the closest to kickoff,
+ *  the one that could fall inside the game window. null when absent/malformed. */
+export function nearestSunset(payload: unknown, kickoffMs: number): string | null {
+	const sunsets = (payload as { daily?: { sunset?: unknown[] } })?.daily?.sunset;
+	if (!Array.isArray(sunsets)) return null;
+	let best: string | null = null;
+	let bestDelta = Infinity;
+	for (const s of sunsets) {
+		if (typeof s !== "string") continue;
+		const ms = Date.parse(s.endsWith("Z") ? s : `${s}Z`);
+		if (Number.isNaN(ms)) continue;
+		const delta = Math.abs(ms - kickoffMs);
+		if (delta < bestDelta) {
+			bestDelta = delta;
+			best = new Date(ms).toISOString();
+		}
+	}
+	return best;
+}
+
+/** 8h — the forecast's edge-cache + client TTL. The underlying models refresh only a few times/day
+ *  (GFS 4×, ECMWF 2×), so a shorter TTL just re-downloads the same run. Open-Meteo already stitches
+ *  to the latest available run on every fetch, so 8h keeps the strip current without waste. */
+export const FORECAST_TTL_SECONDS = 8 * 3600;
+
 // ── Extract the kickoff-hour reading from an Open-Meteo payload ──────────────────
 export interface HourReading {
 	tempF: number;
@@ -153,9 +265,15 @@ export function extractHour(payload: unknown, isoHour: string): HourReading | nu
 }
 
 // ── Response envelopes ──────────────────────────────────────────────────────────
+// The app's `MatchWeather` decoder is versioned by `mode` and reads every field optionally, so a
+// new mode is additive — no app-side decode change to ship the forecast (the app just starts
+// rendering it once its build handles `isForecast`). Top-level `tempF` stays ABSENT in forecast
+// mode: the app's `roundedTemp` feeds the Match Detail header-rail gate, and a value there would
+// surface the rail on a future match.
 type Envelope =
 	| { v: 1; mode: "historical"; tempF: number; weatherCode: number; isDay: number; condition: string; asOf: string }
-	| { v: 1; mode: "unavailable"; reason: "not-finished" | "unknown-venue" | "upstream-error" };
+	| { v: 1; mode: "forecast"; venueName: string; hours: ForecastHour[]; sunset: string | null; asOf: string }
+	| { v: 1; mode: "unavailable"; reason: "not-finished" | "unknown-venue" | "upstream-error" | "too-far-out" | "indoor-venue" };
 
 function json(body: Envelope, cacheControl: string): Response {
 	return new Response(JSON.stringify(body), {
@@ -168,6 +286,8 @@ const CC_IMMUTABLE = "public, max-age=31536000, immutable";
 const CC_NOT_FINISHED = "public, max-age=60";     // flips fast once the match hits full-time
 const CC_UNKNOWN_VENUE = "public, max-age=3600";  // a table fix serves within the hour
 const CC_ERROR = "no-store";
+const CC_FORECAST = `public, max-age=${FORECAST_TTL_SECONDS}`;  // 8h — see FORECAST_TTL_SECONDS
+const CC_TOO_FAR = "public, max-age=3600";        // re-check hourly as the match enters the horizon
 
 // A minimal shape of the fields we read out of ESPN's /summary payload.
 interface SummaryLite {
@@ -227,10 +347,6 @@ export async function handleWeather(
 
 	const competition = summary.header?.competitions?.[0];
 	const state = competition?.status?.type?.state;
-	if (state !== "post") {
-		// Future/live — forecast mode isn't built yet. Not an error; expected-silent for the app.
-		return json({ v: 1, mode: "unavailable", reason: "not-finished" }, CC_NOT_FINISHED);
-	}
 
 	const coords = venueCoords(summary.gameInfo?.venue?.id);
 	if (!coords) {
@@ -243,6 +359,21 @@ export async function handleWeather(
 	if (!isoHour || Number.isNaN(kickoffMs)) {
 		emit(env, ctx, "weatherUpstreamFail", `${eventId} bad-kickoff-date`);
 		return json({ v: 1, mode: "unavailable", reason: "upstream-error" }, CC_ERROR);
+	}
+
+	// FORECAST path — a pre-match (not `post`) game. A LIVE game (`in`) gets no card either
+	// (`not-finished`); only a genuinely future kickoff inside the 10-day horizon forecasts.
+	if (state !== "post") {
+		if (state === "in") {
+			return json({ v: 1, mode: "unavailable", reason: "not-finished" }, CC_NOT_FINISHED);
+		}
+		if (!withinForecastHorizon(kickoffMs, nowMs)) {
+			return json({ v: 1, mode: "unavailable", reason: "too-far-out" }, CC_TOO_FAR);
+		}
+		if (coords.indoor) {
+			return json({ v: 1, mode: "unavailable", reason: "indoor-venue" }, CC_FORECAST);
+		}
+		return forecastResponse(env, ctx, eventId, url, coords, kickoffMs, isoHour, emit);
 	}
 
 	// 3. Fetch Open-Meteo (chosen source, one fallback to the other if the hour is missing).
@@ -265,6 +396,64 @@ export async function handleWeather(
 	// 4. Write-once: a finished match's weather is final, so no TTL. Don't block the response.
 	ctx.waitUntil(env.FEED_TAGS.put(kvKey, JSON.stringify(record)));
 	return json(record, CC_IMMUTABLE);
+}
+
+/**
+ * The forecast half — EDGE-cached (not KV), because a forecast changes run-to-run and KV's
+ * 1k-writes/day free cap is a real scaling wall. The edge Cache API is unlimited + free + TTL-based,
+ * so Open-Meteo is hit at most once per match per 8h per colo — INDEPENDENT of user count (the whole
+ * feature never approaches the 10k/day free limit at any scale). A `Cache-Control` header alone would
+ * only cache client-side; a Worker response must be explicitly `cache.put()`-ed to live at the edge
+ * (the same reason /scoreboard and /summary do it in proxyAndCache).
+ */
+async function forecastResponse(
+	env: Env,
+	ctx: ExecutionContext,
+	eventId: string,
+	url: URL,
+	coords: { lat: number; lon: number; name: string },
+	kickoffMs: number,
+	isoHour: string,
+	emit: EmitDiag,
+): Promise<Response> {
+	const cache = caches.default;
+	// Key on a normalized URL (own origin + eventId) — never the Open-Meteo URL. Independent of any
+	// extra query params the caller might add.
+	const keyURL = new URL(url.origin + url.pathname);
+	keyURL.searchParams.set("event", eventId);
+	keyURL.searchParams.set("mode", "forecast");
+	const cacheKey = new Request(keyURL.toString(), { method: "GET" });
+
+	const hit = await cache.match(cacheKey);
+	if (hit) return hit;
+
+	let payload: unknown;
+	try {
+		const r = await fetch(buildForecastUrl(coords, kickoffMs), { headers: { Accept: "application/json" } });
+		if (!r.ok) throw new Error(`open-meteo ${r.status}`);
+		payload = await r.json();
+	} catch (e) {
+		emit(env, ctx, "weatherForecastFail", `${eventId} ${(e as Error).message.slice(0, 50)}`);
+		return json({ v: 1, mode: "unavailable", reason: "upstream-error" }, CC_ERROR);
+	}
+
+	const hours = extractWindow(payload, isoHour);
+	if (!hours) {
+		emit(env, ctx, "weatherForecastNoWindow", `${eventId} ${isoHour}`);
+		return json({ v: 1, mode: "unavailable", reason: "upstream-error" }, CC_ERROR);
+	}
+
+	const record: Envelope = {
+		v: 1,
+		mode: "forecast",
+		venueName: coords.name,
+		hours,
+		sunset: nearestSunset(payload, kickoffMs),
+		asOf: new Date(kickoffMs).toISOString(),
+	};
+	const response = json(record, CC_FORECAST);
+	ctx.waitUntil(cache.put(cacheKey, response.clone()));
+	return response;
 }
 
 /** Hit the age-appropriate Open-Meteo API; if the chosen source lacks the kickoff hour and the
