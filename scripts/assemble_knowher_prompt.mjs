@@ -145,7 +145,11 @@ function playerBlock(clubName, abbr, season, p) {
 }
 
 async function fetchPick(abbr) {
-  const res = await fetch(`${BASE}/knowher/todo?team=${abbr}`);
+  // Cache-buster (`_cb`): the assembler is the GENERATION feed and must see LIVE eligibility, never a
+  // stale edge copy. /knowher/todo edge-caches 1h keyed on the full URL; without a buster, a same-day
+  // ledger change (a same-weekKey correction, or a player crossing the 100' floor) is masked for up to
+  // an hour — which silently makes a re-run pick the WRONG players. A unique _cb forces a fresh compute.
+  const res = await fetch(`${BASE}/knowher/todo?team=${abbr}&_cb=${Date.now()}-${abbr}`);
   if (!res.ok) throw new Error(`HTTP ${res.status}`);
   return res.json(); // { team, year, season, player|null }
 }
