@@ -166,11 +166,27 @@ Output ONLY this JSON (no prose around it), **every player above included** in t
 }
 ```
 
-After the JSON, list (for MY review only, outside the JSON), per player:
-1. The source(s) you used for each human fact — noting which are gold-tier — so I can spot-check.
-2. **A personality count** — how many of her questions are genuine OFF-PITCH personality vs. career/identity
-   fallback (e.g. "Sams: 5 personality / 3 career"). This is the quality signal I'm watching; a player
-   heavy on career fallback tells me the hunt fell short for her.
-3. **Rejected facts** — any interesting fact you FOUND but did NOT use, and why (couldn't verify / only a
-   banned source / failed a guardrail / too private). Even "none rejected" is useful. This makes the sourcing
-   visible: if a good fact was dropped for a fixable reason, I want to see it, not have it silently vanish.
+After the JSON, write a review section (for MY review only, outside the JSON). ⚠️ **THE REPORT MUST BE
+DERIVED FROM THE JSON YOU JUST PUBLISHED — READ YOUR OWN QUESTIONS BACK AND DESCRIBE ONLY THOSE.** Do NOT
+write the report from memory or re-summarize your research; by now the questions are far up in the context
+and paraphrasing from memory invents facts that aren't in the quiz (a real failure: a past run's report
+listed "art school, architecture, bookstores" for a player whose actual questions were about her twin
+sister and hometown — pure confabulation). The report is worthless — worse than worthless — if it
+describes facts the player's quiz doesn't contain. So build it mechanically, per player:
+
+1. **Walk her published `questions` array IN ORDER.** For each NON-stat question (skip `herGame`), write one
+   line: the fact it tests, tagged `[P]` off-pitch personality or `[C]` career/identity — taken VERBATIM
+   from that question's own `prompt`/`revealFact`, not from memory. If you can't point to the question in
+   the JSON that a report line describes, DELETE the line — it's a hallucination.
+2. **Personality count** = the tally of `[P]` vs `[C]` lines you just wrote (e.g. "Sams: 5 personality / 3
+   career"). It must equal her real question mix, because you counted the actual questions. A player heavy
+   on `[C]` tells me the hunt fell short for her.
+3. **Source(s)** per player — the gold-tier / general-web pages you actually retrieved, so I can spot-check.
+4. **Rejected facts** — any interesting fact you FOUND in research but did NOT put in a question, and why
+   (couldn't verify / banned source / failed a guardrail / too private). "None rejected" is fine. A fact you
+   never used does NOT go in the count above — only published questions are counted.
+
+⚠️ The single hard rule for this whole section: **every fact you mention must be traceable to a specific
+published question.** A "rejected fact" is the only exception (it's explicitly a fact NOT in the quiz). If
+you catch yourself writing a personality trait you didn't turn into a question, it doesn't belong in the
+count — it's either a rejected fact (say so) or a memory-confabulation (delete it).
