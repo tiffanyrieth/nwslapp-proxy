@@ -51,14 +51,25 @@ is a story question, so spend the whole budget there.
   Warm, surprising, makes-you-smile details. VARY them throughout — don't cluster all the True/False
   together, and don't save the single best fact for last. (The system weaves its 2 stat questions into your
   run at the one-third and two-thirds marks, so you don't need to leave room for them.)
-- ⚠️ **Coverage varies across 16 players — NEVER fabricate to reach the count.** A less-covered player (a
-  backup keeper, a lower-profile international) may not have 8 clean, well-sourced *personality* facts. If so:
-  use as many as genuinely exist, then fill the rest with **verifiable CAREER / IDENTITY questions** — previous
-  clubs, college or youth club, how she arrived at this club (draft, transfer, signing), national-team caps or
-  a first call-up, a debut, an honor. Those are documented for every professional, still tell you who she is,
-  and are NOT stat questions (the system handles those). Make them THINK — no gimmes ("what position does she
-  play?", "what's her number?"). A stretched or invented fun fact is the WORST failure: a solid career question
-  beats a personality fact you had to reach for.
+- ⭐ **PERSONALITY QUOTA — the whole point of this game (non-negotiable).** At least **4 of each player's
+  questions MUST come from OFF-PITCH personality / quirk / human-interest material** — a hobby, a relatable
+  habit, a life-beyond-soccer detail, a get-to-know-her answer, a superstition, a pre-game ritual, a pet, a
+  second passion, an unusual skill (the right-to-left-note-writer, the PS5-in-the-suitcase, the pregame-artist
+  kind). These facts EXIST for almost every professional — they're in the "get to know", the club Q&A, the
+  feature interview, the signing-day human-interest angle, the local paper. Your job is to GO FIND THEM. A
+  quiz where every "human" question is really about college / draft / transfers / clubs is a FAILED quiz, even
+  if every fact is true — that is the stat-sheet trap wearing a disguise.
+- ⚠️ **Career/identity questions are a LAST RESORT, capped — not a safe default.** Previous clubs, college,
+  how she arrived (draft/transfer/signing), caps, a debut, an honor ARE legitimate and NOT fabrication — but
+  they are the FALLBACK you reach for ONLY after a genuine personality hunt comes up short, and **no more than
+  ~2–3 per player.** If you catch yourself filling a player mostly with where-she-went-to-school facts, STOP:
+  that means you bailed on the hunt too early. Go back and search the off-pitch angle harder before settling.
+- ⚠️ **NEVER fabricate to reach the count** — a stretched or invented fun fact is still the worst failure. But
+  "I couldn't find personality facts" is almost always "I didn't search the right way," not "they don't
+  exist." If a genuinely low-coverage player (a just-signed backup, an obscure international) truly yields
+  fewer than 4 off-pitch facts after a REAL hunt, use what exists, fall back within the ~2–3 career cap, and
+  **say so in your report** (name her + what you searched) — do NOT paper over the gap with more résumé facts.
+  A reported gap is useful; a quiz silently padded with college trivia hides the problem.
 
 ## THE FIVE-LAYER GUARDRAIL (every human question — non-negotiable)
 
@@ -86,10 +97,15 @@ she's dating or which relative is famous.
   social, unsourced blogs. Only cite URLs you actually retrieved — if you can't verify, drop it.
 - **Disambiguate:** confirm each fact is about THIS player (the correct NWSL player + her CURRENT club as
   listed above / her national team) — discard same-or-similar-name namesakes.
-- **Search budget (soft):** aim for **~5–6 searches per player**. Well-covered players won't need that
-  many; for a thin-coverage player, once you've spent ~5–6 and the personality well is dry, STOP — fall back
-  to verifiable career/identity questions (per the coverage rule above) rather than hunting endlessly. A
-  solid career question beats grinding a dozen searches for one more reached-for fact.
+- **Search effort — a FLOOR, not a ceiling (spend it on personality):** do **at least ~5–6 searches per
+  player**, and they must be aimed at the OFF-PITCH angle — a first pass ("<player> get to know / off the
+  pitch / hobbies / fun facts / what she's like"), then follow the specific threads it surfaces (her club's
+  player Q&A, a feature interview, a local-paper profile, her signing-day human-interest story). One generic
+  "<player> background" search that returns a résumé is NOT a hunt — it's the thing to avoid. ⚠️ Do not treat
+  the budget as permission to stop early: under-searching, then backfilling with college/draft facts, is the
+  #1 way this game degrades. Only after a genuine personality hunt is exhausted do you fall back (within the
+  ~2–3 career cap above). The failure mode to design against is quitting the hunt while easy personality facts
+  are still one thread away — err toward one more targeted search, not one more college question.
 
 ## Format — fix the True/False trap
 
@@ -109,6 +125,11 @@ she's dating or which relative is famous.
   "learn"/delight payoff). **8–9 questions per player — 8 is the FLOOR.** The system appends 2 stat questions,
   so the published quiz lands at 10–11; a richer player may go to 13 (published 15). One player per team.
   ⚠️ Fewer than 8 and the merged quiz falls under the app's 10-question floor and the whole run is rejected.
+  ⚠️ **Hitting 8 is NOT "done" — the count is the floor, the personality quota is the bar.** A player with 8
+  questions where fewer than 4 are genuine off-pitch personality is INCOMPLETE, not finished — go back and
+  find more before moving on. And **no two questions per player may test the SAME fact** (e.g. an MC "where
+  did she grow up?" and a T/F re-asking the same hometown, or three questions all restating one comeback
+  story) — vary the SUBJECT, not just the phrasing. Repetition is the tell that the hunt stopped early.
 - Also write a warm one-line `tagline` for each player.
 - **`jerseyNumber`:** take it from the player's line above (the `#N`). If a player's line shows no number
   (ESPN didn't have it), do ONE quick lookup of her current squad number and use that — a plain integer,
@@ -145,5 +166,11 @@ Output ONLY this JSON (no prose around it), **every player above included** in t
 }
 ```
 
-After the JSON, list (for MY review only, outside the JSON) the source(s) you used for each human fact per
-player — noting which are gold-tier — so I can spot-check before it goes live.
+After the JSON, list (for MY review only, outside the JSON), per player:
+1. The source(s) you used for each human fact — noting which are gold-tier — so I can spot-check.
+2. **A personality count** — how many of her questions are genuine OFF-PITCH personality vs. career/identity
+   fallback (e.g. "Sams: 5 personality / 3 career"). This is the quality signal I'm watching; a player
+   heavy on career fallback tells me the hunt fell short for her.
+3. **Rejected facts** — any interesting fact you FOUND but did NOT use, and why (couldn't verify / only a
+   banned source / failed a guardrail / too private). Even "none rejected" is useful. This makes the sourcing
+   visible: if a good fact was dropped for a fixable reason, I want to see it, not have it silently vanish.
