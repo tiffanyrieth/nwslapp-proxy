@@ -83,12 +83,19 @@ export function clubCompletenessError(teamAbbrs) {
 /**
  * Validate a pool document. Pure: returns { errors, warnings } instead of exiting, so the CLI
  * wrapper AND the unit tests share one code path. `errors` non-empty ⇒ do not publish.
+ *
+ * `opts.humanOnly` (2026-08-12 weekend/Monday split): the pool is the WEEKEND human-only candidate — no
+ * stat questions yet (Monday's publish-verified injects fresh ones). It lowers the per-player floor to 8
+ * (8 human is a complete human half; the merged Monday pool reaches the 10 app-floor via stats) and REQUIRES
+ * zero stat questions (a stray herGame means the generator injected stats it shouldn't have). Every other
+ * rule — sources, all-16-clubs, T/F balance, human minimum — still applies.
  */
-export function validatePool(doc) {
+export function validatePool(doc, opts = {}) {
   const errors = [];
   const warnings = [];
   const fail = (m) => errors.push(m);
   const warn = (m) => warnings.push(m);
+  const minQuestions = opts.humanOnly ? 8 : MIN_QUESTIONS;
 
   // --- Schema (same rules as src/knowher.ts) ---
   if (!doc || typeof doc !== "object" || Array.isArray(doc)) {
@@ -120,8 +127,8 @@ export function validatePool(doc) {
     if (typeof p?.position !== "string" || !p.position.trim()) fail(`${at}: missing position`);
     if (typeof p?.tagline !== "string" || !p.tagline.trim()) fail(`${at}: missing tagline`);
 
-    if (!Array.isArray(p?.questions) || p.questions.length < MIN_QUESTIONS || p.questions.length > MAX_QUESTIONS) {
-      fail(`${at}: must have ${MIN_QUESTIONS}–${MAX_QUESTIONS} questions (has ${p?.questions?.length ?? 0})`);
+    if (!Array.isArray(p?.questions) || p.questions.length < minQuestions || p.questions.length > MAX_QUESTIONS) {
+      fail(`${at}: must have ${minQuestions}–${MAX_QUESTIONS} questions (has ${p?.questions?.length ?? 0})`);
       return; // can't lint questions we don't have
     }
 
@@ -164,6 +171,7 @@ export function validatePool(doc) {
     });
 
     // Per-player content-quality lints (human-first, not a stat sheet)
+    if (opts.humanOnly && stat > 0) fail(`${at}: ${stat} stat (herGame) question(s) in a HUMAN-ONLY candidate — Monday's publish injects stats; the weekend pool must be human-only`);
     if (stat > MAX_STAT_QUESTIONS) fail(`${at}: ${stat} stat (herGame) questions — max ${MAX_STAT_QUESTIONS}; Know Her Game is human-first, not a stat sheet`);
     if (human < MIN_HUMAN_QUESTIONS) fail(`${at}: only ${human} human (story/personality) questions — need ≥ ${MIN_HUMAN_QUESTIONS}`);
     else if (human < TARGET_HUMAN_QUESTIONS) warn(`${at}: ${human} human questions (aim ≥ ${TARGET_HUMAN_QUESTIONS})`);
@@ -190,6 +198,8 @@ export function validatePool(doc) {
 if (import.meta.url === pathToFileURL(process.argv[1] ?? "").href) {
   const args = process.argv.slice(2);
   const dryRun = args.includes("--dry-run");
+  // The weekend generator + verifier dry-run their HUMAN-ONLY pool with this: floor 8, no stats yet.
+  const humanOnly = args.includes("--human-only");
   // The KV-direct write skips markFeatured (see LEDGER BYPASS above), so it must be asked for
   // explicitly. Validation (--dry-run) stays the default, unflagged path — that's what the
   // weekly routine runs.
@@ -204,7 +214,7 @@ if (import.meta.url === pathToFileURL(process.argv[1] ?? "").href) {
     process.exit(1);
   }
 
-  const { errors, warnings } = validatePool(doc);
+  const { errors, warnings } = validatePool(doc, { humanOnly });
   warnings.forEach((w) => console.error(`⚠️  ${w}`));
   if (errors.length) {
     errors.forEach((e) => console.error(`✗ ${e}`));

@@ -54,6 +54,8 @@ import {
 	publishKnowHerPool,
 	stageKnowHerCandidate,
 	readKnowHerCandidate,
+	stageVerifiedCandidate,
+	publishVerifiedPool,
 	isoWeekKey,
 	KNOWHER_POOL_KEY,
 	type KnowHerPool,
@@ -747,6 +749,14 @@ export default {
 		}
 		if (url.pathname === "/knowher/candidate") {
 			return handleKnowHerCandidate(request, env, ctx);
+		}
+		// The weekend/Monday split (2026-08-12): the VERIFIER stages its cleaned human-only pool here;
+		// the MONDAY watcher pass reads it, injects fresh stats + Lever 1, and publishes.
+		if (url.pathname === "/knowher/candidate/verified") {
+			return handleKnowHerVerifiedCandidate(request, env, ctx);
+		}
+		if (url.pathname === "/knowher/publish-verified") {
+			return handleKnowHerPublishVerified(request, env, ctx);
 		}
 
 		// Operator escape hatch: a KV JSON the app layers over its ESPN-derived playoff bracket,
@@ -4266,6 +4276,75 @@ async function handleKnowHerCandidate(request: Request, env: Env, ctx: Execution
 		return json({ ...result, note: "Staged for the verify gate — NOT live. The verifier re-confirms each fact, then publishes." });
 	}
 	return new Response("Method not allowed. Use GET (verifier) or POST (generator).", { status: 405, headers: { Allow: "GET, POST" } });
+}
+
+/** `POST /knowher/candidate/verified` — the VERIFIER stages its cleaned, HUMAN-ONLY pool here (auth: the
+ *  publish key, since only the verifier reaches this). This is NOT live: the Monday publish-verified pass
+ *  injects fresh stats + Lever 1 and publishes. A short-of-5-human player is rejected (400) so the hold
+ *  surfaces at the verifier, on the weekend, when the owner can still hand-fix. (2026-08-12 split.) */
+async function handleKnowHerVerifiedCandidate(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
+	if (request.method !== "POST") {
+		return new Response("Method not allowed. Use POST.", { status: 405, headers: { Allow: "POST" } });
+	}
+	const kenv = env as unknown as KnowHerEnv;
+	const json = (b: unknown, s = 200) => new Response(JSON.stringify(b), { status: s, headers: { "Content-Type": "application/json" } });
+	const key = kenv.KNOWHER_INGEST_KEY;
+	if (!key || request.headers.get("x-ingest-key") !== key) {
+		emitDiag(env, ctx, "knowherVerifiedAuth", key ? "bad x-ingest-key" : "KNOWHER_INGEST_KEY unset");
+		return json({ error: "unauthorized" }, 401);
+	}
+	let body: Record<string, unknown>;
+	try { body = (await request.json()) as Record<string, unknown>; }
+	catch { emitDiag(env, ctx, "knowherVerifiedReject", "body is not JSON"); return json({ error: "body must be JSON" }, 400); }
+	const result = await stageVerifiedCandidate(kenv, body.pool ?? body);
+	if ("error" in result) {
+		emitDiag(env, ctx, "knowherVerifiedReject", result.error.slice(0, 70));
+		return json(result, 400);
+	}
+	emitDiag(env, ctx, "knowherVerifiedStaged", `${result.weekKey} players=${result.playerCount}`);
+	return json({ ...result, note: "Verified human-only pool staged — NOT live. Monday's publish-verified pass injects fresh stats + publishes." });
+}
+
+/** `POST /knowher/publish-verified` — the MONDAY half of the split (2026-08-12). The watcher's Monday
+ *  10:00-UTC pass calls this (via the service binding, holding the publish key); the owner also curls it for
+ *  the supervised first run. Reads the weekend-verified pool, injects FRESH ESPN stats (so Sunday-night
+ *  games count) + Lever 1, and publishes. Every outcome diags: an unattended 3am publish must be loud. */
+async function handleKnowHerPublishVerified(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
+	if (request.method !== "POST") {
+		return new Response("Method not allowed. Use POST.", { status: 405, headers: { Allow: "POST" } });
+	}
+	const kenv = env as unknown as KnowHerEnv;
+	const json = (b: unknown, s = 200) => new Response(JSON.stringify(b), { status: s, headers: { "Content-Type": "application/json" } });
+	const key = kenv.KNOWHER_INGEST_KEY;
+	if (!key || request.headers.get("x-ingest-key") !== key) {
+		emitDiag(env, ctx, "knowherPublishVerifiedAuth", key ? "bad x-ingest-key" : "KNOWHER_INGEST_KEY unset");
+		return json({ error: "unauthorized" }, 401);
+	}
+	// ?dryRun=1 — the supervised first run: assemble + validate the Monday pool but write NOTHING live.
+	const dryRun = new URL(request.url).searchParams.get("dryRun") === "1";
+	let result;
+	try {
+		result = await publishVerifiedPool(kenv, { dryRun });
+	} catch (e) {
+		// A thrown error here (e.g. ESPN unreachable for the stat fetch) means we could NOT build the pool —
+		// so nothing publishes and the last edition stays live. Loud, never a silent non-publish.
+		const msg = `${(e as Error).message ?? e}`;
+		emitDiag(env, ctx, "knowherPublishVerifiedError", msg.slice(0, 70));
+		return json({ error: msg }, 500);
+	}
+	if ("error" in result) {
+		// A held run (a player below the floor even with stat top-up, or no candidate staged) — report every
+		// held player + reason so the owner sees exactly what fell short.
+		emitDiag(env, ctx, "knowherPublishVerifiedHeld", `${result.error.slice(0, 60)}${result.held ? ` [${result.held.length}]` : ""}`);
+		return json(result, result.held ? 409 : 404);
+	}
+	if (result.lever1.length > 0) {
+		// Lever 1 fired for ≥1 player — loud but not fatal (the run still published on time). Names them so
+		// the owner can improve those players' human facts next cycle.
+		emitDiag(env, ctx, "knowherLever1", result.lever1.map((f) => `${f.team}:${f.human}h+${f.stat}s`).join(" "));
+	}
+	emitDiag(env, ctx, "knowherPublishVerifiedOk", `${result.dryRun ? "DRYRUN " : ""}${result.weekKey} players=${result.playerCount} lever1=${result.lever1.length}`);
+	return json(result);
 }
 
 /** Roster-learning eligibility for one team (docs §4): `?team=WAS` → the players who started

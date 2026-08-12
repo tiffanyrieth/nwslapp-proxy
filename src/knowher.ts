@@ -19,14 +19,23 @@ import {
   type BracketEnv,
 } from "./bracket-engine.ts";
 import { adminAuthed, adminRealm } from "./admin-auth.ts";
+import { buildStatQuestionsN, weaveStats, type StatInput } from "./knowher-stats.ts";
 
 export const KNOWHER_POOL_KEY = "knowher-pool-v1"; // KV: the live pool document (this week's players)
-// KV: the STAGED candidate pool awaiting the verify gate (2026-08-11). The generator routine POSTs here
-// (never to the live pool); the verifier reads it, re-confirms each fact, and only THEN publishes to
-// KNOWHER_POOL_KEY. A candidate is NOT live and does NOT advance the featured ledger — so a failed
-// verification is a safe no-op (last edition stays). Short TTL: a candidate is consumed within the hour.
+// KV: the STAGED candidate pool awaiting the verify gate (2026-08-11). The GENERATOR routine POSTs here
+// (never to the live pool); the VERIFIER reads it, re-confirms each fact, and stages a VERIFIED candidate.
+// A candidate is NOT live and does NOT advance the featured ledger — so a failed verification is a safe
+// no-op (last edition stays).
 export const KNOWHER_CANDIDATE_KEY = "knowher:candidate-v1";
-export const KNOWHER_CANDIDATE_TTL = 6 * 3600; // 6h — plenty for the verifier to run; auto-expires if it never does
+// 24h (was 6h): the weekend/Monday split (2026-08-12) can chain generate→verify with a delay, and the
+// generator's raw candidate must survive that gap. Auto-expires if the verifier never runs.
+export const KNOWHER_CANDIDATE_TTL = 24 * 3600;
+// KV: the VERIFIED, HUMAN-ONLY candidate the verifier stages on the WEEKEND (2026-08-12 split). It carries
+// no stat questions — the Monday `publishVerifiedPool` injects those from FRESH ESPN data (so Sunday-night
+// games are reflected) and only then publishes. 72h TTL: it must survive from Saturday/Sunday verify to
+// Monday 3am publish, plus margin.
+export const KNOWHER_CANDIDATE_VERIFIED_KEY = "knowher:candidate-verified-v1";
+export const KNOWHER_CANDIDATE_VERIFIED_TTL = 72 * 3600;
 export const KNOWHER_MODE_KEY = "knowher:mode"; // KV: "manual" | "auto" (default manual)
 // Per-season "already featured" ledger (docs §4 "once per season, hard"): key `knowher:featured:{season}`.
 // A player featured this season is removed from the eligible pool so the weekly pick advances through the
@@ -114,8 +123,13 @@ export function validateKnowHerPool(
    *  frame is legitimately incomplete and must not be judged as an edition.
    *  `requireSource`: ON for the automated candidate + ingest paths (every human question must carry a
    *  `source` URL for the verify gate); OFF for manual admin ops so a hand-paste isn't blocked on URLs. */
-  opts: { requireAllClubs?: boolean; requireSource?: boolean } = {},
+  /** `minQuestions`: the per-player floor (default MIN_QUESTIONS = 8). The weekend VERIFIED candidate is
+   *  HUMAN-ONLY and may carry a player the verifier dropped toward the Lever-1 minimum, so
+   *  stageVerifiedCandidate lowers this to 5 (5 human + 5 stat = the app's 10-floor; below 5 can never
+   *  ship, so it's the natural stage floor). Every OTHER path keeps the 8 default. */
+  opts: { requireAllClubs?: boolean; requireSource?: boolean; minQuestions?: number } = {},
 ): { pool: KnowHerPool } | { error: string } {
+  const minQ = opts.minQuestions ?? MIN_QUESTIONS;
   const doc = raw as Partial<KnowHerPool> | null;
   if (!doc || typeof doc !== "object" || Array.isArray(doc)) return { error: "pool must be a JSON object" };
   if (typeof doc.weekKey !== "string" || !doc.weekKey.trim()) return { error: "missing/blank weekKey" };
@@ -135,8 +149,8 @@ export function validateKnowHerPool(
     if (!Number.isInteger(p.jerseyNumber) || (p.jerseyNumber as number) < 0) return { error: `${at}: jerseyNumber must be a non-negative integer` };
     if (typeof p.position !== "string" || !p.position.trim()) return { error: `${at}: missing position` };
     if (typeof p.tagline !== "string" || !p.tagline.trim()) return { error: `${at}: missing tagline` };
-    if (!Array.isArray(p.questions) || p.questions.length < MIN_QUESTIONS || p.questions.length > MAX_QUESTIONS) {
-      return { error: `${at}: must have ${MIN_QUESTIONS}–${MAX_QUESTIONS} questions (has ${p.questions?.length ?? 0})` };
+    if (!Array.isArray(p.questions) || p.questions.length < minQ || p.questions.length > MAX_QUESTIONS) {
+      return { error: `${at}: must have ${minQ}–${MAX_QUESTIONS} questions (has ${p.questions?.length ?? 0})` };
     }
     const qids = new Set<string>();
     for (let j = 0; j < p.questions.length; j++) {
@@ -468,6 +482,176 @@ export async function stageKnowHerCandidate(
 /** Read back the staged candidate for the verifier. Null if none staged (or it expired). */
 export async function readKnowHerCandidate(env: KnowHerEnv): Promise<KnowHerPool | null> {
   return (await env.FEED_TAGS.get(KNOWHER_CANDIDATE_KEY, "json")) as KnowHerPool | null;
+}
+
+/** Stage the VERIFIED, HUMAN-ONLY candidate the verifier produces on the weekend (2026-08-12 split). Same
+ *  shape/club/source validation as the generator's stage — but deliberately NOT the ≥8-human-per-player or
+ *  the stat-question rules: a player left short after verification is Monday's job (Lever 1 tops it up, or
+ *  the run holds), never a reason to reject the whole verified pool here. Writes the verified key with a
+ *  72h TTL so it survives to Monday's publish. Does NOT go live and does NOT advance the featured ledger. */
+export async function stageVerifiedCandidate(
+  env: KnowHerEnv,
+  poolInput: unknown,
+): Promise<{ ok: true; weekKey: string; playerCount: number; humanByTeam: Record<string, number> } | { error: string }> {
+  // minQuestions: 5 — a human-only pool the verifier trimmed toward the Lever-1 minimum (5 human + 5 stat =
+  // the 10-floor) still stages; a player below 5 human can never reach the floor even at the stat cap, so
+  // that rejection surfaces the hold AT THE VERIFIER (the weekend, when the owner can hand-fix), not Monday.
+  const v = validateKnowHerPool(poolInput, { requireAllClubs: true, requireSource: true, minQuestions: 5 });
+  if ("error" in v) return { error: v.error };
+  await env.FEED_TAGS.put(KNOWHER_CANDIDATE_VERIFIED_KEY, JSON.stringify(v.pool), { expirationTtl: KNOWHER_CANDIDATE_VERIFIED_TTL });
+  // Per-team human counts so the verifier's report is exact and any Monday-Lever-1 top-up is predictable.
+  const humanByTeam: Record<string, number> = {};
+  for (const p of v.pool.players) {
+    humanByTeam[p.teamAbbreviation] = p.questions.filter((q) => q.category !== "herGame").length;
+  }
+  return { ok: true, weekKey: v.pool.weekKey, playerCount: v.pool.players.length, humanByTeam };
+}
+
+/** Read back the verified candidate for the Monday publish. Null if none staged (or it expired). */
+export async function readVerifiedCandidate(env: KnowHerEnv): Promise<KnowHerPool | null> {
+  return (await env.FEED_TAGS.get(KNOWHER_CANDIDATE_VERIFIED_KEY, "json")) as KnowHerPool | null;
+}
+
+// The app plays a quiz of at least this many questions per player (mirrors scripts/load_knowher.mjs
+// MIN_QUESTIONS). Lever 1 tops a short player up to this floor with deterministic stat questions.
+const APP_QUESTION_FLOOR = 10;
+// The most stat questions Lever 1 will ever inject for one player (mirrors load_knowher.mjs
+// MAX_STAT_QUESTIONS). Past this, a player is too thin on human facts to ship without becoming a stat sheet
+// — so the run holds instead. A normal player gets exactly 2.
+const MAX_STAT_QUESTIONS = 5;
+
+/** Lever 1's per-player decision (pure): how many stat questions to aim for given the verified human count.
+ *  A normal player (≥8 human) gets exactly 2 (→ 10–11). A short one is topped toward the 10-floor, capped
+ *  at MAX_STAT_QUESTIONS so it never becomes a stat sheet. The caller then builds up to this many from the
+ *  player's real ESPN stats; if what's buildable still can't reach the floor, the whole run holds. */
+export function wantStatFor(humanCount: number): number {
+  return humanCount >= 8 ? 2 : Math.min(MAX_STAT_QUESTIONS, APP_QUESTION_FLOOR - humanCount);
+}
+
+export interface Lever1Flag {
+  team: string;
+  player: string;
+  human: number;
+  stat: number; // > 2 ⇒ this player was topped up beyond the standard pair
+}
+
+export interface PublishVerifiedResult {
+  ok: true;
+  dryRun?: boolean; // true ⇒ everything ran but NOTHING was written live / featured (supervised-test mode)
+  weekKey: string;
+  playerCount: number;
+  featuredThisSeason: number;
+  lever1: Lever1Flag[]; // players that needed a stat top-up beyond the standard 2 (loud but not fatal)
+  perPlayer?: Array<{ team: string; player: string; human: number; stat: number; total: number }>;
+  note: string;
+}
+
+/** Map the raw ESPN stat record (fetchStatsForMany keys) into the shape the stat builder reads. Mirrors the
+ *  same projection in computeEligiblePlayers so the two never drift. Uses the pool player's own name +
+ *  position (the verified human pool already carries them). */
+function statInputFor(player: KnowHerPlayer, raw: Record<string, number> | undefined): StatInput | null {
+  if (!raw) return null;
+  const r = (k: string) => Math.round(raw[k] ?? 0);
+  return {
+    name: player.playerName,
+    position: player.position,
+    starts: r("general.starts"),
+    minutes: r("general.minutes"),
+    appearances: r("general.appearances"),
+    goals: r("offensive.totalGoals"),
+    assists: r("offensive.goalAssists"),
+    shots: r("offensive.totalShots"),
+    shotsOnTarget: r("offensive.shotsOnTarget"),
+    cleanSheets: r("goalKeeping.cleanSheet"),
+    saves: r("goalKeeping.saves"),
+  };
+}
+
+/** The MONDAY half of the weekend/Monday split (2026-08-12). Reads the weekend-verified HUMAN-ONLY pool,
+ *  injects FRESH stat questions (so Sunday-night games are reflected — the whole reason stats stay Monday),
+ *  and publishes. **Lever 1:** a player left below the app's 10-question floor after verification is topped
+ *  up with EXTRA deterministic stats (up to MAX_STAT_QUESTIONS) rather than holding the run — so the Monday
+ *  nudge never fires on stale content. A player so thin that even the cap can't reach the floor (fewer than
+ *  ~5 confirmable human questions) HOLDS the whole run (last edition stays) — the rare backstop-to-the-
+ *  backstop; the weekend hand-fix window is the primary defense. Returns Lever-1 flags for the audit diag. */
+export async function publishVerifiedPool(
+  env: KnowHerEnv,
+  /** dryRun (supervised first run): assemble + validate the Monday pool EXACTLY — inject fresh stats, run
+   *  Lever 1, check the floor — but do NOT write the live pool and do NOT advance the featured ledger.
+   *  Proves the whole Monday half against the real verified candidate without disturbing the current live
+   *  edition. The only thing it doesn't exercise is the final KV write + markFeatured (the unchanged
+   *  `publishKnowHerPool`, already proven in production). */
+  opts: { dryRun?: boolean } = {},
+): Promise<PublishVerifiedResult | { error: string; held?: string[] }> {
+  const pool = await readVerifiedCandidate(env);
+  if (!pool) return { error: "no verified candidate staged" };
+
+  const year = pool.season ?? new Date().getUTCFullYear();
+  const ids = pool.players.map((p) => String(p.espnAthleteId)).filter(Boolean);
+  const stats = await fetchStatsForMany(ids, year);
+
+  const lever1: Lever1Flag[] = [];
+  const held: string[] = [];
+  const perPlayer: Array<{ team: string; player: string; human: number; stat: number; total: number }> = [];
+
+  for (const p of pool.players) {
+    const label = `${p.teamAbbreviation} (${p.playerName})`;
+    const human = p.questions.filter((q) => q.category !== "herGame");
+    const humanCount = human.length;
+    // Standard players get exactly 2 stats (→ 10–11). A short one is topped to the 10-floor, capped at 5.
+    const wantStat = wantStatFor(humanCount);
+
+    const input = statInputFor(p, stats.get(String(p.espnAthleteId)));
+    if (!input) {
+      held.push(`${label}: no ESPN stats available to inject`);
+      continue;
+    }
+    let statQs: KnowHerQuestion[] = [];
+    try {
+      statQs = buildStatQuestionsN(p.teamAbbreviation, input, wantStat);
+    } catch {
+      statQs = [];
+    }
+    const existing = new Set(human.map((q) => q.id));
+    statQs = statQs.filter((q) => !existing.has(q.id));
+
+    if (humanCount + statQs.length < APP_QUESTION_FLOOR) {
+      held.push(`${label}: ${humanCount} human + ${statQs.length} stat = ${humanCount + statQs.length} < ${APP_QUESTION_FLOOR} floor`);
+      continue;
+    }
+    p.questions = weaveStats(human, statQs);
+    perPlayer.push({ team: p.teamAbbreviation, player: p.playerName, human: humanCount, stat: statQs.length, total: p.questions.length });
+    if (statQs.length > 2) lever1.push({ team: p.teamAbbreviation, player: p.playerName, human: humanCount, stat: statQs.length });
+  }
+
+  // Any player unable to reach the floor holds the WHOLE run — a short (15-club or thin) edition is worse
+  // than a missed cycle (last edition stays live). Loud: the caller diags every held player + reason.
+  if (held.length > 0) {
+    return { error: `held — ${held.length} player(s) below the ${APP_QUESTION_FLOOR}-question floor even with stat top-up`, held };
+  }
+
+  // dryRun: prove the assembled pool VALIDATES for publish, but write nothing + don't advance the ledger.
+  if (opts.dryRun) {
+    const v = validateKnowHerPool(pool, { requireAllClubs: true, requireSource: true });
+    if ("error" in v) return { error: `dry-run: assembled pool would FAIL publish validation — ${v.error}` };
+    return {
+      ok: true, dryRun: true, weekKey: pool.weekKey, playerCount: pool.players.length,
+      featuredThisSeason: (await readFeaturedIds(env, year)).size, lever1, perPlayer,
+      note: "DRY RUN — nothing published, ledger untouched. This is exactly what Monday would publish.",
+    };
+  }
+
+  const result = await publishKnowHerPool(env, pool, { requireSource: true });
+  if ("error" in result) return { error: result.error };
+  return {
+    ok: true,
+    weekKey: result.weekKey,
+    playerCount: result.playerCount,
+    featuredThisSeason: result.featuredThisSeason,
+    lever1,
+    perPlayer,
+    note: result.note,
+  };
 }
 
 async function knowHerAdminOp(env: KnowHerEnv, op: string, body: Record<string, unknown>): Promise<unknown> {
