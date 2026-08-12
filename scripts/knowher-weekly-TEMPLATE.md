@@ -121,8 +121,12 @@ she's dating or which relative is famous.
   IS the banned obvious-true pattern; make the claim a believable-but-FALSE one, or convert it to an MC
   "which of these has she actually done?". A pool that is mostly-"True" will be REJECTED by the validator.
 - Each question: unique `id` (e.g. `"was-rodman-<slug>"` — always three parts, club-player-slug, so it can't
-  collide with the system's `was-stat-goals` ids), a `prompt`, and a warm one-sentence `revealFact` (the
-  "learn"/delight payoff). **8–9 questions per player — 8 is the FLOOR.** The system appends 2 stat questions,
+  collide with the system's `was-stat-goals` ids), a `prompt`, a warm one-sentence `revealFact` (the
+  "learn"/delight payoff), and a **`source`** — the exact URL you verified that fact from (⚠️ REQUIRED on
+  every question you write; the publish is now gated on it). The `source` is what lets an independent VERIFY
+  pass re-confirm each fact before it goes live, and it keeps every published fact auditable. Cite the page
+  you actually retrieved the fact from — a gold-tier club/NWSL/editorial URL, not a search-results page.
+  **8–9 questions per player — 8 is the FLOOR.** The system appends 2 stat questions,
   so the published quiz lands at 10–11; a richer player may go to 13 (published 15). One player per team.
   ⚠️ Fewer than 8 and the merged quiz falls under the app's 10-question floor and the whole run is rejected.
   ⚠️ **Hitting 8 is NOT "done" — the count is the floor, the personality quota is the bar.** A player with 8
@@ -158,7 +162,8 @@ Output ONLY this JSON (no prose around it), **every player above included** in t
           "prompt": "Which of these has Trinity Rodman actually done?",
           "options": ["<true one>", "<plausible false>", "<plausible false>", "<plausible false>"],
           "correctIndex": 0,
-          "revealFact": "<one warm sentence>"
+          "revealFact": "<one warm sentence>",
+          "source": "https://<the exact gold-tier page you verified this fact from>"
         }
       ]
     }

@@ -107,45 +107,43 @@ fails a pool that's ~80% "True", the banned obvious-true pattern).
   publish nothing, report FAILURE with the validator's exact error. The previous edition's content stays
   live automatically — a missed week is safe; a malformed publish is not.
 
-### 4. Publish
+### 4. STAGE the candidate (you do NOT publish — the verifier does)
+
+⚠️ **You are the GENERATOR half of a two-routine pipeline (2026-08-11). You never make content live.** You
+stage your pool as a *candidate*; a separate VERIFY routine then re-confirms every human fact from a fresh
+search and publishes only what survives. This split exists because a generator can't be the judge of its own
+work — a past run wrote good questions but then hallucinated its own review. Staging, not publishing, is the
+fix. You hold a `CANDIDATE_KEY` (stage-only), NOT the publish key.
 
 ```bash
-curl -sS -X POST "https://nwslapp-proxy.tiffany-rieth.workers.dev/knowher/ingest" \
-  -H "x-ingest-key: $INGEST_KEY" -H "Content-Type: application/json" \
+curl -sS -X POST "https://nwslapp-proxy.tiffany-rieth.workers.dev/knowher/candidate" \
+  -H "x-candidate-key: $CANDIDATE_KEY" -H "Content-Type: application/json" \
   --data @/tmp/knowher-pool.json
 ```
 
-Expect `{"ok":true,"weekKey":"<this week>","playerCount":N,...}`. Any other response → retry ONCE; still
-failing → **STOP** and report FAILURE with the HTTP status/body (do not echo the key).
+Expect `{"ok":true,"weekKey":"<this week>","playerCount":16,"humanQuestions":N,"note":"Staged …"}`. The
+endpoint runs the SAME validation as publish PLUS the per-fact `source` requirement — a `400` here almost
+always means a question is missing its `source` URL (go add it) or the pool is short a club. Any non-`ok`
+response → retry ONCE; still failing → **STOP** and report FAILURE with the HTTP status/body (do not echo
+the key). ⚠️ A staged candidate is **NOT live** and does **NOT** advance the featured ledger — nothing has
+changed for users yet. The verify routine takes it from here.
 
-### 5. Verify live
-
-Verify against a **teams-scoped** query, NOT the empty `?teams=` one — that empty-teams response has its
-own edge-cache entry that commonly still serves LAST week for up to ~5 min after a successful publish (a
-known lag, NOT a failure). Pick two teams you just published and use a fresh cache key:
-
-```bash
-curl -sS "https://nwslapp-proxy.tiffany-rieth.workers.dev/knowher?teams=WAS,LA" | head -c 200
-```
-
-Confirm the served `weekKey` matches this week's. If the ingest POST in step 4 returned `{"ok":true,…}`,
-**the publish already succeeded** — a stale `weekKey` here is just the edge cache catching up, so do NOT
-report a failure over it. Note it in your report if you like, but the step-4 `ok:true` is the source of
-truth. (Don't burn time re-polling; one teams-scoped check is enough.)
-
-### 6. Report
+### 5. Report (the generator does NOT verify live — there's nothing live yet)
 
 Final message, exactly one of:
-- **SUCCESS** — `Know Her Game <weekKey>: published <N> players (<gaps, if any: "gap: BAY, …">).`
-  Then the per-player source list from step 2 (for spot-checking).
-- **FAILURE** — `Know Her Game <weekKey>: NOT published — <step> failed: <exact error>.` Plus what (if
-  anything) the app is serving instead (last week's pool stays live).
+- **STAGED** — `Know Her Game <weekKey>: staged <N> players for verification (<gaps, if any>).` Then the
+  per-player review section (built from the JSON per the OUTPUT rules — walk the questions, tag [P]/[C],
+  count, sources, rejected facts). Note explicitly: *"Not yet live — awaiting the verify gate."*
+- **FAILURE** — `Know Her Game <weekKey>: NOT staged — <step> failed: <exact error>.` Plus: last week's
+  pool stays live (a missed week is safe).
 
 ## Hard rules
 
-- Never publish a pool that failed `--dry-run` validation.
-- Never publish a pool that hasn't been through step 2b — the human-only pool is incomplete by design.
+- Never stage a pool that failed `--dry-run` validation.
+- Never stage a pool that hasn't been through step 2b — the human-only pool is incomplete by design.
+- Every HUMAN question MUST carry a `source` URL — the stage endpoint rejects the pool otherwise.
+- You do NOT publish. You have no publish key. Staging is the end of your job.
 - Never alter the assembled prompt's wording.
 - Never put the source list, commentary, or markdown fences inside `/tmp/knowher-pool.json`.
-- Never print or persist `INGEST_KEY`.
+- Never print or persist your key.
 - One retry per failed step, then stop loud. A quiet skipped week beats a bad publish.
