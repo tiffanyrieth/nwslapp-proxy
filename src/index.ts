@@ -24,6 +24,7 @@ import {
 	forceCloseActiveRound,
 	handleBracketAdmin,
 	ROSTER_GOOD_MIN,
+	fetchTeamSeasonStats,
 	type BracketEnv,
 } from "./bracket-engine.ts";
 import { buildHeadshotMap, handleHeadshots, normalizeName } from "./headshots.ts";
@@ -165,6 +166,9 @@ const CLIENT_MAX_TTL = 3600; // 1h
 // ESPN's own stale CDN before /summary busted upstream) — the frozen-attendance regression.
 const CACHE_EPOCH = "3";
 const TEAM_VIDEOS_TTL = 3600; // 1hr — a club's recent uploads change at most a few times/day
+const TEAM_STATS_TTL = 3600; // 1hr — a squad's season stat totals only move after a match (a few times/week);
+// 1h keeps the shared cache warm so the team page's ~27-athlete stat bundle is one edge-cached call, not 27
+// per-device ESPN calls. Not a live surface — the live match card is elsewhere.
 
 const YT_API = "https://www.googleapis.com/youtube/v3";
 const UPLOADS_PER_TEAM = 5; // recent uploads to pull per club (the app filters/caps)
@@ -901,6 +905,9 @@ export default {
 		if (url.pathname === "/roster") {
 			return handleRoster(url, env, ctx);
 		}
+		if (url.pathname === "/team-stats") {
+			return handleTeamStats(url, env, ctx);
+		}
 		if (url.pathname === "/weather") {
 			// Historical kickoff weather for a past match (see weather.ts). The event →
 			// (venue, kickoff, state) lookup reuses this worker's OWN edge-cached /summary
@@ -920,7 +927,7 @@ export default {
 		}
 
 		return new Response(
-			"Not found. This proxy serves GET /scoreboard, /summary, /weather, /team-videos, /feed, /spotlight, /trivia, /knowher, /knowher/eligible, /knowher/todo, /quiz-results, /predict/community, /headshots, /crest, /crest/manifest, /roster, /national-teams, /playoff-override, and POST /telemetry, /analytics.",
+			"Not found. This proxy serves GET /scoreboard, /summary, /weather, /team-videos, /feed, /spotlight, /trivia, /knowher, /knowher/eligible, /knowher/todo, /quiz-results, /predict/community, /headshots, /crest, /crest/manifest, /roster, /team-stats, /national-teams, /playoff-override, and POST /telemetry, /analytics.",
 			{ status: 404 },
 		);
 	},
@@ -4376,6 +4383,42 @@ async function handleKnowHerEligible(url: URL, env: Env): Promise<Response> {
 		// Note: no ctx here (admin/debug endpoint) — cache synchronously via the returned clone.
 		await cache.put(cacheKey, body.clone());
 	}
+	return withCacheStatus(body, "MISS");
+}
+
+/** `GET /team-stats?team={id}` — every rostered athlete of a club with their FULL flattened season stats
+ *  (`"category.statName" → value`, the exact shape the app's PlayerSeasonStats.all consumes), in ONE
+ *  edge-cached call. Replaces the app's old ~27-per-athlete device→ESPN burst on every team-page open
+ *  (docs/stress-testing.md §6). Reuses `fetchTeamSeasonStats` (resilient roster + batched stat fetch,
+ *  ~29 subrequests, under the free 50/invocation cap). On any failure the app falls back to its own
+ *  per-athlete fetch, so a proxy miss DEGRADES (per-device fan-out), never blanks. */
+async function handleTeamStats(url: URL, env: Env, ctx: ExecutionContext): Promise<Response> {
+	const id = (url.searchParams.get("team") ?? "").replace(/[^0-9]/g, "");
+	if (!id) return new Response("missing ?team", { status: 400 });
+	const year = Number(url.searchParams.get("year")) || new Date().getUTCFullYear();
+	const cache = caches.default;
+	const cacheKey = new Request(url.toString(), { method: "GET" });
+	const hit = await cache.match(cacheKey);
+	if (hit) return withCacheStatus(hit, "HIT");
+
+	let players: Awaited<ReturnType<typeof fetchTeamSeasonStats>>;
+	try {
+		players = await fetchTeamSeasonStats(env as unknown as BracketEnv, id, year);
+	} catch (e) {
+		emitDiag(env, ctx, "teamStatsError", `${id}: ${(e as Error).message.slice(0, 50)}`);
+		return upstreamError();
+	}
+	if (players.length === 0) {
+		// No roster resolved (bad id, or an ESPN roster outage with no last-known-good). Don't cache an
+		// empty — return an error so the app falls back to its per-athlete path. Loud (no silent empty).
+		emitDiag(env, ctx, "teamStatsEmpty", `${id}: 0 players`);
+		return upstreamError();
+	}
+	const headers = new Headers();
+	headers.set("Content-Type", "application/json");
+	headers.set("Cache-Control", `public, max-age=${TEAM_STATS_TTL}`);
+	const body = new Response(JSON.stringify({ team: id, year, players }), { status: 200, headers });
+	ctx.waitUntil(cache.put(cacheKey, body.clone()));
 	return withCacheStatus(body, "MISS");
 }
 

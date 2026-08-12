@@ -400,6 +400,27 @@ export async function fetchStatsForMany(ids: string[], year: number): Promise<Ma
   return out;
 }
 
+/** Every rostered athlete of a team with their FULL flattened season stats (`"category.statName" → value`)
+ *  — powers the app's `GET /team-stats?team={id}` route, which bundles the ~27 per-athlete ESPN calls the
+ *  device used to fire on every team-page open into ONE edge-cached call (docs: the team-page stats burst).
+ *  Unlike `computeEligiblePlayers` this does NOT gate/rank — it returns every rostered player (stats or an
+ *  empty map when ESPN had none), because the team page shows the whole squad. One invocation: teams (1) +
+ *  roster (1) + ~27 stat calls ≈ 29 ESPN subrequests, under the free 50/invocation cap (same profile as
+ *  `/knowher/todo`). The roster comes through `fetchRosterResilient`, so a live ESPN blip falls back to the
+ *  same `roster:{id}` last-known-good that `/roster` serves. */
+export async function fetchTeamSeasonStats(
+  env: BracketEnv,
+  teamId: string,
+  year: number,
+): Promise<Array<{ athleteId: string; stats: Record<string, number> }>> {
+  const teams = await fetchTeamAbbrs();
+  const team = teams.find((t) => String(t.id) === String(teamId));
+  const roster = await fetchRosterResilient(env, String(teamId), team?.abbr ?? "");
+  const ids = roster.map((p) => p.id).filter(Boolean);
+  const stats = await fetchStatsForMany(ids, year);
+  return roster.map((p) => ({ athleteId: p.id, stats: stats.get(p.id) ?? {} }));
+}
+
 /** A comparable seeding score from the edition's stat, or null when the data's absent
  *  (→ the player falls to roster-depth order). save% is computed (the ESPN field is buggy). */
 function statScore(seedingStat: string, leaders: LeaderLine | undefined, per: Record<string, number> | undefined): number | null {
