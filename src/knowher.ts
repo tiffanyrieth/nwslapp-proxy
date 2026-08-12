@@ -21,6 +21,12 @@ import {
 import { adminAuthed, adminRealm } from "./admin-auth.ts";
 
 export const KNOWHER_POOL_KEY = "knowher-pool-v1"; // KV: the live pool document (this week's players)
+// KV: the STAGED candidate pool awaiting the verify gate (2026-08-11). The generator routine POSTs here
+// (never to the live pool); the verifier reads it, re-confirms each fact, and only THEN publishes to
+// KNOWHER_POOL_KEY. A candidate is NOT live and does NOT advance the featured ledger — so a failed
+// verification is a safe no-op (last edition stays). Short TTL: a candidate is consumed within the hour.
+export const KNOWHER_CANDIDATE_KEY = "knowher:candidate-v1";
+export const KNOWHER_CANDIDATE_TTL = 6 * 3600; // 6h — plenty for the verifier to run; auto-expires if it never does
 export const KNOWHER_MODE_KEY = "knowher:mode"; // KV: "manual" | "auto" (default manual)
 // Per-season "already featured" ledger (docs §4 "once per season, hard"): key `knowher:featured:{season}`.
 // A player featured this season is removed from the eligible pool so the weekly pick advances through the
@@ -40,6 +46,12 @@ export interface KnowHerQuestion {
   options: string[]; // exactly 4 for MC, exactly 2 (True/False) for trueOrFalse
   correctIndex: number; // 0-based, within options
   revealFact?: string; // the "learn" payoff surfaced on the result screen
+  // The URL this HUMAN fact was verified from — carried so the VERIFY gate can re-confirm each claim
+  // independently, and so a published fact is auditable forever (2026-08-11). Absent on `herGame` (stat)
+  // questions, which are code-generated from ESPN numbers and need no web source. The app ignores it
+  // (optional → every shipped build keeps decoding); the validator REQUIRES it on human questions so the
+  // generator can't ship an unsourced fact. See docs/know-her-game.md §5c (the verify gate).
+  source?: string;
 }
 
 export interface KnowHerPlayer {
@@ -99,8 +111,10 @@ export function validateKnowHerPool(
   raw: unknown,
   /** Whole-edition checks (currently club completeness). OFF for the admin `upsertPlayer` op,
    *  which reuses this validator on a ONE-player frame to lint a single pasted player — that
-   *  frame is legitimately incomplete and must not be judged as an edition. */
-  opts: { requireAllClubs?: boolean } = {},
+   *  frame is legitimately incomplete and must not be judged as an edition.
+   *  `requireSource`: ON for the automated candidate + ingest paths (every human question must carry a
+   *  `source` URL for the verify gate); OFF for manual admin ops so a hand-paste isn't blocked on URLs. */
+  opts: { requireAllClubs?: boolean; requireSource?: boolean } = {},
 ): { pool: KnowHerPool } | { error: string } {
   const doc = raw as Partial<KnowHerPool> | null;
   if (!doc || typeof doc !== "object" || Array.isArray(doc)) return { error: "pool must be a JSON object" };
@@ -143,6 +157,14 @@ export function validateKnowHerPool(
         return { error: `${qat}: correctIndex must be 0–${wantOpts - 1}` };
       }
       if (q.revealFact !== undefined && (typeof q.revealFact !== "string")) return { error: `${qat}: revealFact must be a string` };
+      if (q.source !== undefined && typeof q.source !== "string") return { error: `${qat}: source must be a string` };
+      // The verify gate needs a per-fact URL on every HUMAN question to re-confirm it independently — and a
+      // sourced fact is auditable forever. `herGame` (stat) questions are code-generated from ESPN numbers,
+      // so they carry no web source and are exempt. Enforced only on the automated paths (candidate + ingest),
+      // not the manual admin single-player upsert, which stays a lenient escape hatch.
+      if (opts.requireSource && q.category !== "herGame" && (typeof q.source !== "string" || !q.source.trim())) {
+        return { error: `${qat}: human question needs a "source" URL (the verify gate re-confirms each fact from it)` };
+      }
     }
   }
   if (opts.requireAllClubs) {
@@ -347,8 +369,13 @@ export interface KnowHerEnv {
   BRACKET_ADMIN_KEY?: string;
   /** Dedicated secret for the automated weekly /knowher/ingest POST — deliberately NOT the master
    *  BRACKET_ADMIN_KEY (the weekly Claude routine holds this key, so its blast radius is one feature
-   *  and it rotates independently of every other admin surface). */
+   *  and it rotates independently of every other admin surface). Held by the VERIFIER routine (it is
+   *  the only thing that publishes) + used to authorize the verifier's candidate READ. */
   KNOWHER_INGEST_KEY?: string;
+  /** Weaker key for the GENERATOR routine — it can only STAGE a candidate (POST /knowher/candidate),
+   *  never publish. Separating it means a compromised generator key can't push live content; only the
+   *  verifier (holding KNOWHER_INGEST_KEY) makes anything go live. */
+  KNOWHER_CANDIDATE_KEY_SECRET?: string;
 }
 
 const ADMIN_REALM = adminRealm("Know Her Game Admin");
@@ -388,10 +415,13 @@ export async function handleKnowHerAdmin(request: Request, env: KnowHerEnv): Pro
 export async function publishKnowHerPool(
   env: KnowHerEnv,
   poolInput: unknown,
+  /** ON for the automated /knowher/ingest (the verifier publishes only sourced, gate-passed pools);
+   *  OFF for the manual admin paste, which stays a lenient hand-edit escape hatch. */
+  opts: { requireSource?: boolean } = {},
 ): Promise<{ ok: true; weekKey: string; playerCount: number; featuredThisSeason: number; note: string } | { error: string }> {
   // requireAllClubs: this is the PUBLISH path (automated /knowher/ingest + admin paste), the
   // only one that makes a pool live — so it's where a short edition has to be stopped.
-  const v = validateKnowHerPool(poolInput, { requireAllClubs: true });
+  const v = validateKnowHerPool(poolInput, { requireAllClubs: true, requireSource: opts.requireSource });
   if ("error" in v) return { error: v.error };
   // Stamp each player's numeric ESPN team id (abbr→id via the shared teams map) so the match-watcher can
   // target the team's followers for the biweekly KHG push without its own abbr→id table. Best-effort: a
@@ -415,6 +445,29 @@ export async function publishKnowHerPool(
     v.pool.players.map((p) => ({ athleteId: p.espnAthleteId, teamAbbr: p.teamAbbreviation })),
   );
   return { ok: true, weekKey: v.pool.weekKey, playerCount: v.pool.players.length, featuredThisSeason, note: "Live within ~5 min (the /knowher edge cache TTL)." };
+}
+
+/** Stage a GENERATED candidate pool for the verify gate (2026-08-11). Validates shape + club-completeness
+ *  + per-fact `source` (same bar as publish), but does NOT go live and does NOT touch the featured ledger.
+ *  The generator routine calls this; the verifier routine reads it back, re-confirms each fact from a FRESH
+ *  search, drops the unconfirmable, and only then calls the real publish. A candidate that never gets
+ *  verified simply expires (TTL) — a safe no-op, last edition stays live. Returns a summary for the report. */
+export async function stageKnowHerCandidate(
+  env: KnowHerEnv,
+  poolInput: unknown,
+): Promise<{ ok: true; weekKey: string; playerCount: number; humanQuestions: number } | { error: string }> {
+  // requireSource: a candidate MUST carry a per-fact source or the verifier has nothing to re-confirm against.
+  const v = validateKnowHerPool(poolInput, { requireAllClubs: true, requireSource: true });
+  if ("error" in v) return { error: v.error };
+  await env.FEED_TAGS.put(KNOWHER_CANDIDATE_KEY, JSON.stringify(v.pool), { expirationTtl: KNOWHER_CANDIDATE_TTL });
+  const humanQuestions = v.pool.players.reduce(
+    (n, p) => n + p.questions.filter((q) => q.category !== "herGame").length, 0);
+  return { ok: true, weekKey: v.pool.weekKey, playerCount: v.pool.players.length, humanQuestions };
+}
+
+/** Read back the staged candidate for the verifier. Null if none staged (or it expired). */
+export async function readKnowHerCandidate(env: KnowHerEnv): Promise<KnowHerPool | null> {
+  return (await env.FEED_TAGS.get(KNOWHER_CANDIDATE_KEY, "json")) as KnowHerPool | null;
 }
 
 async function knowHerAdminOp(env: KnowHerEnv, op: string, body: Record<string, unknown>): Promise<unknown> {

@@ -144,6 +144,14 @@ export function validatePool(doc) {
       else if (q.options.some((o) => typeof o !== "string" || !o.trim())) fail(`${qat}: every option must be a non-blank string`);
       if (!Number.isInteger(q?.correctIndex) || q.correctIndex < 0 || q.correctIndex >= wantOpts) fail(`${qat}: correctIndex must be 0–${wantOpts - 1}`);
       if (q?.revealFact !== undefined && typeof q.revealFact !== "string") fail(`${qat}: revealFact must be a string`);
+      if (q?.source !== undefined && typeof q.source !== "string") fail(`${qat}: source must be a string`);
+      // Every HUMAN question needs a per-fact source URL (the verify gate re-confirms each fact from it, and
+      // a published fact stays auditable). herGame (stat) questions are code-generated → exempt. This lint
+      // mirrors the proxy validator's requireSource; the merged pool the routine dry-runs must already carry
+      // sources on every human question written in step 2.
+      if (q?.category !== "herGame" && (typeof q?.source !== "string" || !q.source.trim())) {
+        fail(`${qat}: human question needs a "source" URL (the verify gate re-confirms each fact from it)`);
+      }
 
       // Quality tallies
       if (HUMAN_CATEGORIES.has(q?.category)) human++;

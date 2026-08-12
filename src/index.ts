@@ -52,6 +52,8 @@ import {
 	pickWeeklyFeatured,
 	filterPoolByTeams,
 	publishKnowHerPool,
+	stageKnowHerCandidate,
+	readKnowHerCandidate,
 	isoWeekKey,
 	KNOWHER_POOL_KEY,
 	type KnowHerPool,
@@ -742,6 +744,9 @@ export default {
 		// be loud, never a silent non-publish.
 		if (url.pathname === "/knowher/ingest") {
 			return handleKnowHerIngest(request, env, ctx);
+		}
+		if (url.pathname === "/knowher/candidate") {
+			return handleKnowHerCandidate(request, env, ctx);
 		}
 
 		// Operator escape hatch: a KV JSON the app layers over its ESPN-derived playoff bracket,
@@ -4212,13 +4217,55 @@ async function handleKnowHerIngest(request: Request, env: Env, ctx: ExecutionCon
 			status: 400, headers: { "Content-Type": "application/json" },
 		});
 	}
-	const result = await publishKnowHerPool(env as unknown as KnowHerEnv, body.pool ?? body);
+	// requireSource: the ingest path is now the VERIFIER's publish — it only ever posts a gate-passed pool,
+	// and every human question must carry the `source` the verifier re-confirmed it from.
+	const result = await publishKnowHerPool(env as unknown as KnowHerEnv, body.pool ?? body, { requireSource: true });
 	if ("error" in result) {
 		emitDiag(env, ctx, "knowherIngestReject", result.error.slice(0, 70));
 		return new Response(JSON.stringify(result), { status: 400, headers: { "Content-Type": "application/json" } });
 	}
 	emitDiag(env, ctx, "knowherIngestOk", `${result.weekKey} players=${result.playerCount}`);
 	return new Response(JSON.stringify(result), { status: 200, headers: { "Content-Type": "application/json" } });
+}
+
+/** `POST /knowher/candidate` — the GENERATOR routine stages its pool here (auth: the weaker
+ *  x-candidate-key). Validates shape + club-completeness + per-fact source, but does NOT go live and does
+ *  NOT touch the featured ledger. `GET /knowher/candidate` — the VERIFIER routine reads it back (auth: the
+ *  stronger x-ingest-key, since only the verifier should see/act on it). This is the split that stops the
+ *  generator from being judge of its own work: it can stage, only the verifier can publish. */
+async function handleKnowHerCandidate(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
+	const kenv = env as unknown as KnowHerEnv;
+	const json = (b: unknown, s = 200) => new Response(JSON.stringify(b), { status: s, headers: { "Content-Type": "application/json" } });
+	if (request.method === "GET") {
+		// Verifier read — gated by the publish key (only the verifier reads candidates).
+		const key = kenv.KNOWHER_INGEST_KEY;
+		if (!key || request.headers.get("x-ingest-key") !== key) {
+			emitDiag(env, ctx, "knowherCandidateAuth", key ? "bad x-ingest-key (GET)" : "KNOWHER_INGEST_KEY unset");
+			return json({ error: "unauthorized" }, 401);
+		}
+		const cand = await readKnowHerCandidate(kenv);
+		if (!cand) return json({ error: "no candidate staged" }, 404);
+		return json(cand);
+	}
+	if (request.method === "POST") {
+		// Generator stage — gated by the WEAKER candidate key (can stage, never publish).
+		const key = kenv.KNOWHER_CANDIDATE_KEY_SECRET;
+		if (!key || request.headers.get("x-candidate-key") !== key) {
+			emitDiag(env, ctx, "knowherCandidateAuth", key ? "bad x-candidate-key" : "KNOWHER_CANDIDATE_KEY_SECRET unset");
+			return json({ error: "unauthorized" }, 401);
+		}
+		let body: Record<string, unknown>;
+		try { body = (await request.json()) as Record<string, unknown>; }
+		catch { emitDiag(env, ctx, "knowherCandidateReject", "body is not JSON"); return json({ error: "body must be JSON" }, 400); }
+		const result = await stageKnowHerCandidate(kenv, body.pool ?? body);
+		if ("error" in result) {
+			emitDiag(env, ctx, "knowherCandidateReject", result.error.slice(0, 70));
+			return json(result, 400);
+		}
+		emitDiag(env, ctx, "knowherCandidateStaged", `${result.weekKey} players=${result.playerCount} human=${result.humanQuestions}`);
+		return json({ ...result, note: "Staged for the verify gate — NOT live. The verifier re-confirms each fact, then publishes." });
+	}
+	return new Response("Method not allowed. Use GET (verifier) or POST (generator).", { status: 405, headers: { Allow: "GET, POST" } });
 }
 
 /** Roster-learning eligibility for one team (docs §4): `?team=WAS` → the players who started
