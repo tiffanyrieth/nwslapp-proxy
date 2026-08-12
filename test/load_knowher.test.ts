@@ -14,6 +14,8 @@ function q(id: string, category: string, correctIndex = 0) {
 		id, category, prompt: `prompt ${id}`,
 		options: tf ? ["True", "False"] : ["a", "b", "c", "d"],
 		correctIndex, revealFact: "fact",
+		// Human questions carry a source (the verify gate requires it since 2026-08-11); herGame is exempt.
+		...(category === "herGame" ? {} : { source: `https://example.com/${id}` }),
 	};
 }
 
@@ -48,6 +50,22 @@ test("a healthy pool (10 Qs/player, mixed T/F) passes clean", () => {
 test("uniform 8-question players fail the 10-question floor", () => {
 	const { errors } = validatePool(pool(ABBRS.map((a) => player(a, { human: 6, stat: 2 })))); // 8 total
 	assert.ok(errors.some((e) => e.includes("must have 10")), errors.join(" | "));
+});
+
+test("--human-only: an 8-human, no-stat weekend candidate passes (floor 8, stats come Monday)", () => {
+	const { errors, warnings } = validatePool(pool(ABBRS.map((a) => player(a, { human: 8, stat: 0 }))), { humanOnly: true });
+	assert.deepEqual(errors, [], errors.join(" | "));
+	assert.deepEqual(warnings, []);
+});
+
+test("--human-only: a stray stat question in the weekend pool fails (Monday injects stats, not the generator)", () => {
+	const { errors } = validatePool(pool(ABBRS.map((a) => player(a, { human: 8, stat: 1 }))), { humanOnly: true });
+	assert.ok(errors.some((e) => e.includes("HUMAN-ONLY")), errors.join(" | "));
+});
+
+test("--human-only: still enforces the 8-human floor (7 human fails)", () => {
+	const { errors } = validatePool(pool(ABBRS.map((a) => player(a, { human: 7, stat: 0 }))), { humanOnly: true });
+	assert.ok(errors.some((e) => e.includes("must have 8")), errors.join(" | "));
 });
 
 test("too many stat (herGame) questions fails — human-first, not a stat sheet", () => {

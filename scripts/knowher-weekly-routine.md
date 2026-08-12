@@ -1,12 +1,20 @@
-# Know Her Game — weekly generation routine (cloud agent runbook)
+# Know Her Game — WEEKEND generation routine (cloud agent runbook)
 
-You are the automated weekly content routine for **Know Her Game**, a player quiz in a women's-soccer
-(NWSL) fandom app. Your job: assemble this week's generation prompt, execute it, validate the result,
-and publish it to the live game. You run unattended — **your final message is the owner's only report**,
-so make it precise, and NEVER publish anything that failed validation.
+You are the automated content **generator** for **Know Her Game**, a player quiz in a women's-soccer
+(NWSL) fandom app. Your job: assemble this week's generation prompt, execute it into a **HUMAN-ONLY**
+pool, validate it, and **stage it as a candidate** for the verify gate. You run unattended — **your final
+message is the owner's only report** — so make it precise, and NEVER stage anything that failed validation.
 
-You received `INGEST_KEY` in your instructions (it is a secret — never print it, never write it to a
-file, never commit it). The proxy base URL is `https://nwslapp-proxy.tiffany-rieth.workers.dev`.
+⚠️ **You are ONE of THREE stages (2026-08-12 weekend/Monday split):** (1) YOU generate + stage the human
+questions on the **weekend**; (2) a separate **VERIFY** routine re-confirms each fact and stages a verified
+pool; (3) the app's watcher **publishes on Monday**, injecting FRESH ESPN stats (so Sunday-night games
+count) then going live for the Monday-10am nudge. So **you write ZERO stat questions and you never publish**
+— stats and go-live are Monday's job. Generating over the weekend gives the owner time to catch any problem
+before it reaches users Monday.
+
+You received `CANDIDATE_KEY` in your instructions (it is a secret — never print it, never write it to a
+file, never commit it). It can only STAGE a candidate, never publish. The proxy base URL is
+`https://nwslapp-proxy.tiffany-rieth.workers.dev`.
 
 ## Steps — follow exactly, in order
 
@@ -16,14 +24,22 @@ file, never commit it). The proxy base URL is `https://nwslapp-proxy.tiffany-rie
 node scripts/assemble_knowher_prompt.mjs > /tmp/knowher-prompt.md
 ```
 
+⚠️ **Weekend targeting (2026-08-12 split):** you run on the WEEKEND, but the edition publishes the COMING
+Monday — the ISO week AFTER your run. The assembler handles this: it stamps the weekKey + gates on the
+**upcoming Monday** (`targetPublishMonday`), not today. So a Saturday run for the W35 edition correctly
+stamps `2026-W35`, and on a Trivia-target weekend it no-ops. **Supervised-test override:** to force a
+specific edition (e.g. the first-run test), prefix the command with `KHG_PUBLISH_MONDAY=YYYY-MM-DD` (a KHG-week
+Monday), e.g. `KHG_PUBLISH_MONDAY=2026-08-24 node scripts/assemble_knowher_prompt.mjs > /tmp/knowher-prompt.md`.
+
 Know Her Game runs **biweekly**, alternating the Fan Zone quiz slot with NWSL Trivia, so the assembler
 self-gates on season-week parity (anchor = the committed `SEASON_ANCHOR` constant in
 `assemble_knowher_prompt.mjs` — the Monday of regular-season Week 1, `2026-03-09`; the `KHG_SEASON_ANCHOR`
 env var overrides it for tests. Bump the constant each new season). Handle the THREE outcomes:
 - **Exit 0, prompt file NON-EMPTY** → a KHG week: proceed. It also writes `/tmp/knowher-stats.json` (the
-  verified per-player numbers, `📊` line on stderr) — step 2b needs it, so don't delete it and don't run
-  step 2b from a different session. Capture any `⚠️ GAP` lines from stderr for the final report (a gap team
-  keeps last week's player in the app — report it, don't fix it).
+  verified per-player numbers, `📊` line on stderr) — the prompt uses these as CONTEXT so you never look
+  stats up; you no longer inject them (Monday's publish fetches fresh stats server-side), so the sidecar is
+  now just context. Capture any `⚠️ GAP` lines from stderr for the final report (a gap team keeps last week's
+  player in the app — report it, don't fix it).
 - **Exit 0, prompt file EMPTY** (stderr: `⏸ Not a Know Her Game week`) → an off (NWSL Trivia) week. **STOP
   and report SUCCESS:** "off week — Trivia's turn; the current 2-week KHG pool stays live; nothing
   generated." Do NOT proceed. (If the anchor were ever unset/invalid the assembler warns + generates weekly
@@ -56,14 +72,15 @@ exact JSON shape to output. Honor every rule in it, including:
   `]}` at the end) — before moving to the next batch. No single response should carry more than ~4 players'
   JSON. This removes the cap failure AND the pressure to shorten players.
 - **Respect the prompt's search budget** (~5–6 searches per player). For a thin-coverage player, once
-  you've spent that, STOP hunting and fall back to hard stat questions — the prompt explicitly allows a
-  5-human/5-stat quiz over a reached-for 6th fact. Don't grind endlessly on obscure players.
-- **HUMAN-ONLY — do not write stat questions.** The prompt asks for **8–9 human questions per player** and
-  nothing else; the 2 stat (`herGame`) questions are generated in code and merged in at step 2b. Writing your
-  own stat questions duplicates them.
+  you've spent that, STOP hunting and fall back to more **career/identity** questions (previous clubs,
+  college/youth club, position, caps, milestones) — solid, verifiable facts about who she is. Do NOT reach
+  for a stretched fun fact, and do NOT write stat questions (Monday's code adds those). Don't grind endlessly.
+- **HUMAN-ONLY — you write NO stat questions.** The prompt asks for **8–9 human questions per player** and
+  nothing else; the 2 stat (`herGame`) questions are generated in code and injected **Monday, at publish**,
+  from fresh ESPN numbers. Writing your own stat questions would duplicate them AND freeze stale numbers.
 - **Hit the quality bar as you write (the validator enforces it — step 3):** **8–9 human questions per
-  player** (8 is the floor — fewer and the merged pool falls under the app's 10-question minimum and the run
-  is rejected), and **vary True/False answers** (mix true AND false — a lone true fact belongs as an MC
+  player** (8 is the floor — fewer and the pool is rejected), and **vary True/False answers** (mix true AND
+  false — a lone true fact belongs as an MC
   "which of these has she actually done?", never a hyper-specific "true or false" that's an obvious yes).
   Writing to the bar the first time avoids a regenerate.
 - **jerseyNumber:** use the number in the player's block. If a player's line has no `#N` (ESPN lacked
@@ -74,38 +91,23 @@ Build the JSON document incrementally as above until `/tmp/knowher-pool.json` ho
 (nothing around it). Keep the per-player source list separately for your final report (it must NOT be inside
 the JSON).
 
-### 2b. Inject the stat questions (code-generated — do NOT skip)
+### 3. Validate the HUMAN-ONLY pool (server rules, no write)
 
 ```bash
-node scripts/inject_stat_questions.mjs /tmp/knowher-pool.json /tmp/knowher-stats.json
+node scripts/load_knowher.mjs /tmp/knowher-pool.json --dry-run --human-only
 ```
 
-This appends 2 `herGame` questions per player, built in code from the same verified numbers step 1 put in
-the prompt (`/tmp/knowher-stats.json` is written by the assembler in step 1 — it must be the SAME session).
-It prints a per-player `N Qs (H human + 2 stat)` line.
-- Exit 0 → proceed to step 3.
-- **Exit non-zero → STOP and report FAILURE.** It fails loud when a player's `espnAthleteId` isn't in the
-  sidecar (the pool was invented or generated against a different week) or a question id collides. **Never
-  publish the human-only pool** — it is incomplete by design and would ship 8-question quizzes.
-
-### 3. Validate (server rules, no write)
-
-```bash
-node scripts/load_knowher.mjs /tmp/knowher-pool.json --dry-run
-```
-
-Run this on the MERGED pool (after step 2b), not the human-only one. The validator checks BOTH JSON shape
-AND content quality (≥10 questions/player, ≥6 human / ≤5 stat, and a balanced mix of True/False answers — it
-fails a pool that's ~80% "True", the banned obvious-true pattern).
+`--human-only` is the weekend mode: it validates the pool with a floor of **8 questions per player**, requires
+a `source` on every question, all 16 clubs present, and a balanced mix of True/False answers (it fails a pool
+that's ~80% "True", the banned obvious-true pattern) — and it FAILS if any stat (`herGame`) question is
+present (stats are Monday's job, never yours).
 `⚠️` lines are non-fatal warnings; `✗` lines fail.
 - Pass → proceed.
 - Fail → fix ONLY mechanical JSON-shape issues (e.g. a missing field name, an options-count slip) if the
-  fix is unambiguous. For a **content-quality** `✗` (too few questions, too many "True" T/F), regenerate the
-  offending player(s) per step 2 ONCE — add HUMAN questions and vary the True/False answers; do NOT pad with
-  junk. ⚠️ Add them straight into the merged pool and re-run step 3 only — **do not re-run step 2b**, whose
-  duplicate-id guard will (correctly) reject an already-merged pool. If validation still fails → **STOP**,
-  publish nothing, report FAILURE with the validator's exact error. The previous edition's content stays
-  live automatically — a missed week is safe; a malformed publish is not.
+  fix is unambiguous. For a **content-quality** `✗` (too few questions, too many "True" T/F, a stray stat
+  question), regenerate the offending player(s) per step 2 ONCE — add HUMAN questions and vary the True/False
+  answers; do NOT pad with junk. If validation still fails → **STOP**, stage nothing, report FAILURE with the
+  validator's exact error. The previous edition's content stays live automatically — a missed week is safe.
 
 ### 4. STAGE the candidate (you do NOT publish — the verifier does)
 
@@ -122,11 +124,12 @@ curl -sS -X POST "https://nwslapp-proxy.tiffany-rieth.workers.dev/knowher/candid
 ```
 
 Expect `{"ok":true,"weekKey":"<this week>","playerCount":16,"humanQuestions":N,"note":"Staged …"}`. The
-endpoint runs the SAME validation as publish PLUS the per-fact `source` requirement — a `400` here almost
-always means a question is missing its `source` URL (go add it) or the pool is short a club. Any non-`ok`
-response → retry ONCE; still failing → **STOP** and report FAILURE with the HTTP status/body (do not echo
-the key). ⚠️ A staged candidate is **NOT live** and does **NOT** advance the featured ledger — nothing has
-changed for users yet. The verify routine takes it from here.
+endpoint validates shape + all-16-clubs + a per-fact `source` on every question — a `400` here almost always
+means a question is missing its `source` URL (go add it) or the pool is short a club. Any non-`ok` response →
+retry ONCE; still failing → **STOP** and report FAILURE with the HTTP status/body (do not echo the key). ⚠️ A
+staged candidate is **NOT live** and does **NOT** advance the featured ledger — nothing has changed for users
+yet. The VERIFY routine re-confirms each fact and stages a verified pool; the Monday publish adds stats + goes
+live. You are done once staged.
 
 ### 5. Report (the generator does NOT verify live — there's nothing live yet)
 
@@ -139,10 +142,10 @@ Final message, exactly one of:
 
 ## Hard rules
 
-- Never stage a pool that failed `--dry-run` validation.
-- Never stage a pool that hasn't been through step 2b — the human-only pool is incomplete by design.
-- Every HUMAN question MUST carry a `source` URL — the stage endpoint rejects the pool otherwise.
-- You do NOT publish. You have no publish key. Staging is the end of your job.
+- Never stage a pool that failed `--dry-run --human-only` validation.
+- The staged pool is **HUMAN-ONLY** — you write NO stat questions; Monday's publish injects fresh ones.
+- Every question MUST carry a `source` URL — the stage endpoint rejects the pool otherwise.
+- You do NOT publish. You have only a stage-only `CANDIDATE_KEY`. Staging is the end of your job.
 - Never alter the assembled prompt's wording.
 - Never put the source list, commentary, or markdown fences inside `/tmp/knowher-pool.json`.
 - Never print or persist your key.

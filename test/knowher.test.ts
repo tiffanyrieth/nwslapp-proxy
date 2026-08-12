@@ -107,7 +107,27 @@ for (const [iso, want] of WEEK_CASES) {
 }
 
 // ── Biweekly cadence gate (assembler self-gate) ─────────────────────────────────
-import { isKnowHerWeek, SEASON_ANCHOR } from "../scripts/assemble_knowher_prompt.mjs";
+import { isKnowHerWeek, SEASON_ANCHOR, targetPublishMonday } from "../scripts/assemble_knowher_prompt.mjs";
+
+// ── Weekend/Monday split: the edition targets the COMING Monday, not the generation day ──
+test("targetPublishMonday: a weekend run targets the upcoming Monday (the split's whole point)", () => {
+	const iso = (d: Date) => d.toISOString().slice(0, 10);
+	// The 2026-W35 edition publishes Mon 2026-08-24; it generates the weekend before (W34: Aug 22–23).
+	assert.equal(iso(targetPublishMonday(new Date(Date.UTC(2026, 7, 22)))), "2026-08-24", "Saturday → the coming Monday");
+	assert.equal(iso(targetPublishMonday(new Date(Date.UTC(2026, 7, 23)))), "2026-08-24", "Sunday → the coming Monday");
+	// A Monday run targets that same Monday — so the OLD Monday-3am cadence is unchanged.
+	assert.equal(iso(targetPublishMonday(new Date(Date.UTC(2026, 7, 24)))), "2026-08-24", "Monday → itself (back-compat)");
+	// The gate now evaluates the PUBLISH week: generating on the W34 weekend targets W35, a KHG week —
+	// whereas gating on the generation day (W34, a Trivia week) would wrongly skip it.
+	assert.equal(isKnowHerWeek(targetPublishMonday(new Date(Date.UTC(2026, 7, 22))), SEASON_ANCHOR), true, "the W34 weekend generates the W35 (KHG) edition");
+	assert.equal(isKnowHerWeek(new Date(Date.UTC(2026, 7, 22)), SEASON_ANCHOR), false, "…and the generation day itself (W34) is a Trivia week — the bug the target fixes");
+});
+
+test("targetPublishMonday: KHG_PUBLISH_MONDAY overrides for the supervised test / manual re-run", () => {
+	const iso = (d: Date) => d.toISOString().slice(0, 10);
+	assert.equal(iso(targetPublishMonday(new Date(Date.UTC(2026, 7, 12)), "2026-08-24")), "2026-08-24", "explicit override wins");
+	assert.equal(iso(targetPublishMonday(new Date(Date.UTC(2026, 7, 12)), "not-a-date")), "2026-08-17", "invalid override falls back to the computed next Monday");
+});
 
 test("SEASON_ANCHOR: the committed anchor puts Week 1 (season opener week) on Know Her Game", () => {
 	// 2026 opener = Fri 2026-03-13 → Week 1 is the week of Mon 2026-03-09.

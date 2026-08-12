@@ -94,6 +94,24 @@ export function mondayOrdinal(date) {
  *  the `KHG_SEASON_ANCHOR` env var stays as a test/CI override. ⚠️ Bump this each new season. */
 export const SEASON_ANCHOR = "2026-03-09";
 
+/** The Monday the generated edition PUBLISHES on. In the weekend/Monday split (2026-08-12) the generator
+ *  runs on the WEEKEND — the ISO week BEFORE go-live — so the edition's weekKey AND its biweekly parity must
+ *  be computed from the COMING Monday, not the generation day (a Saturday run is in the prior ISO week).
+ *  Default = the next Monday on/after `now`: 0 days if run on a Monday (so the old Monday-3am behavior is
+ *  unchanged), +1 from Sunday, +2 from Saturday, next Monday from mid-week. Env override `KHG_PUBLISH_MONDAY`
+ *  (YYYY-MM-DD) forces a target — the supervised first-run test (pick a KHG-week Monday) or a manual re-run. */
+export function targetPublishMonday(now = new Date(), overrideRaw = process.env.KHG_PUBLISH_MONDAY) {
+  if (overrideRaw) {
+    const d = new Date(`${overrideRaw}T00:00:00Z`);
+    if (!Number.isNaN(d.getTime())) return d;
+    console.error(`⚠️  KHG_PUBLISH_MONDAY="${overrideRaw}" is not a valid date — ignoring; using the computed next Monday.`);
+  }
+  const d = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()));
+  const daysToMonday = (1 - d.getUTCDay() + 7) % 7; // Mon→0, Sun→1, Sat→2, …
+  d.setUTCDate(d.getUTCDate() + daysToMonday);
+  return d;
+}
+
 /** Biweekly cadence gate. Know Her Game runs on ALTERNATING ISO weeks (Season Weeks 1, 3, 5 …), sharing
  *  the Fan Zone quiz slot with NWSL Trivia (Weeks 2, 4, 6 …) so only one quiz game generates content in a
  *  given week. The anchor = the Monday of regular-season Week 1 (`SEASON_ANCHOR`; env var overrides for
@@ -162,10 +180,12 @@ if (import.meta.url === pathToFileURL(process.argv[1] ?? "").href) {
 
 async function main() {
 // Biweekly cadence: on a NWSL Trivia week, emit no prompt and exit cleanly — the routine no-ops and the
-// current 2-week KHG pool stays live. Checked BEFORE fetching 16 teams (no work on an off week). Anchor =
-// env override ?? the committed SEASON_ANCHOR (the routine has no env-var UI, so the constant is the source).
-if (!isKnowHerWeek(new Date(), process.env.KHG_SEASON_ANCHOR ?? SEASON_ANCHOR)) {
-  console.error("⏸  Not a Know Her Game week (NWSL Trivia's turn in the quiz slot) — no prompt emitted; the current 2-week pool stays live.");
+// current 2-week KHG pool stays live. Checked BEFORE fetching 16 teams (no work on an off week). The gate +
+// the weekKey are computed from the edition's PUBLISH Monday (the coming Monday for a weekend run), not the
+// generation day — see targetPublishMonday. Anchor = env override ?? committed SEASON_ANCHOR.
+const publishMonday = targetPublishMonday();
+if (!isKnowHerWeek(publishMonday, process.env.KHG_SEASON_ANCHOR ?? SEASON_ANCHOR)) {
+  console.error(`⏸  Not a Know Her Game week for the ${isoWeekKey(publishMonday)} publish (NWSL Trivia's turn) — no prompt emitted; the current 2-week pool stays live.`);
   process.exit(0);
 }
 const template = readFileSync(
@@ -216,11 +236,13 @@ try {
 }
 console.error(`📊 Wrote stats for ${Object.keys(statsByAthleteId).length} players to ${STATS_PATH} (stat questions are generated in code, not by the model).`);
 
-const weekKey = isoWeekKey();
+// Stamp the edition with the PUBLISH Monday's week (the coming Monday for a weekend run), not today's —
+// so a Saturday-generated pool is labelled the week it goes live, matching the biweekly gate above.
+const weekKey = isoWeekKey(publishMonday);
 process.stdout.write(
   template
     .replaceAll("<<WEEK_KEY>>", weekKey)
-    .replaceAll("<<SEASON>>", String(season ?? new Date().getUTCFullYear()))
+    .replaceAll("<<SEASON>>", String(season ?? publishMonday.getUTCFullYear()))
     .replace("<<PLAYER_LIST>>", blocks.join("\n")),
 );
 console.error(`✅ Assembled ${blocks.length}-player prompt for ${weekKey} (season ${season}).`);
