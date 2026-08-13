@@ -144,7 +144,39 @@ export function buildOpenMeteoUrl(
 // far out would assert precision the forecast doesn't have — against the data-only design stance.
 export const FORECAST_MAX_DAYS = 10;
 export const FORECAST_HOURLY =
-	"temperature_2m,apparent_temperature,weather_code,is_day,wind_speed_10m,precipitation_probability";
+	"temperature_2m,relative_humidity_2m,apparent_temperature,weather_code,is_day,wind_speed_10m,precipitation_probability";
+
+/** NWS heat index (°F) from air temp (°F) + relative humidity (%) — the Rothfusz regression with the two
+ *  NWS adjustments and the Steadman low-end check. This is the "feels like 105°" number fans + stadiums use
+ *  for heat protocols; below ~80°F it isn't meaningful and returns ≈ the air temp. We COMPUTE it rather than
+ *  use Open-Meteo's `apparent_temperature`, which is a different metric — it nets humidity against wind and
+ *  lands back near the air temp on a hot windy day (live-verified: a 96°F Houston game came back "feels 96°").
+ *  Pure + unit-tested (test/weather-heat-index.test.ts). */
+export function heatIndexF(tempF: number, rh: number): number {
+	const T = tempF;
+	const R = Math.max(0, Math.min(100, rh));
+	// Steadman low-end: if the simple average stays under 80°F, there's no meaningful heat index.
+	const simple = 0.5 * (T + 61 + (T - 68) * 1.2 + R * 0.094);
+	if ((simple + T) / 2 < 80) return T;
+	let hi =
+		-42.379 + 2.04901523 * T + 10.14333127 * R - 0.22475541 * T * R -
+		6.83783e-3 * T * T - 5.481717e-2 * R * R + 1.22874e-3 * T * T * R +
+		8.5282e-4 * T * R * R - 1.99e-6 * T * T * R * R;
+	if (R < 13 && T >= 80 && T <= 112) {
+		hi -= ((13 - R) / 4) * Math.sqrt((17 - Math.abs(T - 95)) / 17);
+	} else if (R > 85 && T >= 80 && T <= 87) {
+		hi += ((R - 85) / 10) * ((87 - T) / 5);
+	}
+	return hi;
+}
+
+/** The venue's UTC offset (seconds) from an Open-Meteo `timezone=auto` payload — 0 if absent. Lets the
+ *  app render the weather card's hour labels + sunset in VENUE-LOCAL time (a sunset is a local event; the
+ *  kickoff time in the match header stays the fan's own local time). */
+export function utcOffsetSeconds(payload: unknown): number {
+	const o = (payload as { utc_offset_seconds?: unknown })?.utc_offset_seconds;
+	return typeof o === "number" && Number.isFinite(o) ? o : 0;
+}
 
 /** True when kickoff is in the future and inside the forecast horizon. */
 export function withinForecastHorizon(kickoffMs: number, nowMs: number): boolean {
@@ -161,11 +193,18 @@ export function withinForecastHorizon(kickoffMs: number, nowMs: number): boolean
  */
 export function buildForecastUrl(coords: { lat: number; lon: number }, kickoffMs: number): string {
 	const dayOf = (ms: number) => new Date(ms).toISOString().slice(0, 10);
-	const start = dayOf(kickoffMs - 3_600_000); // window opens at kickoff −1h
-	const end = dayOf(kickoffMs + 2 * 3_600_000); // window closes at kickoff +2h
+	// ⚠️ `timezone=auto`, NOT UTC (changed 2026-08-12): the hourly + daily arrays come back in the venue's
+	// LOCAL time, with a top-level `utc_offset_seconds`. This is what makes the daily `sunset` the venue's
+	// LOCAL-day sunset — a UTC-day request returned the WRONG day for west-coast/late games (e.g. an SD game's
+	// sunset came back +24h off, so the app hid it). We widen the date range to ±1 UTC day so the venue-local
+	// match day + its sunset are always covered regardless of the offset (~3 local days, still tiny). The
+	// window hours + sunset are matched by UTC INSTANT downstream (extractWindow/nearestSunset convert using
+	// the offset), so the app's UTC-instant contract is unchanged.
+	const start = dayOf(kickoffMs - 86_400_000);
+	const end = dayOf(kickoffMs + 86_400_000);
 	return (
 		`https://api.open-meteo.com/v1/forecast?latitude=${coords.lat}&longitude=${coords.lon}` +
-		`&hourly=${FORECAST_HOURLY}&daily=sunset&temperature_unit=fahrenheit&wind_speed_unit=mph&timezone=UTC` +
+		`&hourly=${FORECAST_HOURLY}&daily=sunset&temperature_unit=fahrenheit&wind_speed_unit=mph&timezone=auto` +
 		`&start_date=${start}&end_date=${end}`
 	);
 }
@@ -189,23 +228,36 @@ export function extractWindow(payload: unknown, isoKickoffHour: string): Forecas
 	if (!hourly || !Array.isArray(hourly.time)) return null;
 	const kickoffMs = Date.parse(`${isoKickoffHour}:00Z`);
 	if (Number.isNaN(kickoffMs)) return null;
+	const offsetMs = utcOffsetSeconds(payload) * 1000;
+	// hourly.time is VENUE-LOCAL now (timezone=auto). Index each entry by its true UTC instant so the
+	// window is matched by instant, not by a UTC-labelled string (keeps the app's UTC-instant contract).
+	const idxByUtc = new Map<number, number>();
+	for (let i = 0; i < hourly.time.length; i++) {
+		const t = hourly.time[i];
+		if (typeof t !== "string") continue;
+		const localAsUtc = Date.parse(t.endsWith("Z") ? t : `${t}Z`);
+		if (!Number.isNaN(localAsUtc)) idxByUtc.set(localAsUtc - offsetMs, i);
+	}
 	const out: ForecastHour[] = [];
 	for (let offset = -1; offset <= 2; offset++) {
-		const key = kickoffHourUtc(new Date(kickoffMs + offset * 3_600_000).toISOString());
-		if (!key) return null;
-		const i = hourly.time.indexOf(key);
-		if (i < 0) return null;
+		const i = idxByUtc.get(kickoffMs + offset * 3_600_000);
+		if (i === undefined) return null;
 		const temp = hourly.temperature_2m?.[i];
-		const feels = hourly.apparent_temperature?.[i];
+		const rh = hourly.relative_humidity_2m?.[i];
+		const apparent = hourly.apparent_temperature?.[i];
 		const code = hourly.weather_code?.[i];
 		const day = hourly.is_day?.[i];
 		const wind = hourly.wind_speed_10m?.[i];
 		const precip = hourly.precipitation_probability?.[i];
 		if (typeof temp !== "number" || Number.isNaN(temp)) return null;
+		// feels-like: the COMPUTED NWS heat index when it's a real boost (hot + humid); otherwise Open-Meteo's
+		// apparent_temperature (which carries the wind chill in the cold); otherwise the air temp.
+		const hi = typeof rh === "number" ? heatIndexF(temp, rh) : temp;
+		const feelsRaw = hi > temp + 0.5 ? hi : typeof apparent === "number" ? apparent : temp;
 		out.push({
-			time: `${key}Z`,
+			time: new Date(kickoffMs + offset * 3_600_000).toISOString(), // UTC instant, WITH seconds
 			tempF: Math.round(temp),
-			feelsLikeF: typeof feels === "number" ? Math.round(feels) : Math.round(temp),
+			feelsLikeF: Math.round(feelsRaw),
 			weatherCode: typeof code === "number" ? code : -1,
 			isDay: typeof day === "number" ? day : 1,
 			windMph: typeof wind === "number" ? Math.round(wind) : 0,
@@ -215,18 +267,22 @@ export function extractWindow(payload: unknown, isoKickoffHour: string): Forecas
 	return out;
 }
 
-/** The sunset instant nearest the kickoff (Open-Meteo `daily.sunset` is a per-date array of local
- *  ISO strings; we requested timezone=UTC so they're UTC instants). Picks the closest to kickoff,
- *  the one that could fall inside the game window. null when absent/malformed. */
+/** The sunset instant (UTC) nearest the kickoff. Open-Meteo `daily.sunset` is now a per-date array of
+ *  VENUE-LOCAL ISO strings (timezone=auto), so each is converted to a true UTC instant using the venue
+ *  offset before picking the closest to kickoff — the one that falls in/near the game window. Because the
+ *  array is keyed on the venue's LOCAL days, the match-evening sunset is present + wins (the old UTC-day
+ *  request returned a neighbouring day's sunset for west-coast/late games). null when absent/malformed. */
 export function nearestSunset(payload: unknown, kickoffMs: number): string | null {
 	const sunsets = (payload as { daily?: { sunset?: unknown[] } })?.daily?.sunset;
 	if (!Array.isArray(sunsets)) return null;
+	const offsetMs = utcOffsetSeconds(payload) * 1000;
 	let best: string | null = null;
 	let bestDelta = Infinity;
 	for (const s of sunsets) {
 		if (typeof s !== "string") continue;
-		const ms = Date.parse(s.endsWith("Z") ? s : `${s}Z`);
-		if (Number.isNaN(ms)) continue;
+		const localAsUtc = Date.parse(s.endsWith("Z") ? s : `${s}Z`);
+		if (Number.isNaN(localAsUtc)) continue;
+		const ms = localAsUtc - offsetMs; // true UTC instant of the local sunset
 		const delta = Math.abs(ms - kickoffMs);
 		if (delta < bestDelta) {
 			bestDelta = delta;
@@ -272,7 +328,7 @@ export function extractHour(payload: unknown, isoHour: string): HourReading | nu
 // surface the rail on a future match.
 type Envelope =
 	| { v: 1; mode: "historical"; tempF: number; weatherCode: number; isDay: number; condition: string; asOf: string }
-	| { v: 1; mode: "forecast"; venueName: string; hours: ForecastHour[]; sunset: string | null; asOf: string }
+	| { v: 1; mode: "forecast"; venueName: string; hours: ForecastHour[]; sunset: string | null; utcOffsetSeconds: number; asOf: string }
 	| { v: 1; mode: "unavailable"; reason: "not-finished" | "unknown-venue" | "upstream-error" | "too-far-out" | "indoor-venue" };
 
 function json(body: Envelope, cacheControl: string): Response {
@@ -422,6 +478,10 @@ async function forecastResponse(
 	const keyURL = new URL(url.origin + url.pathname);
 	keyURL.searchParams.set("event", eventId);
 	keyURL.searchParams.set("mode", "forecast");
+	// Cache-shape version — bump when the forecast RESPONSE shape changes so the 8h edge cache doesn't keep
+	// serving stale-shaped payloads across a deploy. cv=2 (2026-08-12): venue-local sunset + utcOffsetSeconds
+	// + computed heat index.
+	keyURL.searchParams.set("cv", "2");
 	const cacheKey = new Request(keyURL.toString(), { method: "GET" });
 
 	const hit = await cache.match(cacheKey);
@@ -449,6 +509,7 @@ async function forecastResponse(
 		venueName: coords.name,
 		hours,
 		sunset: nearestSunset(payload, kickoffMs),
+		utcOffsetSeconds: utcOffsetSeconds(payload), // venue offset → app renders card times venue-local
 		asOf: new Date(kickoffMs).toISOString(),
 	};
 	const response = json(record, CC_FORECAST);
