@@ -295,6 +295,23 @@ export function resolveRound(
   return q && q.length ? { questions: q, wrapped: true } : null;
 }
 
+/** BRIDGE serving: deterministically slice the LEGACY flat pool into a round of `perRound` questions
+ *  (id-sorted → fixed-seed shuffle → round-paged with wrap) — the server-side equivalent of the app's retired
+ *  client slicer. Used ONLY until the v2 grouped doc is published, so a round-aware app build keeps working on
+ *  the existing flat pool instead of showing an empty game during the Phase-1→Phase-2 gap. Generic over `id`
+ *  so it slices the untagged v1 pool too. */
+export function sliceFlatPool<T extends { id: string }>(pool: T[], round: number, perRound: number): T[] {
+  if (pool.length === 0) return [];
+  const ordered = [...pool].sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
+  const rng = splitmix64(0x6e57534c54525631n); // "nWSLTRV1" — one stable cycle order across all requests
+  shuffle(ordered, rng);
+  const take = Math.min(perRound, ordered.length);
+  const start = ((((round - 1) * take) % ordered.length) + ordered.length) % ordered.length;
+  const out: T[] = [];
+  for (let i = 0; i < take; i++) out.push(ordered[(start + i) % ordered.length]);
+  return out;
+}
+
 function poolHistogram(pool: TriviaQuestion[]): Record<string, number> {
   const h: Record<string, number> = {};
   const bump = (k: string) => (h[k] = (h[k] ?? 0) + 1);

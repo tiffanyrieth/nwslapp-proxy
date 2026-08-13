@@ -3,6 +3,7 @@ import {
   validateTriviaFlatPool,
   groupIntoRounds,
   resolveRound,
+  sliceFlatPool,
   makeEditionKey,
   parseEditionKey,
   wrapRound,
@@ -185,5 +186,23 @@ describe("resolveRound (fail-safe wrap)", () => {
 
   it("returns null when nothing is published", () => {
     expect(resolveRound(null, "2026-R01")).toBeNull();
+  });
+});
+
+describe("sliceFlatPool (bridge)", () => {
+  const pool = Array.from({ length: 40 }, (_, i) => q(`q${String(i).padStart(3, "0")}`));
+
+  it("returns disjoint rounds of perRound, deterministic, wrapping after the pool is exhausted", () => {
+    const r1 = sliceFlatPool(pool, 1, 10);
+    const r2 = sliceFlatPool(pool, 2, 10);
+    const r5 = sliceFlatPool(pool, 5, 10); // 40/10 = 4 rounds, so round 5 wraps to round 1
+    expect(r1.length).toBe(10);
+    expect(new Set([...r1, ...r2].map((x) => x.id)).size).toBe(20); // rounds 1 & 2 disjoint
+    expect(sliceFlatPool(pool, 1, 10).map((x) => x.id)).toEqual(r1.map((x) => x.id)); // deterministic
+    expect(r5.map((x) => x.id)).toEqual(r1.map((x) => x.id)); // wraps
+  });
+
+  it("is empty on an empty pool", () => {
+    expect(sliceFlatPool([], 1, 10)).toEqual([]);
   });
 });

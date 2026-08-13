@@ -67,8 +67,12 @@ import {
 	stageTriviaCandidate,
 	readTriviaCandidate,
 	resolveRound,
+	sliceFlatPool,
+	parseEditionKey,
+	DEFAULT_GROUP_CONFIG,
 	TRIVIA_POOL_V2_KEY,
 	type TriviaPoolDoc,
+	type TriviaQuestion,
 	type TriviaEnv,
 } from "./trivia.ts";
 import { handleQuizResults } from "./quiz-results.ts";
@@ -4147,18 +4151,28 @@ async function handleTrivia(url: URL, env: Env, ctx: ExecutionContext): Promise<
 	}
 
 	const resolved = resolveRound(doc, round);
-	const questions = resolved?.questions ?? [];
-	if (resolved?.wrapped && doc) {
-		// The requested round isn't in the stored season → a missed annual refresh; we serve a prior year
-		// (cross-year repeat, acceptable) but say so LOUDLY server-side, throttled 1/day (KHG stale pattern).
-		ctx.waitUntil((async () => {
-			const THROTTLE_KEY = "trivia:stale-diag-at";
-			const last = Number(await env.FEED_TAGS.get(THROTTLE_KEY)) || 0;
-			if (Date.now() - last > 24 * 3600 * 1000) {
-				await env.FEED_TAGS.put(THROTTLE_KEY, String(Date.now()), { expirationTtl: 7 * 24 * 3600 });
-				emitDiag(env, ctx, "triviaStaleServe", `requested ${round}, wrapped to stored season ${doc.season} — annual refresh missed`);
-			}
-		})());
+	let questions: TriviaQuestion[];
+	if (resolved) {
+		questions = resolved.questions;
+		if (resolved.wrapped && doc) {
+			// The requested round isn't in the stored season → a missed annual refresh; we serve a prior year
+			// (cross-year repeat, acceptable) but say so LOUDLY server-side, throttled 1/day (KHG stale pattern).
+			ctx.waitUntil((async () => {
+				const THROTTLE_KEY = "trivia:stale-diag-at";
+				const last = Number(await env.FEED_TAGS.get(THROTTLE_KEY)) || 0;
+				if (Date.now() - last > 24 * 3600 * 1000) {
+					await env.FEED_TAGS.put(THROTTLE_KEY, String(Date.now()), { expirationTtl: 7 * 24 * 3600 });
+					emitDiag(env, ctx, "triviaStaleServe", `requested ${round}, wrapped to stored season ${doc.season} — annual refresh missed`);
+				}
+			})());
+		}
+	} else {
+		// BRIDGE (no v2 doc published yet — the Phase-1→Phase-2 content gap): serve a deterministic round
+		// sliced from the legacy flat pool so a round-aware build isn't empty. Falls away the moment the
+		// grouped v2 doc lands.
+		const parsed = parseEditionKey(round);
+		const flat = ((await env.FEED_TAGS.get(TRIVIA_POOL_KEY, "json")) as TriviaQuestion[] | null) ?? [];
+		questions = parsed ? sliceFlatPool(flat, parsed.round, DEFAULT_GROUP_CONFIG.perRound) : [];
 	}
 
 	const headers = new Headers();
