@@ -62,6 +62,15 @@ import {
 	type KnowHerPool,
 	type KnowHerEnv,
 } from "./knowher.ts";
+import {
+	publishTriviaPool,
+	stageTriviaCandidate,
+	readTriviaCandidate,
+	resolveRound,
+	TRIVIA_POOL_V2_KEY,
+	type TriviaPoolDoc,
+	type TriviaEnv,
+} from "./trivia.ts";
 import { handleQuizResults } from "./quiz-results.ts";
 import { handlePredictCommunity } from "./predict-community.ts";
 import { handleWeather } from "./weather.ts";
@@ -761,6 +770,15 @@ export default {
 		}
 		if (url.pathname === "/knowher/publish-verified") {
 			return handleKnowHerPublishVerified(request, env, ctx);
+		}
+		// NWSL Trivia content pipeline (roadmap #2): the GENERATOR stages category batches, the VERIFIER
+		// reads them back + publishes the yearly grouped pool. Both serve non-GET methods (POST stage/ingest,
+		// GET candidate-read), so they MUST precede the GET-only guard.
+		if (url.pathname === "/trivia/ingest") {
+			return handleTriviaIngest(request, env, ctx);
+		}
+		if (url.pathname === "/trivia/candidate") {
+			return handleTriviaCandidate(request, env, ctx);
 		}
 
 		// Operator escape hatch: a KV JSON the app layers over its ESPN-derived playoff bracket,
@@ -4101,12 +4119,61 @@ async function handleSpotlight(url: URL, env: Env, ctx: ExecutionContext): Promi
 const TRIVIA_TTL = 6 * 3600; // 6h edge cache — the question pool changes rarely (owner reloads via scripts/load_trivia.mjs)
 const TRIVIA_POOL_KEY = "trivia-pool-v1"; // KV key for the owner-loaded question pool
 
-/** Daily Trivia's question pool. League-wide (no `teams` param) and read-only:
- *  returns the owner-loaded `[TriviaQuestion]` array straight from KV (loaded via
- *  scripts/load_trivia.mjs). Returns `[]` when the pool hasn't been loaded yet —
- *  the app then falls back to its bundled seed — so the route is safe to deploy
- *  before the pool exists. (A reload is picked up after the 6h edge cache expires.) */
+/** NWSL Trivia's question serving. Two shapes for a clean rollout:
+ *   • `GET /trivia?round=<editionKey>` (current app) — returns THAT round's pre-grouped 10 questions from the
+ *     v2 doc (routine-generated, no in-year repeats). Missing/future rounds WRAP to the stored season (a
+ *     missed annual refresh degrades to cross-year repeats, never empty) + emit a throttled stale diag.
+ *   • `GET /trivia` with NO round (legacy app builds) — the flat v1 pool the app slices client-side; kept so
+ *     builds in the wild keep working. Retire after the min-build gate clears. */
 async function handleTrivia(url: URL, env: Env, ctx: ExecutionContext): Promise<Response> {
+	const round = url.searchParams.get("round");
+	if (!round) return handleTriviaLegacyFlat(url, env, ctx);
+
+	const cache = caches.default;
+	const cacheUrl = new URL(url);
+	cacheUrl.search = "";
+	cacheUrl.searchParams.set("cv", "2"); // v2 = the round-grouped doc; bump to abandon stale edge entries
+	cacheUrl.searchParams.set("round", round);
+	const cacheKey = new Request(cacheUrl.toString(), { method: "GET" });
+
+	const hit = await cache.match(cacheKey);
+	if (hit) return withCacheStatus(hit, "HIT");
+
+	let doc: TriviaPoolDoc | null = null;
+	try {
+		doc = (await env.FEED_TAGS.get(TRIVIA_POOL_V2_KEY, "json")) as TriviaPoolDoc | null;
+	} catch {
+		return (await serveStale(cache, cacheKey)) ?? upstreamError();
+	}
+
+	const resolved = resolveRound(doc, round);
+	const questions = resolved?.questions ?? [];
+	if (resolved?.wrapped && doc) {
+		// The requested round isn't in the stored season → a missed annual refresh; we serve a prior year
+		// (cross-year repeat, acceptable) but say so LOUDLY server-side, throttled 1/day (KHG stale pattern).
+		ctx.waitUntil((async () => {
+			const THROTTLE_KEY = "trivia:stale-diag-at";
+			const last = Number(await env.FEED_TAGS.get(THROTTLE_KEY)) || 0;
+			if (Date.now() - last > 24 * 3600 * 1000) {
+				await env.FEED_TAGS.put(THROTTLE_KEY, String(Date.now()), { expirationTtl: 7 * 24 * 3600 });
+				emitDiag(env, ctx, "triviaStaleServe", `requested ${round}, wrapped to stored season ${doc.season} — annual refresh missed`);
+			}
+		})());
+	}
+
+	const headers = new Headers();
+	headers.set("Content-Type", "application/json");
+	// Never long-cache an empty round (pre-load / never-published) — the app shows an honest error and
+	// re-checks each launch; only a real round gets the edge cache + TTL.
+	headers.set("Cache-Control", questions.length > 0 ? `public, max-age=${TRIVIA_TTL}` : "no-store");
+	const body = new Response(JSON.stringify(questions), { status: 200, headers });
+	if (questions.length > 0) ctx.waitUntil(cache.put(cacheKey, body.clone()));
+	return withCacheStatus(body, "MISS");
+}
+
+/** LEGACY flat pool (no `round` param): the owner-loaded `[TriviaQuestion]` array straight from KV. Kept for
+ *  old app builds that slice client-side; safe to serve `[]` before the pool exists. */
+async function handleTriviaLegacyFlat(url: URL, env: Env, ctx: ExecutionContext): Promise<Response> {
 	const cache = caches.default;
 	// Normalized, versioned cache key: the pool is league-wide, so every request
 	// (with or without a cache-busting query) maps to ONE entry. `cv` is a manual
@@ -4281,6 +4348,74 @@ async function handleKnowHerCandidate(request: Request, env: Env, ctx: Execution
 		}
 		emitDiag(env, ctx, "knowherCandidateStaged", `${result.weekKey} players=${result.playerCount} human=${result.humanQuestions}`);
 		return json({ ...result, note: "Staged for the verify gate — NOT live. The verifier re-confirms each fact, then publishes." });
+	}
+	return new Response("Method not allowed. Use GET (verifier) or POST (generator).", { status: 405, headers: { Allow: "GET, POST" } });
+}
+
+/** `POST /trivia/ingest` — the VERIFIER routine (or the owner, supervised) publishes the yearly Trivia pool.
+ *  Auth = x-ingest-key (TRIVIA_INGEST_KEY; unset → 401). Body = the flat verified `[TriviaQuestion]` (or
+ *  `{ questions }`). `?season=YYYY` (required) is the season to group for; `?dryRun=1` groups+validates
+ *  without writing; `?force=1` overrides the "don't rewrite an already-published season" guard. Delegates to
+ *  the ONE publish path (validate → group → KV). Diags every accept AND rejection (no human watches the POST). */
+async function handleTriviaIngest(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
+	if (request.method !== "POST") return new Response("Method not allowed. Use POST.", { status: 405, headers: { Allow: "POST" } });
+	const tenv = env as unknown as TriviaEnv;
+	const json = (b: unknown, s = 200) => new Response(JSON.stringify(b), { status: s, headers: { "Content-Type": "application/json" } });
+	const key = tenv.TRIVIA_INGEST_KEY;
+	if (!key || request.headers.get("x-ingest-key") !== key) {
+		emitDiag(env, ctx, "triviaIngestAuth", key ? "bad x-ingest-key" : "TRIVIA_INGEST_KEY unset");
+		return json({ error: "unauthorized" }, 401);
+	}
+	const url = new URL(request.url);
+	const season = parseInt(url.searchParams.get("season") ?? "", 10);
+	if (!Number.isInteger(season)) return json({ error: "missing/invalid ?season=YYYY" }, 400);
+	const dryRun = url.searchParams.get("dryRun") === "1";
+	const force = url.searchParams.get("force") === "1";
+	let body: unknown;
+	try { body = await request.json(); }
+	catch { emitDiag(env, ctx, "triviaIngestReject", "body is not JSON"); return json({ error: "body must be JSON" }, 400); }
+	const result = await publishTriviaPool(tenv, body, { season, dryRun, force });
+	if ("error" in result) {
+		// Group-infeasibility is the loud, pageable failure (the pool couldn't satisfy the round constraints);
+		// everything else is a plain reject.
+		const kind = /infeasible|^round \d+/.test(result.error) ? "triviaGroupInfeasible" : "triviaIngestReject";
+		emitDiag(env, ctx, kind, result.error.slice(0, 90));
+		return json(result, 400);
+	}
+	emitDiag(env, ctx, "triviaIngestOk", `season ${result.season} ${result.roundCount}×${result.perRound} lib=${result.library}${result.dryRun ? " (dryRun)" : ""}`);
+	return json(result);
+}
+
+/** `POST /trivia/candidate` — the GENERATOR routine stages a category-BATCH (auth: weak x-candidate-key),
+ *  MERGED into the accumulating yearly library. `GET /trivia/candidate` — the VERIFIER reads the whole staged
+ *  library back (auth: strong x-ingest-key). Same generator-can't-judge-itself split as KHG; staging is never
+ *  live. */
+async function handleTriviaCandidate(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
+	const tenv = env as unknown as TriviaEnv;
+	const json = (b: unknown, s = 200) => new Response(JSON.stringify(b), { status: s, headers: { "Content-Type": "application/json" } });
+	if (request.method === "GET") {
+		const key = tenv.TRIVIA_INGEST_KEY;
+		if (!key || request.headers.get("x-ingest-key") !== key) {
+			emitDiag(env, ctx, "triviaCandidateAuth", key ? "bad x-ingest-key (GET)" : "TRIVIA_INGEST_KEY unset");
+			return json({ error: "unauthorized" }, 401);
+		}
+		const cand = await readTriviaCandidate(tenv);
+		if (!cand) return json({ error: "no candidate staged" }, 404);
+		return json(cand);
+	}
+	if (request.method === "POST") {
+		const key = tenv.TRIVIA_CANDIDATE_KEY;
+		if (!key || request.headers.get("x-candidate-key") !== key) {
+			emitDiag(env, ctx, "triviaCandidateAuth", key ? "bad x-candidate-key" : "TRIVIA_CANDIDATE_KEY unset");
+			return json({ error: "unauthorized" }, 401);
+		}
+		let body: unknown;
+		try { body = await request.json(); }
+		catch { emitDiag(env, ctx, "triviaCandidateReject", "body is not JSON"); return json({ error: "body must be JSON" }, 400); }
+		const result = await stageTriviaCandidate(tenv, body);
+		if ("error" in result) { emitDiag(env, ctx, "triviaCandidateReject", result.error.slice(0, 90)); return json(result, 400); }
+		emitDiag(env, ctx, "triviaCandidateStaged", `+${result.added} → ${result.total} staged`);
+		return json({ ...result, note: "Staged into the yearly library — NOT live. The verifier re-confirms, then publishes." });
 	}
 	return new Response("Method not allowed. Use GET (verifier) or POST (generator).", { status: 405, headers: { Allow: "GET, POST" } });
 }
@@ -4691,6 +4826,11 @@ const ALERT_ERROR_KINDS = new Set([
 	// contamination or a deleted club fails many gates at once and pages. Severity scales with
 	// blast radius for free. Per-player diffs (positions, erasures) deliberately do NOT page.
 	"rosterTruthGateFail", "rosterTruthRunFail",
+	// Trivia content pipeline (roadmap #2). `triviaGroupInfeasible` = an ingest whose pool couldn't satisfy
+	// the round constraints (a bad generation) → the prior season stays live. `triviaStaleServe` = the app
+	// requested a round past the published season (a missed annual refresh); throttled 1/day, so it's really
+	// report-only visibility — health_check_trivia.mjs is the true "wrong-season pool" gate.
+	"triviaGroupInfeasible", "triviaStaleServe",
 ]);
 const ALERT_WINDOW_MS = 15 * 60 * 1000;
 const ALERT_THRESHOLD = 8; // error events in the window ⇒ email (2-user baseline is ~0-2/day; a real incident bursts)

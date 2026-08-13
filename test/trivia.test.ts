@@ -2,10 +2,12 @@ import { describe, it, expect } from "vitest";
 import {
   validateTriviaFlatPool,
   groupIntoRounds,
+  resolveRound,
   makeEditionKey,
   parseEditionKey,
   wrapRound,
   DEFAULT_GROUP_CONFIG,
+  type TriviaPoolDoc,
   type TriviaQuestion,
 } from "../src/trivia";
 
@@ -147,5 +149,41 @@ describe("groupIntoRounds", () => {
     const r = groupIntoRounds(pool, 2026);
     expect("error" in r).toBe(true);
     if ("error" in r) expect(r.error).toContain("fun");
+  });
+});
+
+describe("resolveRound (fail-safe wrap)", () => {
+  const doc: TriviaPoolDoc = {
+    season: 2026,
+    roundCount: 3,
+    perRound: 1,
+    rounds: {
+      "2026-R01": [q("a")],
+      "2026-R02": [q("b")],
+      "2026-R03": [q("c")],
+    },
+  };
+
+  it("returns the exact round with no wrap", () => {
+    const r = resolveRound(doc, "2026-R02");
+    expect(r?.wrapped).toBe(false);
+    expect(r?.questions[0].id).toBe("b");
+  });
+
+  it("wraps a future-season key onto the stored season (missed refresh)", () => {
+    // 2027-R02 not published → wrap to the stored season's round 2.
+    const r = resolveRound(doc, "2027-R02");
+    expect(r?.wrapped).toBe(true);
+    expect(r?.questions[0].id).toBe("b");
+  });
+
+  it("wraps a round number past the stored count", () => {
+    const r = resolveRound(doc, "2026-R05"); // 5 → ((5-1)%3)+1 = 2
+    expect(r?.wrapped).toBe(true);
+    expect(r?.questions[0].id).toBe("b");
+  });
+
+  it("returns null when nothing is published", () => {
+    expect(resolveRound(null, "2026-R01")).toBeNull();
   });
 });

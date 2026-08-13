@@ -274,3 +274,132 @@ export function groupIntoRounds(
   }
   return { rounds };
 }
+
+// ── Serving (with the fail-safe wrap) ───────────────────────────────────────
+
+/** Resolve a requested round from the stored doc. Exact hit → those 10. Otherwise (the requested season is
+ *  ahead of the stored one, or the key is absent — a missed annual refresh) → WRAP onto the stored season's
+ *  round range (cross-year repeat, acceptable; the caller emits a stale-serve diag on a wrap). Null only when
+ *  nothing is published at all (→ the app's honest empty state). */
+export function resolveRound(
+  doc: TriviaPoolDoc | null,
+  requestedKey: string,
+): { questions: TriviaQuestion[]; wrapped: boolean } | null {
+  if (!doc || !doc.rounds) return null;
+  const direct = doc.rounds[requestedKey];
+  if (direct && direct.length) return { questions: direct, wrapped: false };
+  const parsed = parseEditionKey(requestedKey);
+  if (!parsed || !doc.roundCount) return null;
+  const wrappedKey = makeEditionKey(doc.season, wrapRound(parsed.round, doc.roundCount));
+  const q = doc.rounds[wrappedKey];
+  return q && q.length ? { questions: q, wrapped: true } : null;
+}
+
+function poolHistogram(pool: TriviaQuestion[]): Record<string, number> {
+  const h: Record<string, number> = {};
+  const bump = (k: string) => (h[k] = (h[k] ?? 0) + 1);
+  for (const q of pool) {
+    bump(`diff:${q.difficulty}`);
+    bump(`cat:${q.category}`);
+    bump(`scope:${q.scope}`);
+    if (isFun(q)) bump("funFact");
+  }
+  return h;
+}
+
+// ── KV env functions (candidate staging → publish) ──────────────────────────
+
+export interface TriviaEnv {
+  FEED_TAGS: KVNamespace;
+  /** Strong key: reads the staged candidate AND publishes (held by the VERIFIER routine + owner). */
+  TRIVIA_INGEST_KEY?: string;
+  /** Weak key: the GENERATOR routine can only STAGE a batch, never publish (blast-radius split, KHG pattern). */
+  TRIVIA_CANDIDATE_KEY?: string;
+}
+
+/** The accumulating staged library (the generator adds one category-batch per run). */
+export interface TriviaCandidate {
+  questions: TriviaQuestion[];
+}
+
+/** Stage a batch of generated questions, MERGING into the accumulating candidate (dedupe by id, last-write
+ *  wins on a re-stage). The annual generation runs category-by-category across multiple routine invocations,
+ *  so each POST ADDS to the staging doc rather than replacing it. Validates shape + per-question source. NOT
+ *  live, NOT grouped — the verifier reads it back and publishes. Expires (TTL) if never published: safe no-op. */
+export async function stageTriviaCandidate(
+  env: TriviaEnv,
+  batchInput: unknown,
+): Promise<{ ok: true; added: number; total: number } | { error: string }> {
+  const raw = Array.isArray(batchInput) ? batchInput : (batchInput as { questions?: unknown } | null)?.questions;
+  const v = validateTriviaFlatPool(raw, { requireSource: true });
+  if ("error" in v) return { error: v.error };
+  const existing = (await env.FEED_TAGS.get(TRIVIA_CANDIDATE_KEY, "json")) as TriviaCandidate | null;
+  const byId = new Map<string, TriviaQuestion>();
+  for (const q of existing?.questions ?? []) byId.set(q.id, q);
+  let added = 0;
+  for (const q of v.questions) {
+    if (!byId.has(q.id)) added++;
+    byId.set(q.id, q);
+  }
+  const merged: TriviaCandidate = { questions: [...byId.values()] };
+  await env.FEED_TAGS.put(TRIVIA_CANDIDATE_KEY, JSON.stringify(merged), { expirationTtl: TRIVIA_CANDIDATE_TTL });
+  return { ok: true, added, total: merged.questions.length };
+}
+
+export async function readTriviaCandidate(env: TriviaEnv): Promise<TriviaCandidate | null> {
+  return (await env.FEED_TAGS.get(TRIVIA_CANDIDATE_KEY, "json")) as TriviaCandidate | null;
+}
+
+export interface PublishResult {
+  ok: true;
+  season: number;
+  roundCount: number;
+  perRound: number;
+  used: number;
+  library: number;
+  dryRun: boolean;
+  histogram: Record<string, number>;
+}
+
+/** The ONE publish path: validate the flat pool → group into the season's rounds → (unless dryRun) write the
+ *  v2 doc. Immutability guard: refuse to overwrite the CURRENTLY-STORED season's doc (rounds fans may already
+ *  have played) without `force`; a brand-new season doc is always fine. On any validation/grouping failure it
+ *  returns the error and writes NOTHING (the prior season stays live — the fail-safe). */
+export async function publishTriviaPool(
+  env: TriviaEnv,
+  input: unknown,
+  opts: { season: number; force?: boolean; dryRun?: boolean; config?: GroupConfig },
+): Promise<PublishResult | { error: string }> {
+  const cfg = opts.config ?? DEFAULT_GROUP_CONFIG;
+  if (!Number.isInteger(opts.season) || opts.season < 2000) return { error: `invalid season ${opts.season}` };
+  const raw = Array.isArray(input) ? input : (input as { questions?: unknown } | null)?.questions;
+  const v = validateTriviaFlatPool(raw, { requireSource: true });
+  if ("error" in v) return { error: v.error };
+
+  const grouped = groupIntoRounds(v.questions, opts.season, cfg);
+  if ("error" in grouped) return { error: grouped.error };
+
+  const existing = (await env.FEED_TAGS.get(TRIVIA_POOL_V2_KEY, "json")) as TriviaPoolDoc | null;
+  if (!opts.dryRun && existing && existing.season === opts.season && !opts.force) {
+    return { error: `season ${opts.season} already published — re-ingest would rewrite already-played rounds; pass force=1 to override` };
+  }
+
+  const doc: TriviaPoolDoc = {
+    season: opts.season,
+    roundCount: cfg.roundCount,
+    perRound: cfg.perRound,
+    rounds: grouped.rounds,
+  };
+  if (!opts.dryRun) await env.FEED_TAGS.put(TRIVIA_POOL_V2_KEY, JSON.stringify(doc));
+
+  return {
+    ok: true,
+    season: opts.season,
+    roundCount: cfg.roundCount,
+    perRound: cfg.perRound,
+    used: cfg.roundCount * cfg.perRound,
+    library: v.questions.length,
+    dryRun: !!opts.dryRun,
+    histogram: poolHistogram(v.questions),
+  };
+}
