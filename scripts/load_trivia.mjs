@@ -2,10 +2,12 @@
 //
 // load_trivia.mjs — load the Daily Trivia question pool into Cloudflare KV.
 //
-// The app's Fan Zone Daily Trivia game fetches its questions from the proxy's
-// GET /trivia route, which serves the array stored at KV key `trivia-pool-v1`
-// (binding FEED_TAGS). This script validates a local pool file against the app's
-// `TriviaQuestion` shape and writes it to KV.
+// ⚠️ This loads the LEGACY/BRIDGE flat pool at KV `trivia-pool-v1` (binding FEED_TAGS): the pool old app
+// builds slice client-side, and the pool the round-aware server slices as a BRIDGE until the yearly grouped
+// doc is published. The GROUPED yearly pool (`trivia-pool-v2`, roadmap #2) is NOT written here — it goes
+// through `POST /trivia/ingest`, which runs the deterministic round grouper. Don't hand-write v2 (it would
+// bypass the grouper); use the ingest route. This script validates a local flat pool against the app's
+// `TriviaQuestion` shape (extra pipeline tags are ignored here) and writes it to KV.
 //
 // USAGE:
 //   node scripts/load_trivia.mjs [path]            # validate + upload (default path: trivia-pool.json)
