@@ -325,21 +325,21 @@ const HAIKU_BATCH = 20; // posts per Haiku call (one numbered list → array of 
 const TAG_TTL = 7 * 24 * 3600; // a post's verdict is stable; cache it a week
 const MAX_PER_HANDLE = 3; // free anti-flood cap: keep at most N posts per account
 
-// B3b — Instagram social pipe, LOAD-BALANCED across two scrape services (2026-07-05):
-//   CLUBS (16 handles → Home tab)  = Apify sones/instagram-posts-scraper-lowcost ($0.30/1k).
-//     The cheap actor ignores postsPerProfile and returns ~12/profile — a FEATURE for clubs:
-//     Home serves the club pool uncapped and pages through the depth on refresh.
-//     16 × ~12 × ~15 runs/mo ≈ 2,880 items ≈ $0.86/mo — permanently inside Apify's free $5.
-//   PLAYERS (34 handles → Feed tab) = Bright Data Web Scraper API (free 5,000 records/mo,
-//     recurring). BD DOES honor a per-profile cap; players only ever serve 3/handle
-//     (capPerHandle), so a shallow pull is fine: 34 × 6 × ~15 ≈ 3,060 records/mo = $0.
+// B3b — Instagram social pipe, LOAD-BALANCED across two scrape services (swapped 2026-08-14):
+//   PLAYERS (→ Feed tab) = Apify sones/instagram-posts-scraper-lowcost ($0.30/1k items).
+//     The cheap actor ignores postsPerProfile and returns ~12/profile; players only ever
+//     serve 3/handle (capPerHandle), so the excess is harmless and cheap.
+//     34 × ~12 × ~15 runs/mo ≈ 6,120 items ≈ $1.84/mo — inside Apify's free $5.
+//     Budget cap: ~90 handles fit the free tier; MAX_PLAYER_HANDLES guards the ceiling.
+//   CLUBS (16 handles → Home tab) = Bright Data Web Scraper API (free 5,000 records/mo,
+//     recurring). BD DOES honor a per-profile cap: 16 × 6 × ~15 ≈ 1,440 records/mo = $2.16.
 //     ⚠️ BD bills a record even when a handle returns EMPTY (renamed/dead account) — a stale
 //     handle list silently eats the free quota, so empties emit diag (bdHandleEmpty).
-//   Until BRIGHTDATA_TOKEN is set, players fall back to the Apify run (full 50-handle scrape,
+//   Until BRIGHTDATA_TOKEN is set, clubs fall back to the Apify run (full all-handle scrape,
 //   the pre-split behavior) so the split deploys without a flag day.
 // TikTok (clockworks/tiktok-scraper, $3.70/1k, no rental) is DEFERRED but its id + mapper
 // are kept ready. Apify API path uses "~" for the actor "/".
-// We DON'T scrape on the user request path (a 50-account sync run is too slow and would
+// We DON'T scrape on the user request path (an 80-account sync run is too slow and would
 // risk a Worker timeout). Instead a CRON refreshes the card snapshot into KV; /feed and
 // /team-videos just READ that snapshot — pinning scrape spend to ~1 run/cron regardless
 // of app traffic. The app's staleness filter (Home 72h / Feed 7d) drops old posts
@@ -348,12 +348,13 @@ const APIFY_API = "https://api.apify.com/v2/acts";
 const APIFY_IG_ACTOR = "sones~instagram-posts-scraper-lowcost";
 const APIFY_TIKTOK_ACTOR = "clockworks~tiktok-scraper"; // deferred; kept ready for re-enable
 const SOCIAL_POSTS_PER_PROFILE = 4; // requested of Apify (ignored by the cheap actor — see above)
-// Bright Data Web Scraper API (players). ASYNC: the cron POSTs /trigger with the player
+// Bright Data Web Scraper API (clubs). ASYNC: the cron POSTs /trigger with the club
 // profile URLs + webhook delivery params; BD scrapes (~1–3 min) then POSTs the finished
 // JSON to /brightdata-webhook, echoing BD_WEBHOOK_SECRET in the Authorization header.
 const BRIGHTDATA_API = "https://api.brightdata.com/datasets/v3";
 const BRIGHTDATA_IG_DATASET = "gd_lk5ns7kz21pck8jpis"; // Instagram Posts scraper dataset id
 const BD_POSTS_PER_PROFILE = 6; // BD honors per-profile caps; 3/handle is the serve cap anyway
+const MAX_PLAYER_HANDLES = 80; // budget guardrail: ~90 fit Apify's $5 free tier; 80 leaves headroom
 // The cron has no incoming request to derive its own origin from, so the webhook endpoint
 // base is pinned here (workers.dev origin; update if the worker ever moves to a custom domain).
 const PROXY_PUBLIC_ORIGIN = "https://nwslapp-proxy.tiffany-rieth.workers.dev";
@@ -361,8 +362,8 @@ const PROXY_PUBLIC_ORIGIN = "https://nwslapp-proxy.tiffany-rieth.workers.dev";
 // BD = the webhook, minutes later), so each side owns a KV key — two writers on one key
 // would race. The legacy combined key remains a read-only fallback until both exist.
 const SOCIAL_CACHE_KEY = "social-cards-v1"; // legacy combined snapshot (read fallback only)
-const SOCIAL_CLUB_KEY = "social-cards-club-v1"; // written by the Apify cron path
-const SOCIAL_PLAYER_KEY = "social-cards-player-v1"; // written by the Bright Data webhook
+const SOCIAL_CLUB_KEY = "social-cards-club-v1"; // written by the Bright Data webhook
+const SOCIAL_PLAYER_KEY = "social-cards-player-v1"; // written by the Apify cron path
 const SOCIAL_CACHE_TTL = 3 * 24 * 3600; // 3d KV safety net — the every-2-day cron refreshes well within it
 
 // Social (reporter + league-outlet) Bluesky classifier. These accounts post
@@ -3560,8 +3561,8 @@ export async function handleBrightDataWebhook(request: Request, env: Env, ctx: E
 		return new Response("bad body", { status: 400 });
 	}
 
-	const players = SOCIAL_HANDLES.filter((h) => h.platform === "instagram" && h.kind === "player");
-	const byUser = new Map(players.map((h) => [h.handle.toLowerCase(), h]));
+	const clubs = SOCIAL_HANDLES.filter((h) => h.platform === "instagram" && h.kind === "team");
+	const byUser = new Map(clubs.map((h) => [h.handle.toLowerCase(), h]));
 	const seen = new Set<string>();
 	const cards = items
 		.map((it) => {
@@ -3578,12 +3579,12 @@ export async function handleBrightDataWebhook(request: Request, env: Env, ctx: E
 
 	// A handle with no delivered posts was still billed a record — flag it so a renamed/
 	// dead account can't silently drain the free quota run after run.
-	const missing = players.filter((h) => !seen.has(h.handle.toLowerCase()));
+	const missing = clubs.filter((h) => !seen.has(h.handle.toLowerCase()));
 	if (missing.length > 0 && cards.length > 0) {
-		emitDiag(env, ctx, "bdHandleEmpty", `${missing.length}: ${missing.map((h) => h.handle).slice(0, 5).join(",")}`);
+		emitDiag(env, ctx, "bdHandleEmpty", `${missing.length} clubs: ${missing.map((h) => h.handle).slice(0, 5).join(",")}`);
 	}
 
-	const kept = await writeSideOrKeepLastGood(env, ctx, SOCIAL_PLAYER_KEY, cards, "player");
+	const kept = await writeSideOrKeepLastGood(env, ctx, SOCIAL_CLUB_KEY, cards, "club");
 	return new Response(JSON.stringify({ received: items.length, cards: cards.length, kept }), {
 		headers: { "Content-Type": "application/json" },
 	});
@@ -3591,6 +3592,7 @@ export async function handleBrightDataWebhook(request: Request, env: Env, ctx: E
 
 /** Scrape the given IG handles via Apify and map to cards (defaults to ALL IG handles —
  *  the pre-split behavior, still used while BRIGHTDATA_TOKEN is unset). Cron-only.
+ *  After the 2026-08-14 swap, the normal-path call is PLAYER handles only (clubs → BD).
  *
  *  TikTok is DEFERRED (owner: IG-only for now), so only Instagram is scraped — which
  *  also means a single actor runs, sidestepping the Apify FREE plan's 8192MB TOTAL
@@ -3629,29 +3631,33 @@ async function buildSocialCards(env: Env, handles?: SocialHandle[]): Promise<{ i
 }
 
 /** Cron/manual-refresh entry: rebuild the social snapshot → the SPLIT KV keys.
- *  CLUB side: scraped via Apify inline (sync run) and written here. PLAYER side: when
+ *  PLAYER side: scraped via Apify inline (sync run) and written here. CLUB side: when
  *  Bright Data is configured, an ASYNC scrape is triggered and /brightdata-webhook writes
- *  the player key minutes later; until then players ride the same Apify run (pre-split
+ *  the club key minutes later; until then clubs ride the same Apify run (pre-split
  *  fallback — the split deploys without a flag day). Returns a summary for /refresh-social. */
-async function refreshSocialCache(env: Env, ctx?: ExecutionContext): Promise<{ clubCards: number; players: string }> {
+async function refreshSocialCache(env: Env, ctx?: ExecutionContext): Promise<{ playerCards: number; clubs: string }> {
 	const igHandles = SOCIAL_HANDLES.filter((h) => h.platform === "instagram");
 	const bdConfigured = !!(env.BRIGHTDATA_TOKEN && env.BD_WEBHOOK_SECRET);
 
-	const apifyHandles = bdConfigured ? igHandles.filter((h) => h.kind === "team") : igHandles;
-	const { instagram } = await buildSocialCards(env, apifyHandles);
-	const clubs = instagram.filter((c) => (c as { placement?: string }).placement === "home");
-	const clubCards = await writeSideOrKeepLastGood(env, ctx, SOCIAL_CLUB_KEY, clubs, "club");
-
-	let players: string;
-	if (bdConfigured) {
-		players = await triggerBrightDataPlayers(env, ctx);
-	} else {
-		const fresh = instagram.filter((c) => (c as { placement?: string }).placement === "feed");
-		const kept = await writeSideOrKeepLastGood(env, ctx, SOCIAL_PLAYER_KEY, fresh, "player");
-		players = `apify-fallback:${kept}`;
-		if (ctx) emitDiag(env, ctx, "bdUnconfigured", "players via apify fallback");
+	if (PLAYER_SOCIAL.length > MAX_PLAYER_HANDLES && ctx) {
+		emitDiag(env, ctx, "playerCapExceeded", `${PLAYER_SOCIAL.length}/${MAX_PLAYER_HANDLES}`);
 	}
-	return { clubCards, players };
+
+	const apifyHandles = bdConfigured ? igHandles.filter((h) => h.kind === "player") : igHandles;
+	const { instagram } = await buildSocialCards(env, apifyHandles);
+	const players = instagram.filter((c) => (c as { placement?: string }).placement === "feed");
+	const playerCards = await writeSideOrKeepLastGood(env, ctx, SOCIAL_PLAYER_KEY, players, "player");
+
+	let clubs: string;
+	if (bdConfigured) {
+		clubs = await triggerBrightDataClubs(env, ctx);
+	} else {
+		const fresh = instagram.filter((c) => (c as { placement?: string }).placement === "home");
+		const kept = await writeSideOrKeepLastGood(env, ctx, SOCIAL_CLUB_KEY, fresh, "club");
+		clubs = `apify-fallback:${kept}`;
+		if (ctx) emitDiag(env, ctx, "bdUnconfigured", "clubs via apify fallback");
+	}
+	return { playerCards, clubs };
 }
 
 /** Write one side's fresh cards to its KV key — or, when THIS scrape came back empty
@@ -3680,15 +3686,15 @@ async function writeSideOrKeepLastGood(
 	return cards.length;
 }
 
-/** Fire the ASYNC Bright Data scrape for the 34 player handles. Results arrive minutes
+/** Fire the ASYNC Bright Data scrape for the 16 club handles. Results arrive minutes
  *  later at POST /brightdata-webhook (delivery params on the trigger: our endpoint URL +
  *  BD_WEBHOOK_SECRET echoed as the Authorization header). Returns a status note for
  *  /refresh-social. Only called when BRIGHTDATA_TOKEN + BD_WEBHOOK_SECRET are set. */
-async function triggerBrightDataPlayers(env: Env, ctx?: ExecutionContext): Promise<string> {
-	const players = SOCIAL_HANDLES.filter((h) => h.platform === "instagram" && h.kind === "player");
+async function triggerBrightDataClubs(env: Env, ctx?: ExecutionContext): Promise<string> {
+	const clubs = SOCIAL_HANDLES.filter((h) => h.platform === "instagram" && h.kind === "team");
 	// Discover-by-profile-URL with a per-profile cap — BD honors num_of_posts (unlike the
 	// cheap Apify actor), which is what keeps us inside the free 5k records/mo.
-	const inputs = players.map((h) => ({
+	const inputs = clubs.map((h) => ({
 		url: `https://www.instagram.com/${h.handle}/`,
 		num_of_posts: BD_POSTS_PER_PROFILE,
 	}));
