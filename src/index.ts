@@ -4121,6 +4121,8 @@ async function handleSpotlight(url: URL, env: Env, ctx: ExecutionContext): Promi
 }
 
 const TRIVIA_TTL = 6 * 3600; // 6h edge cache — the question pool changes rarely (owner reloads via scripts/load_trivia.mjs)
+const TRIVIA_BRIDGE_TTL = 300; // 5m — a BRIDGE slice (no grouped pool yet) is transitional; short-cache it so a
+// publish becomes visible within minutes instead of being masked by a stale bridge entry for the full 6h.
 const TRIVIA_POOL_KEY = "trivia-pool-v1"; // KV key for the owner-loaded question pool
 
 /** NWSL Trivia's question serving. Two shapes for a clean rollout:
@@ -4136,7 +4138,7 @@ async function handleTrivia(url: URL, env: Env, ctx: ExecutionContext): Promise<
 	const cache = caches.default;
 	const cacheUrl = new URL(url);
 	cacheUrl.search = "";
-	cacheUrl.searchParams.set("cv", "2"); // v2 = the round-grouped doc; bump to abandon stale edge entries
+	cacheUrl.searchParams.set("cv", "3"); // v2 = the round-grouped doc; bump to abandon stale edge entries
 	cacheUrl.searchParams.set("round", round);
 	const cacheKey = new Request(cacheUrl.toString(), { method: "GET" });
 
@@ -4152,6 +4154,7 @@ async function handleTrivia(url: URL, env: Env, ctx: ExecutionContext): Promise<
 
 	const resolved = resolveRound(doc, round);
 	let questions: TriviaQuestion[];
+	let isBridge = false;
 	if (resolved) {
 		questions = resolved.questions;
 		if (resolved.wrapped && doc) {
@@ -4170,6 +4173,7 @@ async function handleTrivia(url: URL, env: Env, ctx: ExecutionContext): Promise<
 		// BRIDGE (no v2 doc published yet — the Phase-1→Phase-2 content gap): serve a deterministic round
 		// sliced from the legacy flat pool so a round-aware build isn't empty. Falls away the moment the
 		// grouped v2 doc lands.
+		isBridge = true;
 		const parsed = parseEditionKey(round);
 		const flat = ((await env.FEED_TAGS.get(TRIVIA_POOL_KEY, "json")) as TriviaQuestion[] | null) ?? [];
 		questions = parsed ? sliceFlatPool(flat, parsed.round, DEFAULT_GROUP_CONFIG.perRound) : [];
@@ -4178,10 +4182,12 @@ async function handleTrivia(url: URL, env: Env, ctx: ExecutionContext): Promise<
 	const headers = new Headers();
 	headers.set("Content-Type", "application/json");
 	// Never long-cache an empty round (pre-load / never-published) — the app shows an honest error and
-	// re-checks each launch; only a real round gets the edge cache + TTL.
-	headers.set("Cache-Control", questions.length > 0 ? `public, max-age=${TRIVIA_TTL}` : "no-store");
+	// re-checks each launch. A real GROUPED round is frozen for the season → full 6h TTL. A BRIDGE slice is
+	// transitional → short TTL so the first publish (or an annual re-group) isn't masked by a stale bridge.
+	const ttl = questions.length === 0 ? 0 : isBridge ? TRIVIA_BRIDGE_TTL : TRIVIA_TTL;
+	headers.set("Cache-Control", ttl > 0 ? `public, max-age=${ttl}` : "no-store");
 	const body = new Response(JSON.stringify(questions), { status: 200, headers });
-	if (questions.length > 0) ctx.waitUntil(cache.put(cacheKey, body.clone()));
+	if (ttl > 0) ctx.waitUntil(cache.put(cacheKey, body.clone()));
 	return withCacheStatus(body, "MISS");
 }
 
