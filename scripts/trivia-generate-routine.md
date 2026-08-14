@@ -21,19 +21,26 @@ don't write it — pick another. A smaller, correct batch beats a padded, shaky 
 
 ## Steps — in order
 
-### 1. Pick this run's category + targets
-Each run does ONE category. Cycle across runs so the year's library covers all six:
-`leagueHistory · teamHistory · records · venues · rules · playerFacts`. Per-batch targets (so the whole
-~400-question library stays FEASIBLE for the grouper's per-round mix of 2 easy / 4 medium / 4 hard + 2 fun):
-aim for **~65–70 questions: ~13 easy / ~26 medium / ~26 hard, with ~14 flagged `funFact`**, biased evergreen.
-(The owner may override the category/counts in the run instructions.)
+### 1. Generate ALL SIX categories — one at a time, staging each as you go
+This run produces the whole year's library, covering all six categories:
+`leagueHistory · teamHistory · records · venues · rules · playerFacts`. Do them **ONE AT A TIME** — fully
+generate a category, VALIDATE it, and **STAGE it (step 5) before starting the next one.** Staging as you go
+means a run that stops partway keeps the categories it finished (staging dedupes by id, so a re-run is safe),
+and one-category-at-a-time keeps each batch focused (quality doesn't blur across 400 questions).
 
-### 2. Assemble the prompt
-Read `scripts/trivia-generate-TEMPLATE.md`. Substitute ONLY the two placeholders — `<<CATEGORY>>` and
-`<<TARGETS>>` (from step 1) — and **treat the rest of the wording as IMMUTABLE**: do not edit, reorder,
-summarize, or "improve" it. It was tuned deliberately; small changes degrade the output.
+Per-category targets (so the whole ~400-question library stays FEASIBLE for the grouper's per-round mix of
+2 easy / 4 medium / 4 hard + 2 fun): **~65–70 questions per category: ~13 easy / ~26 medium / ~26 hard, with
+~14 flagged `funFact`**, biased heavily evergreen. (The owner may override the categories/counts in the run
+instructions — e.g. a mid-season patch that only refreshes `records`.)
 
-### 3. Execute it
+**For EACH category, repeat steps 2–5 below**, then do the final report (step 6) once for the whole run.
+
+### 2. Assemble the prompt (per category)
+Read `scripts/trivia-generate-TEMPLATE.md`. Substitute ONLY the two placeholders — `<<CATEGORY>>` (the
+current category) and `<<TARGETS>>` (its counts) — and **treat the rest of the wording as IMMUTABLE**: do not
+edit, reorder, summarize, or "improve" it. It was tuned deliberately; small changes degrade the output.
+
+### 3. Execute it (per category)
 Carry out the assembled prompt exactly. Write the questions from your knowledge (NO web_search), honoring
 every rule in it: exactly-4 options with credible wrong answers, the lean-harder difficulty calibration, the
 funFact "oh wow" bar, the evergreen bias, a `source` URL + `revealFact` on every question, current
@@ -45,17 +52,18 @@ Confirm every question: `id` unique in the batch; `options` exactly 4, all non-b
 evergreen|seasonBound; `flavor` ∈ standard|funFact; `source` present + non-blank. Check the difficulty spread
 and funFact count are close to the targets. If anything is off, FIX it (rewrite/drop) before staging.
 
-### 5. Stage the candidate
-POST the JSON to `/trivia/candidate` (it MERGES into the accumulating library, deduped by id):
+### 5. Stage this category's batch (then loop to the next category)
+POST the batch to `/trivia/candidate` (it MERGES into the accumulating library, deduped by id):
 ```bash
 curl -sS -X POST "$PROXY/trivia/candidate" -H "x-candidate-key: $CANDIDATE_KEY" \
   -H "content-type: application/json" --data @batch.json
 ```
 A `200` returns `{added, total}`. A `400` means validation failed server-side — read the error, fix, re-POST.
-(The endpoint re-validates every question; a bad enum or missing source is rejected.)
+(The endpoint re-validates every question; a bad enum or missing source is rejected.) **Then go back to step 2
+for the NEXT category** until all six are staged. Staging each before the next means a partial run isn't lost.
 
-### 6. Report (your final message)
-State: the category, questions staged (`added`), the running library `total`, the difficulty + funFact +
-evergreen/seasonBound breakdown, and anything you dropped and why. If a step failed, STOP and report FAILURE
-plainly (nothing was staged). When the whole library is complete across categories, note that the VERIFY
+### 6. Report (your final message, ONCE, after all six categories)
+State per category: questions staged (`added`) + the difficulty / funFact / evergreen-vs-seasonBound
+breakdown + anything dropped and why; then the final library `total`. If a category failed, report which
+staged and which didn't (the completed ones persist). When all six are staged, note that the VERIFY
 routine is next.
