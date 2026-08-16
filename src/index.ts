@@ -304,7 +304,7 @@ const BROWSER_UA =
 
 // ⚠️ ESPN bot rule: EVERY ESPN fetch needs the shared UA (ESPN 403s UA-less Worker fetches,
 // 2026-08-04) — the constant + full story live in espn-ua.ts so no module can miss it again.
-import { ESPN_UA } from "./espn-ua.ts";
+import { ESPN_UA, ESPN_HEADERS } from "./espn-ua.ts";
 
 // Bluesky AT Protocol PUBLIC API (keyless, no auth) — backs the Feed's
 // reporter/league/team posts (and the team voices merged onto Home).
