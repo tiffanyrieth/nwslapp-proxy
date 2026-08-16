@@ -3600,7 +3600,7 @@ export async function handleBrightDataWebhook(request: Request, env: Env, ctx: E
  *  To re-enable TikTok: add a SEQUENTIAL second pass (after IG, to stay under that cap)
  *  scraping APIFY_TIKTOK_ACTOR over the CLUB_SOCIAL.tiktok handles → mapApifyTikTok.
  *  IG empty (or no APIFY_TOKEN) → caller keeps the last good snapshot (→ seed fallback). */
-async function buildSocialCards(env: Env, handles?: SocialHandle[]): Promise<{ instagram: unknown[]; tiktok: unknown[] }> {
+async function buildSocialCards(env: Env, handles?: SocialHandle[], ctx?: ExecutionContext): Promise<{ instagram: unknown[]; tiktok: unknown[] }> {
 	const token = env.APIFY_TOKEN;
 	if (!token) return { instagram: [], tiktok: [] };
 
@@ -3614,17 +3614,33 @@ async function buildSocialCards(env: Env, handles?: SocialHandle[]): Promise<{ i
 			{ usernames: igHandles.map((h) => h.handle), postsPerProfile: SOCIAL_POSTS_PER_PROFILE },
 			token,
 		);
+		const seen = new Set<string>();
 		instagram = items
 			.map((it) => {
 				// sones output keys the scraped account on `scraped_username`.
 				const rec = it as { scraped_username?: string; ownerUsername?: string; user?: { username?: string } };
 				const user = String(rec.scraped_username ?? rec.user?.username ?? rec.ownerUsername ?? "").toLowerCase();
 				const h = igByUser.get(user);
-				return h ? mapApifyInstagram(it, h) : null;
+				if (!h) return null;
+				seen.add(user);
+				return mapApifyInstagram(it, h);
 			})
 			.filter(Boolean) as unknown[];
-	} catch {
-		/* IG failed this run — caller keeps the last good IG snapshot */
+
+		// Post-swap the player IG path lost the club webhook's dead-handle detection: a renamed/
+		// deleted/private handle just yields zero cards silently. Flag the gap (same shape + total-
+		// failure guard as the BD `bdHandleEmpty` diag) so a dead player handle can't drain the
+		// free quota run after run unnoticed.
+		if (ctx) {
+			const missing = igHandles.filter((h) => !seen.has(h.handle.toLowerCase()));
+			if (missing.length > 0 && instagram.length > 0) {
+				emitDiag(env, ctx, "apifyHandleEmpty", `${missing.length}: ${missing.map((h) => h.handle).slice(0, 5).join(",")}`);
+			}
+		}
+	} catch (e) {
+		// IG failed this run — caller keeps the last good IG snapshot. Fail LOUD to the engineer so a
+		// persistent Apify outage/402 is visible rather than looking like a quiet "no new posts".
+		if (ctx) emitDiag(env, ctx, "apifyRunFail", String((e as Error)?.message ?? e).slice(0, 80));
 	}
 
 	return { instagram, tiktok: [] };
@@ -3644,7 +3660,7 @@ async function refreshSocialCache(env: Env, ctx?: ExecutionContext): Promise<{ p
 	}
 
 	const apifyHandles = bdConfigured ? igHandles.filter((h) => h.kind === "player") : igHandles;
-	const { instagram } = await buildSocialCards(env, apifyHandles);
+	const { instagram } = await buildSocialCards(env, apifyHandles, ctx);
 	const players = instagram.filter((c) => (c as { placement?: string }).placement === "feed");
 	const playerCards = await writeSideOrKeepLastGood(env, ctx, SOCIAL_PLAYER_KEY, players, "player");
 
