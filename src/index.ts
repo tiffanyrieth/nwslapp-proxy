@@ -3898,17 +3898,23 @@ async function fetchNtRosters(slug: string): Promise<{ nation: string; name: str
 	return out;
 }
 
-/** normalized NWSL player name → club abbr, across all 16 rosters. Cached 12h in KV. Built
- *  KV-FIRST: decode the `roster:{id}` records handleRoster keeps warm (cheap KV reads, no fetch)
- *  and only live-fetch a club whose cache is cold/thin — so even a cold-cache 32-nation World Cup
- *  `?nt=` call stays well under the free-tier 50-subrequest cap. */
-async function nwslNameMap(env: Env, ctx: ExecutionContext): Promise<Map<string, string>> {
-	const cached = await env.FEED_TAGS.get(NWSL_NAMES_KEY);
-	if (cached) {
-		try {
-			return new Map(JSON.parse(cached) as [string, string][]);
-		} catch {
-			/* fall through and rebuild */
+/** normalized NWSL player name → club abbr, across all 16 rosters.
+ *  TWO FRESHNESS MODES (the Sam Kerr lesson, 2026-08-16 — a stale gate hid a July transfer from
+ *  the first routine run): `live: true` (the ?section=nwsl DECISION report + /apply validation)
+ *  skips every cache and fetches all 16 rosters (17 subrequests — affordable there); the default
+ *  cached mode (the ?nt= ledger populate, which fans out up to ~33 ESPN calls of its own and
+ *  genuinely needs the budget) reads the 12h KV map first, then `roster:{id}` records, then live.
+ *  A ledger miss from staleness only DELAYS discovery (earned-forever); a decision-report miss
+ *  hides a signing — so the decision path pays for fresh. Live builds write through to the cache. */
+async function nwslNameMap(env: Env, ctx: ExecutionContext, opts?: { live?: boolean }): Promise<Map<string, string>> {
+	if (!opts?.live) {
+		const cached = await env.FEED_TAGS.get(NWSL_NAMES_KEY);
+		if (cached) {
+			try {
+				return new Map(JSON.parse(cached) as [string, string][]);
+			} catch {
+				/* fall through and rebuild */
+			}
 		}
 	}
 	const teams = await fetchTeamAbbrs();
@@ -3916,15 +3922,17 @@ async function nwslNameMap(env: Env, ctx: ExecutionContext): Promise<Map<string,
 	await Promise.all(
 		teams.map(async (t) => {
 			let players: { name: string; team: string }[] = [];
-			try {
-				const raw = await env.FEED_TAGS.get(`roster:${t.id}`);
-				if (raw) {
-					const rec = JSON.parse(raw) as { body?: unknown };
-					const decoded = mapEspnRosterAthletes(rec.body as Parameters<typeof mapEspnRosterAthletes>[0], t.abbr);
-					if (decoded.length >= ROSTER_GOOD_MIN) players = decoded;
+			if (!opts?.live) {
+				try {
+					const raw = await env.FEED_TAGS.get(`roster:${t.id}`);
+					if (raw) {
+						const rec = JSON.parse(raw) as { body?: unknown };
+						const decoded = mapEspnRosterAthletes(rec.body as Parameters<typeof mapEspnRosterAthletes>[0], t.abbr);
+						if (decoded.length >= ROSTER_GOOD_MIN) players = decoded;
+					}
+				} catch {
+					/* cold/corrupt cache — fall to a live fetch below */
 				}
-			} catch {
-				/* cold/corrupt cache — fall to a live fetch below */
 			}
 			if (players.length === 0) players = await fetchRosterResilient(env as unknown as BracketEnv, t.id, t.abbr);
 			for (const p of players) map.set(normalizeName(p.name), t.abbr);
@@ -3999,7 +4007,7 @@ async function handlePlayerAudit(request: Request, env: Env, ctx: ExecutionConte
 			return j({ error: "unparseable JSON" }, 400);
 		}
 		const list = [...(await loadPlayerSocial(env))];
-		const nwsl = await nwslNameMap(env, ctx);
+		const nwsl = await nwslNameMap(env, ctx, { live: true });
 		const clubs = new Set(nwsl.values());
 		const igSeen = new Set(list.map((p) => p.ig.toLowerCase()));
 		const nameSeen = new Set(list.map((p) => normalizeName(p.name)));
@@ -4064,7 +4072,7 @@ async function handlePlayerAudit(request: Request, env: Env, ctx: ExecutionConte
 
 	// ── Stage 1c: the decision report the discovery routine (and owner) reads ─────────
 	if (params.get("section") === "nwsl") {
-		const [nwsl, ledger, playerList] = await Promise.all([nwslNameMap(env, ctx), readNtLedger(env), loadPlayerSocial(env)]);
+		const [nwsl, ledger, playerList] = await Promise.all([nwslNameMap(env, ctx, { live: true }), readNtLedger(env), loadPlayerSocial(env)]);
 		const featured = new Map(playerList.map((p) => [normalizeName(p.name), p]));
 
 		// candidates = (ledger ∩ current NWSL rosters) − featured, split by research state so the
