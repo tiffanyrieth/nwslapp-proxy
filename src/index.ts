@@ -313,6 +313,32 @@ const BSKY_UA = "nwslapp-proxy/0.3 (+https://nwslapp-proxy.tiffany-rieth.workers
 const FEED_TTL = 900; // 15min — the Feed is conversational, fresher than Home's 1h
 const POSTS_PER_HANDLE = 12; // recent posts pulled per account (app applies staleness)
 
+/** Hang bound for /feed's upstream fetches (Bluesky author feeds, outlet RSS, OG scrapes).
+ *  GENEROUS by design — these normally answer in 1-2s, so 8s only converts a HUNG connection
+ *  into that one source sitting out THIS refresh (per-source isolation + a diag at the call
+ *  site; the next refresh retries it fresh). It must never skip a merely-slow-normal source.
+ *  Added 2026-08-16 after one hung upstream dragged a cold /feed build past the app's 60s
+ *  client timeout (owner-approved: fix the hang class only, never blanket-ignore a source). */
+const UPSTREAM_FETCH_MS = 8000;
+// TRUE cancellation (AbortController), not a bare Promise.race: workerd allows ~6 concurrent
+// outbound connections per invocation, so a hung upstream doesn't just cost itself — it
+// STARVES the lane queue for healthy sources behind it. Abort actually frees the lane.
+// (Proven during the 2026-08-16 Bluesky degradation: 16 hung bsky fetches at 50s+ made a
+// 0.6s Guardian RSS "time out" purely from queueing. A race-only bound can't fix that.)
+async function fetchBounded(url: string, init?: RequestInit): Promise<Response> {
+	const ac = new AbortController();
+	const timer = setTimeout(() => ac.abort(), UPSTREAM_FETCH_MS);
+	try {
+		return await fetch(url, { ...init, signal: ac.signal });
+	} catch (e) {
+		if ((e as Error)?.name === "AbortError") throw Object.assign(new Error(`upstream hang >${UPSTREAM_FETCH_MS}ms`), { name: "TimeoutError" });
+		throw e;
+	} finally {
+		clearTimeout(timer);
+	}
+}
+const isTimeout = (e: unknown): boolean => ["TimeoutError", "AbortError"].includes((e as Error)?.name ?? "");
+
 // Claude Haiku relevance + team-tag (Step 2). Runs on the third-party Bluesky
 // bucket — REPORTER and LEAGUE-OUTLET accounts (both post off-topic/non-NWSL and
 // neither carries a team tag of its own). It gates relevance AND tags the team so a
@@ -1873,7 +1899,7 @@ async function buildOutletFallbackCards(abbr: string): Promise<NewsCard[]> {
 	const perFeed = await Promise.all(
 		NEWS_FEEDS.map(async (feed) => {
 			try {
-				const r = await fetch(feed.url, {
+				const r = await fetchBounded(feed.url, {
 					headers: {
 						"User-Agent": BROWSER_UA,
 						Accept: "application/rss+xml, application/xml, text/xml",
@@ -2711,7 +2737,7 @@ function isoNoFraction(s?: string): string | undefined {
 async function fetchOG(
 	url: string,
 ): Promise<{ title?: string; description?: string; image?: string; published?: string }> {
-	const r = await fetch(url, { headers: { "User-Agent": BROWSER_UA, Accept: "text/html" } });
+	const r = await fetchBounded(url, { headers: { "User-Agent": BROWSER_UA, Accept: "text/html" } });
 	if (!r.ok) throw new Error(`og fetch ${r.status}`);
 	const html = await r.text();
 
@@ -2933,7 +2959,7 @@ async function buildNewsCards(teams: string[], env: Env, ctx: ExecutionContext):
 	const perFeed = await Promise.all(
 		NEWS_FEEDS.map(async (feed) => {
 			try {
-				const r = await fetch(feed.url, {
+				const r = await fetchBounded(feed.url, {
 					headers: {
 						"User-Agent": BROWSER_UA,
 						Accept: "application/rss+xml, application/xml, text/xml",
@@ -2965,7 +2991,10 @@ async function buildNewsCards(teams: string[], env: Env, ctx: ExecutionContext):
 					});
 				}
 				return cards;
-			} catch {
+			} catch (e) {
+				// Hang-bound tripped (or outlet died): this outlet sits out THIS refresh only —
+				// loud to the engineer, retried fresh next cycle. Never a standing exclusion.
+				if (isTimeout(e)) emitDiag(env, ctx, "feedUpstreamTimeout", `rss:${feed.url.slice(0, 60)}`);
 				return [] as NewsCard[];
 			}
 		}),
@@ -3167,10 +3196,13 @@ async function handleFeed(url: URL, env: Env, ctx: ExecutionContext): Promise<Re
 		const userReporterHandles: FeedHandle[] = userHandles
 			.filter((h) => !activeDefaultSet.has(h.toLowerCase()))
 			.map((h) => ({ handle: h, kind: "reporter" }));
-		const [rawReporters, rawLeague, rawUserReporters, newsCards, social] = await Promise.all([
-			buildBlueskyCards(reporterHandles),
-			buildBlueskyCards(leagueHandles),
-			buildBlueskyCards(userReporterHandles),
+		// TWO WAVES, deliberately sequential (2026-08-16): workerd caps ~6 concurrent outbound
+		// connections per invocation, so 16 parallel Bluesky fetches starve the lane queue for
+		// everything behind them — during a Bluesky degradation that made a 0.6s RSS fetch
+		// "time out" from queueing alone. News + the KV snapshot go FIRST (fast, small); the
+		// Bluesky wave follows with its hang bound, so a Bluesky incident degrades ONLY the
+		// Bluesky sources and the rest of the feed always arrives.
+		const [newsCards, social] = await Promise.all([
 			// News (B1): per-outlet RSS → Haiku NWSL-gate + team-tag + followed-team
 			// filter → OG-enrich → newsArticle cards. Self-isolating; failures yield [].
 			buildNewsCards(teams, env, ctx),
@@ -3178,6 +3210,11 @@ async function handleFeed(url: URL, env: Env, ctx: ExecutionContext): Promise<Re
 			// (placement "feed") for the followed teams PLUS the user's followed cross-team
 			// players. (Club-official Bluesky was retired from the Feed 2026-08.)
 			readSocialCards(env),
+		]);
+		const [rawReporters, rawLeague, rawUserReporters] = await Promise.all([
+			buildBlueskyCards(reporterHandles, env, ctx),
+			buildBlueskyCards(leagueHandles, env, ctx),
+			buildBlueskyCards(userReporterHandles, env, ctx),
 		]);
 		// Reporter + league-outlet Bluesky carry no team tag of their own and post
 		// off-topic too → one Haiku pass gates relevance, team-tags, and filters to
@@ -3255,15 +3292,15 @@ async function handleValidateReporter(url: URL, env: Env, ctx: ExecutionContext)
 }
 
 /** Build cards for a set of Bluesky handles (per-handle failures isolated). */
-async function buildBlueskyCards(handles: FeedHandle[]): Promise<unknown[]> {
-	const per = await Promise.all(handles.map((h) => blueskyCardsFor(h)));
+async function buildBlueskyCards(handles: FeedHandle[], env?: Env, ctx?: ExecutionContext): Promise<unknown[]> {
+	const per = await Promise.all(handles.map((h) => blueskyCardsFor(h, env, ctx)));
 	return per.flat();
 }
 
 /** Fetch one account's recent OWN posts (reposts dropped) and map them to
  *  ContentCards. A single handle failing yields [] — isolated like /team-videos'
  *  per-team try/catch — so one dead account never sinks the whole response. */
-async function blueskyCardsFor(h: FeedHandle): Promise<unknown[]> {
+async function blueskyCardsFor(h: FeedHandle, env?: Env, ctx?: ExecutionContext): Promise<unknown[]> {
 	try {
 		const feed = await bskyAuthorFeed(h.handle, POSTS_PER_HANDLE);
 		return feed
@@ -3272,7 +3309,10 @@ async function blueskyCardsFor(h: FeedHandle): Promise<unknown[]> {
 			.filter((it) => !it.reason && it.post?.record?.text)
 			.map((it) => mapBskyPost(it.post as BskyPost, h))
 			.filter(Boolean);
-	} catch {
+	} catch (e) {
+		// Hang-bound tripped: this handle sits out THIS refresh only (retried fresh next
+		// cycle) — diag'd so a repeat-offender upstream is visible, never silently skipped.
+		if (isTimeout(e) && env && ctx) emitDiag(env, ctx, "feedUpstreamTimeout", `bsky:${h.handle}`);
 		return [];
 	}
 }
@@ -3297,7 +3337,7 @@ async function bskyAuthorFeed(actor: string, limit: number): Promise<BskyItem[]>
 	u.searchParams.set("actor", actor);
 	u.searchParams.set("limit", String(limit));
 	u.searchParams.set("filter", "posts_no_replies");
-	const r = await fetch(u.toString(), {
+	const r = await fetchBounded(u.toString(), {
 		headers: { "User-Agent": BSKY_UA, Accept: "application/json" },
 	});
 	if (!r.ok) throw new Error(`bsky getAuthorFeed ${r.status}`);
