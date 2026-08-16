@@ -759,6 +759,9 @@ export default {
 		if (url.pathname === "/social/player-audit" || url.pathname.startsWith("/social/player-audit/")) {
 			return handlePlayerAudit(request, env, ctx);
 		}
+		if (url.pathname === "/social/reporter-audit") {
+			return handleReporterAudit(request, env, ctx);
+		}
 
 		// POST telemetry ingest must be registered BEFORE the GET-only guard below.
 		if (url.pathname === "/telemetry") {
@@ -2484,25 +2487,39 @@ function latestOriginalAgeMs(feed: BskyItem[], now: number): number | null {
 	return null;
 }
 
-async function statusCheckFeedSources(): Promise<StatusSection> {
+/** One default Bluesky handle's health, shared by the admin Status tab (HTML) and
+ *  GET /social/reporter-audit (JSON) — one source of truth for the tier logic. */
+type BskyHealth = { handle: string; kind: "reporter" | "league"; tier: "ok" | "cooling" | "dormant" | "empty" | "dead"; lastPostDays: number | null };
+async function bskySourceHealth(): Promise<BskyHealth[]> {
 	const now = Date.now();
 	const bsky = FEED_HANDLES.filter((h) => h.kind === "reporter" || h.kind === "league");
-	const bskyChecks = await Promise.all(bsky.map(async (h): Promise<StatusCheck> => {
+	return Promise.all(bsky.map(async (h): Promise<BskyHealth> => {
+		const kind = h.kind as "reporter" | "league";
 		try {
 			const feed = await bskyAuthorFeed(h.handle, 15); // deeper sample so reposts don't mask an active handle
 			const age = latestOriginalAgeMs(feed, now);
-			if (age === null) {
-				return { label: h.handle, status: "fail", detail: feed.length === 0 ? "resolves but timeline is EMPTY" : "no original posts in last 15 items (repost-only?) — drop candidate" };
-			}
+			if (age === null) return { handle: h.handle, kind, tier: "empty", lastPostDays: null };
 			const days = Math.floor(age / 86_400_000);
-			const when = `last post ${days}d ago`;
-			if (age < BSKY_COOLING_MS) return { label: h.handle, status: "ok", detail: when };
-			if (age <= BSKY_DORMANT_MS) return { label: h.handle, status: "warn", detail: `${when} — cooling` };
-			return { label: h.handle, status: "fail", detail: `${when} — past the ~30d feed window, invisible in Social (drop candidate)` };
+			if (age < BSKY_COOLING_MS) return { handle: h.handle, kind, tier: "ok", lastPostDays: days };
+			if (age <= BSKY_DORMANT_MS) return { handle: h.handle, kind, tier: "cooling", lastPostDays: days };
+			return { handle: h.handle, kind, tier: "dormant", lastPostDays: days };
 		} catch {
-			return { label: h.handle, status: "fail", detail: "does NOT resolve on the keyless API — dead/renamed?" };
+			return { handle: h.handle, kind, tier: "dead", lastPostDays: null };
 		}
 	}));
+}
+
+async function statusCheckFeedSources(): Promise<StatusSection> {
+	const bskyChecks = (await bskySourceHealth()).map((s): StatusCheck => {
+		const when = s.lastPostDays !== null ? `last post ${s.lastPostDays}d ago` : "";
+		switch (s.tier) {
+			case "ok":      return { label: s.handle, status: "ok", detail: when };
+			case "cooling": return { label: s.handle, status: "warn", detail: `${when} — cooling` };
+			case "dormant": return { label: s.handle, status: "fail", detail: `${when} — past the ~30d feed window, invisible in Social (drop candidate)` };
+			case "empty":   return { label: s.handle, status: "fail", detail: "no original posts in last 15 items (repost-only or empty timeline) — drop candidate" };
+			case "dead":    return { label: s.handle, status: "fail", detail: "does NOT resolve on the keyless API — dead/renamed?" };
+		}
+	});
 	const rssChecks = await Promise.all(NEWS_FEEDS.map(async (f): Promise<StatusCheck> => {
 		try {
 			const r = await fetch(f.url, { headers: { "User-Agent": BROWSER_UA, Accept: "application/rss+xml, application/xml, text/xml" } });
@@ -4139,6 +4156,98 @@ async function handlePlayerAudit(request: Request, env: Env, ctx: ExecutionConte
 	}
 
 	return j({ error: "specify ?section=nwsl (the audit report) or ?nt=<slug> (ledger populate)", validNt: ntAuditFeeds() }, 400);
+}
+
+// ── Social self-tuning · Stage 2d: reporter audit surface ─────────────────────────
+/** GET /social/reporter-audit — admin/routine-keyed JSON for the reporter side of the
+ *  self-tuning routine: default-handle health (same tier logic as the admin Status tab via
+ *  bskySourceHealth), a consecutive-dormant streak (the settled drop rule: flagged dormant on
+ *  TWO consecutive audits ⇒ strong drop candidate; one flag = watch, could be vacation/leave),
+ *  and the fans' add-signals from anonymous analytics (the Stage-3 counter feeds this — built
+ *  consumer-first per the backbone rule, empty until that ships). Discovery beyond signals is
+ *  the ROUTINE's web research (follows-of-follows graph signals REJECTED by owner). */
+const REPORTER_AUDIT_STREAK_KEY = "social:reporter-dormant-streak";
+async function handleReporterAudit(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
+	if (!auditAuthed(request, env)) {
+		return new Response("Authentication required.", { status: 401, headers: { "WWW-Authenticate": adminRealm("NWSLApp Admin") } });
+	}
+	const health = await bskySourceHealth();
+
+	// Consecutive-dormant streaks: previous audit's flagged set ∩ this one's.
+	// ⚠️ OUTAGE GUARD (live-proven necessary during the 2026-08-16 Bluesky outage, when all 16
+	// read "dead"): a MAJORITY flagged at once means Bluesky is down, not 16 simultaneous
+	// retirements — freeze the streak state (don't persist, don't advance) and say so, so an
+	// audit run during an outage can never manufacture mass drop candidates.
+	const flaggedNow = health.filter((h) => h.tier === "dormant" || h.tier === "empty" || h.tier === "dead").map((h) => h.handle);
+	const outageSuspected = flaggedNow.length > health.length / 2;
+	let prevFlagged: string[] = [];
+	try {
+		prevFlagged = JSON.parse((await env.FEED_TAGS.get(REPORTER_AUDIT_STREAK_KEY)) ?? "[]") as string[];
+	} catch {
+		/* first run / corrupt — no streaks */
+	}
+	const secondConsecutive = outageSuspected ? [] : flaggedNow.filter((h) => prevFlagged.includes(h));
+	if (!outageSuspected) ctx.waitUntil(env.FEED_TAGS.put(REPORTER_AUDIT_STREAK_KEY, JSON.stringify(flaggedNow)));
+	else emitDiag(env, ctx, "reporterAuditOutage", `${flaggedNow.length}/${health.length} flagged — streaks frozen`);
+
+	// Fans' add-signals (anonymous Level-3 counters; NO ids ever): reporter_added rows carry
+	// param "TEAM|handle", reporter_add_session is the adders denominator. The threshold rule
+	// (owner): 3+ adds of one handle among a team's fans ⇒ escalate to routine research.
+	let addSignals: { handle: string; totalAdds: number; byTeam: Record<string, number> }[] = [];
+	let totalAdders = 0;
+	const sb = env as unknown as { SUPABASE_URL?: string; SUPABASE_SERVICE_ROLE_KEY?: string };
+	if (sb.SUPABASE_URL && sb.SUPABASE_SERVICE_ROLE_KEY) {
+		try {
+			const base = sb.SUPABASE_URL.replace(/\/$/, "");
+			const r = await fetch(
+				`${base}/rest/v1/analytics_counters?event=in.(reporter_added,reporter_add_session)&select=event,param,count`,
+				{ headers: { apikey: sb.SUPABASE_SERVICE_ROLE_KEY, Authorization: `Bearer ${sb.SUPABASE_SERVICE_ROLE_KEY}` } },
+			);
+			if (r.ok) {
+				const rows = (await r.json()) as { event: string; param: string; count: number }[];
+				const byHandle = new Map<string, { totalAdds: number; byTeam: Record<string, number> }>();
+				for (const row of rows) {
+					if (row.event === "reporter_add_session") {
+						totalAdders += row.count;
+						continue;
+					}
+					const [team, ...rest] = row.param.split("|");
+					const handle = rest.join("|");
+					if (!handle) continue;
+					const e = byHandle.get(handle) ?? { totalAdds: 0, byTeam: {} };
+					e.totalAdds += row.count;
+					e.byTeam[team] = (e.byTeam[team] ?? 0) + row.count;
+					byHandle.set(handle, e);
+				}
+				addSignals = [...byHandle.entries()].map(([handle, e]) => ({ handle, ...e })).sort((a, b) => b.totalAdds - a.totalAdds);
+			} else {
+				emitDiag(env, ctx, "reporterAuditSbFail", `analytics read ${r.status}`);
+			}
+		} catch (e) {
+			emitDiag(env, ctx, "reporterAuditSbFail", String((e as Error)?.message ?? e).slice(0, 60));
+		}
+	}
+
+	return new Response(
+		JSON.stringify(
+			{
+				generatedAt: new Date().toISOString(),
+				defaults: health,
+				outageSuspected,
+				dropCandidates: outageSuspected
+					? { secondConsecutiveFlag: [], firstFlag: [], note: "MAJORITY of defaults flagged at once ⇒ Bluesky outage suspected — streaks frozen, no candidates this run; re-audit when healthy" }
+					: {
+							secondConsecutiveFlag: secondConsecutive,
+							firstFlag: flaggedNow.filter((h) => !secondConsecutive.includes(h)),
+							note: "two consecutive flagged audits = strong drop candidate; one = watch (vacation/leave)",
+						},
+				addSignals: { totalAdders, handles: addSignals, note: "empty until the reporter_added counter ships (Stage 3); threshold = 3+ adds of one handle among a team's fans" },
+			},
+			null,
+			2,
+		),
+		{ headers: { "Content-Type": "application/json" } },
+	);
 }
 
 /** Write one side's fresh cards to its KV key — or, when THIS scrape came back empty
