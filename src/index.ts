@@ -3696,6 +3696,15 @@ const NT_LEDGER_KEY = "social:nt-ledger";
 const NWSL_NAMES_KEY = "social:nwsl-names"; // cached normalized-name → club-abbr map (12h)
 const NWSL_NAMES_TTL = 60 * 60 * 12;
 
+/** Feeds the `?nt=` audit accepts = WOMENS_NT_FEEDS minus the two pan-European QUALIFYING feeds
+ *  (~53 teams each → 1 + 53 roster fetches, over the free-plan 50-subrequest cap, so they'd
+ *  silently under-count). Excluded BY DESIGN, not paged around (owner 2026-08-16): qualifying is
+ *  the expanded-trial player pool; anyone who matters appears in a friendly/major within a run or
+ *  two, and the ledger is earned-forever so a miss only delays discovery, never loses it. */
+const NT_AUDIT_EXCLUDED = new Set(["uefa.w.nations", "fifa.wworldq.uefa"]);
+// Lazy: WOMENS_NT_FEEDS is declared further down the module — a top-level .filter() would TDZ-crash at init.
+const ntAuditFeeds = () => WOMENS_NT_FEEDS.filter((s) => !NT_AUDIT_EXCLUDED.has(s));
+
 type LedgerEntry = { name: string; firstSeen: string; source: string; nation: string | null };
 
 /** ESPN NT rosters come GROUPED by position (`athletes[].items[]`), unlike the FLAT NWSL club
@@ -3808,7 +3817,7 @@ async function handlePlayerAudit(request: Request, env: Env, ctx: ExecutionConte
 	const nt = new URL(request.url).searchParams.get("nt");
 
 	if (nt) {
-		if (!WOMENS_NT_FEEDS.includes(nt)) return j({ error: "unknown nt slug", validNt: WOMENS_NT_FEEDS }, 400);
+		if (!ntAuditFeeds().includes(nt)) return j({ error: "unknown or excluded nt slug", validNt: ntAuditFeeds() }, 400);
 		const [ntPlayers, nwsl] = await Promise.all([fetchNtRosters(nt), nwslNameMap(env, ctx)]);
 		const ledger = await readNtLedger(env);
 		const before = Object.keys(ledger).length;
@@ -3839,7 +3848,7 @@ async function handlePlayerAudit(request: Request, env: Env, ctx: ExecutionConte
 		});
 	}
 
-	return j({ error: "specify ?nt=<slug> (the ?section=nwsl report is Stage 1c, not built yet)", validNt: WOMENS_NT_FEEDS }, 400);
+	return j({ error: "specify ?nt=<slug> (the ?section=nwsl report is Stage 1c, not built yet)", validNt: ntAuditFeeds() }, 400);
 }
 
 /** Write one side's fresh cards to its KV key — or, when THIS scrape came back empty
