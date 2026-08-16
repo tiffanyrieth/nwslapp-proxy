@@ -526,7 +526,11 @@ const NEWS_SCHEMA = {
 // 2026-08 — the app's Clubs chip is gone; a club's Home voice is its IG/YT/news.)
 interface FeedHandle {
 	handle: string;
-	kind: "reporter" | "league";
+	kind: "reporter" | "league" | "player";
+	// Player-kind extras (2c): her NWSL club (default players; undefined for a user add) and
+	// her IG id — the app's player-follow key, so bsky + IG cards toggle as ONE player.
+	abbr?: string;
+	playerId?: string;
 }
 const FEED_HANDLES: FeedHandle[] = [
 	// Reporters / journalists (league-wide)
@@ -3161,6 +3165,9 @@ async function handleFeed(url: URL, env: Env, ctx: ExecutionContext): Promise<Re
 	const userHandles = parseHandleList(url.searchParams.get("handles")).slice(0, MAX_USER_HANDLES);
 	const userPlayers = new Set(parseHandleList(url.searchParams.get("players")));
 	const mutedDefaults = new Set(parseHandleList(url.searchParams.get("muted")));
+	// 2c: Bluesky handles the user added AS PLAYERS (the add-flow's reporter|player pick).
+	// Player voices NEVER go through Haiku (owner law) — served unfiltered like player IG.
+	const userPlayerBsky = parseHandleList(url.searchParams.get("playerBsky")).slice(0, MAX_USER_HANDLES);
 
 	const cache = caches.default;
 	const cacheUrl = new URL(url);
@@ -3173,6 +3180,8 @@ async function handleFeed(url: URL, env: Env, ctx: ExecutionContext): Promise<Re
 	else cacheUrl.searchParams.delete("players");
 	if (mutedDefaults.size) cacheUrl.searchParams.set("muted", [...mutedDefaults].sort().join(","));
 	else cacheUrl.searchParams.delete("muted");
+	if (userPlayerBsky.length) cacheUrl.searchParams.set("playerBsky", [...userPlayerBsky].sort().join(","));
+	else cacheUrl.searchParams.delete("playerBsky");
 	const cacheKey = new Request(cacheUrl.toString(), { method: "GET" });
 
 	const hit = await cache.match(cacheKey);
@@ -3211,10 +3220,20 @@ async function handleFeed(url: URL, env: Env, ctx: ExecutionContext): Promise<Re
 			// players. (Club-official Bluesky was retired from the Feed 2026-08.)
 			readSocialCards(env),
 		]);
-		const [rawReporters, rawLeague, rawUserReporters] = await Promise.all([
+		// 2c: featured players who ALSO have a Bluesky (KV list `bsky` field — the routine's
+		// bsky-only discoveries land here) — scoped like their IG: followed teams ∪ the user's
+		// cross-team follows. Plus the user's own player-Bluesky adds. NO Haiku on any of it.
+		const defaultPlayerBsky: FeedHandle[] = (await loadPlayerSocial(env))
+			.filter((p) => p.bsky && (teams.includes(p.abbr) || userPlayers.has(p.ig)))
+			.map((p) => ({ handle: p.bsky as string, kind: "player", abbr: p.abbr, playerId: p.ig }));
+		const userPlayerBskyHandles: FeedHandle[] = userPlayerBsky.map((h) => ({ handle: h, kind: "player" }));
+
+		const [rawReporters, rawLeague, rawUserReporters, rawDefaultPlayerBsky, rawUserPlayerBsky] = await Promise.all([
 			buildBlueskyCards(reporterHandles, env, ctx),
 			buildBlueskyCards(leagueHandles, env, ctx),
 			buildBlueskyCards(userReporterHandles, env, ctx),
+			buildBlueskyCards(defaultPlayerBsky, env, ctx),
+			buildBlueskyCards(userPlayerBskyHandles, env, ctx),
 		]);
 		// Reporter + league-outlet Bluesky carry no team tag of their own and post
 		// off-topic too → one Haiku pass gates relevance, team-tags, and filters to
@@ -3233,8 +3252,9 @@ async function handleFeed(url: URL, env: Env, ctx: ExecutionContext): Promise<Re
 		// to the owner-curated defaults no matter how many handles users add. `userAdded`
 		// marks the cards for the app's layering logic.
 		const userReporterCards = rawUserReporters.map((c) => ({ ...(c as Record<string, unknown>), userAdded: true }));
+		const userPlayerBskyCards = rawUserPlayerBsky.map((c) => ({ ...(c as Record<string, unknown>), userAdded: true }));
 		const playerSocial = socialFor(social, teams, new Set(["feed"]), userPlayers);
-		cards = [...socialBluesky, ...userReporterCards, ...newsCards, ...playerSocial].sort(
+		cards = [...socialBluesky, ...userReporterCards, ...newsCards, ...playerSocial, ...rawDefaultPlayerBsky, ...userPlayerBskyCards].sort(
 			byTimestampDesc,
 		);
 		// Collapse identical-text duplicates (bot double-posts) BEFORE the cap, so a
@@ -3364,14 +3384,16 @@ function mapBskyPost(post: BskyPost, h: FeedHandle): unknown | null {
 		id: `bsky-${rkey}`,
 		layout: "blueskyReporter",
 		platform: "bluesky",
-		// Source class for the app's Feed chips (Reporters · …). Players come from the
-		// IG pipe; here it's reporter / league-outlet (club-official Bluesky retired).
-		sourceType: h.kind === "league" ? "league" : "reporter",
+		// Source class for the app's Feed chips. Player-kind (2c) = a player's OWN Bluesky —
+		// the trusted fast path like player IG: NEVER Haiku-classified (owner law).
+		sourceType: h.kind === "league" ? "league" : h.kind === "player" ? "player" : "reporter",
 		// Reporters + league outlets are league-wide (no team tag of their own; Haiku
-		// team-tags + scopes them downstream). All Bluesky lives in the Feed only.
+		// team-tags + scopes them downstream). A DEFAULT player's card carries her club
+		// (server already scoped it to followed teams); user adds stay league-wide-relevant.
 		placement: "feed",
-		teamAbbreviation: undefined,
-		isLeague: true,
+		teamAbbreviation: h.kind === "player" ? h.abbr : undefined,
+		isLeague: h.kind !== "player" || !h.abbr,
+		playerId: h.kind === "player" ? h.playerId : undefined,
 		authorName: post.author?.displayName || handle,
 		handle: `@${handle}`,
 		bodyText: post.record?.text,
