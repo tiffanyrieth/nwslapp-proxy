@@ -379,14 +379,24 @@ const SOCIAL_CACHE_TTL = 3 * 24 * 3600; // 3d KV safety net — the every-2-day 
 const SOCIAL_POLICY = `You are filtering and tagging Bluesky posts for an NWSL (US National Women's Soccer League) fan app. The posts come from soccer reporters/journalists and NWSL media/league accounts, who also post off-topic things (other sports, foreign leagues, men's soccer, personal life, general chatter).
 
 For each post (handle + text) decide three things:
-1. "isNWSL": true ONLY if the post is clearly about the NWSL — an NWSL club, an NWSL match/result/standing/award, a player at an NWSL club, a transfer into or out of an NWSL club, or the US women's national team (USWNT). false for everything else, INCLUDING women's soccer that isn't NWSL (England's WSL, Liga F, the UEFA Women's Champions League, other foreign leagues), other sports (PWHL, WNBA), men's soccer (including the men's World Cup), and the author's personal/off-topic posts. A post that only mentions another league, market, or country in passing — the size of the WSL's audience, a foreign transfer market, broadcast deals abroad — is NOT about the NWSL: the NWSL (a club/player/match/the league itself) or the USWNT must be the SUBJECT of the post. Example: "Japan is the joint-largest market for the WSL outside of the UK" is about England's WSL → isNWSL false. When you are unsure whether a post is about the NWSL, return false.
-2. "teams": if isNWSL, the NWSL club abbreviation(s) the post is primarily about; [] for genuinely league-wide/general NWSL or USWNT posts. If isNWSL is false, return [].
+1. "isNWSL": true ONLY if the post is clearly about the NWSL — an NWSL club, an NWSL match/result/standing/award, a player at an NWSL club, a transfer into or out of an NWSL club, or the US women's national team (USWNT) — OR if an NWSL-rostered player is a PRIMARY SUBJECT of the post in ANY competition, including her own country's national team (a hat trick at WAFCON, a World Cup or Olympics performance, a continental tournament, an international friendly). Soccer is worldwide and NWSL players represent many countries: the NWSL connection is the PLAYER, not the competition. "Banda scores a hat trick for Zambia at WAFCON" → isNWSL true (Barbra Banda plays for Orlando Pride). PRIMARY SUBJECT is a real bar: the post must be meaningfully about her — her performance, her news, her story. Being one name among many (a tournament preview naming dozens of players, a best-XI list, a full squad announcement for a non-US country) is a passing mention, NOT primary-subject. false for everything else, INCLUDING women's soccer that isn't NWSL with no NWSL player as a primary subject (England's WSL, Liga F, the UEFA Women's Champions League, other foreign leagues), other sports (PWHL, WNBA), men's soccer (including the men's World Cup), and the author's personal/off-topic posts. A post that only mentions another league, market, or country in passing — the size of the WSL's audience, a foreign transfer market, broadcast deals abroad — is NOT about the NWSL. Example: "Japan is the joint-largest market for the WSL outside of the UK" is about England's WSL → isNWSL false. When you are unsure, return false.
+2. "teams": if isNWSL, the NWSL club abbreviation(s) the post is primarily about; for a national-team post kept because of an NWSL player, tag HER NWSL CLUB (use the FEATURED NWSL PLAYERS list when present, plus your knowledge of current NWSL rosters); [] for genuinely league-wide/general NWSL or USWNT posts. If isNWSL is false, return [].
 3. "leagueNews": true ONLY when isNWSL is true AND teams is empty AND the post is genuine league-wide NWSL NEWS — expansion, the schedule/fixtures release, awards/honors, the playoff race, rule/CBA/roster-rule changes, or other league-wide announcements. false for general opinion, hot takes, predictions, banter, or chatter not tied to hard news. If isNWSL is false or teams is non-empty, return false.
 
 The 16 NWSL teams and their abbreviations:
 LA = Angel City FC, BAY = Bay FC, BOS = Boston, CHI = Chicago Stars, DEN = Denver, GFC = Gotham FC, HOU = Houston Dash, KC = Kansas City Current, NC = North Carolina Courage, ORL = Orlando Pride, POR = Portland Thorns, LOU = Racing Louisville, SD = San Diego Wave, SEA = Seattle Reign, UTA = Utah Royals, WAS = Washington Spirit.
 
 Rules: a single-team post → exactly that one abbreviation; a multi-team post → all clubs named; league-wide → []. Only use the 16 abbreviations above. Echo each post's id exactly.`;
+
+/** The featured-player ↔ club map injected into BOTH classifier prompts (social + news) so
+ *  Haiku can connect an international post to the player's NWSL club ("Banda scores for
+ *  Zambia" → ORL). Built from the LIVE KV player list — the day the routine adds a player,
+ *  the classifiers know her with no deploy. ~34–80 names ≈ trivial input tokens, and
+ *  verdicts are cached per post, so cost impact is nil. */
+function featuredPlayerMapBlock(players: PlayerSocialEntry[]): string {
+	const pairs = players.map((p) => `${p.name} → ${p.abbr}`).join("; ");
+	return `FEATURED NWSL PLAYERS (name → club; not exhaustive — any current NWSL player qualifies): ${pairs}.`;
+}
 
 // Forced structured output (output_config.format) — Haiku 4.5 returns the first
 // text block as JSON matching this schema. No min/max constraints (unsupported);
@@ -453,8 +463,8 @@ const NEWS_TEAM_ABBR_SET = new Set(NEWS_TEAM_ABBRS);
 const NEWS_POLICY = `You are filtering and tagging news articles for an NWSL (US National Women's Soccer League) fan app. The articles come from women's-soccer outlets whose feeds also carry non-NWSL items (other women's sports like the PWHL/WNBA, the English WSL or other foreign leagues, men's soccer, general news).
 
 For each article (headline + outlet) decide two things:
-1. "isNWSL": true ONLY if the article is primarily about the NWSL itself — an NWSL club, an NWSL match/standing/award/power-ranking, a player AT an NWSL club in an NWSL context, or a transfer INTO or OUT OF an NWSL club. false for everything else, INCLUDING: national-team soccer (the USWNT or ANY country's national team — international friendlies, tournaments, the World Cup, call-ups, FIFA windows) EVEN WHEN NWSL players take part; women's soccer that isn't NWSL (England's WSL, Spain's Liga F, the UEFA Women's Champions League, other foreign leagues); players moving between two non-NWSL clubs; other sports (PWHL, WNBA); and men's soccer. When the headline centers a national team, an international match/window, a foreign league, or a non-NWSL transfer, isNWSL is false even though it may involve women's soccer or NWSL players. When unsure, return false.
-2. "teams": if isNWSL, the NWSL club abbreviation(s) it is primarily about; [] for genuinely league-wide/general NWSL news. If isNWSL is false, return [].
+1. "isNWSL": true ONLY if the article is primarily about the NWSL itself — an NWSL club, an NWSL match/standing/award/power-ranking, a player AT an NWSL club, a transfer INTO or OUT OF an NWSL club, or the US women's national team (USWNT) — OR if an NWSL-rostered player is a PRIMARY SUBJECT of the article in ANY competition, including her own country's national team (WAFCON, the World Cup, the Olympics, continental tournaments, friendlies). Soccer is worldwide and NWSL players represent many countries: she plays for her club AND her country, so an article about her national-team goal is news about an NWSL club's player. "Banda hat trick sends Zambia to the WAFCON final" → isNWSL true (Barbra Banda plays for Orlando Pride). PRIMARY SUBJECT is a real bar: the article must be meaningfully about her — her performance, her news, her story. Being one name among many (a tournament preview naming dozens, a squad-list announcement for a non-US country, a best-XI round-up) is a passing mention, NOT primary-subject. false for everything else, INCLUDING: women's soccer that isn't NWSL with no NWSL player as a primary subject (England's WSL, Spain's Liga F, the UEFA Women's Champions League, other foreign leagues); players moving between two non-NWSL clubs; other sports (PWHL, WNBA); and men's soccer. When unsure, return false.
+2. "teams": if isNWSL, the NWSL club abbreviation(s) it is primarily about; for a national-team article kept because of an NWSL player, tag HER NWSL CLUB (use the FEATURED NWSL PLAYERS list when present, plus your knowledge of current NWSL rosters); [] for genuinely league-wide/general NWSL or USWNT news. If isNWSL is false, return [].
 
 The 16 NWSL teams and their abbreviations:
 LA = Angel City FC, BAY = Bay FC, BOS = Boston, CHI = Chicago Stars, DEN = Denver, GFC = Gotham FC, HOU = Houston Dash, KC = Kansas City Current, NC = North Carolina Courage, ORL = Orlando Pride, POR = Portland Thorns, LOU = Racing Louisville, SD = San Diego Wave, SEA = Seattle Reign, UTA = Utah Royals, WAS = Washington Spirit.
@@ -4196,7 +4206,9 @@ async function classifySocialBluesky(
 	if (typed.length === 0) return [];
 	const followed = new Set(teams);
 	const verdicts = new Map<string, SocialVerdict>();
-	const vkey = (id: string) => `sv2-${id}`;
+	// sv2→sv3 (2026-08-16): player-centric international rule — bump orphans week-old verdicts
+	// judged under the old "USWNT-only" policy so the new rule applies immediately.
+	const vkey = (id: string) => `sv3-${id}`;
 
 	// 1. Load cached verdicts (one KV read per card; misses return null).
 	const cached = await Promise.all(
@@ -4211,11 +4223,12 @@ async function classifySocialBluesky(
 
 	// 2. Classify the misses via Haiku, batched. No key → skip (those fail closed below).
 	if (uncached.length > 0 && env.ANTHROPIC_API_KEY) {
+		const playerMap = featuredPlayerMapBlock(await loadPlayerSocial(env));
 		for (let i = 0; i < uncached.length; i += HAIKU_BATCH) {
 			const batch = uncached.slice(i, i + HAIKU_BATCH);
 			let out: SocialVerdict[] | null;
 			try {
-				out = await haikuClassifySocialBatch(batch, env.ANTHROPIC_API_KEY);
+				out = await haikuClassifySocialBatch(batch, env.ANTHROPIC_API_KEY, playerMap);
 			} catch {
 				out = null; // fail closed: this batch stays unjudged → dropped below
 			}
@@ -4266,7 +4279,7 @@ async function classifySocialBluesky(
 }
 
 /** Classify one batch of social posts via a single Haiku call (forced JSON). */
-async function haikuClassifySocialBatch(cards: FeedCard[], apiKey: string): Promise<SocialVerdict[]> {
+async function haikuClassifySocialBatch(cards: FeedCard[], apiKey: string, playerMap: string): Promise<SocialVerdict[]> {
 	const list = cards
 		.map((c) => {
 			const handle = (c.handle ?? "").replace(/^@/, "");
@@ -4288,7 +4301,7 @@ async function haikuClassifySocialBatch(cards: FeedCard[], apiKey: string): Prom
 			messages: [
 				{
 					role: "user",
-					content: `${SOCIAL_POLICY}\n\nClassify each post. Echo its id exactly.\n\n${list}`,
+					content: `${SOCIAL_POLICY}\n\n${playerMap}\n\nClassify each post. Echo its id exactly.\n\n${list}`,
 				},
 			],
 			output_config: { format: { type: "json_schema", schema: SOCIAL_SCHEMA } },
@@ -4335,10 +4348,11 @@ async function tagNewsTeams(
 	const verdicts = new Map<string, NewsVerdict>();
 
 	// 1. Load cached verdicts (one KV read per card; misses return null). The key is
-	//    versioned (`nv2-`) so tightening the policy/schema can be rolled by bumping
-	//    the version rather than waiting out every cached verdict's TTL. (nv1→nv2:
-	//    dropped the USWNT/national-team relevance allowance.)
-	const vkey = (id: string) => `nv2-${id}`;
+	//    versioned (`nv3-`) so a policy/schema change rolls by bumping the version rather
+	//    than waiting out every cached verdict's TTL. (nv1→nv2: dropped the USWNT/NT
+	//    allowance. nv2→nv3, 2026-08-16: that exclusion is REVERSED into the unified
+	//    player-centric international rule — an NWSL player as primary subject matches.)
+	const vkey = (id: string) => `nv3-${id}`;
 	const cached = await Promise.all(cards.map((c) => env.FEED_TAGS.get(vkey(c.id), "json")));
 	const uncached: NewsCard[] = [];
 	cards.forEach((c, i) => {
@@ -4349,11 +4363,12 @@ async function tagNewsTeams(
 
 	// 2. Tag the misses via Haiku, batched. No key → skip (everything fails open).
 	if (uncached.length > 0 && env.ANTHROPIC_API_KEY) {
+		const playerMap = featuredPlayerMapBlock(await loadPlayerSocial(env));
 		for (let i = 0; i < uncached.length; i += HAIKU_BATCH) {
 			const batch = uncached.slice(i, i + HAIKU_BATCH);
 			let out: NewsVerdict[] | null;
 			try {
-				out = await haikuTagNewsBatch(batch, env.ANTHROPIC_API_KEY);
+				out = await haikuTagNewsBatch(batch, env.ANTHROPIC_API_KEY, playerMap);
 			} catch {
 				out = null; // fail open: batch unjudged → kept league-wide below
 			}
@@ -4391,7 +4406,7 @@ async function tagNewsTeams(
 }
 
 /** Tag one batch of news cards to team(s) via a single Haiku call (forced JSON). */
-async function haikuTagNewsBatch(cards: NewsCard[], apiKey: string): Promise<NewsVerdict[]> {
+async function haikuTagNewsBatch(cards: NewsCard[], apiKey: string, playerMap: string): Promise<NewsVerdict[]> {
 	const list = cards
 		.map((c) => {
 			const src = c.sourceName ?? "";
@@ -4414,7 +4429,7 @@ async function haikuTagNewsBatch(cards: NewsCard[], apiKey: string): Promise<New
 			messages: [
 				{
 					role: "user",
-					content: `${NEWS_POLICY}\n\nTag each article. Echo its id exactly.\n\n${list}`,
+					content: `${NEWS_POLICY}\n\n${playerMap}\n\nTag each article. Echo its id exactly.\n\n${list}`,
 				},
 			],
 			output_config: { format: { type: "json_schema", schema: NEWS_SCHEMA } },
