@@ -560,9 +560,14 @@ const CLUB_SOCIAL: Record<string, { name: string; ig: string; tiktok?: string }>
 	WAS: { name: "Washington Spirit",    ig: "washingtonspirit",   tiktok: "washspirit" },        // ⚠️ TikTok abbreviated
 };
 
-// USWNT-pool + marquee-international players → IG only, routed to current NWSL club.
-// Europe-based (Fox/Girma/A.Thompson) included per owner, tagged to last NWSL club.
-const PLAYER_SOCIAL: Array<{ name: string; abbr: string; ig: string }> = [
+// The featured-player pool is DATA, not code (owner 2026-08-16, full automation): the live
+// list lives in KV (`social:player-list`), written by the self-tuning routine through
+// POST /social/player-audit/apply. This constant is only the SEED — served verbatim until
+// the first apply creates the KV record; never edited to add/drop players after that.
+// Europe-based (Fox/Girma/A.Thompson) grandfathered per owner, tagged to last NWSL club.
+type PlayerSocialEntry = { name: string; abbr: string; ig: string; bsky?: string; addedAt?: string; source?: string };
+const PLAYER_LIST_KEY = "social:player-list";
+const PLAYER_SOCIAL_SEED: PlayerSocialEntry[] = [
 	{ name: "Trinity Rodman",   abbr: "WAS", ig: "trinity_rodman" },
 	{ name: "Mallory Swanson",  abbr: "CHI", ig: "malpugh" },
 	{ name: "Sophia Wilson",    abbr: "POR", ig: "sophiawilson" },
@@ -601,14 +606,29 @@ const PLAYER_SOCIAL: Array<{ name: string; abbr: string; ig: string }> = [
 
 // IG-only for now (TikTok deferred — owner decision). CLUB_SOCIAL.tiktok handles are
 // kept above as ready reference for when TikTok is re-enabled (see buildSocialCards).
-const SOCIAL_HANDLES: SocialHandle[] = [
-	...Object.entries(CLUB_SOCIAL).map(
-		([abbr, c]): SocialHandle => ({ handle: c.ig, platform: "instagram", kind: "team", abbr, name: c.name }),
-	),
-	...PLAYER_SOCIAL.map(
-		(p): SocialHandle => ({ handle: p.ig, platform: "instagram", kind: "player", abbr: p.abbr, name: p.name }),
-	),
-];
+// Clubs stay STATIC code (16 clubs, changes ~never); players are loaded per-use from KV.
+const CLUB_HANDLES: SocialHandle[] = Object.entries(CLUB_SOCIAL).map(
+	([abbr, c]): SocialHandle => ({ handle: c.ig, platform: "instagram", kind: "team", abbr, name: c.name }),
+);
+
+/** The LIVE featured-player list: KV overlay if the routine has ever written one, else the seed.
+ *  Fail-open to the seed on a corrupt record (diag'd by the writer path, never silent-empty). */
+async function loadPlayerSocial(env: Env): Promise<PlayerSocialEntry[]> {
+	try {
+		const raw = await env.FEED_TAGS.get(PLAYER_LIST_KEY);
+		if (raw) {
+			const list = JSON.parse(raw) as PlayerSocialEntry[];
+			if (Array.isArray(list) && list.length > 0 && list.every((p) => p.name && p.abbr && p.ig)) return list;
+		}
+	} catch {
+		/* fall through to seed */
+	}
+	return PLAYER_SOCIAL_SEED;
+}
+
+function playerIgHandles(players: PlayerSocialEntry[]): SocialHandle[] {
+	return players.map((p): SocialHandle => ({ handle: p.ig, platform: "instagram", kind: "player", abbr: p.abbr, name: p.name }));
+}
 
 export default {
 	async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
@@ -693,9 +713,10 @@ export default {
 				url.searchParams.get("sweep") === "1");
 		}
 
-		// Admin-only: social self-tuning player audit (Stage 1b `?nt=<slug>` ledger populate;
-		// 1c `?section=nwsl` report to come). GET + self-checks the admin key.
-		if (url.pathname === "/social/player-audit") {
+		// Admin/routine-keyed social self-tuning audit surface: GET ?nt= (ledger populate),
+		// GET ?section=nwsl (decision report), POST /research + /apply (routine write-back).
+		// Prefix match + registered BEFORE the GET-only guard (the two POSTs need it).
+		if (url.pathname === "/social/player-audit" || url.pathname.startsWith("/social/player-audit/")) {
 			return handlePlayerAudit(request, env, ctx);
 		}
 
@@ -871,7 +892,7 @@ export default {
 			return handleFeed(url, env, ctx);
 		}
 		if (url.pathname === "/feed/players") {
-			return handlePlayerDirectory();
+			return handlePlayerDirectory(env);
 		}
 		if (url.pathname === "/feed/validate-reporter") {
 			return handleValidateReporter(url, env, ctx);
@@ -3176,13 +3197,13 @@ async function handleFeed(url: URL, env: Env, ctx: ExecutionContext): Promise<Re
 
 /** GET /feed/players — the DIRECTORY of the featured players (Phase 3 "Follow players").
  *  The app only receives followed-team player cards on /feed, so it needs this to browse
- *  them all + follow across team lines. Served from PLAYER_SOCIAL (the same pool the 6-month
- *  routine keeps current) so it's always fresh and the app stays thin. `id` is the IG handle
- *  — the stable key the app sends back in /feed's `players` param. */
-function handlePlayerDirectory(): Response {
-	const players = PLAYER_SOCIAL.map((p) => ({ id: p.ig, name: p.name, team: p.abbr }));
+ *  them all + follow across team lines. Served from the LIVE player list (KV overlay the
+ *  self-tuning routine maintains, seed until then) so it's always fresh and the app stays
+ *  thin. `id` is the IG handle — the stable key the app sends back in /feed's `players` param. */
+async function handlePlayerDirectory(env: Env): Promise<Response> {
+	const players = (await loadPlayerSocial(env)).map((p) => ({ id: p.ig, name: p.name, team: p.abbr }));
 	const headers = new Headers({ "Content-Type": "application/json" });
-	headers.set("Cache-Control", "public, max-age=3600"); // static until the next deploy
+	headers.set("Cache-Control", "public, max-age=3600"); // 1h edge cache; routine changes land within the hour
 	return new Response(JSON.stringify(players), { status: 200, headers });
 }
 
@@ -3393,7 +3414,7 @@ function capPerHandle(cards: unknown[], max: number): unknown[] {
 // it. We never scrape on a user request — a ~50-account sync run is far too slow
 // for the request path and would risk a Worker timeout; the cron has a generous
 // budget and pins Apify to ~1 run/day. The two actors + the handle map are the
-// SOCIAL_* constants / SOCIAL_HANDLES above. Mappers are exported for unit tests.
+// SOCIAL_* constants / CLUB_HANDLES + loadPlayerSocial above. Mappers are exported for unit tests.
 // ---------------------------------------------------------------------------
 
 /** Normalize an ISO string OR a unix timestamp (seconds or ms) to the app's
@@ -3570,7 +3591,7 @@ export async function handleBrightDataWebhook(request: Request, env: Env, ctx: E
 		return new Response("bad body", { status: 400 });
 	}
 
-	const clubs = SOCIAL_HANDLES.filter((h) => h.platform === "instagram" && h.kind === "team");
+	const clubs = CLUB_HANDLES;
 	const byUser = new Map(clubs.map((h) => [h.handle.toLowerCase(), h]));
 	const seen = new Set<string>();
 	const cards = items
@@ -3609,11 +3630,11 @@ export async function handleBrightDataWebhook(request: Request, env: Env, ctx: E
  *  To re-enable TikTok: add a SEQUENTIAL second pass (after IG, to stay under that cap)
  *  scraping APIFY_TIKTOK_ACTOR over the CLUB_SOCIAL.tiktok handles → mapApifyTikTok.
  *  IG empty (or no APIFY_TOKEN) → caller keeps the last good snapshot (→ seed fallback). */
-async function buildSocialCards(env: Env, handles?: SocialHandle[], ctx?: ExecutionContext): Promise<{ instagram: unknown[]; tiktok: unknown[] }> {
+async function buildSocialCards(env: Env, handles: SocialHandle[], ctx?: ExecutionContext): Promise<{ instagram: unknown[]; tiktok: unknown[] }> {
 	const token = env.APIFY_TOKEN;
 	if (!token) return { instagram: [], tiktok: [] };
 
-	const igHandles = (handles ?? SOCIAL_HANDLES).filter((h) => h.platform === "instagram");
+	const igHandles = handles.filter((h) => h.platform === "instagram");
 	const igByUser = new Map(igHandles.map((h) => [h.handle.toLowerCase(), h]));
 
 	let instagram: unknown[] = [];
@@ -3661,11 +3682,12 @@ async function buildSocialCards(env: Env, handles?: SocialHandle[], ctx?: Execut
  *  the club key minutes later; until then clubs ride the same Apify run (pre-split
  *  fallback — the split deploys without a flag day). Returns a summary for /refresh-social. */
 async function refreshSocialCache(env: Env, ctx?: ExecutionContext): Promise<{ playerCards: number; clubs: string }> {
-	const igHandles = SOCIAL_HANDLES.filter((h) => h.platform === "instagram");
+	const playerList = await loadPlayerSocial(env);
+	const igHandles = [...CLUB_HANDLES, ...playerIgHandles(playerList)];
 	const bdConfigured = !!(env.BRIGHTDATA_TOKEN && env.BD_WEBHOOK_SECRET);
 
-	if (PLAYER_SOCIAL.length > MAX_PLAYER_HANDLES && ctx) {
-		emitDiag(env, ctx, "playerCapExceeded", `${PLAYER_SOCIAL.length}/${MAX_PLAYER_HANDLES}`);
+	if (playerList.length > MAX_PLAYER_HANDLES && ctx) {
+		emitDiag(env, ctx, "playerCapExceeded", `${playerList.length}/${MAX_PLAYER_HANDLES}`);
 	}
 
 	const apifyHandles = bdConfigured ? igHandles.filter((h) => h.kind === "player") : igHandles;
@@ -3690,8 +3712,9 @@ async function refreshSocialCache(env: Env, ctx?: ExecutionContext): Promise<{ p
 // represented her NT, she stays eligible forever — a missed camp never drops her). The proxy
 // had no NT roster data, so this builds it: per-federation ESPN squad fetch → intersect with
 // current NWSL rosters by normalized name → append the matches to a KV ledger. Append-only:
-// the ledger records observed fact; promoting a ledger entry into PLAYER_SOCIAL stays
-// owner-approval-gated (the Stage 1d routine + a source edit). See the plan + docs/backend.md.
+// the ledger records observed fact. Promotion into the live player list is FULLY AUTOMATED
+// (owner 2026-08-16): the Stage 1d routine researches handles and writes through
+// POST /social/player-audit/apply; the run report is transparency, not a gate. docs/backend.md.
 const NT_LEDGER_KEY = "social:nt-ledger";
 const NWSL_NAMES_KEY = "social:nwsl-names"; // cached normalized-name → club-abbr map (12h)
 const NWSL_NAMES_TTL = 60 * 60 * 12;
@@ -3705,7 +3728,29 @@ const NT_AUDIT_EXCLUDED = new Set(["uefa.w.nations", "fifa.wworldq.uefa"]);
 // Lazy: WOMENS_NT_FEEDS is declared further down the module — a top-level .filter() would TDZ-crash at init.
 const ntAuditFeeds = () => WOMENS_NT_FEEDS.filter((s) => !NT_AUDIT_EXCLUDED.has(s));
 
-type LedgerEntry = { name: string; firstSeen: string; source: string; nation: string | null };
+// Owner ruling 2026-08-15: the three Europe-based players STAY while quota is limited —
+// never listed as drops, and the apply route refuses to drop them (normalized names).
+const GRANDFATHERED_PLAYERS = new Set(["emily fox", "naomi girma", "alyssa thompson"]);
+
+/** Routine auth for the audit surface: the owner's admin key OR the scoped SOCIAL_AUDIT_KEY
+ *  (x-audit-key header) the Claude Remote routine holds — so the routine never carries the
+ *  full admin credential. Fail-closed: unset audit key ⇒ only the admin key works. */
+function auditAuthed(request: Request, env: Env): boolean {
+	const adminKey = (env as unknown as { BRACKET_ADMIN_KEY?: string }).BRACKET_ADMIN_KEY;
+	if (adminAuthed(request, adminKey)) return true;
+	const auditKey = (env as unknown as { SOCIAL_AUDIT_KEY?: string }).SOCIAL_AUDIT_KEY;
+	return !!auditKey && request.headers.get("x-audit-key") === auditKey;
+}
+
+type LedgerEntry = {
+	name: string;
+	firstSeen: string;
+	source: string;
+	nation: string | null;
+	// Written once by the routine's web research (POST /social/player-audit/research) so no
+	// candidate is ever re-researched: found handles, or an explicit none/private verdict.
+	research?: { status: "found" | "none" | "private"; ig?: string; bsky?: string; checkedAt: string };
+};
 
 /** ESPN NT rosters come GROUPED by position (`athletes[].items[]`), unlike the FLAT NWSL club
  *  shape `mapEspnRosterAthletes` handles — decode defensively, tolerating either. */
@@ -3800,7 +3845,7 @@ async function readNtLedger(env: Env): Promise<Record<string, LedgerEntry>> {
 	}
 	const now = new Date().toISOString();
 	const seed: Record<string, LedgerEntry> = {};
-	for (const p of PLAYER_SOCIAL) seed[normalizeName(p.name)] = { name: p.name, firstSeen: now, source: "seed", nation: null };
+	for (const p of await loadPlayerSocial(env)) seed[normalizeName(p.name)] = { name: p.name, firstSeen: now, source: "seed", nation: null };
 	return seed;
 }
 
@@ -3808,48 +3853,154 @@ async function readNtLedger(env: Env): Promise<Record<string, LedgerEntry>> {
  *  1b ships the `?nt=<slug>` mode: fetch that federation's squads, intersect with NWSL rosters,
  *  append new matches to the ledger, return a run summary. (`?section=nwsl` report = Stage 1c.) */
 async function handlePlayerAudit(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
-	const key = (env as unknown as { BRACKET_ADMIN_KEY?: string }).BRACKET_ADMIN_KEY;
-	if (!adminAuthed(request, key)) {
+	if (!auditAuthed(request, env)) {
 		return new Response("Authentication required.", { status: 401, headers: { "WWW-Authenticate": adminRealm("NWSLApp Admin") } });
 	}
 	const j = (body: unknown, status = 200) =>
 		new Response(JSON.stringify(body, null, 2), { status, headers: { "Content-Type": "application/json" } });
-	const params = new URL(request.url).searchParams;
+	const url = new URL(request.url);
+	const params = url.searchParams;
 	const nt = params.get("nt");
+
+	// ── Stage 1d: routine write-back — research memory + fully-automated apply ────────
+	if (request.method === "POST" && url.pathname === "/social/player-audit/research") {
+		let body: { results?: { name?: string; status?: string; ig?: string; bsky?: string }[] };
+		try {
+			body = (await request.json()) as typeof body;
+		} catch {
+			return j({ error: "unparseable JSON" }, 400);
+		}
+		const ledger = await readNtLedger(env);
+		const saved: string[] = [];
+		const unknown: string[] = [];
+		const now = new Date().toISOString();
+		for (const r of body.results ?? []) {
+			if (!r.name || !["found", "none", "private"].includes(r.status ?? "")) continue;
+			const entry = ledger[normalizeName(r.name)];
+			if (!entry) {
+				unknown.push(r.name);
+				continue;
+			}
+			entry.research = { status: r.status as "found" | "none" | "private", ig: r.ig || undefined, bsky: r.bsky || undefined, checkedAt: now };
+			saved.push(r.name);
+		}
+		await env.FEED_TAGS.put(NT_LEDGER_KEY, JSON.stringify(ledger));
+		emitDiag(env, ctx, "socialResearchSaved", `${saved.length} saved${unknown.length ? `, ${unknown.length} unknown` : ""}`);
+		return j({ saved: saved.length, unknown });
+	}
+
+	if (request.method === "POST" && url.pathname === "/social/player-audit/apply") {
+		let body: { add?: { name?: string; abbr?: string; ig?: string; bsky?: string }[]; drop?: string[] };
+		try {
+			body = (await request.json()) as typeof body;
+		} catch {
+			return j({ error: "unparseable JSON" }, 400);
+		}
+		const list = [...(await loadPlayerSocial(env))];
+		const nwsl = await nwslNameMap(env, ctx);
+		const clubs = new Set(nwsl.values());
+		const igSeen = new Set(list.map((p) => p.ig.toLowerCase()));
+		const nameSeen = new Set(list.map((p) => normalizeName(p.name)));
+		const now = new Date().toISOString();
+		const rejected: { name: string; reason: string }[] = [];
+		const added: string[] = [];
+		const dropped: string[] = [];
+
+		for (const d of body.drop ?? []) {
+			const norm = normalizeName(String(d));
+			if (GRANDFATHERED_PLAYERS.has(norm)) {
+				rejected.push({ name: d, reason: "grandfathered — owner-only removal" });
+				continue;
+			}
+			const idx = list.findIndex((p) => normalizeName(p.name) === norm);
+			if (idx === -1) {
+				rejected.push({ name: d, reason: "not on the list" });
+				continue;
+			}
+			const [gone] = list.splice(idx, 1);
+			igSeen.delete(gone.ig.toLowerCase());
+			nameSeen.delete(norm);
+			dropped.push(gone.name);
+		}
+
+		for (const a of body.add ?? []) {
+			const name = String(a.name ?? "").trim();
+			const abbr = String(a.abbr ?? "").trim().toUpperCase();
+			const ig = String(a.ig ?? "").trim().replace(/^@/, "");
+			if (!name || !abbr || !ig) {
+				rejected.push({ name: name || "(missing)", reason: "name/abbr/ig required" });
+				continue;
+			}
+			if (!/^[a-z0-9._]{1,30}$/i.test(ig)) {
+				rejected.push({ name, reason: `invalid ig handle: ${ig.slice(0, 30)}` });
+				continue;
+			}
+			if (!clubs.has(abbr)) {
+				rejected.push({ name, reason: `unknown club abbr: ${abbr}` });
+				continue;
+			}
+			if (nameSeen.has(normalizeName(name)) || igSeen.has(ig.toLowerCase())) {
+				rejected.push({ name, reason: "already on the list" });
+				continue;
+			}
+			if (list.length >= MAX_PLAYER_HANDLES) {
+				rejected.push({ name, reason: `ceiling ${MAX_PLAYER_HANDLES} reached` });
+				continue;
+			}
+			list.push({ name, abbr, ig, bsky: a.bsky || undefined, addedAt: now, source: "routine" });
+			igSeen.add(ig.toLowerCase());
+			nameSeen.add(normalizeName(name));
+			added.push(name);
+		}
+
+		if (added.length > 0 || dropped.length > 0) {
+			await env.FEED_TAGS.put(PLAYER_LIST_KEY, JSON.stringify(list));
+		}
+		emitDiag(env, ctx, "socialPlayerApply", `+${added.length} -${dropped.length} → ${list.length}/${MAX_PLAYER_HANDLES}${rejected.length ? ` (${rejected.length} rejected)` : ""}`);
+		return j({ added, dropped, rejected, total: list.length, ceiling: MAX_PLAYER_HANDLES });
+	}
 
 	// ── Stage 1c: the decision report the discovery routine (and owner) reads ─────────
 	if (params.get("section") === "nwsl") {
-		const [nwsl, ledger] = await Promise.all([nwslNameMap(env, ctx), readNtLedger(env)]);
-		const featured = new Map(PLAYER_SOCIAL.map((p) => [normalizeName(p.name), p]));
+		const [nwsl, ledger, playerList] = await Promise.all([nwslNameMap(env, ctx), readNtLedger(env), loadPlayerSocial(env)]);
+		const featured = new Map(playerList.map((p) => [normalizeName(p.name), p]));
 
-		// Owner ruling 2026-08-15: the three Europe-based players STAY while quota is limited —
-		// never list them as drops, never let the routine propose dropping them.
-		const GRANDFATHERED = new Set(["emily fox", "naomi girma", "alyssa thompson"]);
-
-		// candidates = (ledger ∩ current NWSL rosters) − featured. Delta-oriented for the routine:
-		// each carries the feed that earned eligibility so majors can outrank friendly-only later.
-		const candidates: { name: string; club: string; nation: string | null; source: string; firstSeen: string }[] = [];
+		// candidates = (ledger ∩ current NWSL rosters) − featured, split by research state so the
+		// routine only ever web-researches the NEW names (token efficiency, adjudication-style).
+		// Each carries the feed that earned eligibility so majors can outrank friendly-only later.
+		type Candidate = { name: string; club: string; nation: string | null; source: string; firstSeen: string; research?: LedgerEntry["research"] };
+		const needsResearch: Candidate[] = [];
+		const researched: Candidate[] = [];
 		for (const [norm, e] of Object.entries(ledger)) {
 			const club = nwsl.get(norm);
-			if (club && !featured.has(norm)) candidates.push({ name: e.name, club, nation: e.nation, source: e.source, firstSeen: e.firstSeen });
+			if (!club || featured.has(norm)) continue;
+			const c: Candidate = { name: e.name, club, nation: e.nation, source: e.source, firstSeen: e.firstSeen };
+			if (e.research) {
+				c.research = e.research;
+				researched.push(c);
+			} else {
+				needsResearch.push(c);
+			}
 		}
-		candidates.sort((a, b) => a.club.localeCompare(b.club) || a.name.localeCompare(b.name));
+		const byClub = (a: Candidate, b: Candidate) => a.club.localeCompare(b.club) || a.name.localeCompare(b.name);
+		needsResearch.sort(byClub);
+		researched.sort(byClub);
 
 		// drops = featured − current NWSL rosters (the ONLY roster-based drop). Advisory: a name
-		// ESPN spells differently would land here too, so the routine/owner verifies before acting.
+		// ESPN spells differently would land here too, so the routine verifies before applying.
 		const drops: { name: string; club: string; ig: string }[] = [];
 		const grandfathered: { name: string; club: string; grandfathered: true }[] = [];
-		for (const p of PLAYER_SOCIAL) {
+		for (const p of playerList) {
 			const norm = normalizeName(p.name);
 			if (nwsl.has(norm)) continue;
-			if (GRANDFATHERED.has(norm)) grandfathered.push({ name: p.name, club: p.abbr, grandfathered: true });
+			if (GRANDFATHERED_PLAYERS.has(norm)) grandfathered.push({ name: p.name, club: p.abbr, grandfathered: true });
 			else drops.push({ name: p.name, club: p.abbr, ig: p.ig });
 		}
 
 		// Featured-count per club, EVERY club listed (zeros are the point: BOS/DEN/LOU gaps).
 		const clubCoverage: Record<string, number> = {};
 		for (const abbr of new Set(nwsl.values())) clubCoverage[abbr] = 0;
-		for (const p of PLAYER_SOCIAL) if (p.abbr in clubCoverage) clubCoverage[p.abbr]++;
+		for (const p of playerList) if (p.abbr in clubCoverage) clubCoverage[p.abbr]++;
 
 		const bySource: Record<string, number> = {};
 		for (const e of Object.values(ledger)) bySource[e.source] = (bySource[e.source] ?? 0) + 1;
@@ -3857,14 +4008,14 @@ async function handlePlayerAudit(request: Request, env: Env, ctx: ExecutionConte
 		return j({
 			generatedAt: new Date().toISOString(),
 			capacity: {
-				used: PLAYER_SOCIAL.length,
+				used: playerList.length,
 				ceiling: MAX_PLAYER_HANDLES,
-				headroom: MAX_PLAYER_HANDLES - PLAYER_SOCIAL.length,
+				headroom: MAX_PLAYER_HANDLES - playerList.length,
 				note: "ceiling is a CEILING, never a target — carry exactly who qualifies",
 			},
 			clubCoverage,
-			candidates,
-			drops: { players: drops, note: "not on any NWSL roster — verify (ESPN name variant lands here too) before acting" },
+			candidates: { needsResearch, researched },
+			drops: { players: drops, note: "not on any NWSL roster — verify (ESPN name variant lands here too) before applying" },
 			grandfathered,
 			ledger: { size: Object.keys(ledger).length, bySource, feedsCovered: Object.keys(bySource).filter((s) => s !== "seed") },
 		});
@@ -3936,7 +4087,7 @@ async function writeSideOrKeepLastGood(
  *  BD_WEBHOOK_SECRET echoed as the Authorization header). Returns a status note for
  *  /refresh-social. Only called when BRIGHTDATA_TOKEN + BD_WEBHOOK_SECRET are set. */
 async function triggerBrightDataClubs(env: Env, ctx?: ExecutionContext): Promise<string> {
-	const clubs = SOCIAL_HANDLES.filter((h) => h.platform === "instagram" && h.kind === "team");
+	const clubs = CLUB_HANDLES;
 	// Discover-by-profile-URL with a per-profile cap — BD honors num_of_posts (unlike the
 	// cheap Apify actor), which is what keeps us inside the free 5k records/mo.
 	const inputs = clubs.map((h) => ({
