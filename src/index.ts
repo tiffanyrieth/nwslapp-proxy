@@ -3126,8 +3126,12 @@ async function handleFeed(url: URL, env: Env, ctx: ExecutionContext): Promise<Re
 	const teams = normalizeTeams(url.searchParams.get("teams"));
 	// Phase 3 "make it yours": the user's added Bluesky reporter handles + followed player
 	// IG ids. Both personalize the feed and are folded into the cache key below.
+	// 2b layering (owner design): `muted` = DEFAULT handles the user toggled off — excluded
+	// from the curated fetch, and NOT allowed to supersede a same-handle user add (row 4 of
+	// the layering table: default off + user-added ⇒ the unfiltered add resurfaces).
 	const userHandles = parseHandleList(url.searchParams.get("handles")).slice(0, MAX_USER_HANDLES);
 	const userPlayers = new Set(parseHandleList(url.searchParams.get("players")));
+	const mutedDefaults = new Set(parseHandleList(url.searchParams.get("muted")));
 
 	const cache = caches.default;
 	const cacheUrl = new URL(url);
@@ -3138,6 +3142,8 @@ async function handleFeed(url: URL, env: Env, ctx: ExecutionContext): Promise<Re
 	else cacheUrl.searchParams.delete("handles");
 	if (userPlayers.size) cacheUrl.searchParams.set("players", [...userPlayers].sort().join(","));
 	else cacheUrl.searchParams.delete("players");
+	if (mutedDefaults.size) cacheUrl.searchParams.set("muted", [...mutedDefaults].sort().join(","));
+	else cacheUrl.searchParams.delete("muted");
 	const cacheKey = new Request(cacheUrl.toString(), { method: "GET" });
 
 	const hit = await cache.match(cacheKey);
@@ -3149,11 +3155,18 @@ async function handleFeed(url: URL, env: Env, ctx: ExecutionContext): Promise<Re
 		// own posts. Per-handle failures are isolated inside blueskyCardsFor, so a
 		// single dead account can't trip the stale/502 fallback — that's reserved for
 		// a total Bluesky outage.
-		const reporterHandles = FEED_HANDLES.filter((h) => h.kind === "reporter");
-		const leagueHandles = FEED_HANDLES.filter((h) => h.kind === "league");
+		// Layering: active defaults = curated list minus the user's muted toggles. A user-added
+		// handle that is ALSO an active default is superseded (served filtered, once); if the
+		// default is muted, the user add wins and serves unfiltered below.
+		const activeDefaults = FEED_HANDLES.filter((h) => !mutedDefaults.has(h.handle.toLowerCase()));
+		const activeDefaultSet = new Set(activeDefaults.map((h) => h.handle.toLowerCase()));
+		const reporterHandles = activeDefaults.filter((h) => h.kind === "reporter");
+		const leagueHandles = activeDefaults.filter((h) => h.kind === "league");
 		// Phase 3 "make it yours": the user's own-added Bluesky reporters, fetched alongside
 		// the curated set (per-handle failures isolated in blueskyCardsFor).
-		const userReporterHandles: FeedHandle[] = userHandles.map((h) => ({ handle: h, kind: "reporter" }));
+		const userReporterHandles: FeedHandle[] = userHandles
+			.filter((h) => !activeDefaultSet.has(h.toLowerCase()))
+			.map((h) => ({ handle: h, kind: "reporter" }));
 		const [rawReporters, rawLeague, rawUserReporters, newsCards, social] = await Promise.all([
 			buildBlueskyCards(reporterHandles),
 			buildBlueskyCards(leagueHandles),
@@ -3177,12 +3190,12 @@ async function handleFeed(url: URL, env: Env, ctx: ExecutionContext): Promise<Re
 			env,
 			ctx,
 		);
-		// User-added reporters are NWSL-gated but NOT team-scoped — the user chose them, so
-		// keep every NWSL post (pass the full team set so decideFeedItem never drops a post
-		// just because its club isn't one the user follows).
-		const userReporterCards = rawUserReporters.length
-			? await classifySocialBluesky(rawUserReporters, [...NEWS_TEAM_ABBR_SET], env, ctx)
-			: [];
+		// ⚠️ COST FIREWALL (owner design, 2b): user-added handles NEVER touch Haiku. The user
+		// chose to follow them — show everything, unfiltered (that's the value of a personal
+		// add; the curated default list is the filtered experience). This bounds Haiku spend
+		// to the owner-curated defaults no matter how many handles users add. `userAdded`
+		// marks the cards for the app's layering logic.
+		const userReporterCards = rawUserReporters.map((c) => ({ ...(c as Record<string, unknown>), userAdded: true }));
 		const playerSocial = socialFor(social, teams, new Set(["feed"]), userPlayers);
 		cards = [...socialBluesky, ...userReporterCards, ...newsCards, ...playerSocial].sort(
 			byTimestampDesc,
