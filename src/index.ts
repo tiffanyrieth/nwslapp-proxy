@@ -25,6 +25,9 @@ import {
 	handleBracketAdmin,
 	ROSTER_GOOD_MIN,
 	fetchTeamSeasonStats,
+	fetchTeamAbbrs,
+	fetchRosterResilient,
+	mapEspnRosterAthletes,
 	type BracketEnv,
 } from "./bracket-engine.ts";
 import { buildHeadshotMap, handleHeadshots, normalizeName } from "./headshots.ts";
@@ -688,6 +691,12 @@ export default {
 			}
 			return handleAdminAttendance(env, (kind, detail) => emitDiag(env, ctx, kind, detail),
 				url.searchParams.get("sweep") === "1");
+		}
+
+		// Admin-only: social self-tuning player audit (Stage 1b `?nt=<slug>` ledger populate;
+		// 1c `?section=nwsl` report to come). GET + self-checks the admin key.
+		if (url.pathname === "/social/player-audit") {
+			return handlePlayerAudit(request, env, ctx);
 		}
 
 		// POST telemetry ingest must be registered BEFORE the GET-only guard below.
@@ -3674,6 +3683,163 @@ async function refreshSocialCache(env: Env, ctx?: ExecutionContext): Promise<{ p
 		if (ctx) emitDiag(env, ctx, "bdUnconfigured", "clubs via apify fallback");
 	}
 	return { playerCards, clubs };
+}
+
+// ── Social self-tuning · Stage 1b: national-team eligibility ledger ───────────────
+// The featured-player set's eligibility law is NWSL ∧ NT, EARNED (once an NWSL player has
+// represented her NT, she stays eligible forever — a missed camp never drops her). The proxy
+// had no NT roster data, so this builds it: per-federation ESPN squad fetch → intersect with
+// current NWSL rosters by normalized name → append the matches to a KV ledger. Append-only:
+// the ledger records observed fact; promoting a ledger entry into PLAYER_SOCIAL stays
+// owner-approval-gated (the Stage 1d routine + a source edit). See the plan + docs/backend.md.
+const NT_LEDGER_KEY = "social:nt-ledger";
+const NWSL_NAMES_KEY = "social:nwsl-names"; // cached normalized-name → club-abbr map (12h)
+const NWSL_NAMES_TTL = 60 * 60 * 12;
+
+type LedgerEntry = { name: string; firstSeen: string; source: string; nation: string | null };
+
+/** ESPN NT rosters come GROUPED by position (`athletes[].items[]`), unlike the FLAT NWSL club
+ *  shape `mapEspnRosterAthletes` handles — decode defensively, tolerating either. */
+function decodeNtRoster(json: unknown): string[] {
+	const groups = ((json as { athletes?: unknown[] } | null)?.athletes ?? []) as unknown[];
+	const names: string[] = [];
+	for (const g of groups) {
+		const rec = g as { items?: unknown[]; displayName?: string; fullName?: string };
+		const items = Array.isArray(rec.items) ? rec.items : rec.displayName || rec.fullName ? [rec] : [];
+		for (const it of items) {
+			const p = it as { displayName?: string; fullName?: string };
+			const name = p.displayName ?? p.fullName;
+			if (name) names.push(String(name));
+		}
+	}
+	return names;
+}
+
+/** One NT competition → every squad member with the nation they represent. One `/teams` call +
+ *  one `/roster` call per nation, all under the free-tier 50-subrequest cap for a single slug. */
+async function fetchNtRosters(slug: string): Promise<{ nation: string; name: string }[]> {
+	const teamsRes = await fetch(`https://site.api.espn.com/apis/site/v2/sports/soccer/${slug}/teams`, { headers: ESPN_HEADERS });
+	if (!teamsRes.ok) return [];
+	const teamsData = (await teamsRes.json().catch(() => null)) as {
+		sports?: { leagues?: { teams?: { team?: { id?: string; abbreviation?: string; displayName?: string } }[] }[] }[];
+	} | null;
+	const teams = teamsData?.sports?.[0]?.leagues?.[0]?.teams ?? [];
+	const out: { nation: string; name: string }[] = [];
+	await Promise.all(
+		teams.map(async (entry) => {
+			const team = entry.team ?? {};
+			if (!team.id) return;
+			const nation = team.displayName ?? team.abbreviation ?? "?";
+			try {
+				const rRes = await fetch(`https://site.api.espn.com/apis/site/v2/sports/soccer/${slug}/teams/${team.id}/roster`, { headers: ESPN_HEADERS });
+				if (!rRes.ok) return;
+				for (const name of decodeNtRoster(await rRes.json())) out.push({ nation, name });
+			} catch {
+				/* one nation short-read — the ledger is earned-not-snapshot, so a miss only delays */
+			}
+		}),
+	);
+	return out;
+}
+
+/** normalized NWSL player name → club abbr, across all 16 rosters. Cached 12h in KV. Built
+ *  KV-FIRST: decode the `roster:{id}` records handleRoster keeps warm (cheap KV reads, no fetch)
+ *  and only live-fetch a club whose cache is cold/thin — so even a cold-cache 32-nation World Cup
+ *  `?nt=` call stays well under the free-tier 50-subrequest cap. */
+async function nwslNameMap(env: Env, ctx: ExecutionContext): Promise<Map<string, string>> {
+	const cached = await env.FEED_TAGS.get(NWSL_NAMES_KEY);
+	if (cached) {
+		try {
+			return new Map(JSON.parse(cached) as [string, string][]);
+		} catch {
+			/* fall through and rebuild */
+		}
+	}
+	const teams = await fetchTeamAbbrs();
+	const map = new Map<string, string>();
+	await Promise.all(
+		teams.map(async (t) => {
+			let players: { name: string; team: string }[] = [];
+			try {
+				const raw = await env.FEED_TAGS.get(`roster:${t.id}`);
+				if (raw) {
+					const rec = JSON.parse(raw) as { body?: unknown };
+					const decoded = mapEspnRosterAthletes(rec.body as Parameters<typeof mapEspnRosterAthletes>[0], t.abbr);
+					if (decoded.length >= ROSTER_GOOD_MIN) players = decoded;
+				}
+			} catch {
+				/* cold/corrupt cache — fall to a live fetch below */
+			}
+			if (players.length === 0) players = await fetchRosterResilient(env as unknown as BracketEnv, t.id, t.abbr);
+			for (const p of players) map.set(normalizeName(p.name), t.abbr);
+		}),
+	);
+	if (map.size > 0) ctx.waitUntil(env.FEED_TAGS.put(NWSL_NAMES_KEY, JSON.stringify([...map]), { expirationTtl: NWSL_NAMES_TTL }));
+	return map;
+}
+
+/** Read the ledger; if it doesn't exist yet, seed it from the current featured 34 (all
+ *  NT-caliber by curation → earned). Returns the in-memory object for the caller to merge + write. */
+async function readNtLedger(env: Env): Promise<Record<string, LedgerEntry>> {
+	const raw = await env.FEED_TAGS.get(NT_LEDGER_KEY);
+	if (raw) {
+		try {
+			return JSON.parse(raw) as Record<string, LedgerEntry>;
+		} catch {
+			/* corrupt — reseed below */
+		}
+	}
+	const now = new Date().toISOString();
+	const seed: Record<string, LedgerEntry> = {};
+	for (const p of PLAYER_SOCIAL) seed[normalizeName(p.name)] = { name: p.name, firstSeen: now, source: "seed", nation: null };
+	return seed;
+}
+
+/** GET /social/player-audit — admin-keyed audit surface for the Stage 1d discovery routine.
+ *  1b ships the `?nt=<slug>` mode: fetch that federation's squads, intersect with NWSL rosters,
+ *  append new matches to the ledger, return a run summary. (`?section=nwsl` report = Stage 1c.) */
+async function handlePlayerAudit(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
+	const key = (env as unknown as { BRACKET_ADMIN_KEY?: string }).BRACKET_ADMIN_KEY;
+	if (!adminAuthed(request, key)) {
+		return new Response("Authentication required.", { status: 401, headers: { "WWW-Authenticate": adminRealm("NWSLApp Admin") } });
+	}
+	const j = (body: unknown, status = 200) =>
+		new Response(JSON.stringify(body, null, 2), { status, headers: { "Content-Type": "application/json" } });
+	const nt = new URL(request.url).searchParams.get("nt");
+
+	if (nt) {
+		if (!WOMENS_NT_FEEDS.includes(nt)) return j({ error: "unknown nt slug", validNt: WOMENS_NT_FEEDS }, 400);
+		const [ntPlayers, nwsl] = await Promise.all([fetchNtRosters(nt), nwslNameMap(env, ctx)]);
+		const ledger = await readNtLedger(env);
+		const before = Object.keys(ledger).length;
+		const now = new Date().toISOString();
+		let matched = 0;
+		const added: { name: string; nation: string; club: string }[] = [];
+		for (const p of ntPlayers) {
+			const norm = normalizeName(p.name);
+			const club = nwsl.get(norm);
+			if (!club) continue;
+			matched++;
+			if (!ledger[norm]) {
+				ledger[norm] = { name: p.name, firstSeen: now, source: nt, nation: p.nation };
+				added.push({ name: p.name, nation: p.nation, club });
+			}
+		}
+		// Persist BEFORE responding (not waitUntil) so the summary's ledgerSize is truthful.
+		await env.FEED_TAGS.put(NT_LEDGER_KEY, JSON.stringify(ledger));
+		emitDiag(env, ctx, "socialNtLedgerRun", `${nt}: ${ntPlayers.length} nt / ${matched} nwsl / +${added.length}`);
+		return j({
+			slug: nt,
+			ntPlayersFetched: ntPlayers.length,
+			nwslRosterSize: nwsl.size,
+			nwslMatched: matched,
+			newlyAdded: added.length,
+			added,
+			ledgerSize: { before, after: Object.keys(ledger).length },
+		});
+	}
+
+	return j({ error: "specify ?nt=<slug> (the ?section=nwsl report is Stage 1c, not built yet)", validNt: WOMENS_NT_FEEDS }, 400);
 }
 
 /** Write one side's fresh cards to its KV key — or, when THIS scrape came back empty
