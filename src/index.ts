@@ -3814,7 +3814,61 @@ async function handlePlayerAudit(request: Request, env: Env, ctx: ExecutionConte
 	}
 	const j = (body: unknown, status = 200) =>
 		new Response(JSON.stringify(body, null, 2), { status, headers: { "Content-Type": "application/json" } });
-	const nt = new URL(request.url).searchParams.get("nt");
+	const params = new URL(request.url).searchParams;
+	const nt = params.get("nt");
+
+	// ── Stage 1c: the decision report the discovery routine (and owner) reads ─────────
+	if (params.get("section") === "nwsl") {
+		const [nwsl, ledger] = await Promise.all([nwslNameMap(env, ctx), readNtLedger(env)]);
+		const featured = new Map(PLAYER_SOCIAL.map((p) => [normalizeName(p.name), p]));
+
+		// Owner ruling 2026-08-15: the three Europe-based players STAY while quota is limited —
+		// never list them as drops, never let the routine propose dropping them.
+		const GRANDFATHERED = new Set(["emily fox", "naomi girma", "alyssa thompson"]);
+
+		// candidates = (ledger ∩ current NWSL rosters) − featured. Delta-oriented for the routine:
+		// each carries the feed that earned eligibility so majors can outrank friendly-only later.
+		const candidates: { name: string; club: string; nation: string | null; source: string; firstSeen: string }[] = [];
+		for (const [norm, e] of Object.entries(ledger)) {
+			const club = nwsl.get(norm);
+			if (club && !featured.has(norm)) candidates.push({ name: e.name, club, nation: e.nation, source: e.source, firstSeen: e.firstSeen });
+		}
+		candidates.sort((a, b) => a.club.localeCompare(b.club) || a.name.localeCompare(b.name));
+
+		// drops = featured − current NWSL rosters (the ONLY roster-based drop). Advisory: a name
+		// ESPN spells differently would land here too, so the routine/owner verifies before acting.
+		const drops: { name: string; club: string; ig: string }[] = [];
+		const grandfathered: { name: string; club: string; grandfathered: true }[] = [];
+		for (const p of PLAYER_SOCIAL) {
+			const norm = normalizeName(p.name);
+			if (nwsl.has(norm)) continue;
+			if (GRANDFATHERED.has(norm)) grandfathered.push({ name: p.name, club: p.abbr, grandfathered: true });
+			else drops.push({ name: p.name, club: p.abbr, ig: p.ig });
+		}
+
+		// Featured-count per club, EVERY club listed (zeros are the point: BOS/DEN/LOU gaps).
+		const clubCoverage: Record<string, number> = {};
+		for (const abbr of new Set(nwsl.values())) clubCoverage[abbr] = 0;
+		for (const p of PLAYER_SOCIAL) if (p.abbr in clubCoverage) clubCoverage[p.abbr]++;
+
+		const bySource: Record<string, number> = {};
+		for (const e of Object.values(ledger)) bySource[e.source] = (bySource[e.source] ?? 0) + 1;
+
+		return j({
+			generatedAt: new Date().toISOString(),
+			capacity: {
+				used: PLAYER_SOCIAL.length,
+				ceiling: MAX_PLAYER_HANDLES,
+				headroom: MAX_PLAYER_HANDLES - PLAYER_SOCIAL.length,
+				note: "ceiling is a CEILING, never a target — carry exactly who qualifies",
+			},
+			clubCoverage,
+			candidates,
+			drops: { players: drops, note: "not on any NWSL roster — verify (ESPN name variant lands here too) before acting" },
+			grandfathered,
+			ledger: { size: Object.keys(ledger).length, bySource, feedsCovered: Object.keys(bySource).filter((s) => s !== "seed") },
+		});
+	}
 
 	if (nt) {
 		if (!ntAuditFeeds().includes(nt)) return j({ error: "unknown or excluded nt slug", validNt: ntAuditFeeds() }, 400);
@@ -3848,7 +3902,7 @@ async function handlePlayerAudit(request: Request, env: Env, ctx: ExecutionConte
 		});
 	}
 
-	return j({ error: "specify ?nt=<slug> (the ?section=nwsl report is Stage 1c, not built yet)", validNt: ntAuditFeeds() }, 400);
+	return j({ error: "specify ?section=nwsl (the audit report) or ?nt=<slug> (ledger populate)", validNt: ntAuditFeeds() }, 400);
 }
 
 /** Write one side's fresh cards to its KV key — or, when THIS scrape came back empty
