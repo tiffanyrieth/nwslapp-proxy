@@ -3851,7 +3851,11 @@ type LedgerEntry = {
 	nation: string | null;
 	// Written once by the routine's web research (POST /social/player-audit/research) so no
 	// candidate is ever re-researched: found handles, or an explicit none/private verdict.
-	research?: { status: "found" | "none" | "private"; ig?: string; bsky?: string; checkedAt: string };
+	// IDENTITY GATE (owner 2026-08-17): `category` = the account's exact IG professional-category
+	// label as found ("Athlete", "Futbolista", …) — the evidence; `athleteClass` = the routine's
+	// judgment that it's an athlete-class label. /apply REFUSES adds without athleteClass:true —
+	// the same-name protection (verified blue check is an accuracy ACCELERATOR, not the gate).
+	research?: { status: "found" | "none" | "private"; ig?: string; bsky?: string; category?: string; athleteClass?: boolean; verified?: boolean; checkedAt: string };
 };
 
 /** ESPN NT rosters come GROUPED by position (`athletes[].items[]`), unlike the FLAT NWSL club
@@ -4019,7 +4023,7 @@ async function handlePlayerAudit(request: Request, env: Env, ctx: ExecutionConte
 	}
 
 	if (request.method === "POST" && url.pathname === "/social/player-audit/research") {
-		let body: { results?: { name?: string; status?: string; ig?: string; bsky?: string }[] };
+		let body: { results?: { name?: string; status?: string; ig?: string; bsky?: string; category?: string; athleteClass?: boolean; verified?: boolean }[] };
 		try {
 			body = (await request.json()) as typeof body;
 		} catch {
@@ -4036,7 +4040,15 @@ async function handlePlayerAudit(request: Request, env: Env, ctx: ExecutionConte
 				unknown.push(r.name);
 				continue;
 			}
-			entry.research = { status: r.status as "found" | "none" | "private", ig: r.ig || undefined, bsky: r.bsky || undefined, checkedAt: now };
+			entry.research = {
+				status: r.status as "found" | "none" | "private",
+				ig: r.ig || undefined,
+				bsky: r.bsky || undefined,
+				category: r.category || undefined,
+				athleteClass: typeof r.athleteClass === "boolean" ? r.athleteClass : undefined,
+				verified: typeof r.verified === "boolean" ? r.verified : undefined,
+				checkedAt: now,
+			};
 			saved.push(r.name);
 		}
 		await env.FEED_TAGS.put(NT_LEDGER_KEY, JSON.stringify(ledger));
@@ -4053,6 +4065,7 @@ async function handlePlayerAudit(request: Request, env: Env, ctx: ExecutionConte
 		}
 		const list = [...(await loadPlayerSocial(env))];
 		const nwsl = await nwslNameMap(env, ctx, { live: true });
+		const gateLedger = await readNtLedger(env);
 		const clubs = new Set(nwsl.values());
 		const igSeen = new Set(list.map((p) => p.ig.toLowerCase()));
 		const nameSeen = new Set(list.map((p) => normalizeName(p.name)));
@@ -4084,6 +4097,15 @@ async function handlePlayerAudit(request: Request, env: Env, ctx: ExecutionConte
 			const ig = String(a.ig ?? "").trim().replace(/^@/, "");
 			if (!name || !abbr || !ig) {
 				rejected.push({ name: name || "(missing)", reason: "name/abbr/ig required" });
+				continue;
+			}
+			// ⚠️ IDENTITY GATE (owner 2026-08-17, server-enforced — not even the routine can skip it):
+			// an add requires research on the ledger with athleteClass:true — the account carries an
+			// athlete-class IG professional-category label ("Athlete"/localized equivalent), the
+			// same-name protection. The app must never claim a feed is a pro player's without it.
+			const gate = gateLedger[normalizeName(name)]?.research;
+			if (gate?.athleteClass !== true) {
+				rejected.push({ name, reason: `identity gate: athlete-class category not confirmed${gate?.category ? ` (found: ${gate.category})` : ""}` });
 				continue;
 			}
 			if (!/^[a-z0-9._]{1,30}$/i.test(ig)) {

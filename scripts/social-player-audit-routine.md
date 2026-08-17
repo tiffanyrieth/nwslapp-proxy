@@ -37,17 +37,29 @@ One retry per failed slug, then move on and note it in the report. Record each s
 
 Never re-research `researched` names — that memory exists so you don't. For each new candidate,
 web-search her Instagram and Bluesky (e.g. `"<name>" <club> Instagram`, `"<name>" <nation>
-Instagram`). The bar for **found**:
+Instagram`). **The two-tier identity bar (owner law, 2026-08-17 — the app is a publisher; a
+wrong account is the app lying to fans, including 12-year-olds):**
 
-- **Clearly her** — the profile references her club/national team, or a club/league post links to
-  it, or it carries a verified badge. ⚠️ Impersonator and fan accounts are the trap: a name-match
-  alone is NEVER enough. When identity is not certain, record `none` — a missed add costs a wait;
-  a stranger's content in fans' feeds costs trust.
-- **Public and alive** — not private, has a post within roughly the last 6 months.
+- **REQUIRED — athlete-class professional category.** The IG account must carry an athlete-class
+  professional-category label: "Athlete" or a clear localized equivalent ("Futbolista",
+  "Sportlerin", …). This is the same-name protection — a personal account or any non-athlete
+  category FAILS the gate no matter how convincing the name match. Record the EXACT label you saw
+  as `category` and your judgment as `athleteClass: true/false`. The category shows on the
+  profile (under the name, above the bio) — read it via the profile page, a Google-indexed
+  profile title, or a source that quotes it. If you cannot determine the category, record what
+  you found WITHOUT `athleteClass: true` — the server refuses the add, which is correct: unproven
+  stays unfeatured.
+- **Verified (blue check) = the accuracy ACCELERATOR, not the gate.** Record `verified` when you
+  can see it. A verified account needs only the category check; an UNVERIFIED account needs full
+  identity corroboration — her club's or federation's own page linking that exact handle, or the
+  bio itself naming her club/NT (e.g. @barbrabandaofficial: category "Athlete", bio links
+  @orlpride + @fazfootball — passes without a blue check).
+- **Public and alive** — not private, a post within roughly the last 6 months.
 
 Verdicts: `found` (with `ig` and/or `bsky`, bare handles no @), `private`, or `none`.
-POST the whole batch once:
-`POST {base}/research` body `{"results":[{"name":"...","status":"found","ig":"...","bsky":"..."}, ...]}`
+POST the whole batch once — include the gate fields:
+`POST {base}/research` body
+`{"results":[{"name":"...","status":"found","ig":"...","bsky":"...","category":"Athlete","athleteClass":true,"verified":true}, ...]}`
 
 ### 4. Verify drops (departures only, never name variants)
 
@@ -60,9 +72,11 @@ do NOT drop — note it in the report instead. Ambiguous → leave her on, note 
 
 `POST {base}/apply` body `{"add":[{"name","abbr","ig","bsky"?}...], "drop":["name",...]}`
 
-- Adds = every candidate whose research found a **public IG handle** (IG is required to serve
-  today; a bsky-only player stays in research memory and auto-surfaces when Bluesky player
-  serving ships — do NOT add her yet).
+- Adds = every candidate whose research found a **public IG handle AND confirmed athlete-class
+  category** (`athleteClass: true`). The server enforces this independently — an add without a
+  passing gate record is rejected, never silently accepted. (IG is required to serve today; a
+  bsky-only player stays in research memory and auto-surfaces when Bluesky player serving ships
+  — do NOT add her yet.)
 - `abbr` = the `club` from the report's candidate entry, verbatim.
 - If adds would exceed the ceiling, prioritize (a) clubs at 0 coverage, then (b) major-tournament
   `source` over friendlies — and report exactly who was left off and why.
