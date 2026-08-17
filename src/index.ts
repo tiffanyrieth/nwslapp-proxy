@@ -4071,9 +4071,19 @@ async function handlePlayerAudit(request: Request, env: Env, ctx: ExecutionConte
 		const ledger = await readNtLedger(env);
 		const saved: string[] = [];
 		const unknown: string[] = [];
+		// NO-SILENT-FAILURES (bug found by the 2026-08-17 backfill run): malformed entries used to
+		// be skipped without a trace — `saved:0, unknown:[]` looked like success-shaped nothing
+		// while the caller retried format after format. Every rejected entry now says WHY.
+		const skipped: { name?: string; reason: string }[] = [];
+		if (!Array.isArray(body.results)) {
+			return j({ saved: 0, unknown: [], skipped: [{ reason: `body must be {"results":[...]} — got keys ${Object.keys(body as object).join(",") || "(none)"}` }] }, 400);
+		}
 		const now = new Date().toISOString();
 		for (const r of body.results ?? []) {
-			if (!r.name || !["found", "none", "private"].includes(r.status ?? "")) continue;
+			if (!r.name || !["found", "none", "private"].includes(r.status ?? "")) {
+				skipped.push({ name: r.name, reason: !r.name ? "missing name" : `status must be found|none|private (got ${JSON.stringify(r.status)})` });
+				continue;
+			}
 			const entry = ledger[normalizeName(r.name)];
 			if (!entry) {
 				unknown.push(r.name);
@@ -4092,7 +4102,7 @@ async function handlePlayerAudit(request: Request, env: Env, ctx: ExecutionConte
 		}
 		await env.FEED_TAGS.put(NT_LEDGER_KEY, JSON.stringify(ledger));
 		emitDiag(env, ctx, "socialResearchSaved", `${saved.length} saved${unknown.length ? `, ${unknown.length} unknown` : ""}`);
-		return j({ saved: saved.length, unknown });
+		return j({ saved: saved.length, unknown, skipped });
 	}
 
 	if (request.method === "POST" && url.pathname === "/social/player-audit/apply") {
