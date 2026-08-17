@@ -30,15 +30,23 @@ moved outlets, moved to another platform, left the beat, or left journalism. A r
 still covers NWSL elsewhere but abandoned Bluesky is still a drop FROM THE BLUESKY LIST
 (we serve what posts). Cite what you find.
 
-### 3. Discovery (web research — NOT the follow graph)
+### 3. Discovery (web research — NOT the follow graph) — RUN THIS EVERY TIME
 
+⚠️ Discovery is NOT conditional on fan signals existing (audit run #1 skipped it when
+addSignals was empty — wrong). Every run does BOTH halves:
+- **Fan signals:** research each `addSignals` handle clearing the threshold (3+ adds among one
+  club's fans): is this a real NWSL voice (beat writer, club insider, analyst)? Active on
+  Bluesky? Cite sources. Ignore any signal whose team code is not one of the 16 club
+  abbreviations (malformed/test data).
+- **Beat-coverage sweep (unconditional):** the current defaults skew to league-wide voices.
+  For clubs without a dedicated beat voice on the list, search for their beat reporters
+  ("<club> beat reporter", club press corps, local outlet soccer desks, podcast hosts) and
+  check whether they have an ACTIVE Bluesky posting original coverage (many are X-only — an
+  X-only voice is NOT addable, note her and move on). Recommend only genuinely additive,
+  active voices — a handful per run at most; every add is recurring classification cost the
+  owner budgets for.
 ⛔ Follows-of-follows / graph signals are REJECTED (owner): reporters follow peers across all
-beats, so "reporters follow her" proves nothing. Instead:
-- Research each `addSignals` handle that clears the threshold: is this a real NWSL voice
-  (beat writer, club insider, analyst)? Active on Bluesky? Cite sources.
-- For clubs with weak coverage in the current defaults, search for their beat reporters
-  ("<club> beat reporter", club press corps, podcast hosts) and check whether they have an
-  ACTIVE Bluesky (many are X-only — an X-only voice is NOT addable).
+beats, so "reporters follow her" proves nothing.
 
 ### 4. Report (recommendation, not application)
 
