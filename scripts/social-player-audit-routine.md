@@ -16,7 +16,10 @@ Base: `https://nwslapp-proxy.tiffany-rieth.workers.dev/social/player-audit`
 - The ONLY drops are: left the NWSL, or a dead/impersonated handle. **Never drop for NT-roster
   absence.** Emily Fox, Naomi Girma, Alyssa Thompson are grandfathered — never attempt to drop
   them (the server refuses anyway).
-- The 80 ceiling is a **CEILING, never a target**. Carry exactly who qualifies; never pad.
+- The ceiling is a **CEILING, never a target** — read `capacity` in the report (160 total = two
+  ROTATING POOLS × 80 per scrape run; the every-2-day scrape alternates pools, so every featured
+  player serves all week and refreshes every 4 days). Pools are AUTO-ASSIGNED server-side (new
+  adds join the lighter pool) — you never manage pools. Carry exactly who qualifies; never pad.
 
 ## Steps — execute in order
 

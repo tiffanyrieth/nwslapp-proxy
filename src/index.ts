@@ -383,7 +383,8 @@ const SOCIAL_POSTS_PER_PROFILE = 4; // requested of Apify (ignored by the cheap 
 const BRIGHTDATA_API = "https://api.brightdata.com/datasets/v3";
 const BRIGHTDATA_IG_DATASET = "gd_lk5ns7kz21pck8jpis"; // Instagram Posts scraper dataset id
 const BD_POSTS_PER_PROFILE = 6; // BD honors per-profile caps; 3/handle is the serve cap anyway
-const MAX_PLAYER_HANDLES = 80; // budget guardrail: ~90 fit Apify's $5 free tier; 80 leaves headroom
+const MAX_POOL_HANDLES = 80; // per-RUN budget guardrail: ~90 fit Apify's $5 free tier; 80 leaves headroom
+const MAX_PLAYER_HANDLES = 160; // TOTAL ceiling = 2 rotating pools × 80 (owner 2026-08-17); still a CEILING, never a target
 // The cron has no incoming request to derive its own origin from, so the webhook endpoint
 // base is pinned here (workers.dev origin; update if the worker ever moves to a custom domain).
 const PROXY_PUBLIC_ORIGIN = "https://nwslapp-proxy.tiffany-rieth.workers.dev";
@@ -605,8 +606,24 @@ const CLUB_SOCIAL: Record<string, { name: string; ig: string; tiktok?: string }>
 // POST /social/player-audit/apply. This constant is only the SEED — served verbatim until
 // the first apply creates the KV record; never edited to add/drop players after that.
 // Europe-based (Fox/Girma/A.Thompson) grandfathered per owner, tagged to last NWSL club.
-type PlayerSocialEntry = { name: string; abbr: string; ig: string; bsky?: string; addedAt?: string; source?: string };
+type PlayerSocialEntry = { name: string; abbr: string; ig: string; bsky?: string; addedAt?: string; source?: string; pool?: "A" | "B" };
 const PLAYER_LIST_KEY = "social:player-list";
+
+// ── Pool ROTATION (owner 2026-08-17): the every-2-day scrape alternates pools A/B — same
+// monthly Apify volume (cost driver = results/month, not distinct handles), DOUBLE the player
+// ceiling. Serving merges both pool snapshots, so every player is in the app all week; each
+// player's cards refresh every 4 days. Resilience UP vs the old single snapshot: a missed cron
+// costs one pool's freshness, never the whole chip. Pool TTL = 6 days = tolerate exactly ONE
+// missed cycle, then that pool goes honestly empty (the owner's one-miss canary design).
+// New adds auto-assign to the LIGHTER pool (server-side — the routine needs no pool awareness).
+const POOL_MARKER_KEY = "social:pool-last-scraped";
+const POOL_SNAPSHOT_TTL = 60 * 60 * 24 * 6;
+const poolKey = (p: "A" | "B") => `social-cards-player-pool-${p.toLowerCase()}`;
+const lighterPool = (list: PlayerSocialEntry[]): "A" | "B" => {
+	const a = list.filter((p) => p.pool === "A").length;
+	const b = list.filter((p) => p.pool === "B").length;
+	return a <= b ? "A" : "B";
+};
 const PLAYER_SOCIAL_SEED: PlayerSocialEntry[] = [
 	{ name: "Trinity Rodman",   abbr: "WAS", ig: "trinity_rodman" },
 	{ name: "Mallory Swanson",  abbr: "CHI", ig: "malpugh" },
@@ -2539,7 +2556,7 @@ async function statusCheckFeedSources(): Promise<StatusSection> {
 
 async function statusCheckIG(env: Env): Promise<StatusSection> {
 	const checks: StatusCheck[] = [];
-	for (const [label, k] of [["Players (Feed IG)", SOCIAL_PLAYER_KEY], ["Clubs (Home IG)", SOCIAL_CLUB_KEY]] as [string, string][]) {
+	for (const [label, k] of [["Players pool A (Feed IG)", poolKey("A")], ["Players pool B (Feed IG)", poolKey("B")], ["Clubs (Home IG)", SOCIAL_CLUB_KEY]] as [string, string][]) {
 		const raw = await env.FEED_TAGS.get(k).catch(() => null);
 		if (!raw) {
 			checks.push({ label, status: "fail", detail: "snapshot MISSING (cron failed or KV expired → no IG on that tab)" });
@@ -3783,19 +3800,36 @@ async function buildSocialCards(env: Env, handles: SocialHandle[], ctx?: Executi
  *  Bright Data is configured, an ASYNC scrape is triggered and /brightdata-webhook writes
  *  the club key minutes later; until then clubs ride the same Apify run (pre-split
  *  fallback — the split deploys without a flag day). Returns a summary for /refresh-social. */
-async function refreshSocialCache(env: Env, ctx?: ExecutionContext): Promise<{ playerCards: number; clubs: string }> {
+async function refreshSocialCache(env: Env, ctx?: ExecutionContext): Promise<{ playerCards: number; pool: string; clubs: string }> {
 	const playerList = await loadPlayerSocial(env);
-	const igHandles = [...CLUB_HANDLES, ...playerIgHandles(playerList)];
+	// Pool hygiene: any entry without a pool (pre-rotation data, or a write that skipped
+	// assignment) gets the lighter pool NOW and the list is persisted — never scrape-skipped.
+	let assigned = false;
+	for (const p of playerList) {
+		if (p.pool !== "A" && p.pool !== "B") {
+			p.pool = lighterPool(playerList);
+			assigned = true;
+		}
+	}
+	if (assigned) await env.FEED_TAGS.put(PLAYER_LIST_KEY, JSON.stringify(playerList));
+
+	// Alternate pools: scrape the one NOT scraped last run.
+	const last = await env.FEED_TAGS.get(POOL_MARKER_KEY);
+	const thisPool: "A" | "B" = last === "A" ? "B" : "A";
+	await env.FEED_TAGS.put(POOL_MARKER_KEY, thisPool);
+	const poolPlayers = playerList.filter((p) => p.pool === thisPool);
+
+	const igHandles = [...CLUB_HANDLES, ...playerIgHandles(poolPlayers)];
 	const bdConfigured = !!(env.BRIGHTDATA_TOKEN && env.BD_WEBHOOK_SECRET);
 
-	if (playerList.length > MAX_PLAYER_HANDLES && ctx) {
-		emitDiag(env, ctx, "playerCapExceeded", `${playerList.length}/${MAX_PLAYER_HANDLES}`);
+	if (poolPlayers.length > MAX_POOL_HANDLES && ctx) {
+		emitDiag(env, ctx, "playerCapExceeded", `pool ${thisPool}: ${poolPlayers.length}/${MAX_POOL_HANDLES}`);
 	}
 
 	const apifyHandles = bdConfigured ? igHandles.filter((h) => h.kind === "player") : igHandles;
 	const { instagram } = await buildSocialCards(env, apifyHandles, ctx);
 	const players = instagram.filter((c) => (c as { placement?: string }).placement === "feed");
-	const playerCards = await writeSideOrKeepLastGood(env, ctx, SOCIAL_PLAYER_KEY, players, "player");
+	const playerCards = await writeSideOrKeepLastGood(env, ctx, poolKey(thisPool), players, "player", POOL_SNAPSHOT_TTL);
 
 	let clubs: string;
 	if (bdConfigured) {
@@ -3806,7 +3840,7 @@ async function refreshSocialCache(env: Env, ctx?: ExecutionContext): Promise<{ p
 		clubs = `apify-fallback:${kept}`;
 		if (ctx) emitDiag(env, ctx, "bdUnconfigured", "clubs via apify fallback");
 	}
-	return { playerCards, clubs };
+	return { playerCards, pool: thisPool, clubs };
 }
 
 // ── Social self-tuning · Stage 1b: national-team eligibility ledger ───────────────
@@ -4128,7 +4162,9 @@ async function handlePlayerAudit(request: Request, env: Env, ctx: ExecutionConte
 				rejected.push({ name, reason: `ceiling ${MAX_PLAYER_HANDLES} reached` });
 				continue;
 			}
-			list.push({ name, abbr, ig, bsky: a.bsky || undefined, addedAt: now, source: "routine" });
+			// Pool auto-assignment (owner rule): new adds join whichever pool is lighter — the
+			// routine never needs pool awareness; balance converges on its own.
+			list.push({ name, abbr, ig, bsky: a.bsky || undefined, addedAt: now, source: "routine", pool: lighterPool(list) });
 			igSeen.add(ig.toLowerCase());
 			nameSeen.add(normalizeName(name));
 			added.push(name);
@@ -4192,12 +4228,13 @@ async function handlePlayerAudit(request: Request, env: Env, ctx: ExecutionConte
 				used: playerList.length,
 				ceiling: MAX_PLAYER_HANDLES,
 				headroom: MAX_PLAYER_HANDLES - playerList.length,
-				note: "ceiling is a CEILING, never a target — carry exactly who qualifies",
+				pools: { A: playerList.filter((p) => p.pool === "A").length, B: playerList.filter((p) => p.pool === "B").length, perRunBudget: MAX_POOL_HANDLES },
+				note: "ceiling is a CEILING, never a target — carry exactly who qualifies (2 rotating pools; adds auto-assign to the lighter)",
 			},
 			clubCoverage,
 			// The live featured list WITH each player's research/gate record — what the
 			// re-curation + backfill passes read (candidates below exclude featured by definition).
-			featured: playerList.map((p) => ({ name: p.name, abbr: p.abbr, ig: p.ig, bsky: p.bsky, research: gateLedgerLookup(ledger, p.name) })),
+			featured: playerList.map((p) => ({ name: p.name, abbr: p.abbr, ig: p.ig, bsky: p.bsky, pool: p.pool, research: gateLedgerLookup(ledger, p.name) })),
 			candidates: { needsResearch, researched },
 			drops: { players: drops, note: "not on any NWSL roster — verify (ESPN name variant lands here too) before applying" },
 			grandfathered,
@@ -4342,6 +4379,7 @@ async function writeSideOrKeepLastGood(
 	key: string,
 	fresh: unknown[],
 	side: "club" | "player",
+	ttl: number = SOCIAL_CACHE_TTL,
 ): Promise<number> {
 	let cards = fresh;
 	if (cards.length === 0) {
@@ -4354,7 +4392,7 @@ async function writeSideOrKeepLastGood(
 		if (ctx) emitDiag(env, ctx, "socialScrapeEmpty", `${side}: kept last-good ${cards.length}`);
 	}
 	if (cards.length === 0) return 0; // nothing now, nothing before — keep KV as-is
-	await env.FEED_TAGS.put(key, JSON.stringify(cards), { expirationTtl: SOCIAL_CACHE_TTL });
+	await env.FEED_TAGS.put(key, JSON.stringify(cards), { expirationTtl: ttl });
 	return cards.length;
 }
 
@@ -4396,14 +4434,21 @@ async function triggerBrightDataClubs(env: Env, ctx?: ExecutionContext): Promise
 /** Read the social snapshot (club + player sides merged), falling back per side to the
  *  legacy combined key until the split keys exist. [] if nothing yet. */
 async function readSocialCards(env: Env): Promise<unknown[]> {
-	const [club, player, legacy] = await Promise.all([
+	const [club, poolA, poolB, playerLegacy, legacy] = await Promise.all([
 		env.FEED_TAGS.get(SOCIAL_CLUB_KEY, "json") as Promise<unknown[] | null>,
+		env.FEED_TAGS.get(poolKey("A"), "json") as Promise<unknown[] | null>,
+		env.FEED_TAGS.get(poolKey("B"), "json") as Promise<unknown[] | null>,
 		env.FEED_TAGS.get(SOCIAL_PLAYER_KEY, "json") as Promise<unknown[] | null>,
 		env.FEED_TAGS.get(SOCIAL_CACHE_KEY, "json") as Promise<Array<{ placement?: string }> | null>,
 	]);
 	const legacyArr = legacy ?? [];
 	const clubs = club ?? legacyArr.filter((c) => c.placement === "home");
-	const players = player ?? legacyArr.filter((c) => c.placement === "feed");
+	// Rotation: players = the MERGE of both pool snapshots (each refreshed on alternate runs, so
+	// every featured player is served all week). Pre-rotation keys are fallback-only migration.
+	const players =
+		poolA || poolB
+			? [...(poolA ?? []), ...(poolB ?? [])]
+			: (playerLegacy ?? legacyArr.filter((c) => c.placement === "feed"));
 	return [...clubs, ...players];
 }
 
