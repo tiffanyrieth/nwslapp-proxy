@@ -25,6 +25,9 @@ import {
 	handleBracketAdmin,
 	ROSTER_GOOD_MIN,
 	fetchTeamSeasonStats,
+	fetchTeamAbbrs,
+	fetchRosterResilient,
+	mapEspnRosterAthletes,
 	type BracketEnv,
 } from "./bracket-engine.ts";
 import { buildHeadshotMap, handleHeadshots, normalizeName } from "./headshots.ts";
@@ -301,7 +304,7 @@ const BROWSER_UA =
 
 // ⚠️ ESPN bot rule: EVERY ESPN fetch needs the shared UA (ESPN 403s UA-less Worker fetches,
 // 2026-08-04) — the constant + full story live in espn-ua.ts so no module can miss it again.
-import { ESPN_UA } from "./espn-ua.ts";
+import { ESPN_UA, ESPN_HEADERS } from "./espn-ua.ts";
 
 // Bluesky AT Protocol PUBLIC API (keyless, no auth) — backs the Feed's
 // reporter/league/team posts (and the team voices merged onto Home).
@@ -309,6 +312,32 @@ const BSKY_PUBLIC = "https://public.api.bsky.app/xrpc";
 const BSKY_UA = "nwslapp-proxy/0.3 (+https://nwslapp-proxy.tiffany-rieth.workers.dev)";
 const FEED_TTL = 900; // 15min — the Feed is conversational, fresher than Home's 1h
 const POSTS_PER_HANDLE = 12; // recent posts pulled per account (app applies staleness)
+
+/** Hang bound for /feed's upstream fetches (Bluesky author feeds, outlet RSS, OG scrapes).
+ *  GENEROUS by design — these normally answer in 1-2s, so 8s only converts a HUNG connection
+ *  into that one source sitting out THIS refresh (per-source isolation + a diag at the call
+ *  site; the next refresh retries it fresh). It must never skip a merely-slow-normal source.
+ *  Added 2026-08-16 after one hung upstream dragged a cold /feed build past the app's 60s
+ *  client timeout (owner-approved: fix the hang class only, never blanket-ignore a source). */
+const UPSTREAM_FETCH_MS = 8000;
+// TRUE cancellation (AbortController), not a bare Promise.race: workerd allows ~6 concurrent
+// outbound connections per invocation, so a hung upstream doesn't just cost itself — it
+// STARVES the lane queue for healthy sources behind it. Abort actually frees the lane.
+// (Proven during the 2026-08-16 Bluesky degradation: 16 hung bsky fetches at 50s+ made a
+// 0.6s Guardian RSS "time out" purely from queueing. A race-only bound can't fix that.)
+async function fetchBounded(url: string, init?: RequestInit): Promise<Response> {
+	const ac = new AbortController();
+	const timer = setTimeout(() => ac.abort(), UPSTREAM_FETCH_MS);
+	try {
+		return await fetch(url, { ...init, signal: ac.signal });
+	} catch (e) {
+		if ((e as Error)?.name === "AbortError") throw Object.assign(new Error(`upstream hang >${UPSTREAM_FETCH_MS}ms`), { name: "TimeoutError" });
+		throw e;
+	} finally {
+		clearTimeout(timer);
+	}
+}
+const isTimeout = (e: unknown): boolean => ["TimeoutError", "AbortError"].includes((e as Error)?.name ?? "");
 
 // Claude Haiku relevance + team-tag (Step 2). Runs on the third-party Bluesky
 // bucket — REPORTER and LEAGUE-OUTLET accounts (both post off-topic/non-NWSL and
@@ -354,7 +383,8 @@ const SOCIAL_POSTS_PER_PROFILE = 4; // requested of Apify (ignored by the cheap 
 const BRIGHTDATA_API = "https://api.brightdata.com/datasets/v3";
 const BRIGHTDATA_IG_DATASET = "gd_lk5ns7kz21pck8jpis"; // Instagram Posts scraper dataset id
 const BD_POSTS_PER_PROFILE = 6; // BD honors per-profile caps; 3/handle is the serve cap anyway
-const MAX_PLAYER_HANDLES = 80; // budget guardrail: ~90 fit Apify's $5 free tier; 80 leaves headroom
+const MAX_POOL_HANDLES = 80; // per-RUN budget guardrail: ~90 fit Apify's $5 free tier; 80 leaves headroom
+const MAX_PLAYER_HANDLES = 160; // TOTAL ceiling = 2 rotating pools × 80 (owner 2026-08-17); still a CEILING, never a target
 // The cron has no incoming request to derive its own origin from, so the webhook endpoint
 // base is pinned here (workers.dev origin; update if the worker ever moves to a custom domain).
 const PROXY_PUBLIC_ORIGIN = "https://nwslapp-proxy.tiffany-rieth.workers.dev";
@@ -376,14 +406,24 @@ const SOCIAL_CACHE_TTL = 3 * 24 * 3600; // 3d KV safety net — the every-2-day 
 const SOCIAL_POLICY = `You are filtering and tagging Bluesky posts for an NWSL (US National Women's Soccer League) fan app. The posts come from soccer reporters/journalists and NWSL media/league accounts, who also post off-topic things (other sports, foreign leagues, men's soccer, personal life, general chatter).
 
 For each post (handle + text) decide three things:
-1. "isNWSL": true ONLY if the post is clearly about the NWSL — an NWSL club, an NWSL match/result/standing/award, a player at an NWSL club, a transfer into or out of an NWSL club, or the US women's national team (USWNT). false for everything else, INCLUDING women's soccer that isn't NWSL (England's WSL, Liga F, the UEFA Women's Champions League, other foreign leagues), other sports (PWHL, WNBA), men's soccer (including the men's World Cup), and the author's personal/off-topic posts. A post that only mentions another league, market, or country in passing — the size of the WSL's audience, a foreign transfer market, broadcast deals abroad — is NOT about the NWSL: the NWSL (a club/player/match/the league itself) or the USWNT must be the SUBJECT of the post. Example: "Japan is the joint-largest market for the WSL outside of the UK" is about England's WSL → isNWSL false. When you are unsure whether a post is about the NWSL, return false.
-2. "teams": if isNWSL, the NWSL club abbreviation(s) the post is primarily about; [] for genuinely league-wide/general NWSL or USWNT posts. If isNWSL is false, return [].
+1. "isNWSL": true ONLY if the post is clearly about the NWSL — an NWSL club, an NWSL match/result/standing/award, a player at an NWSL club, a transfer into or out of an NWSL club, or the US women's national team (USWNT) — OR if an NWSL-rostered player is a PRIMARY SUBJECT of the post in ANY competition, including her own country's national team (a hat trick at WAFCON, a World Cup or Olympics performance, a continental tournament, an international friendly). Soccer is worldwide and NWSL players represent many countries: the NWSL connection is the PLAYER, not the competition. "Banda scores a hat trick for Zambia at WAFCON" → isNWSL true (Barbra Banda plays for Orlando Pride). PRIMARY SUBJECT is a real bar: the post must be meaningfully about her — her performance, her news, her story. Being one name among many (a tournament preview naming dozens of players, a best-XI list, a full squad announcement for a non-US country) is a passing mention, NOT primary-subject. false for everything else, INCLUDING women's soccer that isn't NWSL with no NWSL player as a primary subject (England's WSL, Liga F, the UEFA Women's Champions League, other foreign leagues), other sports (PWHL, WNBA), men's soccer (including the men's World Cup), and the author's personal/off-topic posts. A post that only mentions another league, market, or country in passing — the size of the WSL's audience, a foreign transfer market, broadcast deals abroad — is NOT about the NWSL. Example: "Japan is the joint-largest market for the WSL outside of the UK" is about England's WSL → isNWSL false. When you are unsure, return false.
+2. "teams": if isNWSL, the NWSL club abbreviation(s) the post is primarily about; for a national-team post kept because of an NWSL player, tag HER NWSL CLUB (use the FEATURED NWSL PLAYERS list when present, plus your knowledge of current NWSL rosters); [] for genuinely league-wide/general NWSL or USWNT posts. If isNWSL is false, return [].
 3. "leagueNews": true ONLY when isNWSL is true AND teams is empty AND the post is genuine league-wide NWSL NEWS — expansion, the schedule/fixtures release, awards/honors, the playoff race, rule/CBA/roster-rule changes, or other league-wide announcements. false for general opinion, hot takes, predictions, banter, or chatter not tied to hard news. If isNWSL is false or teams is non-empty, return false.
 
 The 16 NWSL teams and their abbreviations:
 LA = Angel City FC, BAY = Bay FC, BOS = Boston, CHI = Chicago Stars, DEN = Denver, GFC = Gotham FC, HOU = Houston Dash, KC = Kansas City Current, NC = North Carolina Courage, ORL = Orlando Pride, POR = Portland Thorns, LOU = Racing Louisville, SD = San Diego Wave, SEA = Seattle Reign, UTA = Utah Royals, WAS = Washington Spirit.
 
 Rules: a single-team post → exactly that one abbreviation; a multi-team post → all clubs named; league-wide → []. Only use the 16 abbreviations above. Echo each post's id exactly.`;
+
+/** The featured-player ↔ club map injected into BOTH classifier prompts (social + news) so
+ *  Haiku can connect an international post to the player's NWSL club ("Banda scores for
+ *  Zambia" → ORL). Built from the LIVE KV player list — the day the routine adds a player,
+ *  the classifiers know her with no deploy. ~34–80 names ≈ trivial input tokens, and
+ *  verdicts are cached per post, so cost impact is nil. */
+function featuredPlayerMapBlock(players: PlayerSocialEntry[]): string {
+	const pairs = players.map((p) => `${p.name} → ${p.abbr}`).join("; ");
+	return `FEATURED NWSL PLAYERS (name → club; not exhaustive — any current NWSL player qualifies): ${pairs}.`;
+}
 
 // Forced structured output (output_config.format) — Haiku 4.5 returns the first
 // text block as JSON matching this schema. No min/max constraints (unsupported);
@@ -450,8 +490,8 @@ const NEWS_TEAM_ABBR_SET = new Set(NEWS_TEAM_ABBRS);
 const NEWS_POLICY = `You are filtering and tagging news articles for an NWSL (US National Women's Soccer League) fan app. The articles come from women's-soccer outlets whose feeds also carry non-NWSL items (other women's sports like the PWHL/WNBA, the English WSL or other foreign leagues, men's soccer, general news).
 
 For each article (headline + outlet) decide two things:
-1. "isNWSL": true ONLY if the article is primarily about the NWSL itself — an NWSL club, an NWSL match/standing/award/power-ranking, a player AT an NWSL club in an NWSL context, or a transfer INTO or OUT OF an NWSL club. false for everything else, INCLUDING: national-team soccer (the USWNT or ANY country's national team — international friendlies, tournaments, the World Cup, call-ups, FIFA windows) EVEN WHEN NWSL players take part; women's soccer that isn't NWSL (England's WSL, Spain's Liga F, the UEFA Women's Champions League, other foreign leagues); players moving between two non-NWSL clubs; other sports (PWHL, WNBA); and men's soccer. When the headline centers a national team, an international match/window, a foreign league, or a non-NWSL transfer, isNWSL is false even though it may involve women's soccer or NWSL players. When unsure, return false.
-2. "teams": if isNWSL, the NWSL club abbreviation(s) it is primarily about; [] for genuinely league-wide/general NWSL news. If isNWSL is false, return [].
+1. "isNWSL": true ONLY if the article is primarily about the NWSL itself — an NWSL club, an NWSL match/standing/award/power-ranking, a player AT an NWSL club, a transfer INTO or OUT OF an NWSL club, or the US women's national team (USWNT) — OR if an NWSL-rostered player is a PRIMARY SUBJECT of the article in ANY competition, including her own country's national team (WAFCON, the World Cup, the Olympics, continental tournaments, friendlies). Soccer is worldwide and NWSL players represent many countries: she plays for her club AND her country, so an article about her national-team goal is news about an NWSL club's player. "Banda hat trick sends Zambia to the WAFCON final" → isNWSL true (Barbra Banda plays for Orlando Pride). PRIMARY SUBJECT is a real bar: the article must be meaningfully about her — her performance, her news, her story. Being one name among many (a tournament preview naming dozens, a squad-list announcement for a non-US country, a best-XI round-up) is a passing mention, NOT primary-subject. false for everything else, INCLUDING: women's soccer that isn't NWSL with no NWSL player as a primary subject (England's WSL, Spain's Liga F, the UEFA Women's Champions League, other foreign leagues); players moving between two non-NWSL clubs; other sports (PWHL, WNBA); and men's soccer. When unsure, return false.
+2. "teams": if isNWSL, the NWSL club abbreviation(s) it is primarily about; for a national-team article kept because of an NWSL player, tag HER NWSL CLUB (use the FEATURED NWSL PLAYERS list when present, plus your knowledge of current NWSL rosters); [] for genuinely league-wide/general NWSL or USWNT news. If isNWSL is false, return [].
 
 The 16 NWSL teams and their abbreviations:
 LA = Angel City FC, BAY = Bay FC, BOS = Boston, CHI = Chicago Stars, DEN = Denver, GFC = Gotham FC, HOU = Houston Dash, KC = Kansas City Current, NC = North Carolina Courage, ORL = Orlando Pride, POR = Portland Thorns, LOU = Racing Louisville, SD = San Diego Wave, SEA = Seattle Reign, UTA = Utah Royals, WAS = Washington Spirit.
@@ -487,8 +527,34 @@ const NEWS_SCHEMA = {
 // 2026-08 — the app's Clubs chip is gone; a club's Home voice is its IG/YT/news.)
 interface FeedHandle {
 	handle: string;
-	kind: "reporter" | "league";
+	kind: "reporter" | "league" | "player";
+	// Player-kind extras (2c): her NWSL club (default players; undefined for a user add) and
+	// her IG id — the app's player-follow key, so bsky + IG cards toggle as ONE player.
+	abbr?: string;
+	playerId?: string;
 }
+// The default reporter list is DATA (owner 2026-08-17, reporter automation): the live list is
+// KV `social:reporter-list`, written by the monthly routine through POST
+// /social/reporter-audit/apply under server guardrails (MAX_FEED_HANDLES budget ceiling,
+// per-call add cap, drop rules). This constant is the SEED — served until the first apply;
+// never hand-edited for adds/drops after that.
+const REPORTER_LIST_KEY = "social:reporter-list";
+const MAX_FEED_HANDLES = 24; // classification-budget ceiling for the default list — a CEILING, never a target
+const MAX_REPORTER_ADDS_PER_CALL = 2; // the routine can never go on an add spree in one run
+
+async function loadFeedHandles(env: Env): Promise<FeedHandle[]> {
+	try {
+		const raw = await env.FEED_TAGS.get(REPORTER_LIST_KEY);
+		if (raw) {
+			const list = JSON.parse(raw) as FeedHandle[];
+			if (Array.isArray(list) && list.length > 0 && list.every((h) => h.handle && (h.kind === "reporter" || h.kind === "league"))) return list;
+		}
+	} catch {
+		/* fall through to seed */
+	}
+	return FEED_HANDLES;
+}
+
 const FEED_HANDLES: FeedHandle[] = [
 	// Reporters / journalists (league-wide)
 	{ handle: "meglinehan.com", kind: "reporter" },
@@ -501,7 +567,9 @@ const FEED_HANDLES: FeedHandle[] = [
 	// Tannenwald) only surface on their NWSL/USWNT items.
 	{ handle: "scoutripley.bsky.social", kind: "reporter" }, // Claire Watkins (Just Women's Sports / The Late Sub)
 	{ handle: "jennatonelli.bsky.social", kind: "reporter" }, // Jenna Tonelli (SI / broadcast)
-	{ handle: "caitlinmurr.bsky.social", kind: "reporter" }, // Caitlin Murray (ESPN; "The National Team" author)
+	// caitlinmurr.bsky.social removed 2026-08-17 (routine audit #1): no original posts in 236d
+	// (reposts only). The default list serves accounts that post original coverage here; an
+	// account can be re-added instantly if it becomes active again.
 	{ handle: "jeffrueter.bsky.social", kind: "reporter" }, // Jeff Rueter (The Athletic)
 	{ handle: "jtannenwald.bsky.social", kind: "reporter" }, // Jonathan Tannenwald (Philadelphia Inquirer)
 	{ handle: "girlssoccernetwork.bsky.social", kind: "reporter" }, // Girls Soccer Network (outlet)
@@ -557,9 +625,32 @@ const CLUB_SOCIAL: Record<string, { name: string; ig: string; tiktok?: string }>
 	WAS: { name: "Washington Spirit",    ig: "washingtonspirit",   tiktok: "washspirit" },        // ⚠️ TikTok abbreviated
 };
 
-// USWNT-pool + marquee-international players → IG only, routed to current NWSL club.
-// Europe-based (Fox/Girma/A.Thompson) included per owner, tagged to last NWSL club.
-const PLAYER_SOCIAL: Array<{ name: string; abbr: string; ig: string }> = [
+// The featured-player pool is DATA, not code (owner 2026-08-16, full automation): the live
+// list lives in KV (`social:player-list`), written by the self-tuning routine through
+// POST /social/player-audit/apply. This constant is only the SEED — served verbatim until
+// the first apply creates the KV record; never edited to add/drop players after that.
+// Europe-based (Fox/Girma/A.Thompson) grandfathered per owner, tagged to last NWSL club.
+// bsky was removed from the DEFAULT schema (owner 2026-08-17): the app does not self-discover
+// player Bluesky — defaults are IG-only. (User adds carry their own bsky via /feed?playerBsky=.)
+type PlayerSocialEntry = { name: string; abbr: string; ig: string; addedAt?: string; source?: string; pool?: "A" | "B" };
+const PLAYER_LIST_KEY = "social:player-list";
+
+// ── Pool ROTATION (owner 2026-08-17): the every-2-day scrape alternates pools A/B — same
+// monthly Apify volume (cost driver = results/month, not distinct handles), DOUBLE the player
+// ceiling. Serving merges both pool snapshots, so every player is in the app all week; each
+// player's cards refresh every 4 days. Resilience UP vs the old single snapshot: a missed cron
+// costs one pool's freshness, never the whole chip. Pool TTL = 6 days = tolerate exactly ONE
+// missed cycle, then that pool goes honestly empty (the owner's one-miss canary design).
+// New adds auto-assign to the LIGHTER pool (server-side — the routine needs no pool awareness).
+const POOL_MARKER_KEY = "social:pool-last-scraped";
+const POOL_SNAPSHOT_TTL = 60 * 60 * 24 * 6;
+const poolKey = (p: "A" | "B") => `social-cards-player-pool-${p.toLowerCase()}`;
+const lighterPool = (list: PlayerSocialEntry[]): "A" | "B" => {
+	const a = list.filter((p) => p.pool === "A").length;
+	const b = list.filter((p) => p.pool === "B").length;
+	return a <= b ? "A" : "B";
+};
+const PLAYER_SOCIAL_SEED: PlayerSocialEntry[] = [
 	{ name: "Trinity Rodman",   abbr: "WAS", ig: "trinity_rodman" },
 	{ name: "Mallory Swanson",  abbr: "CHI", ig: "malpugh" },
 	{ name: "Sophia Wilson",    abbr: "POR", ig: "sophiawilson" },
@@ -598,14 +689,29 @@ const PLAYER_SOCIAL: Array<{ name: string; abbr: string; ig: string }> = [
 
 // IG-only for now (TikTok deferred — owner decision). CLUB_SOCIAL.tiktok handles are
 // kept above as ready reference for when TikTok is re-enabled (see buildSocialCards).
-const SOCIAL_HANDLES: SocialHandle[] = [
-	...Object.entries(CLUB_SOCIAL).map(
-		([abbr, c]): SocialHandle => ({ handle: c.ig, platform: "instagram", kind: "team", abbr, name: c.name }),
-	),
-	...PLAYER_SOCIAL.map(
-		(p): SocialHandle => ({ handle: p.ig, platform: "instagram", kind: "player", abbr: p.abbr, name: p.name }),
-	),
-];
+// Clubs stay STATIC code (16 clubs, changes ~never); players are loaded per-use from KV.
+const CLUB_HANDLES: SocialHandle[] = Object.entries(CLUB_SOCIAL).map(
+	([abbr, c]): SocialHandle => ({ handle: c.ig, platform: "instagram", kind: "team", abbr, name: c.name }),
+);
+
+/** The LIVE featured-player list: KV overlay if the routine has ever written one, else the seed.
+ *  Fail-open to the seed on a corrupt record (diag'd by the writer path, never silent-empty). */
+async function loadPlayerSocial(env: Env): Promise<PlayerSocialEntry[]> {
+	try {
+		const raw = await env.FEED_TAGS.get(PLAYER_LIST_KEY);
+		if (raw) {
+			const list = JSON.parse(raw) as PlayerSocialEntry[];
+			if (Array.isArray(list) && list.length > 0 && list.every((p) => p.name && p.abbr && p.ig)) return list;
+		}
+	} catch {
+		/* fall through to seed */
+	}
+	return PLAYER_SOCIAL_SEED;
+}
+
+function playerIgHandles(players: PlayerSocialEntry[]): SocialHandle[] {
+	return players.map((p): SocialHandle => ({ handle: p.ig, platform: "instagram", kind: "player", abbr: p.abbr, name: p.name }));
+}
 
 export default {
 	async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
@@ -688,6 +794,16 @@ export default {
 			}
 			return handleAdminAttendance(env, (kind, detail) => emitDiag(env, ctx, kind, detail),
 				url.searchParams.get("sweep") === "1");
+		}
+
+		// Admin/routine-keyed social self-tuning audit surface: GET ?nt= (ledger populate),
+		// GET ?section=nwsl (decision report), POST /research + /apply (routine write-back).
+		// Prefix match + registered BEFORE the GET-only guard (the two POSTs need it).
+		if (url.pathname === "/social/player-audit" || url.pathname.startsWith("/social/player-audit/")) {
+			return handlePlayerAudit(request, env, ctx);
+		}
+		if (url.pathname === "/social/reporter-audit" || url.pathname.startsWith("/social/reporter-audit/")) {
+			return handleReporterAudit(request, env, ctx);
 		}
 
 		// POST telemetry ingest must be registered BEFORE the GET-only guard below.
@@ -862,7 +978,7 @@ export default {
 			return handleFeed(url, env, ctx);
 		}
 		if (url.pathname === "/feed/players") {
-			return handlePlayerDirectory();
+			return handlePlayerDirectory(env);
 		}
 		if (url.pathname === "/feed/validate-reporter") {
 			return handleValidateReporter(url, env, ctx);
@@ -1833,7 +1949,7 @@ async function buildOutletFallbackCards(abbr: string): Promise<NewsCard[]> {
 	const perFeed = await Promise.all(
 		NEWS_FEEDS.map(async (feed) => {
 			try {
-				const r = await fetch(feed.url, {
+				const r = await fetchBounded(feed.url, {
 					headers: {
 						"User-Agent": BROWSER_UA,
 						Accept: "application/rss+xml, application/xml, text/xml",
@@ -2414,25 +2530,39 @@ function latestOriginalAgeMs(feed: BskyItem[], now: number): number | null {
 	return null;
 }
 
-async function statusCheckFeedSources(): Promise<StatusSection> {
+/** One default Bluesky handle's health, shared by the admin Status tab (HTML) and
+ *  GET /social/reporter-audit (JSON) — one source of truth for the tier logic. */
+type BskyHealth = { handle: string; kind: "reporter" | "league"; tier: "ok" | "cooling" | "dormant" | "empty" | "dead"; lastPostDays: number | null };
+async function bskySourceHealth(env: Env): Promise<BskyHealth[]> {
 	const now = Date.now();
-	const bsky = FEED_HANDLES.filter((h) => h.kind === "reporter" || h.kind === "league");
-	const bskyChecks = await Promise.all(bsky.map(async (h): Promise<StatusCheck> => {
+	const bsky = (await loadFeedHandles(env)).filter((h) => h.kind === "reporter" || h.kind === "league");
+	return Promise.all(bsky.map(async (h): Promise<BskyHealth> => {
+		const kind = h.kind as "reporter" | "league";
 		try {
 			const feed = await bskyAuthorFeed(h.handle, 15); // deeper sample so reposts don't mask an active handle
 			const age = latestOriginalAgeMs(feed, now);
-			if (age === null) {
-				return { label: h.handle, status: "fail", detail: feed.length === 0 ? "resolves but timeline is EMPTY" : "no original posts in last 15 items (repost-only?) — drop candidate" };
-			}
+			if (age === null) return { handle: h.handle, kind, tier: "empty", lastPostDays: null };
 			const days = Math.floor(age / 86_400_000);
-			const when = `last post ${days}d ago`;
-			if (age < BSKY_COOLING_MS) return { label: h.handle, status: "ok", detail: when };
-			if (age <= BSKY_DORMANT_MS) return { label: h.handle, status: "warn", detail: `${when} — cooling` };
-			return { label: h.handle, status: "fail", detail: `${when} — past the ~30d feed window, invisible in Social (drop candidate)` };
+			if (age < BSKY_COOLING_MS) return { handle: h.handle, kind, tier: "ok", lastPostDays: days };
+			if (age <= BSKY_DORMANT_MS) return { handle: h.handle, kind, tier: "cooling", lastPostDays: days };
+			return { handle: h.handle, kind, tier: "dormant", lastPostDays: days };
 		} catch {
-			return { label: h.handle, status: "fail", detail: "does NOT resolve on the keyless API — dead/renamed?" };
+			return { handle: h.handle, kind, tier: "dead", lastPostDays: null };
 		}
 	}));
+}
+
+async function statusCheckFeedSources(env: Env): Promise<StatusSection> {
+	const bskyChecks = (await bskySourceHealth(env)).map((s): StatusCheck => {
+		const when = s.lastPostDays !== null ? `last post ${s.lastPostDays}d ago` : "";
+		switch (s.tier) {
+			case "ok":      return { label: s.handle, status: "ok", detail: when };
+			case "cooling": return { label: s.handle, status: "warn", detail: `${when} — cooling` };
+			case "dormant": return { label: s.handle, status: "fail", detail: `${when} — past the ~30d feed window, invisible in Social (drop candidate)` };
+			case "empty":   return { label: s.handle, status: "fail", detail: "no original posts in last 15 items (repost-only or empty timeline) — drop candidate" };
+			case "dead":    return { label: s.handle, status: "fail", detail: "does NOT resolve on the keyless API — dead/renamed?" };
+		}
+	});
 	const rssChecks = await Promise.all(NEWS_FEEDS.map(async (f): Promise<StatusCheck> => {
 		try {
 			const r = await fetch(f.url, { headers: { "User-Agent": BROWSER_UA, Accept: "application/rss+xml, application/xml, text/xml" } });
@@ -2452,7 +2582,7 @@ async function statusCheckFeedSources(): Promise<StatusSection> {
 
 async function statusCheckIG(env: Env): Promise<StatusSection> {
 	const checks: StatusCheck[] = [];
-	for (const [label, k] of [["Players (Feed IG)", SOCIAL_PLAYER_KEY], ["Clubs (Home IG)", SOCIAL_CLUB_KEY]] as [string, string][]) {
+	for (const [label, k] of [["Players pool A (Feed IG)", poolKey("A")], ["Players pool B (Feed IG)", poolKey("B")], ["Clubs (Home IG)", SOCIAL_CLUB_KEY]] as [string, string][]) {
 		const raw = await env.FEED_TAGS.get(k).catch(() => null);
 		if (!raw) {
 			checks.push({ label, status: "fail", detail: "snapshot MISSING (cron failed or KV expired → no IG on that tab)" });
@@ -2509,7 +2639,7 @@ function renderStatusSection(sec: StatusSection): string {
 const STATUS_SECTIONS: Record<string, { label: string; run: (env: Env) => Promise<StatusSection> }> = {
 	clubnews: { label: "Club news", run: (env) => statusCheckClubNews(env) },
 	espn: { label: "ESPN core", run: () => statusCheckESPN() },
-	feeds: { label: "Feed sources", run: () => statusCheckFeedSources() },
+	feeds: { label: "Feed sources", run: (env) => statusCheckFeedSources(env) },
 	ig: { label: "Instagram", run: (env) => statusCheckIG(env) },
 	errors: { label: "Diagnostics", run: (env) => statusCheckErrors(env) },
 };
@@ -2671,7 +2801,7 @@ function isoNoFraction(s?: string): string | undefined {
 async function fetchOG(
 	url: string,
 ): Promise<{ title?: string; description?: string; image?: string; published?: string }> {
-	const r = await fetch(url, { headers: { "User-Agent": BROWSER_UA, Accept: "text/html" } });
+	const r = await fetchBounded(url, { headers: { "User-Agent": BROWSER_UA, Accept: "text/html" } });
 	if (!r.ok) throw new Error(`og fetch ${r.status}`);
 	const html = await r.text();
 
@@ -2893,7 +3023,7 @@ async function buildNewsCards(teams: string[], env: Env, ctx: ExecutionContext):
 	const perFeed = await Promise.all(
 		NEWS_FEEDS.map(async (feed) => {
 			try {
-				const r = await fetch(feed.url, {
+				const r = await fetchBounded(feed.url, {
 					headers: {
 						"User-Agent": BROWSER_UA,
 						Accept: "application/rss+xml, application/xml, text/xml",
@@ -2925,7 +3055,10 @@ async function buildNewsCards(teams: string[], env: Env, ctx: ExecutionContext):
 					});
 				}
 				return cards;
-			} catch {
+			} catch (e) {
+				// Hang-bound tripped (or outlet died): this outlet sits out THIS refresh only —
+				// loud to the engineer, retried fresh next cycle. Never a standing exclusion.
+				if (isTimeout(e)) emitDiag(env, ctx, "feedUpstreamTimeout", `rss:${feed.url.slice(0, 60)}`);
 				return [] as NewsCard[];
 			}
 		}),
@@ -3086,8 +3219,15 @@ async function handleFeed(url: URL, env: Env, ctx: ExecutionContext): Promise<Re
 	const teams = normalizeTeams(url.searchParams.get("teams"));
 	// Phase 3 "make it yours": the user's added Bluesky reporter handles + followed player
 	// IG ids. Both personalize the feed and are folded into the cache key below.
+	// 2b layering (owner design): `muted` = DEFAULT handles the user toggled off — excluded
+	// from the curated fetch, and NOT allowed to supersede a same-handle user add (row 4 of
+	// the layering table: default off + user-added ⇒ the unfiltered add resurfaces).
 	const userHandles = parseHandleList(url.searchParams.get("handles")).slice(0, MAX_USER_HANDLES);
 	const userPlayers = new Set(parseHandleList(url.searchParams.get("players")));
+	const mutedDefaults = new Set(parseHandleList(url.searchParams.get("muted")));
+	// 2c: Bluesky handles the user added AS PLAYERS (the add-flow's reporter|player pick).
+	// Player voices NEVER go through Haiku (owner law) — served unfiltered like player IG.
+	const userPlayerBsky = parseHandleList(url.searchParams.get("playerBsky")).slice(0, MAX_USER_HANDLES);
 
 	const cache = caches.default;
 	const cacheUrl = new URL(url);
@@ -3098,6 +3238,10 @@ async function handleFeed(url: URL, env: Env, ctx: ExecutionContext): Promise<Re
 	else cacheUrl.searchParams.delete("handles");
 	if (userPlayers.size) cacheUrl.searchParams.set("players", [...userPlayers].sort().join(","));
 	else cacheUrl.searchParams.delete("players");
+	if (mutedDefaults.size) cacheUrl.searchParams.set("muted", [...mutedDefaults].sort().join(","));
+	else cacheUrl.searchParams.delete("muted");
+	if (userPlayerBsky.length) cacheUrl.searchParams.set("playerBsky", [...userPlayerBsky].sort().join(","));
+	else cacheUrl.searchParams.delete("playerBsky");
 	const cacheKey = new Request(cacheUrl.toString(), { method: "GET" });
 
 	const hit = await cache.match(cacheKey);
@@ -3109,15 +3253,25 @@ async function handleFeed(url: URL, env: Env, ctx: ExecutionContext): Promise<Re
 		// own posts. Per-handle failures are isolated inside blueskyCardsFor, so a
 		// single dead account can't trip the stale/502 fallback — that's reserved for
 		// a total Bluesky outage.
-		const reporterHandles = FEED_HANDLES.filter((h) => h.kind === "reporter");
-		const leagueHandles = FEED_HANDLES.filter((h) => h.kind === "league");
+		// Layering: active defaults = curated list minus the user's muted toggles. A user-added
+		// handle that is ALSO an active default is superseded (served filtered, once); if the
+		// default is muted, the user add wins and serves unfiltered below.
+		const activeDefaults = (await loadFeedHandles(env)).filter((h) => !mutedDefaults.has(h.handle.toLowerCase()));
+		const activeDefaultSet = new Set(activeDefaults.map((h) => h.handle.toLowerCase()));
+		const reporterHandles = activeDefaults.filter((h) => h.kind === "reporter");
+		const leagueHandles = activeDefaults.filter((h) => h.kind === "league");
 		// Phase 3 "make it yours": the user's own-added Bluesky reporters, fetched alongside
 		// the curated set (per-handle failures isolated in blueskyCardsFor).
-		const userReporterHandles: FeedHandle[] = userHandles.map((h) => ({ handle: h, kind: "reporter" }));
-		const [rawReporters, rawLeague, rawUserReporters, newsCards, social] = await Promise.all([
-			buildBlueskyCards(reporterHandles),
-			buildBlueskyCards(leagueHandles),
-			buildBlueskyCards(userReporterHandles),
+		const userReporterHandles: FeedHandle[] = userHandles
+			.filter((h) => !activeDefaultSet.has(h.toLowerCase()))
+			.map((h) => ({ handle: h, kind: "reporter" }));
+		// TWO WAVES, deliberately sequential (2026-08-16): workerd caps ~6 concurrent outbound
+		// connections per invocation, so 16 parallel Bluesky fetches starve the lane queue for
+		// everything behind them — during a Bluesky degradation that made a 0.6s RSS fetch
+		// "time out" from queueing alone. News + the KV snapshot go FIRST (fast, small); the
+		// Bluesky wave follows with its hang bound, so a Bluesky incident degrades ONLY the
+		// Bluesky sources and the rest of the feed always arrives.
+		const [newsCards, social] = await Promise.all([
 			// News (B1): per-outlet RSS → Haiku NWSL-gate + team-tag + followed-team
 			// filter → OG-enrich → newsArticle cards. Self-isolating; failures yield [].
 			buildNewsCards(teams, env, ctx),
@@ -3125,6 +3279,20 @@ async function handleFeed(url: URL, env: Env, ctx: ExecutionContext): Promise<Re
 			// (placement "feed") for the followed teams PLUS the user's followed cross-team
 			// players. (Club-official Bluesky was retired from the Feed 2026-08.)
 			readSocialCards(env),
+		]);
+		// 2c: the USER's own player-Bluesky adds (the add-flow's reporter|player pick). NO Haiku.
+		// ⚠️ DEFAULT player-Bluesky discovery/serving was DROPPED (owner 2026-08-17): the backfill
+		// sweep proved almost no players are really on Bluesky (the name-matches were impersonation
+		// squats) — 1-2 default bsky players across 16 clubs would read as broken, not thorough,
+		// and bsky identity is far harder to verify than IG. Players = IG-only for DEFAULTS;
+		// user adds remain free to include player bsky (their explicit choice).
+		const userPlayerBskyHandles: FeedHandle[] = userPlayerBsky.map((h) => ({ handle: h, kind: "player" }));
+
+		const [rawReporters, rawLeague, rawUserReporters, rawUserPlayerBsky] = await Promise.all([
+			buildBlueskyCards(reporterHandles, env, ctx),
+			buildBlueskyCards(leagueHandles, env, ctx),
+			buildBlueskyCards(userReporterHandles, env, ctx),
+			buildBlueskyCards(userPlayerBskyHandles, env, ctx),
 		]);
 		// Reporter + league-outlet Bluesky carry no team tag of their own and post
 		// off-topic too → one Haiku pass gates relevance, team-tags, and filters to
@@ -3137,14 +3305,15 @@ async function handleFeed(url: URL, env: Env, ctx: ExecutionContext): Promise<Re
 			env,
 			ctx,
 		);
-		// User-added reporters are NWSL-gated but NOT team-scoped — the user chose them, so
-		// keep every NWSL post (pass the full team set so decideFeedItem never drops a post
-		// just because its club isn't one the user follows).
-		const userReporterCards = rawUserReporters.length
-			? await classifySocialBluesky(rawUserReporters, [...NEWS_TEAM_ABBR_SET], env, ctx)
-			: [];
+		// ⚠️ COST FIREWALL (owner design, 2b): user-added handles NEVER touch Haiku. The user
+		// chose to follow them — show everything, unfiltered (that's the value of a personal
+		// add; the curated default list is the filtered experience). This bounds Haiku spend
+		// to the owner-curated defaults no matter how many handles users add. `userAdded`
+		// marks the cards for the app's layering logic.
+		const userReporterCards = rawUserReporters.map((c) => ({ ...(c as Record<string, unknown>), userAdded: true }));
+		const userPlayerBskyCards = rawUserPlayerBsky.map((c) => ({ ...(c as Record<string, unknown>), userAdded: true }));
 		const playerSocial = socialFor(social, teams, new Set(["feed"]), userPlayers);
-		cards = [...socialBluesky, ...userReporterCards, ...newsCards, ...playerSocial].sort(
+		cards = [...socialBluesky, ...userReporterCards, ...newsCards, ...playerSocial, ...userPlayerBskyCards].sort(
 			byTimestampDesc,
 		);
 		// Collapse identical-text duplicates (bot double-posts) BEFORE the cap, so a
@@ -3167,13 +3336,13 @@ async function handleFeed(url: URL, env: Env, ctx: ExecutionContext): Promise<Re
 
 /** GET /feed/players — the DIRECTORY of the featured players (Phase 3 "Follow players").
  *  The app only receives followed-team player cards on /feed, so it needs this to browse
- *  them all + follow across team lines. Served from PLAYER_SOCIAL (the same pool the 6-month
- *  routine keeps current) so it's always fresh and the app stays thin. `id` is the IG handle
- *  — the stable key the app sends back in /feed's `players` param. */
-function handlePlayerDirectory(): Response {
-	const players = PLAYER_SOCIAL.map((p) => ({ id: p.ig, name: p.name, team: p.abbr }));
+ *  them all + follow across team lines. Served from the LIVE player list (KV overlay the
+ *  self-tuning routine maintains, seed until then) so it's always fresh and the app stays
+ *  thin. `id` is the IG handle — the stable key the app sends back in /feed's `players` param. */
+async function handlePlayerDirectory(env: Env): Promise<Response> {
+	const players = (await loadPlayerSocial(env)).map((p) => ({ id: p.ig, name: p.name, team: p.abbr }));
 	const headers = new Headers({ "Content-Type": "application/json" });
-	headers.set("Cache-Control", "public, max-age=3600"); // static until the next deploy
+	headers.set("Cache-Control", "public, max-age=3600"); // 1h edge cache; routine changes land within the hour
 	return new Response(JSON.stringify(players), { status: 200, headers });
 }
 
@@ -3202,15 +3371,15 @@ async function handleValidateReporter(url: URL, env: Env, ctx: ExecutionContext)
 }
 
 /** Build cards for a set of Bluesky handles (per-handle failures isolated). */
-async function buildBlueskyCards(handles: FeedHandle[]): Promise<unknown[]> {
-	const per = await Promise.all(handles.map((h) => blueskyCardsFor(h)));
+async function buildBlueskyCards(handles: FeedHandle[], env?: Env, ctx?: ExecutionContext): Promise<unknown[]> {
+	const per = await Promise.all(handles.map((h) => blueskyCardsFor(h, env, ctx)));
 	return per.flat();
 }
 
 /** Fetch one account's recent OWN posts (reposts dropped) and map them to
  *  ContentCards. A single handle failing yields [] — isolated like /team-videos'
  *  per-team try/catch — so one dead account never sinks the whole response. */
-async function blueskyCardsFor(h: FeedHandle): Promise<unknown[]> {
+async function blueskyCardsFor(h: FeedHandle, env?: Env, ctx?: ExecutionContext): Promise<unknown[]> {
 	try {
 		const feed = await bskyAuthorFeed(h.handle, POSTS_PER_HANDLE);
 		return feed
@@ -3219,7 +3388,10 @@ async function blueskyCardsFor(h: FeedHandle): Promise<unknown[]> {
 			.filter((it) => !it.reason && it.post?.record?.text)
 			.map((it) => mapBskyPost(it.post as BskyPost, h))
 			.filter(Boolean);
-	} catch {
+	} catch (e) {
+		// Hang-bound tripped: this handle sits out THIS refresh only (retried fresh next
+		// cycle) — diag'd so a repeat-offender upstream is visible, never silently skipped.
+		if (isTimeout(e) && env && ctx) emitDiag(env, ctx, "feedUpstreamTimeout", `bsky:${h.handle}`);
 		return [];
 	}
 }
@@ -3244,7 +3416,7 @@ async function bskyAuthorFeed(actor: string, limit: number): Promise<BskyItem[]>
 	u.searchParams.set("actor", actor);
 	u.searchParams.set("limit", String(limit));
 	u.searchParams.set("filter", "posts_no_replies");
-	const r = await fetch(u.toString(), {
+	const r = await fetchBounded(u.toString(), {
 		headers: { "User-Agent": BSKY_UA, Accept: "application/json" },
 	});
 	if (!r.ok) throw new Error(`bsky getAuthorFeed ${r.status}`);
@@ -3271,14 +3443,16 @@ function mapBskyPost(post: BskyPost, h: FeedHandle): unknown | null {
 		id: `bsky-${rkey}`,
 		layout: "blueskyReporter",
 		platform: "bluesky",
-		// Source class for the app's Feed chips (Reporters · …). Players come from the
-		// IG pipe; here it's reporter / league-outlet (club-official Bluesky retired).
-		sourceType: h.kind === "league" ? "league" : "reporter",
+		// Source class for the app's Feed chips. Player-kind (2c) = a player's OWN Bluesky —
+		// the trusted fast path like player IG: NEVER Haiku-classified (owner law).
+		sourceType: h.kind === "league" ? "league" : h.kind === "player" ? "player" : "reporter",
 		// Reporters + league outlets are league-wide (no team tag of their own; Haiku
-		// team-tags + scopes them downstream). All Bluesky lives in the Feed only.
+		// team-tags + scopes them downstream). A DEFAULT player's card carries her club
+		// (server already scoped it to followed teams); user adds stay league-wide-relevant.
 		placement: "feed",
-		teamAbbreviation: undefined,
-		isLeague: true,
+		teamAbbreviation: h.kind === "player" ? h.abbr : undefined,
+		isLeague: h.kind !== "player" || !h.abbr,
+		playerId: h.kind === "player" ? h.playerId : undefined,
 		authorName: post.author?.displayName || handle,
 		handle: `@${handle}`,
 		bodyText: post.record?.text,
@@ -3384,7 +3558,7 @@ function capPerHandle(cards: unknown[], max: number): unknown[] {
 // it. We never scrape on a user request — a ~50-account sync run is far too slow
 // for the request path and would risk a Worker timeout; the cron has a generous
 // budget and pins Apify to ~1 run/day. The two actors + the handle map are the
-// SOCIAL_* constants / SOCIAL_HANDLES above. Mappers are exported for unit tests.
+// SOCIAL_* constants / CLUB_HANDLES + loadPlayerSocial above. Mappers are exported for unit tests.
 // ---------------------------------------------------------------------------
 
 /** Normalize an ISO string OR a unix timestamp (seconds or ms) to the app's
@@ -3561,7 +3735,7 @@ export async function handleBrightDataWebhook(request: Request, env: Env, ctx: E
 		return new Response("bad body", { status: 400 });
 	}
 
-	const clubs = SOCIAL_HANDLES.filter((h) => h.platform === "instagram" && h.kind === "team");
+	const clubs = CLUB_HANDLES;
 	const byUser = new Map(clubs.map((h) => [h.handle.toLowerCase(), h]));
 	const seen = new Set<string>();
 	const cards = items
@@ -3600,11 +3774,11 @@ export async function handleBrightDataWebhook(request: Request, env: Env, ctx: E
  *  To re-enable TikTok: add a SEQUENTIAL second pass (after IG, to stay under that cap)
  *  scraping APIFY_TIKTOK_ACTOR over the CLUB_SOCIAL.tiktok handles → mapApifyTikTok.
  *  IG empty (or no APIFY_TOKEN) → caller keeps the last good snapshot (→ seed fallback). */
-async function buildSocialCards(env: Env, handles?: SocialHandle[]): Promise<{ instagram: unknown[]; tiktok: unknown[] }> {
+async function buildSocialCards(env: Env, handles: SocialHandle[], ctx?: ExecutionContext): Promise<{ instagram: unknown[]; tiktok: unknown[] }> {
 	const token = env.APIFY_TOKEN;
 	if (!token) return { instagram: [], tiktok: [] };
 
-	const igHandles = (handles ?? SOCIAL_HANDLES).filter((h) => h.platform === "instagram");
+	const igHandles = handles.filter((h) => h.platform === "instagram");
 	const igByUser = new Map(igHandles.map((h) => [h.handle.toLowerCase(), h]));
 
 	let instagram: unknown[] = [];
@@ -3614,17 +3788,33 @@ async function buildSocialCards(env: Env, handles?: SocialHandle[]): Promise<{ i
 			{ usernames: igHandles.map((h) => h.handle), postsPerProfile: SOCIAL_POSTS_PER_PROFILE },
 			token,
 		);
+		const seen = new Set<string>();
 		instagram = items
 			.map((it) => {
 				// sones output keys the scraped account on `scraped_username`.
 				const rec = it as { scraped_username?: string; ownerUsername?: string; user?: { username?: string } };
 				const user = String(rec.scraped_username ?? rec.user?.username ?? rec.ownerUsername ?? "").toLowerCase();
 				const h = igByUser.get(user);
-				return h ? mapApifyInstagram(it, h) : null;
+				if (!h) return null;
+				seen.add(user);
+				return mapApifyInstagram(it, h);
 			})
 			.filter(Boolean) as unknown[];
-	} catch {
-		/* IG failed this run — caller keeps the last good IG snapshot */
+
+		// Post-swap the player IG path lost the club webhook's dead-handle detection: a renamed/
+		// deleted/private handle just yields zero cards silently. Flag the gap (same shape + total-
+		// failure guard as the BD `bdHandleEmpty` diag) so a dead player handle can't drain the
+		// free quota run after run unnoticed.
+		if (ctx) {
+			const missing = igHandles.filter((h) => !seen.has(h.handle.toLowerCase()));
+			if (missing.length > 0 && instagram.length > 0) {
+				emitDiag(env, ctx, "apifyHandleEmpty", `${missing.length}: ${missing.map((h) => h.handle).slice(0, 5).join(",")}`);
+			}
+		}
+	} catch (e) {
+		// IG failed this run — caller keeps the last good IG snapshot. Fail LOUD to the engineer so a
+		// persistent Apify outage/402 is visible rather than looking like a quiet "no new posts".
+		if (ctx) emitDiag(env, ctx, "apifyRunFail", String((e as Error)?.message ?? e).slice(0, 80));
 	}
 
 	return { instagram, tiktok: [] };
@@ -3635,18 +3825,36 @@ async function buildSocialCards(env: Env, handles?: SocialHandle[]): Promise<{ i
  *  Bright Data is configured, an ASYNC scrape is triggered and /brightdata-webhook writes
  *  the club key minutes later; until then clubs ride the same Apify run (pre-split
  *  fallback — the split deploys without a flag day). Returns a summary for /refresh-social. */
-async function refreshSocialCache(env: Env, ctx?: ExecutionContext): Promise<{ playerCards: number; clubs: string }> {
-	const igHandles = SOCIAL_HANDLES.filter((h) => h.platform === "instagram");
+async function refreshSocialCache(env: Env, ctx?: ExecutionContext): Promise<{ playerCards: number; pool: string; clubs: string }> {
+	const playerList = await loadPlayerSocial(env);
+	// Pool hygiene: any entry without a pool (pre-rotation data, or a write that skipped
+	// assignment) gets the lighter pool NOW and the list is persisted — never scrape-skipped.
+	let assigned = false;
+	for (const p of playerList) {
+		if (p.pool !== "A" && p.pool !== "B") {
+			p.pool = lighterPool(playerList);
+			assigned = true;
+		}
+	}
+	if (assigned) await env.FEED_TAGS.put(PLAYER_LIST_KEY, JSON.stringify(playerList));
+
+	// Alternate pools: scrape the one NOT scraped last run.
+	const last = await env.FEED_TAGS.get(POOL_MARKER_KEY);
+	const thisPool: "A" | "B" = last === "A" ? "B" : "A";
+	await env.FEED_TAGS.put(POOL_MARKER_KEY, thisPool);
+	const poolPlayers = playerList.filter((p) => p.pool === thisPool);
+
+	const igHandles = [...CLUB_HANDLES, ...playerIgHandles(poolPlayers)];
 	const bdConfigured = !!(env.BRIGHTDATA_TOKEN && env.BD_WEBHOOK_SECRET);
 
-	if (PLAYER_SOCIAL.length > MAX_PLAYER_HANDLES && ctx) {
-		emitDiag(env, ctx, "playerCapExceeded", `${PLAYER_SOCIAL.length}/${MAX_PLAYER_HANDLES}`);
+	if (poolPlayers.length > MAX_POOL_HANDLES && ctx) {
+		emitDiag(env, ctx, "playerCapExceeded", `pool ${thisPool}: ${poolPlayers.length}/${MAX_POOL_HANDLES}`);
 	}
 
 	const apifyHandles = bdConfigured ? igHandles.filter((h) => h.kind === "player") : igHandles;
-	const { instagram } = await buildSocialCards(env, apifyHandles);
+	const { instagram } = await buildSocialCards(env, apifyHandles, ctx);
 	const players = instagram.filter((c) => (c as { placement?: string }).placement === "feed");
-	const playerCards = await writeSideOrKeepLastGood(env, ctx, SOCIAL_PLAYER_KEY, players, "player");
+	const playerCards = await writeSideOrKeepLastGood(env, ctx, poolKey(thisPool), players, "player", POOL_SNAPSHOT_TTL);
 
 	let clubs: string;
 	if (bdConfigured) {
@@ -3657,7 +3865,605 @@ async function refreshSocialCache(env: Env, ctx?: ExecutionContext): Promise<{ p
 		clubs = `apify-fallback:${kept}`;
 		if (ctx) emitDiag(env, ctx, "bdUnconfigured", "clubs via apify fallback");
 	}
-	return { playerCards, clubs };
+	return { playerCards, pool: thisPool, clubs };
+}
+
+// ── Social self-tuning · Stage 1b: national-team eligibility ledger ───────────────
+// The featured-player set's eligibility law is NWSL ∧ NT, EARNED (once an NWSL player has
+// represented her NT, she stays eligible forever — a missed camp never drops her). The proxy
+// had no NT roster data, so this builds it: per-federation ESPN squad fetch → intersect with
+// current NWSL rosters by normalized name → append the matches to a KV ledger. Append-only:
+// the ledger records observed fact. Promotion into the live player list is FULLY AUTOMATED
+// (owner 2026-08-16): the Stage 1d routine researches handles and writes through
+// POST /social/player-audit/apply; the run report is transparency, not a gate. docs/backend.md.
+const NT_LEDGER_KEY = "social:nt-ledger";
+const NWSL_NAMES_KEY = "social:nwsl-names"; // cached normalized-name → club-abbr map (12h)
+const NWSL_NAMES_TTL = 60 * 60 * 12;
+
+/** Feeds the `?nt=` audit accepts = WOMENS_NT_FEEDS minus the two pan-European QUALIFYING feeds
+ *  (~53 teams each → 1 + 53 roster fetches, over the free-plan 50-subrequest cap, so they'd
+ *  silently under-count). Excluded BY DESIGN, not paged around (owner 2026-08-16): qualifying is
+ *  the expanded-trial player pool; anyone who matters appears in a friendly/major within a run or
+ *  two, and the ledger is earned-forever so a miss only delays discovery, never loses it. */
+const NT_AUDIT_EXCLUDED = new Set(["uefa.w.nations", "fifa.wworldq.uefa"]);
+// Lazy: WOMENS_NT_FEEDS is declared further down the module — a top-level .filter() would TDZ-crash at init.
+const ntAuditFeeds = () => WOMENS_NT_FEEDS.filter((s) => !NT_AUDIT_EXCLUDED.has(s));
+
+// Owner ruling 2026-08-15: the three Europe-based players STAY while quota is limited —
+// never listed as drops, and the apply route refuses to drop them (normalized names).
+const GRANDFATHERED_PLAYERS = new Set(["emily fox", "naomi girma", "alyssa thompson"]);
+
+/** Routine auth for the audit surface: the owner's admin key OR the scoped SOCIAL_AUDIT_KEY
+ *  (x-audit-key header) the Claude Remote routine holds — so the routine never carries the
+ *  full admin credential. Fail-closed: unset audit key ⇒ only the admin key works. */
+function auditAuthed(request: Request, env: Env): boolean {
+	const adminKey = (env as unknown as { BRACKET_ADMIN_KEY?: string }).BRACKET_ADMIN_KEY;
+	if (adminAuthed(request, adminKey)) return true;
+	const auditKey = (env as unknown as { SOCIAL_AUDIT_KEY?: string }).SOCIAL_AUDIT_KEY;
+	return !!auditKey && request.headers.get("x-audit-key") === auditKey;
+}
+
+type LedgerEntry = {
+	name: string;
+	firstSeen: string;
+	source: string;
+	nation: string | null;
+	// Written once by the routine's web research (POST /social/player-audit/research) so no
+	// candidate is ever re-researched: found handles, or an explicit none/private verdict.
+	// IDENTITY GATE (owner 2026-08-17): `category` = the account's exact IG professional-category
+	// label as found ("Athlete", "Futbolista", …) — the evidence; `athleteClass` = the routine's
+	// judgment that it's an athlete-class label. /apply REFUSES adds without athleteClass:true —
+	// the same-name protection (verified blue check is an accuracy ACCELERATOR, not the gate).
+	research?: { status: "found" | "none" | "private"; ig?: string; bsky?: string; category?: string; athleteClass?: boolean; verified?: boolean; checkedAt: string };
+};
+
+/** ESPN NT rosters come GROUPED by position (`athletes[].items[]`), unlike the FLAT NWSL club
+ *  shape `mapEspnRosterAthletes` handles — decode defensively, tolerating either. */
+function decodeNtRoster(json: unknown): string[] {
+	const groups = ((json as { athletes?: unknown[] } | null)?.athletes ?? []) as unknown[];
+	const names: string[] = [];
+	for (const g of groups) {
+		const rec = g as { items?: unknown[]; displayName?: string; fullName?: string };
+		const items = Array.isArray(rec.items) ? rec.items : rec.displayName || rec.fullName ? [rec] : [];
+		for (const it of items) {
+			const p = it as { displayName?: string; fullName?: string };
+			const name = p.displayName ?? p.fullName;
+			if (name) names.push(String(name));
+		}
+	}
+	return names;
+}
+
+/** One NT competition → every squad member with the nation they represent. One `/teams` call +
+ *  one `/roster` call per nation, all under the free-tier 50-subrequest cap for a single slug. */
+async function fetchNtRosters(slug: string): Promise<{ nation: string; name: string }[]> {
+	const teamsRes = await fetch(`https://site.api.espn.com/apis/site/v2/sports/soccer/${slug}/teams`, { headers: ESPN_HEADERS });
+	if (!teamsRes.ok) return [];
+	const teamsData = (await teamsRes.json().catch(() => null)) as {
+		sports?: { leagues?: { teams?: { team?: { id?: string; abbreviation?: string; displayName?: string } }[] }[] }[];
+	} | null;
+	const teams = teamsData?.sports?.[0]?.leagues?.[0]?.teams ?? [];
+	const out: { nation: string; name: string }[] = [];
+	await Promise.all(
+		teams.map(async (entry) => {
+			const team = entry.team ?? {};
+			if (!team.id) return;
+			const nation = team.displayName ?? team.abbreviation ?? "?";
+			try {
+				const rRes = await fetch(`https://site.api.espn.com/apis/site/v2/sports/soccer/${slug}/teams/${team.id}/roster`, { headers: ESPN_HEADERS });
+				if (!rRes.ok) return;
+				for (const name of decodeNtRoster(await rRes.json())) out.push({ nation, name });
+			} catch {
+				/* one nation short-read — the ledger is earned-not-snapshot, so a miss only delays */
+			}
+		}),
+	);
+	return out;
+}
+
+/** normalized NWSL player name → club abbr, across all 16 rosters.
+ *  TWO FRESHNESS MODES (the Sam Kerr lesson, 2026-08-16 — a stale gate hid a July transfer from
+ *  the first routine run): `live: true` (the ?section=nwsl DECISION report + /apply validation)
+ *  skips every cache and fetches all 16 rosters (17 subrequests — affordable there); the default
+ *  cached mode (the ?nt= ledger populate, which fans out up to ~33 ESPN calls of its own and
+ *  genuinely needs the budget) reads the 12h KV map first, then `roster:{id}` records, then live.
+ *  A ledger miss from staleness only DELAYS discovery (earned-forever); a decision-report miss
+ *  hides a signing — so the decision path pays for fresh. Live builds write through to the cache. */
+async function nwslNameMap(env: Env, ctx: ExecutionContext, opts?: { live?: boolean }): Promise<Map<string, string>> {
+	if (!opts?.live) {
+		const cached = await env.FEED_TAGS.get(NWSL_NAMES_KEY);
+		if (cached) {
+			try {
+				return new Map(JSON.parse(cached) as [string, string][]);
+			} catch {
+				/* fall through and rebuild */
+			}
+		}
+	}
+	const teams = await fetchTeamAbbrs();
+	const map = new Map<string, string>();
+	await Promise.all(
+		teams.map(async (t) => {
+			let players: { name: string; team: string }[] = [];
+			if (!opts?.live) {
+				try {
+					const raw = await env.FEED_TAGS.get(`roster:${t.id}`);
+					if (raw) {
+						const rec = JSON.parse(raw) as { body?: unknown };
+						const decoded = mapEspnRosterAthletes(rec.body as Parameters<typeof mapEspnRosterAthletes>[0], t.abbr);
+						if (decoded.length >= ROSTER_GOOD_MIN) players = decoded;
+					}
+				} catch {
+					/* cold/corrupt cache — fall to a live fetch below */
+				}
+			}
+			if (players.length === 0) players = await fetchRosterResilient(env as unknown as BracketEnv, t.id, t.abbr);
+			for (const p of players) map.set(normalizeName(p.name), t.abbr);
+		}),
+	);
+	if (map.size > 0) ctx.waitUntil(env.FEED_TAGS.put(NWSL_NAMES_KEY, JSON.stringify([...map]), { expirationTtl: NWSL_NAMES_TTL }));
+	return map;
+}
+
+function gateLedgerLookup(ledger: Record<string, LedgerEntry>, name: string): LedgerEntry["research"] | undefined {
+	return ledger[normalizeName(name)]?.research;
+}
+
+/** Read the ledger; if it doesn't exist yet, seed it from the current featured 34 (all
+ *  NT-caliber by curation → earned). Returns the in-memory object for the caller to merge + write. */
+async function readNtLedger(env: Env): Promise<Record<string, LedgerEntry>> {
+	const raw = await env.FEED_TAGS.get(NT_LEDGER_KEY);
+	if (raw) {
+		try {
+			return JSON.parse(raw) as Record<string, LedgerEntry>;
+		} catch {
+			/* corrupt — reseed below */
+		}
+	}
+	const now = new Date().toISOString();
+	const seed: Record<string, LedgerEntry> = {};
+	for (const p of await loadPlayerSocial(env)) seed[normalizeName(p.name)] = { name: p.name, firstSeen: now, source: "seed", nation: null };
+	return seed;
+}
+
+/** GET /social/player-audit — admin-keyed audit surface for the Stage 1d discovery routine.
+ *  1b ships the `?nt=<slug>` mode: fetch that federation's squads, intersect with NWSL rosters,
+ *  append new matches to the ledger, return a run summary. (`?section=nwsl` report = Stage 1c.) */
+async function handlePlayerAudit(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
+	if (!auditAuthed(request, env)) {
+		return new Response("Authentication required.", { status: 401, headers: { "WWW-Authenticate": adminRealm("NWSLApp Admin") } });
+	}
+	const j = (body: unknown, status = 200) =>
+		new Response(JSON.stringify(body, null, 2), { status, headers: { "Content-Type": "application/json" } });
+	const url = new URL(request.url);
+	const params = url.searchParams;
+	const nt = params.get("nt");
+
+	// ── Stage 1d: routine write-back — research memory + fully-automated apply ────────
+	// GET /social/player-audit/scrape-meta — the IDENTITY-GATE data source (owner 2026-08-17:
+	// verification is a MUST, not nice-to-have). Reads the MOST RECENT already-run Apify dataset
+	// (a free API GET — never runs the actor, never spends scrape quota) and extracts each
+	// scraped account's own IG metadata: verified flag, full name, follower count, whatever the
+	// actor carries. This is Instagram's own answer for every featured handle — no login wall.
+	if (request.method === "GET" && url.pathname === "/social/player-audit/scrape-meta") {
+		const token = env.APIFY_TOKEN;
+		if (!token) return j({ error: "APIFY_TOKEN unset" }, 500);
+		const runsRes = await fetch(`${APIFY_API}/${APIFY_IG_ACTOR}/runs?token=${token}&desc=1&limit=1&status=SUCCEEDED`);
+		if (!runsRes.ok) return j({ error: `apify runs list ${runsRes.status}` }, 502);
+		const runs = (await runsRes.json()) as { data?: { items?: { id?: string; defaultDatasetId?: string; finishedAt?: string }[] } };
+		const run = runs.data?.items?.[0];
+		if (!run?.defaultDatasetId) return j({ error: "no succeeded runs found" }, 404);
+		const dsRes = await fetch(`https://api.apify.com/v2/datasets/${run.defaultDatasetId}/items?token=${token}&clean=1&limit=2000`);
+		if (!dsRes.ok) return j({ error: `dataset read ${dsRes.status}` }, 502);
+		const items = (await dsRes.json()) as Record<string, unknown>[];
+		// Aggregate per scraped account; field names are actor-specific, so probe the common
+		// spellings and ALSO return one raw item's key list so gaps are diagnosable, not guessed.
+		const byHandle: Record<string, { verified?: boolean; fullName?: string; followers?: number; private?: boolean; posts: number; selfPosts?: number }> = {};
+		for (const it of items) {
+			const user = (it.user ?? {}) as Record<string, unknown>;
+			const handle = String(it.scraped_username ?? user.username ?? it.ownerUsername ?? "").toLowerCase();
+			if (!handle) continue;
+			const e = (byHandle[handle] ??= { posts: 0 });
+			e.posts++;
+			// ⚠️ `user` = the POST AUTHOR, not the profile owner: a COLLAB post on her profile
+			// carries the CO-POSTER's author object (clubs/sponsors — "TJ Maxx" on Mallory Pugh's
+			// probe; league/club names across 29 handles). Identity fields are taken ONLY from
+			// SELF-AUTHORED posts (author == scraped account) — collab items contribute nothing.
+			if (String(user.username ?? "").toLowerCase() !== handle) continue;
+			e.selfPosts = (e.selfPosts ?? 0) + 1;
+			const v = user.is_verified;
+			if (typeof v === "boolean") e.verified = v;
+			const fn = user.full_name;
+			if (typeof fn === "string" && fn) e.fullName = fn;
+			const fo = user.follower_count;
+			if (typeof fo === "number") e.followers = fo;
+			const pr = user.is_private;
+			if (typeof pr === "boolean") e.private = pr;
+		}
+		const sample = items[0] ? Object.keys(items[0]) : [];
+		const sampleUser = items[0] ? Object.keys((items[0].user as Record<string, unknown>) ?? {}) : [];
+		return j({ runFinishedAt: run.finishedAt, datasetItems: items.length, accounts: Object.keys(byHandle).length, byHandle, sampleItemKeys: sample, sampleUserKeys: sampleUser });
+	}
+
+	if (request.method === "POST" && url.pathname === "/social/player-audit/research") {
+		let body: { results?: { name?: string; status?: string; ig?: string; bsky?: string; category?: string; athleteClass?: boolean; verified?: boolean }[] };
+		try {
+			body = (await request.json()) as typeof body;
+		} catch {
+			return j({ error: "unparseable JSON" }, 400);
+		}
+		const ledger = await readNtLedger(env);
+		const saved: string[] = [];
+		const unknown: string[] = [];
+		// NO-SILENT-FAILURES (bug found by the 2026-08-17 backfill run): malformed entries used to
+		// be skipped without a trace — `saved:0, unknown:[]` looked like success-shaped nothing
+		// while the caller retried format after format. Every rejected entry now says WHY.
+		const skipped: { name?: string; reason: string }[] = [];
+		if (!Array.isArray(body.results)) {
+			return j({ saved: 0, unknown: [], skipped: [{ reason: `body must be {"results":[...]} — got keys ${Object.keys(body as object).join(",") || "(none)"}` }] }, 400);
+		}
+		const now = new Date().toISOString();
+		for (const r of body.results ?? []) {
+			if (!r.name || !["found", "none", "private"].includes(r.status ?? "")) {
+				skipped.push({ name: r.name, reason: !r.name ? "missing name" : `status must be found|none|private (got ${JSON.stringify(r.status)})` });
+				continue;
+			}
+			const entry = ledger[normalizeName(r.name)];
+			if (!entry) {
+				unknown.push(r.name);
+				continue;
+			}
+			entry.research = {
+				status: r.status as "found" | "none" | "private",
+				ig: r.ig || undefined,
+				bsky: r.bsky || undefined,
+				category: r.category || undefined,
+				athleteClass: typeof r.athleteClass === "boolean" ? r.athleteClass : undefined,
+				verified: typeof r.verified === "boolean" ? r.verified : undefined,
+				checkedAt: now,
+			};
+			saved.push(r.name);
+		}
+		await env.FEED_TAGS.put(NT_LEDGER_KEY, JSON.stringify(ledger));
+		emitDiag(env, ctx, "socialResearchSaved", `${saved.length} saved${unknown.length ? `, ${unknown.length} unknown` : ""}`);
+		return j({ saved: saved.length, unknown, skipped });
+	}
+
+	if (request.method === "POST" && url.pathname === "/social/player-audit/apply") {
+		let body: { add?: { name?: string; abbr?: string; ig?: string }[]; drop?: string[] };
+		try {
+			body = (await request.json()) as typeof body;
+		} catch {
+			return j({ error: "unparseable JSON" }, 400);
+		}
+		const list = [...(await loadPlayerSocial(env))];
+		const nwsl = await nwslNameMap(env, ctx, { live: true });
+		const gateLedger = await readNtLedger(env);
+		const clubs = new Set(nwsl.values());
+		const igSeen = new Set(list.map((p) => p.ig.toLowerCase()));
+		const nameSeen = new Set(list.map((p) => normalizeName(p.name)));
+		const now = new Date().toISOString();
+		const rejected: { name: string; reason: string }[] = [];
+		const added: string[] = [];
+		const dropped: string[] = [];
+
+		for (const d of body.drop ?? []) {
+			const norm = normalizeName(String(d));
+			if (GRANDFATHERED_PLAYERS.has(norm)) {
+				rejected.push({ name: d, reason: "grandfathered — owner-only removal" });
+				continue;
+			}
+			const idx = list.findIndex((p) => normalizeName(p.name) === norm);
+			if (idx === -1) {
+				rejected.push({ name: d, reason: "not on the list" });
+				continue;
+			}
+			const [gone] = list.splice(idx, 1);
+			igSeen.delete(gone.ig.toLowerCase());
+			nameSeen.delete(norm);
+			dropped.push(gone.name);
+		}
+
+		for (const a of body.add ?? []) {
+			const name = String(a.name ?? "").trim();
+			const abbr = String(a.abbr ?? "").trim().toUpperCase();
+			const ig = String(a.ig ?? "").trim().replace(/^@/, "");
+			if (!name || !abbr || !ig) {
+				rejected.push({ name: name || "(missing)", reason: "name/abbr/ig required" });
+				continue;
+			}
+			// ⚠️ IDENTITY GATE (owner 2026-08-17, server-enforced — not even the routine can skip it):
+			// an add requires research on the ledger with athleteClass:true — the account carries an
+			// athlete-class IG professional-category label ("Athlete"/localized equivalent), the
+			// same-name protection. The app must never claim a feed is a pro player's without it.
+			const gate = gateLedger[normalizeName(name)]?.research;
+			if (gate?.athleteClass !== true) {
+				rejected.push({ name, reason: `identity gate: athlete-class category not confirmed${gate?.category ? ` (found: ${gate.category})` : ""}` });
+				continue;
+			}
+			if (!/^[a-z0-9._]{1,30}$/i.test(ig)) {
+				rejected.push({ name, reason: `invalid ig handle: ${ig.slice(0, 30)}` });
+				continue;
+			}
+			if (!clubs.has(abbr)) {
+				rejected.push({ name, reason: `unknown club abbr: ${abbr}` });
+				continue;
+			}
+			if (nameSeen.has(normalizeName(name)) || igSeen.has(ig.toLowerCase())) {
+				rejected.push({ name, reason: "already on the list" });
+				continue;
+			}
+			if (list.length >= MAX_PLAYER_HANDLES) {
+				rejected.push({ name, reason: `ceiling ${MAX_PLAYER_HANDLES} reached` });
+				continue;
+			}
+			// Pool auto-assignment (owner rule): new adds join whichever pool is lighter — the
+			// routine never needs pool awareness; balance converges on its own.
+			list.push({ name, abbr, ig, addedAt: now, source: "routine", pool: lighterPool(list) });
+			igSeen.add(ig.toLowerCase());
+			nameSeen.add(normalizeName(name));
+			added.push(name);
+		}
+
+		if (added.length > 0 || dropped.length > 0) {
+			await env.FEED_TAGS.put(PLAYER_LIST_KEY, JSON.stringify(list));
+		}
+		emitDiag(env, ctx, "socialPlayerApply", `+${added.length} -${dropped.length} → ${list.length}/${MAX_PLAYER_HANDLES}${rejected.length ? ` (${rejected.length} rejected)` : ""}`);
+		return j({ added, dropped, rejected, total: list.length, ceiling: MAX_PLAYER_HANDLES });
+	}
+
+	// ── Stage 1c: the decision report the discovery routine (and owner) reads ─────────
+	if (params.get("section") === "nwsl") {
+		const [nwsl, ledger, playerList] = await Promise.all([nwslNameMap(env, ctx, { live: true }), readNtLedger(env), loadPlayerSocial(env)]);
+		const featured = new Map(playerList.map((p) => [normalizeName(p.name), p]));
+
+		// candidates = (ledger ∩ current NWSL rosters) − featured, split by research state so the
+		// routine only ever web-researches the NEW names (token efficiency, adjudication-style).
+		// Each carries the feed that earned eligibility so majors can outrank friendly-only later.
+		type Candidate = { name: string; club: string; nation: string | null; source: string; firstSeen: string; research?: LedgerEntry["research"] };
+		const needsResearch: Candidate[] = [];
+		const researched: Candidate[] = [];
+		for (const [norm, e] of Object.entries(ledger)) {
+			const club = nwsl.get(norm);
+			if (!club || featured.has(norm)) continue;
+			const c: Candidate = { name: e.name, club, nation: e.nation, source: e.source, firstSeen: e.firstSeen };
+			if (e.research) {
+				c.research = e.research;
+				researched.push(c);
+			} else {
+				needsResearch.push(c);
+			}
+		}
+		const byClub = (a: Candidate, b: Candidate) => a.club.localeCompare(b.club) || a.name.localeCompare(b.name);
+		needsResearch.sort(byClub);
+		researched.sort(byClub);
+
+		// drops = featured − current NWSL rosters (the ONLY roster-based drop). Advisory: a name
+		// ESPN spells differently would land here too, so the routine verifies before applying.
+		const drops: { name: string; club: string; ig: string }[] = [];
+		const grandfathered: { name: string; club: string; grandfathered: true }[] = [];
+		for (const p of playerList) {
+			const norm = normalizeName(p.name);
+			if (nwsl.has(norm)) continue;
+			if (GRANDFATHERED_PLAYERS.has(norm)) grandfathered.push({ name: p.name, club: p.abbr, grandfathered: true });
+			else drops.push({ name: p.name, club: p.abbr, ig: p.ig });
+		}
+
+		// Featured-count per club, EVERY club listed (zeros are the point: BOS/DEN/LOU gaps).
+		const clubCoverage: Record<string, number> = {};
+		for (const abbr of new Set(nwsl.values())) clubCoverage[abbr] = 0;
+		for (const p of playerList) if (p.abbr in clubCoverage) clubCoverage[p.abbr]++;
+
+		const bySource: Record<string, number> = {};
+		for (const e of Object.values(ledger)) bySource[e.source] = (bySource[e.source] ?? 0) + 1;
+
+		return j({
+			generatedAt: new Date().toISOString(),
+			capacity: {
+				used: playerList.length,
+				ceiling: MAX_PLAYER_HANDLES,
+				headroom: MAX_PLAYER_HANDLES - playerList.length,
+				pools: { A: playerList.filter((p) => p.pool === "A").length, B: playerList.filter((p) => p.pool === "B").length, perRunBudget: MAX_POOL_HANDLES },
+				note: "ceiling is a CEILING, never a target — carry exactly who qualifies (2 rotating pools; adds auto-assign to the lighter)",
+			},
+			clubCoverage,
+			// The live featured list WITH each player's research/gate record — what the
+			// re-curation + backfill passes read (candidates below exclude featured by definition).
+			featured: playerList.map((p) => ({ name: p.name, abbr: p.abbr, ig: p.ig, pool: p.pool, research: gateLedgerLookup(ledger, p.name) })),
+			candidates: { needsResearch, researched },
+			drops: { players: drops, note: "not on any NWSL roster — verify (ESPN name variant lands here too) before applying" },
+			grandfathered,
+			ledger: { size: Object.keys(ledger).length, bySource, feedsCovered: Object.keys(bySource).filter((s) => s !== "seed") },
+		});
+	}
+
+	if (nt) {
+		if (!ntAuditFeeds().includes(nt)) return j({ error: "unknown or excluded nt slug", validNt: ntAuditFeeds() }, 400);
+		const [ntPlayers, nwsl] = await Promise.all([fetchNtRosters(nt), nwslNameMap(env, ctx)]);
+		const ledger = await readNtLedger(env);
+		const before = Object.keys(ledger).length;
+		const now = new Date().toISOString();
+		let matched = 0;
+		const added: { name: string; nation: string; club: string }[] = [];
+		for (const p of ntPlayers) {
+			const norm = normalizeName(p.name);
+			const club = nwsl.get(norm);
+			if (!club) continue;
+			matched++;
+			if (!ledger[norm]) {
+				ledger[norm] = { name: p.name, firstSeen: now, source: nt, nation: p.nation };
+				added.push({ name: p.name, nation: p.nation, club });
+			}
+		}
+		// Persist BEFORE responding (not waitUntil) so the summary's ledgerSize is truthful.
+		await env.FEED_TAGS.put(NT_LEDGER_KEY, JSON.stringify(ledger));
+		emitDiag(env, ctx, "socialNtLedgerRun", `${nt}: ${ntPlayers.length} nt / ${matched} nwsl / +${added.length}`);
+		return j({
+			slug: nt,
+			ntPlayersFetched: ntPlayers.length,
+			nwslRosterSize: nwsl.size,
+			nwslMatched: matched,
+			newlyAdded: added.length,
+			added,
+			ledgerSize: { before, after: Object.keys(ledger).length },
+		});
+	}
+
+	return j({ error: "specify ?section=nwsl (the audit report) or ?nt=<slug> (ledger populate)", validNt: ntAuditFeeds() }, 400);
+}
+
+// ── Social self-tuning · Stage 2d: reporter audit surface ─────────────────────────
+/** GET /social/reporter-audit — admin/routine-keyed JSON for the reporter side of the
+ *  self-tuning routine: default-handle health (same tier logic as the admin Status tab via
+ *  bskySourceHealth), a consecutive-dormant streak (the settled drop rule: flagged dormant on
+ *  TWO consecutive audits ⇒ strong drop candidate; one flag = watch, could be vacation/leave),
+ *  and the fans' add-signals from anonymous analytics (the Stage-3 counter feeds this — built
+ *  consumer-first per the backbone rule, empty until that ships). Discovery beyond signals is
+ *  the ROUTINE's web research (follows-of-follows graph signals REJECTED by owner). */
+const REPORTER_AUDIT_STREAK_KEY = "social:reporter-dormant-streak";
+async function handleReporterAudit(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
+	if (!auditAuthed(request, env)) {
+		return new Response("Authentication required.", { status: 401, headers: { "WWW-Authenticate": adminRealm("NWSLApp Admin") } });
+	}
+	const url0 = new URL(request.url);
+
+	// POST /social/reporter-audit/apply — the routine's AUTO-APPLY write path (owner 2026-08-17:
+	// automate at ~90%, tune from real runs). Server guardrails the routine cannot bypass:
+	// ≤ MAX_REPORTER_ADDS_PER_CALL adds per call, the MAX_FEED_HANDLES budget ceiling, handle
+	// validation + dedupe. The quality bar (distinctive NWSL coverage, activity recency) lives
+	// in the routine prompt; the mechanical limits live HERE.
+	if (request.method === "POST" && url0.pathname === "/social/reporter-audit/apply") {
+		let body: { add?: { handle?: string; kind?: string }[]; drop?: string[] };
+		try {
+			body = (await request.json()) as typeof body;
+		} catch {
+			return new Response(JSON.stringify({ error: "unparseable JSON" }), { status: 400, headers: { "Content-Type": "application/json" } });
+		}
+		const list = [...(await loadFeedHandles(env))];
+		const seen = new Set(list.map((h) => h.handle.toLowerCase()));
+		const added: string[] = [];
+		const dropped: string[] = [];
+		const rejected: { handle?: string; reason: string }[] = [];
+
+		for (const d of body.drop ?? []) {
+			const key = String(d).toLowerCase().replace(/^@/, "");
+			const idx = list.findIndex((h) => h.handle.toLowerCase() === key);
+			if (idx === -1) {
+				rejected.push({ handle: d, reason: "not on the list" });
+				continue;
+			}
+			list.splice(idx, 1);
+			seen.delete(key);
+			dropped.push(key);
+		}
+
+		for (const a of body.add ?? []) {
+			const handle = String(a.handle ?? "").trim().replace(/^@/, "").toLowerCase();
+			const kind = a.kind === "league" ? "league" : "reporter";
+			if (!handle || !/^[a-z0-9][a-z0-9.-]{2,60}$/.test(handle) || !handle.includes(".")) {
+				rejected.push({ handle: a.handle, reason: "invalid bluesky handle" });
+				continue;
+			}
+			if (seen.has(handle)) {
+				rejected.push({ handle, reason: "already on the list" });
+				continue;
+			}
+			if (added.length >= MAX_REPORTER_ADDS_PER_CALL) {
+				rejected.push({ handle, reason: `per-call add cap (${MAX_REPORTER_ADDS_PER_CALL}) reached` });
+				continue;
+			}
+			if (list.length >= MAX_FEED_HANDLES) {
+				rejected.push({ handle, reason: `budget ceiling ${MAX_FEED_HANDLES} reached` });
+				continue;
+			}
+			list.push({ handle, kind });
+			seen.add(handle);
+			added.push(handle);
+		}
+
+		if (added.length > 0 || dropped.length > 0) {
+			await env.FEED_TAGS.put(REPORTER_LIST_KEY, JSON.stringify(list));
+		}
+		emitDiag(env, ctx, "socialReporterApply", `+${added.length} -${dropped.length} → ${list.length}/${MAX_FEED_HANDLES}${rejected.length ? ` (${rejected.length} rejected)` : ""}`);
+		return new Response(JSON.stringify({ added, dropped, rejected, total: list.length, ceiling: MAX_FEED_HANDLES }, null, 2), { headers: { "Content-Type": "application/json" } });
+	}
+	const health = await bskySourceHealth(env);
+
+	// Consecutive-dormant streaks: previous audit's flagged set ∩ this one's.
+	// ⚠️ OUTAGE GUARD (live-proven necessary during the 2026-08-16 Bluesky outage, when all 16
+	// read "dead"): a MAJORITY flagged at once means Bluesky is down, not 16 simultaneous
+	// retirements — freeze the streak state (don't persist, don't advance) and say so, so an
+	// audit run during an outage can never manufacture mass drop candidates.
+	const flaggedNow = health.filter((h) => h.tier === "dormant" || h.tier === "empty" || h.tier === "dead").map((h) => h.handle);
+	const outageSuspected = flaggedNow.length > health.length / 2;
+	let prevFlagged: string[] = [];
+	try {
+		prevFlagged = JSON.parse((await env.FEED_TAGS.get(REPORTER_AUDIT_STREAK_KEY)) ?? "[]") as string[];
+	} catch {
+		/* first run / corrupt — no streaks */
+	}
+	const secondConsecutive = outageSuspected ? [] : flaggedNow.filter((h) => prevFlagged.includes(h));
+	if (!outageSuspected) ctx.waitUntil(env.FEED_TAGS.put(REPORTER_AUDIT_STREAK_KEY, JSON.stringify(flaggedNow)));
+	else emitDiag(env, ctx, "reporterAuditOutage", `${flaggedNow.length}/${health.length} flagged — streaks frozen`);
+
+	// Fans' add-signals (anonymous Level-3 counters; NO ids ever): reporter_added rows carry
+	// param "TEAM|handle", reporter_add_session is the adders denominator. The threshold rule
+	// (owner): 3+ adds of one handle among a team's fans ⇒ escalate to routine research.
+	let addSignals: { handle: string; totalAdds: number; byTeam: Record<string, number> }[] = [];
+	let totalAdders = 0;
+	const sb = env as unknown as { SUPABASE_URL?: string; SUPABASE_SERVICE_ROLE_KEY?: string };
+	if (sb.SUPABASE_URL && sb.SUPABASE_SERVICE_ROLE_KEY) {
+		try {
+			const base = sb.SUPABASE_URL.replace(/\/$/, "");
+			const r = await fetch(
+				`${base}/rest/v1/analytics_counters?event=in.(reporter_added,reporter_add_session)&select=event,param,count`,
+				{ headers: { apikey: sb.SUPABASE_SERVICE_ROLE_KEY, Authorization: `Bearer ${sb.SUPABASE_SERVICE_ROLE_KEY}` } },
+			);
+			if (r.ok) {
+				const rows = (await r.json()) as { event: string; param: string; count: number }[];
+				const byHandle = new Map<string, { totalAdds: number; byTeam: Record<string, number> }>();
+				for (const row of rows) {
+					if (row.event === "reporter_add_session") {
+						totalAdders += row.count;
+						continue;
+					}
+					const [team, ...rest] = row.param.split("|");
+					const handle = rest.join("|");
+					if (!handle) continue;
+					const e = byHandle.get(handle) ?? { totalAdds: 0, byTeam: {} };
+					e.totalAdds += row.count;
+					e.byTeam[team] = (e.byTeam[team] ?? 0) + row.count;
+					byHandle.set(handle, e);
+				}
+				addSignals = [...byHandle.entries()].map(([handle, e]) => ({ handle, ...e })).sort((a, b) => b.totalAdds - a.totalAdds);
+			} else {
+				emitDiag(env, ctx, "reporterAuditSbFail", `analytics read ${r.status}`);
+			}
+		} catch (e) {
+			emitDiag(env, ctx, "reporterAuditSbFail", String((e as Error)?.message ?? e).slice(0, 60));
+		}
+	}
+
+	return new Response(
+		JSON.stringify(
+			{
+				generatedAt: new Date().toISOString(),
+				defaults: health,
+				outageSuspected,
+				dropCandidates: outageSuspected
+					? { secondConsecutiveFlag: [], firstFlag: [], note: "MAJORITY of defaults flagged at once ⇒ Bluesky outage suspected — streaks frozen, no candidates this run; re-audit when healthy" }
+					: {
+							secondConsecutiveFlag: secondConsecutive,
+							firstFlag: flaggedNow.filter((h) => !secondConsecutive.includes(h)),
+							note: "two consecutive flagged audits = strong drop candidate; one = watch (vacation/leave)",
+						},
+				addSignals: { totalAdders, handles: addSignals, note: "empty until the reporter_added counter ships (Stage 3); threshold = 3+ adds of one handle among a team's fans" },
+			},
+			null,
+			2,
+		),
+		{ headers: { "Content-Type": "application/json" } },
+	);
 }
 
 /** Write one side's fresh cards to its KV key — or, when THIS scrape came back empty
@@ -3670,6 +4476,7 @@ async function writeSideOrKeepLastGood(
 	key: string,
 	fresh: unknown[],
 	side: "club" | "player",
+	ttl: number = SOCIAL_CACHE_TTL,
 ): Promise<number> {
 	let cards = fresh;
 	if (cards.length === 0) {
@@ -3682,7 +4489,7 @@ async function writeSideOrKeepLastGood(
 		if (ctx) emitDiag(env, ctx, "socialScrapeEmpty", `${side}: kept last-good ${cards.length}`);
 	}
 	if (cards.length === 0) return 0; // nothing now, nothing before — keep KV as-is
-	await env.FEED_TAGS.put(key, JSON.stringify(cards), { expirationTtl: SOCIAL_CACHE_TTL });
+	await env.FEED_TAGS.put(key, JSON.stringify(cards), { expirationTtl: ttl });
 	return cards.length;
 }
 
@@ -3691,7 +4498,7 @@ async function writeSideOrKeepLastGood(
  *  BD_WEBHOOK_SECRET echoed as the Authorization header). Returns a status note for
  *  /refresh-social. Only called when BRIGHTDATA_TOKEN + BD_WEBHOOK_SECRET are set. */
 async function triggerBrightDataClubs(env: Env, ctx?: ExecutionContext): Promise<string> {
-	const clubs = SOCIAL_HANDLES.filter((h) => h.platform === "instagram" && h.kind === "team");
+	const clubs = CLUB_HANDLES;
 	// Discover-by-profile-URL with a per-profile cap — BD honors num_of_posts (unlike the
 	// cheap Apify actor), which is what keeps us inside the free 5k records/mo.
 	const inputs = clubs.map((h) => ({
@@ -3724,14 +4531,21 @@ async function triggerBrightDataClubs(env: Env, ctx?: ExecutionContext): Promise
 /** Read the social snapshot (club + player sides merged), falling back per side to the
  *  legacy combined key until the split keys exist. [] if nothing yet. */
 async function readSocialCards(env: Env): Promise<unknown[]> {
-	const [club, player, legacy] = await Promise.all([
+	const [club, poolA, poolB, playerLegacy, legacy] = await Promise.all([
 		env.FEED_TAGS.get(SOCIAL_CLUB_KEY, "json") as Promise<unknown[] | null>,
+		env.FEED_TAGS.get(poolKey("A"), "json") as Promise<unknown[] | null>,
+		env.FEED_TAGS.get(poolKey("B"), "json") as Promise<unknown[] | null>,
 		env.FEED_TAGS.get(SOCIAL_PLAYER_KEY, "json") as Promise<unknown[] | null>,
 		env.FEED_TAGS.get(SOCIAL_CACHE_KEY, "json") as Promise<Array<{ placement?: string }> | null>,
 	]);
 	const legacyArr = legacy ?? [];
 	const clubs = club ?? legacyArr.filter((c) => c.placement === "home");
-	const players = player ?? legacyArr.filter((c) => c.placement === "feed");
+	// Rotation: players = the MERGE of both pool snapshots (each refreshed on alternate runs, so
+	// every featured player is served all week). Pre-rotation keys are fallback-only migration.
+	const players =
+		poolA || poolB
+			? [...(poolA ?? []), ...(poolB ?? [])]
+			: (playerLegacy ?? legacyArr.filter((c) => c.placement === "feed"));
 	return [...clubs, ...players];
 }
 
@@ -3800,7 +4614,9 @@ async function classifySocialBluesky(
 	if (typed.length === 0) return [];
 	const followed = new Set(teams);
 	const verdicts = new Map<string, SocialVerdict>();
-	const vkey = (id: string) => `sv2-${id}`;
+	// sv2→sv3 (2026-08-16): player-centric international rule — bump orphans week-old verdicts
+	// judged under the old "USWNT-only" policy so the new rule applies immediately.
+	const vkey = (id: string) => `sv3-${id}`;
 
 	// 1. Load cached verdicts (one KV read per card; misses return null).
 	const cached = await Promise.all(
@@ -3815,11 +4631,12 @@ async function classifySocialBluesky(
 
 	// 2. Classify the misses via Haiku, batched. No key → skip (those fail closed below).
 	if (uncached.length > 0 && env.ANTHROPIC_API_KEY) {
+		const playerMap = featuredPlayerMapBlock(await loadPlayerSocial(env));
 		for (let i = 0; i < uncached.length; i += HAIKU_BATCH) {
 			const batch = uncached.slice(i, i + HAIKU_BATCH);
 			let out: SocialVerdict[] | null;
 			try {
-				out = await haikuClassifySocialBatch(batch, env.ANTHROPIC_API_KEY);
+				out = await haikuClassifySocialBatch(batch, env.ANTHROPIC_API_KEY, playerMap);
 			} catch {
 				out = null; // fail closed: this batch stays unjudged → dropped below
 			}
@@ -3870,7 +4687,7 @@ async function classifySocialBluesky(
 }
 
 /** Classify one batch of social posts via a single Haiku call (forced JSON). */
-async function haikuClassifySocialBatch(cards: FeedCard[], apiKey: string): Promise<SocialVerdict[]> {
+async function haikuClassifySocialBatch(cards: FeedCard[], apiKey: string, playerMap: string): Promise<SocialVerdict[]> {
 	const list = cards
 		.map((c) => {
 			const handle = (c.handle ?? "").replace(/^@/, "");
@@ -3892,7 +4709,7 @@ async function haikuClassifySocialBatch(cards: FeedCard[], apiKey: string): Prom
 			messages: [
 				{
 					role: "user",
-					content: `${SOCIAL_POLICY}\n\nClassify each post. Echo its id exactly.\n\n${list}`,
+					content: `${SOCIAL_POLICY}\n\n${playerMap}\n\nClassify each post. Echo its id exactly.\n\n${list}`,
 				},
 			],
 			output_config: { format: { type: "json_schema", schema: SOCIAL_SCHEMA } },
@@ -3939,10 +4756,11 @@ async function tagNewsTeams(
 	const verdicts = new Map<string, NewsVerdict>();
 
 	// 1. Load cached verdicts (one KV read per card; misses return null). The key is
-	//    versioned (`nv2-`) so tightening the policy/schema can be rolled by bumping
-	//    the version rather than waiting out every cached verdict's TTL. (nv1→nv2:
-	//    dropped the USWNT/national-team relevance allowance.)
-	const vkey = (id: string) => `nv2-${id}`;
+	//    versioned (`nv3-`) so a policy/schema change rolls by bumping the version rather
+	//    than waiting out every cached verdict's TTL. (nv1→nv2: dropped the USWNT/NT
+	//    allowance. nv2→nv3, 2026-08-16: that exclusion is REVERSED into the unified
+	//    player-centric international rule — an NWSL player as primary subject matches.)
+	const vkey = (id: string) => `nv3-${id}`;
 	const cached = await Promise.all(cards.map((c) => env.FEED_TAGS.get(vkey(c.id), "json")));
 	const uncached: NewsCard[] = [];
 	cards.forEach((c, i) => {
@@ -3953,11 +4771,12 @@ async function tagNewsTeams(
 
 	// 2. Tag the misses via Haiku, batched. No key → skip (everything fails open).
 	if (uncached.length > 0 && env.ANTHROPIC_API_KEY) {
+		const playerMap = featuredPlayerMapBlock(await loadPlayerSocial(env));
 		for (let i = 0; i < uncached.length; i += HAIKU_BATCH) {
 			const batch = uncached.slice(i, i + HAIKU_BATCH);
 			let out: NewsVerdict[] | null;
 			try {
-				out = await haikuTagNewsBatch(batch, env.ANTHROPIC_API_KEY);
+				out = await haikuTagNewsBatch(batch, env.ANTHROPIC_API_KEY, playerMap);
 			} catch {
 				out = null; // fail open: batch unjudged → kept league-wide below
 			}
@@ -3995,7 +4814,7 @@ async function tagNewsTeams(
 }
 
 /** Tag one batch of news cards to team(s) via a single Haiku call (forced JSON). */
-async function haikuTagNewsBatch(cards: NewsCard[], apiKey: string): Promise<NewsVerdict[]> {
+async function haikuTagNewsBatch(cards: NewsCard[], apiKey: string, playerMap: string): Promise<NewsVerdict[]> {
 	const list = cards
 		.map((c) => {
 			const src = c.sourceName ?? "";
@@ -4018,7 +4837,7 @@ async function haikuTagNewsBatch(cards: NewsCard[], apiKey: string): Promise<New
 			messages: [
 				{
 					role: "user",
-					content: `${NEWS_POLICY}\n\nTag each article. Echo its id exactly.\n\n${list}`,
+					content: `${NEWS_POLICY}\n\n${playerMap}\n\nTag each article. Echo its id exactly.\n\n${list}`,
 				},
 			],
 			output_config: { format: { type: "json_schema", schema: NEWS_SCHEMA } },
@@ -4773,6 +5592,11 @@ const ANALYTICS_EVENTS = new Set([
 	"fanzone_game_opened",
 	"feed_item_tapped",
 	"feed_chip_tapped",
+	// Phase 3 reporter discovery (2026-08-17): param "TEAM|handle" — which club FANBASE added
+	// which Bluesky handle, never which fan (anonymous Level-3 law). The reporter-audit
+	// endpoint aggregates these into addSignals; threshold judgment lives in the routine.
+	"reporter_added",
+	"reporter_add_session", // denominator: sessions that added ANY reporter
 ]);
 
 /** Anonymous Level-3 usage counters: `POST /analytics` with a pre-summed per-session batch
@@ -4798,9 +5622,12 @@ async function handleAnalyticsIngest(request: Request, env: Env, ctx: ExecutionC
 		.map((e) => {
 			const ev = e as { event?: unknown; param?: unknown; n?: unknown };
 			const n = typeof ev.n === "number" && Number.isFinite(ev.n) ? Math.floor(ev.n) : 0;
+			const event = String(ev.event ?? "");
+			// reporter_added carries "TEAM|handle" — bsky handles alone run past 32 ("GFC|" +
+			// girlssoccernetwork.bsky.social = 34), so this event gets 64; everything else keeps 32.
 			return {
-				event: String(ev.event ?? ""),
-				param: String(ev.param ?? "").slice(0, 32),
+				event,
+				param: String(ev.param ?? "").slice(0, event === "reporter_added" ? 64 : 32),
 				n: Math.min(Math.max(n, 0), 10_000),
 			};
 		})
