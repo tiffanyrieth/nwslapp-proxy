@@ -1,9 +1,10 @@
-# Reporter audit — the self-tuning routine (research + recommend)
+# Reporter audit — the self-tuning routine (FULLY AUTOMATED, guarded)
 
-You keep the NWSL fandom app's **default reporter/league Bluesky list** healthy. Unlike the
-player routine (fully automated apply), reporter changes are RESEARCH + RECOMMEND: the default
-reporter list is code (`FEED_HANDLES`) and each addition carries recurring Haiku classification
-cost against the owner's budget, so your output is a recommendation report the owner applies.
+You keep the NWSL fandom app's **default reporter/league Bluesky list** healthy — fully
+automated (owner 2026-08-17): what you apply goes live via `POST {base}/apply`; your report is
+transparency for the owner's review, not an approval request. The SERVER enforces the
+mechanical limits (max 2 adds per call, the budget ceiling, dedupe/validation); YOU enforce the
+quality bar below.
 
 Auth: `x-audit-key` header with the SOCIAL_AUDIT_KEY from your prompt.
 Endpoint: `GET https://nwslapp-proxy.tiffany-rieth.workers.dev/social/reporter-audit`
@@ -48,13 +49,25 @@ addSignals was empty — wrong). Every run does BOTH halves:
 ⛔ Follows-of-follows / graph signals are REJECTED (owner): reporters follow peers across all
 beats, so "reporters follow her" proves nothing.
 
-### 4. Report (recommendation, not application)
+### 4. THE QUALITY BAR for adds (judge the CONTENT, not the résumé)
 
-A single structured report: current-list health summary; recommended drops (with the two-audit
-streak + your research citation each); recommended adds (handle, who she is, why, activity
-level, and a posts/day estimate — the owner weighs Haiku budget per `MAX_FEED_HANDLES`);
-fan-signal handles that did NOT clear research, and why. The owner applies changes by editing
-`FEED_HANDLES` + deploy.
+Sample the candidate's recent ORIGINAL posts before adding. Add only voices whose NWSL
+coverage is **distinctive and engaging** — breaking news, transfers and transfer rumors,
+player storylines told with insight or energy, presser/report access. Do NOT add accounts
+whose output is primarily bare article links with no text, generic recaps/aggregation, or
+whose last ORIGINAL post is older than ~30 days (an inactive or link-dump account adds cost
+without content — activity recency is a HARD check, verified via getAuthorFeed, reposts don't
+count). Mixed beats are fine (NWSL + other soccer) — Haiku filters per-post; what matters is
+that the NWSL posts themselves are worth a fan's tap.
+
+### 5. Apply (guarded) + report
+
+`POST {base}/apply` body `{"add":[{"handle":"...","kind":"reporter|league"}],"drop":["handle"]}`
+— at most 2 adds per run (server-capped); drops ONLY for second-consecutive-flag handles whose
+departure you verified in step 2. Treat any `rejected[]` entries as findings, never force.
+Then the report: list health; drops applied (streak + citation); adds applied (who she is, the
+quality evidence, posts/day); candidates you did NOT add and the specific bar they missed
+(X-only, link-dump, inactive, generic) so future runs skip them; fan-signal outcomes.
 
 ## Hard rules (override everything)
 

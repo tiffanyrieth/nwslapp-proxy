@@ -533,6 +533,28 @@ interface FeedHandle {
 	abbr?: string;
 	playerId?: string;
 }
+// The default reporter list is DATA (owner 2026-08-17, reporter automation): the live list is
+// KV `social:reporter-list`, written by the monthly routine through POST
+// /social/reporter-audit/apply under server guardrails (MAX_FEED_HANDLES budget ceiling,
+// per-call add cap, drop rules). This constant is the SEED — served until the first apply;
+// never hand-edited for adds/drops after that.
+const REPORTER_LIST_KEY = "social:reporter-list";
+const MAX_FEED_HANDLES = 24; // classification-budget ceiling for the default list — a CEILING, never a target
+const MAX_REPORTER_ADDS_PER_CALL = 2; // the routine can never go on an add spree in one run
+
+async function loadFeedHandles(env: Env): Promise<FeedHandle[]> {
+	try {
+		const raw = await env.FEED_TAGS.get(REPORTER_LIST_KEY);
+		if (raw) {
+			const list = JSON.parse(raw) as FeedHandle[];
+			if (Array.isArray(list) && list.length > 0 && list.every((h) => h.handle && (h.kind === "reporter" || h.kind === "league"))) return list;
+		}
+	} catch {
+		/* fall through to seed */
+	}
+	return FEED_HANDLES;
+}
+
 const FEED_HANDLES: FeedHandle[] = [
 	// Reporters / journalists (league-wide)
 	{ handle: "meglinehan.com", kind: "reporter" },
@@ -780,7 +802,7 @@ export default {
 		if (url.pathname === "/social/player-audit" || url.pathname.startsWith("/social/player-audit/")) {
 			return handlePlayerAudit(request, env, ctx);
 		}
-		if (url.pathname === "/social/reporter-audit") {
+		if (url.pathname === "/social/reporter-audit" || url.pathname.startsWith("/social/reporter-audit/")) {
 			return handleReporterAudit(request, env, ctx);
 		}
 
@@ -2511,9 +2533,9 @@ function latestOriginalAgeMs(feed: BskyItem[], now: number): number | null {
 /** One default Bluesky handle's health, shared by the admin Status tab (HTML) and
  *  GET /social/reporter-audit (JSON) — one source of truth for the tier logic. */
 type BskyHealth = { handle: string; kind: "reporter" | "league"; tier: "ok" | "cooling" | "dormant" | "empty" | "dead"; lastPostDays: number | null };
-async function bskySourceHealth(): Promise<BskyHealth[]> {
+async function bskySourceHealth(env: Env): Promise<BskyHealth[]> {
 	const now = Date.now();
-	const bsky = FEED_HANDLES.filter((h) => h.kind === "reporter" || h.kind === "league");
+	const bsky = (await loadFeedHandles(env)).filter((h) => h.kind === "reporter" || h.kind === "league");
 	return Promise.all(bsky.map(async (h): Promise<BskyHealth> => {
 		const kind = h.kind as "reporter" | "league";
 		try {
@@ -2530,8 +2552,8 @@ async function bskySourceHealth(): Promise<BskyHealth[]> {
 	}));
 }
 
-async function statusCheckFeedSources(): Promise<StatusSection> {
-	const bskyChecks = (await bskySourceHealth()).map((s): StatusCheck => {
+async function statusCheckFeedSources(env: Env): Promise<StatusSection> {
+	const bskyChecks = (await bskySourceHealth(env)).map((s): StatusCheck => {
 		const when = s.lastPostDays !== null ? `last post ${s.lastPostDays}d ago` : "";
 		switch (s.tier) {
 			case "ok":      return { label: s.handle, status: "ok", detail: when };
@@ -2617,7 +2639,7 @@ function renderStatusSection(sec: StatusSection): string {
 const STATUS_SECTIONS: Record<string, { label: string; run: (env: Env) => Promise<StatusSection> }> = {
 	clubnews: { label: "Club news", run: (env) => statusCheckClubNews(env) },
 	espn: { label: "ESPN core", run: () => statusCheckESPN() },
-	feeds: { label: "Feed sources", run: () => statusCheckFeedSources() },
+	feeds: { label: "Feed sources", run: (env) => statusCheckFeedSources(env) },
 	ig: { label: "Instagram", run: (env) => statusCheckIG(env) },
 	errors: { label: "Diagnostics", run: (env) => statusCheckErrors(env) },
 };
@@ -3234,7 +3256,7 @@ async function handleFeed(url: URL, env: Env, ctx: ExecutionContext): Promise<Re
 		// Layering: active defaults = curated list minus the user's muted toggles. A user-added
 		// handle that is ALSO an active default is superseded (served filtered, once); if the
 		// default is muted, the user add wins and serves unfiltered below.
-		const activeDefaults = FEED_HANDLES.filter((h) => !mutedDefaults.has(h.handle.toLowerCase()));
+		const activeDefaults = (await loadFeedHandles(env)).filter((h) => !mutedDefaults.has(h.handle.toLowerCase()));
 		const activeDefaultSet = new Set(activeDefaults.map((h) => h.handle.toLowerCase()));
 		const reporterHandles = activeDefaults.filter((h) => h.kind === "reporter");
 		const leagueHandles = activeDefaults.filter((h) => h.kind === "league");
@@ -4303,7 +4325,69 @@ async function handleReporterAudit(request: Request, env: Env, ctx: ExecutionCon
 	if (!auditAuthed(request, env)) {
 		return new Response("Authentication required.", { status: 401, headers: { "WWW-Authenticate": adminRealm("NWSLApp Admin") } });
 	}
-	const health = await bskySourceHealth();
+	const url0 = new URL(request.url);
+
+	// POST /social/reporter-audit/apply — the routine's AUTO-APPLY write path (owner 2026-08-17:
+	// automate at ~90%, tune from real runs). Server guardrails the routine cannot bypass:
+	// ≤ MAX_REPORTER_ADDS_PER_CALL adds per call, the MAX_FEED_HANDLES budget ceiling, handle
+	// validation + dedupe. The quality bar (distinctive NWSL coverage, activity recency) lives
+	// in the routine prompt; the mechanical limits live HERE.
+	if (request.method === "POST" && url0.pathname === "/social/reporter-audit/apply") {
+		let body: { add?: { handle?: string; kind?: string }[]; drop?: string[] };
+		try {
+			body = (await request.json()) as typeof body;
+		} catch {
+			return new Response(JSON.stringify({ error: "unparseable JSON" }), { status: 400, headers: { "Content-Type": "application/json" } });
+		}
+		const list = [...(await loadFeedHandles(env))];
+		const seen = new Set(list.map((h) => h.handle.toLowerCase()));
+		const added: string[] = [];
+		const dropped: string[] = [];
+		const rejected: { handle?: string; reason: string }[] = [];
+
+		for (const d of body.drop ?? []) {
+			const key = String(d).toLowerCase().replace(/^@/, "");
+			const idx = list.findIndex((h) => h.handle.toLowerCase() === key);
+			if (idx === -1) {
+				rejected.push({ handle: d, reason: "not on the list" });
+				continue;
+			}
+			list.splice(idx, 1);
+			seen.delete(key);
+			dropped.push(key);
+		}
+
+		for (const a of body.add ?? []) {
+			const handle = String(a.handle ?? "").trim().replace(/^@/, "").toLowerCase();
+			const kind = a.kind === "league" ? "league" : "reporter";
+			if (!handle || !/^[a-z0-9][a-z0-9.-]{2,60}$/.test(handle) || !handle.includes(".")) {
+				rejected.push({ handle: a.handle, reason: "invalid bluesky handle" });
+				continue;
+			}
+			if (seen.has(handle)) {
+				rejected.push({ handle, reason: "already on the list" });
+				continue;
+			}
+			if (added.length >= MAX_REPORTER_ADDS_PER_CALL) {
+				rejected.push({ handle, reason: `per-call add cap (${MAX_REPORTER_ADDS_PER_CALL}) reached` });
+				continue;
+			}
+			if (list.length >= MAX_FEED_HANDLES) {
+				rejected.push({ handle, reason: `budget ceiling ${MAX_FEED_HANDLES} reached` });
+				continue;
+			}
+			list.push({ handle, kind });
+			seen.add(handle);
+			added.push(handle);
+		}
+
+		if (added.length > 0 || dropped.length > 0) {
+			await env.FEED_TAGS.put(REPORTER_LIST_KEY, JSON.stringify(list));
+		}
+		emitDiag(env, ctx, "socialReporterApply", `+${added.length} -${dropped.length} → ${list.length}/${MAX_FEED_HANDLES}${rejected.length ? ` (${rejected.length} rejected)` : ""}`);
+		return new Response(JSON.stringify({ added, dropped, rejected, total: list.length, ceiling: MAX_FEED_HANDLES }, null, 2), { headers: { "Content-Type": "application/json" } });
+	}
+	const health = await bskySourceHealth(env);
 
 	// Consecutive-dormant streaks: previous audit's flagged set ∩ this one's.
 	// ⚠️ OUTAGE GUARD (live-proven necessary during the 2026-08-16 Bluesky outage, when all 16
