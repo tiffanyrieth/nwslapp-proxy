@@ -3973,6 +3973,51 @@ async function handlePlayerAudit(request: Request, env: Env, ctx: ExecutionConte
 	const nt = params.get("nt");
 
 	// ── Stage 1d: routine write-back — research memory + fully-automated apply ────────
+	// GET /social/player-audit/scrape-meta — the IDENTITY-GATE data source (owner 2026-08-17:
+	// verification is a MUST, not nice-to-have). Reads the MOST RECENT already-run Apify dataset
+	// (a free API GET — never runs the actor, never spends scrape quota) and extracts each
+	// scraped account's own IG metadata: verified flag, full name, follower count, whatever the
+	// actor carries. This is Instagram's own answer for every featured handle — no login wall.
+	if (request.method === "GET" && url.pathname === "/social/player-audit/scrape-meta") {
+		const token = env.APIFY_TOKEN;
+		if (!token) return j({ error: "APIFY_TOKEN unset" }, 500);
+		const runsRes = await fetch(`${APIFY_API}/${APIFY_IG_ACTOR}/runs?token=${token}&desc=1&limit=1&status=SUCCEEDED`);
+		if (!runsRes.ok) return j({ error: `apify runs list ${runsRes.status}` }, 502);
+		const runs = (await runsRes.json()) as { data?: { items?: { id?: string; defaultDatasetId?: string; finishedAt?: string }[] } };
+		const run = runs.data?.items?.[0];
+		if (!run?.defaultDatasetId) return j({ error: "no succeeded runs found" }, 404);
+		const dsRes = await fetch(`https://api.apify.com/v2/datasets/${run.defaultDatasetId}/items?token=${token}&clean=1&limit=2000`);
+		if (!dsRes.ok) return j({ error: `dataset read ${dsRes.status}` }, 502);
+		const items = (await dsRes.json()) as Record<string, unknown>[];
+		// Aggregate per scraped account; field names are actor-specific, so probe the common
+		// spellings and ALSO return one raw item's key list so gaps are diagnosable, not guessed.
+		const byHandle: Record<string, { verified?: boolean; fullName?: string; followers?: number; private?: boolean; posts: number; selfPosts?: number }> = {};
+		for (const it of items) {
+			const user = (it.user ?? {}) as Record<string, unknown>;
+			const handle = String(it.scraped_username ?? user.username ?? it.ownerUsername ?? "").toLowerCase();
+			if (!handle) continue;
+			const e = (byHandle[handle] ??= { posts: 0 });
+			e.posts++;
+			// ⚠️ `user` = the POST AUTHOR, not the profile owner: a COLLAB post on her profile
+			// carries the CO-POSTER's author object (clubs/sponsors — "TJ Maxx" on Mallory Pugh's
+			// probe; league/club names across 29 handles). Identity fields are taken ONLY from
+			// SELF-AUTHORED posts (author == scraped account) — collab items contribute nothing.
+			if (String(user.username ?? "").toLowerCase() !== handle) continue;
+			e.selfPosts = (e.selfPosts ?? 0) + 1;
+			const v = user.is_verified;
+			if (typeof v === "boolean") e.verified = v;
+			const fn = user.full_name;
+			if (typeof fn === "string" && fn) e.fullName = fn;
+			const fo = user.follower_count;
+			if (typeof fo === "number") e.followers = fo;
+			const pr = user.is_private;
+			if (typeof pr === "boolean") e.private = pr;
+		}
+		const sample = items[0] ? Object.keys(items[0]) : [];
+		const sampleUser = items[0] ? Object.keys((items[0].user as Record<string, unknown>) ?? {}) : [];
+		return j({ runFinishedAt: run.finishedAt, datasetItems: items.length, accounts: Object.keys(byHandle).length, byHandle, sampleItemKeys: sample, sampleUserKeys: sampleUser });
+	}
+
 	if (request.method === "POST" && url.pathname === "/social/player-audit/research") {
 		let body: { results?: { name?: string; status?: string; ig?: string; bsky?: string }[] };
 		try {
