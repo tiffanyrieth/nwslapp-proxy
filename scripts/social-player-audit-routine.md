@@ -45,15 +45,17 @@ no players are genuinely on Bluesky (name-matches were impersonation squats), so
 IG-only and you never search Bluesky for players. **The two-tier identity bar (owner law, 2026-08-17 — the app is a publisher; a
 wrong account is the app lying to fans, including 12-year-olds):**
 
-- **REQUIRED — athlete-class professional category.** The IG account must carry an athlete-class
-  professional-category label: "Athlete" or a clear localized equivalent ("Futbolista",
-  "Sportlerin", …). This is the same-name protection — a personal account or any non-athlete
-  category FAILS the gate no matter how convincing the name match. Record the EXACT label you saw
-  as `category` and your judgment as `athleteClass: true/false`. The category shows on the
-  profile (under the name, above the bio) — read it via the profile page, a Google-indexed
-  profile title, or a source that quotes it. If you cannot determine the category, record what
-  you found WITHOUT `athleteClass: true` — the server refuses the add, which is correct: unproven
-  stays unfeatured.
+- **REQUIRED — identity confidence (owner ruling 2026-08-17).** `athleteClass: true` means "we
+  are CONFIDENT this is the professional player's own account" — the same-name protection. The
+  BEST evidence is the athlete-class professional-category label ("Athlete"/localized like
+  "Futbolista") read from the profile — record the exact label as `category`. ⚠️ Instagram
+  rate-limits datacenter IPs after ~6 direct profile reads per run. Typical delta runs fit; when
+  a run has MORE candidates than the budget, DO NOT stop and DO NOT lower the bar — establish
+  identity confidence by web corroboration instead: her club's or federation's OWN page linking
+  that exact handle, the bio naming her club/NT (visible in search snippets), a verified badge,
+  or the club/league tagging the handle in an announcement. Any of those, solid, = `athleteClass:
+  true` (leave `category` absent if unread). Nothing solid = leave `athleteClass` absent — the
+  server refuses the add; unproven stays unfeatured.
 - **Verified (blue check) = the accuracy ACCELERATOR, not the gate.** Record `verified` when you
   can see it. A verified account needs only the category check; an UNVERIFIED account needs full
   identity corroboration — her club's or federation's own page linking that exact handle, or the

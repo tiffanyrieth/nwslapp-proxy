@@ -545,7 +545,9 @@ const FEED_HANDLES: FeedHandle[] = [
 	// Tannenwald) only surface on their NWSL/USWNT items.
 	{ handle: "scoutripley.bsky.social", kind: "reporter" }, // Claire Watkins (Just Women's Sports / The Late Sub)
 	{ handle: "jennatonelli.bsky.social", kind: "reporter" }, // Jenna Tonelli (SI / broadcast)
-	{ handle: "caitlinmurr.bsky.social", kind: "reporter" }, // Caitlin Murray (ESPN; "The National Team" author)
+	// caitlinmurr.bsky.social removed 2026-08-17 (routine audit #1): no original posts in 236d
+	// (reposts only). The default list serves accounts that post original coverage here; an
+	// account can be re-added instantly if it becomes active again.
 	{ handle: "jeffrueter.bsky.social", kind: "reporter" }, // Jeff Rueter (The Athletic)
 	{ handle: "jtannenwald.bsky.social", kind: "reporter" }, // Jonathan Tannenwald (Philadelphia Inquirer)
 	{ handle: "girlssoccernetwork.bsky.social", kind: "reporter" }, // Girls Soccer Network (outlet)
