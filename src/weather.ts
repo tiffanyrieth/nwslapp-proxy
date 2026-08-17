@@ -105,6 +105,19 @@ export function kickoffHourUtc(dateStr: string | undefined | null): string | nul
 const RECENT_DAYS = 7;
 const FORECAST_PAST_MAX = 92;
 
+// A LIVE match (`state === "in"`) can take the historical kickoff-temp path once its kickoff hour
+// is settled in Open-Meteo — so the immutable reading is captured DURING the match and is already
+// warm in KV when the card flips to full-time (kills the in→post fetch race). We wait this long
+// past kickoff before locking it: Open-Meteo advises ~10 min after a model update, and this also
+// dodges the parked "fabricated kickoff" edge (a match that shows `in` at 1' but never started).
+export const WEATHER_LIVE_SETTLE_MS = 30 * 60_000; // 30 min — a 7pm kickoff locks at ~7:30pm.
+
+// True when a LIVE match's kickoff hour is settled enough to capture the immutable kickoff temp.
+// A finished match (`post`) always takes the historical path; this only decides the live case.
+export function liveWeatherSettled(state: string | undefined, kickoffMs: number, nowMs: number): boolean {
+	return state === "in" && Number.isFinite(kickoffMs) && kickoffMs <= nowMs - WEATHER_LIVE_SETTLE_MS;
+}
+
 export function pickApi(kickoffMs: number, nowMs: number): "forecast" | "archive" {
 	const daysAgo = (nowMs - kickoffMs) / 86_400_000;
 	return daysAgo <= RECENT_DAYS ? "forecast" : "archive";
@@ -417,9 +430,14 @@ export async function handleWeather(
 		return json({ v: 1, mode: "unavailable", reason: "upstream-error" }, CC_ERROR);
 	}
 
-	// FORECAST path — a pre-match (not `post`) game. A LIVE game (`in`) gets no card either
-	// (`not-finished`); only a genuinely future kickoff inside the 10-day horizon forecasts.
-	if (state !== "post") {
+	// A LIVE game (`in`) whose kickoff hour has settled takes the SAME historical path as a finished
+	// match, so the immutable kickoff temp is captured mid-match and is already in KV at the post flip.
+	const liveSettled = liveWeatherSettled(state, kickoffMs, nowMs);
+
+	// FORECAST path — a pre-match (not `post`, not settled-live) game. An early LIVE game (`in`,
+	// <30 min in) gets no card yet (`not-finished`, retried); only a genuinely future kickoff inside
+	// the 10-day horizon forecasts.
+	if (state !== "post" && !liveSettled) {
 		if (state === "in") {
 			return json({ v: 1, mode: "unavailable", reason: "not-finished" }, CC_NOT_FINISHED);
 		}
@@ -449,7 +467,8 @@ export async function handleWeather(
 		asOf: isoHour + ":00Z",
 	};
 
-	// 4. Write-once: a finished match's weather is final, so no TTL. Don't block the response.
+	// 4. Write-once: the kickoff-hour reading is final (the match is finished, or live and ≥30 min
+	// past kickoff so the hour has settled), so no TTL. Don't block the response.
 	ctx.waitUntil(env.FEED_TAGS.put(kvKey, JSON.stringify(record)));
 	return json(record, CC_IMMUTABLE);
 }

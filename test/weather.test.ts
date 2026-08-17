@@ -22,6 +22,8 @@ import {
 	extractWindow,
 	nearestSunset,
 	FORECAST_MAX_DAYS,
+	liveWeatherSettled,
+	WEATHER_LIVE_SETTLE_MS,
 } from "../src/weather.ts";
 
 test("venueCoords resolves a known ESPN venue id and rejects unknown/empty", () => {
@@ -70,6 +72,23 @@ test("kickoffHourUtc rounds to the nearest UTC hour and rolls the date", () => {
 	assert.equal(kickoffHourUtc("2026-12-31T23:40:00Z"), "2027-01-01T00:00"); // year roll
 	assert.equal(kickoffHourUtc(undefined), null);
 	assert.equal(kickoffHourUtc("not a date"), null);
+});
+
+test("liveWeatherSettled: a live match takes the historical path only ≥30 min past kickoff", () => {
+	const now = Date.parse("2026-08-16T02:00:00Z"); // 10pm ET
+	const minsAgo = (m) => now - m * 60_000;
+	// Live and settled → historical kickoff temp is captured mid-match.
+	assert.equal(liveWeatherSettled("in", minsAgo(30), now), true); // boundary inclusive
+	assert.equal(liveWeatherSettled("in", minsAgo(75), now), true); // deep into the match
+	// Live but too early → still `not-finished`, retried (don't lock an unsettled reading).
+	assert.equal(liveWeatherSettled("in", minsAgo(29), now), false);
+	assert.equal(liveWeatherSettled("in", minsAgo(1), now), false); // fabricated-kickoff edge
+	// Only the live state uses this gate; post/pre are decided elsewhere.
+	assert.equal(liveWeatherSettled("post", minsAgo(120), now), false);
+	assert.equal(liveWeatherSettled("pre", minsAgo(-60), now), false);
+	assert.equal(liveWeatherSettled(undefined, minsAgo(120), now), false);
+	assert.equal(liveWeatherSettled("in", NaN, now), false); // bad kickoff date
+	assert.equal(WEATHER_LIVE_SETTLE_MS, 30 * 60_000);
 });
 
 test("pickApi chooses forecast for recent matches, archive for older", () => {
