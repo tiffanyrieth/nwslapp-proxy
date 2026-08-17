@@ -39,8 +39,10 @@ One retry per failed slug, then move on and note it in the report. Record each s
 ### 3. Research ONLY `candidates.needsResearch` (token discipline)
 
 Never re-research `researched` names — that memory exists so you don't. For each new candidate,
-web-search her Instagram and Bluesky (e.g. `"<name>" <club> Instagram`, `"<name>" <nation>
-Instagram`). **The two-tier identity bar (owner law, 2026-08-17 — the app is a publisher; a
+web-search her Instagram (e.g. `"<name>" <club> Instagram`, `"<name>" <nation> Instagram`).
+⚠️ IG ONLY — player-Bluesky discovery was DROPPED (owner 2026-08-17): a 2026 sweep proved almost
+no players are genuinely on Bluesky (name-matches were impersonation squats), so defaults are
+IG-only and you never search Bluesky for players. **The two-tier identity bar (owner law, 2026-08-17 — the app is a publisher; a
 wrong account is the app lying to fans, including 12-year-olds):**
 
 - **REQUIRED — athlete-class professional category.** The IG account must carry an athlete-class
@@ -59,10 +61,10 @@ wrong account is the app lying to fans, including 12-year-olds):**
   @orlpride + @fazfootball — passes without a blue check).
 - **Public and alive** — not private, a post within roughly the last 6 months.
 
-Verdicts: `found` (with `ig` and/or `bsky`, bare handles no @), `private`, or `none`.
+Verdicts: `found` (with `ig`, bare handle no @), `private`, or `none`.
 POST the whole batch once — include the gate fields:
 `POST {base}/research` body
-`{"results":[{"name":"...","status":"found","ig":"...","bsky":"...","category":"Athlete","athleteClass":true,"verified":true}, ...]}`
+`{"results":[{"name":"...","status":"found","ig":"...","category":"Athlete","athleteClass":true,"verified":true}, ...]}`
 
 ### 4. Verify drops (departures only, never name variants)
 
@@ -77,9 +79,7 @@ do NOT drop — note it in the report instead. Ambiguous → leave her on, note 
 
 - Adds = every candidate whose research found a **public IG handle AND confirmed athlete-class
   category** (`athleteClass: true`). The server enforces this independently — an add without a
-  passing gate record is rejected, never silently accepted. (IG is required to serve today; a
-  bsky-only player stays in research memory and auto-surfaces when Bluesky player serving ships
-  — do NOT add her yet.)
+  passing gate record is rejected, never silently accepted.
 - `abbr` = the `club` from the report's candidate entry, verbatim.
 - If adds would exceed the ceiling, prioritize (a) clubs at 0 coverage, then (b) major-tournament
   `source` over friendlies — and report exactly who was left off and why.

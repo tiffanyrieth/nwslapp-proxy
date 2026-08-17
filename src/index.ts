@@ -606,7 +606,9 @@ const CLUB_SOCIAL: Record<string, { name: string; ig: string; tiktok?: string }>
 // POST /social/player-audit/apply. This constant is only the SEED — served verbatim until
 // the first apply creates the KV record; never edited to add/drop players after that.
 // Europe-based (Fox/Girma/A.Thompson) grandfathered per owner, tagged to last NWSL club.
-type PlayerSocialEntry = { name: string; abbr: string; ig: string; bsky?: string; addedAt?: string; source?: string; pool?: "A" | "B" };
+// bsky was removed from the DEFAULT schema (owner 2026-08-17): the app does not self-discover
+// player Bluesky — defaults are IG-only. (User adds carry their own bsky via /feed?playerBsky=.)
+type PlayerSocialEntry = { name: string; abbr: string; ig: string; addedAt?: string; source?: string; pool?: "A" | "B" };
 const PLAYER_LIST_KEY = "social:player-list";
 
 // ── Pool ROTATION (owner 2026-08-17): the every-2-day scrape alternates pools A/B — same
@@ -3254,19 +3256,18 @@ async function handleFeed(url: URL, env: Env, ctx: ExecutionContext): Promise<Re
 			// players. (Club-official Bluesky was retired from the Feed 2026-08.)
 			readSocialCards(env),
 		]);
-		// 2c: featured players who ALSO have a Bluesky (KV list `bsky` field — the routine's
-		// bsky-only discoveries land here) — scoped like their IG: followed teams ∪ the user's
-		// cross-team follows. Plus the user's own player-Bluesky adds. NO Haiku on any of it.
-		const defaultPlayerBsky: FeedHandle[] = (await loadPlayerSocial(env))
-			.filter((p) => p.bsky && (teams.includes(p.abbr) || userPlayers.has(p.ig)))
-			.map((p) => ({ handle: p.bsky as string, kind: "player", abbr: p.abbr, playerId: p.ig }));
+		// 2c: the USER's own player-Bluesky adds (the add-flow's reporter|player pick). NO Haiku.
+		// ⚠️ DEFAULT player-Bluesky discovery/serving was DROPPED (owner 2026-08-17): the backfill
+		// sweep proved almost no players are really on Bluesky (the name-matches were impersonation
+		// squats) — 1-2 default bsky players across 16 clubs would read as broken, not thorough,
+		// and bsky identity is far harder to verify than IG. Players = IG-only for DEFAULTS;
+		// user adds remain free to include player bsky (their explicit choice).
 		const userPlayerBskyHandles: FeedHandle[] = userPlayerBsky.map((h) => ({ handle: h, kind: "player" }));
 
-		const [rawReporters, rawLeague, rawUserReporters, rawDefaultPlayerBsky, rawUserPlayerBsky] = await Promise.all([
+		const [rawReporters, rawLeague, rawUserReporters, rawUserPlayerBsky] = await Promise.all([
 			buildBlueskyCards(reporterHandles, env, ctx),
 			buildBlueskyCards(leagueHandles, env, ctx),
 			buildBlueskyCards(userReporterHandles, env, ctx),
-			buildBlueskyCards(defaultPlayerBsky, env, ctx),
 			buildBlueskyCards(userPlayerBskyHandles, env, ctx),
 		]);
 		// Reporter + league-outlet Bluesky carry no team tag of their own and post
@@ -3288,7 +3289,7 @@ async function handleFeed(url: URL, env: Env, ctx: ExecutionContext): Promise<Re
 		const userReporterCards = rawUserReporters.map((c) => ({ ...(c as Record<string, unknown>), userAdded: true }));
 		const userPlayerBskyCards = rawUserPlayerBsky.map((c) => ({ ...(c as Record<string, unknown>), userAdded: true }));
 		const playerSocial = socialFor(social, teams, new Set(["feed"]), userPlayers);
-		cards = [...socialBluesky, ...userReporterCards, ...newsCards, ...playerSocial, ...rawDefaultPlayerBsky, ...userPlayerBskyCards].sort(
+		cards = [...socialBluesky, ...userReporterCards, ...newsCards, ...playerSocial, ...userPlayerBskyCards].sort(
 			byTimestampDesc,
 		);
 		// Collapse identical-text duplicates (bot double-posts) BEFORE the cap, so a
@@ -4095,7 +4096,7 @@ async function handlePlayerAudit(request: Request, env: Env, ctx: ExecutionConte
 	}
 
 	if (request.method === "POST" && url.pathname === "/social/player-audit/apply") {
-		let body: { add?: { name?: string; abbr?: string; ig?: string; bsky?: string }[]; drop?: string[] };
+		let body: { add?: { name?: string; abbr?: string; ig?: string }[]; drop?: string[] };
 		try {
 			body = (await request.json()) as typeof body;
 		} catch {
@@ -4164,7 +4165,7 @@ async function handlePlayerAudit(request: Request, env: Env, ctx: ExecutionConte
 			}
 			// Pool auto-assignment (owner rule): new adds join whichever pool is lighter — the
 			// routine never needs pool awareness; balance converges on its own.
-			list.push({ name, abbr, ig, bsky: a.bsky || undefined, addedAt: now, source: "routine", pool: lighterPool(list) });
+			list.push({ name, abbr, ig, addedAt: now, source: "routine", pool: lighterPool(list) });
 			igSeen.add(ig.toLowerCase());
 			nameSeen.add(normalizeName(name));
 			added.push(name);
@@ -4234,7 +4235,7 @@ async function handlePlayerAudit(request: Request, env: Env, ctx: ExecutionConte
 			clubCoverage,
 			// The live featured list WITH each player's research/gate record — what the
 			// re-curation + backfill passes read (candidates below exclude featured by definition).
-			featured: playerList.map((p) => ({ name: p.name, abbr: p.abbr, ig: p.ig, bsky: p.bsky, pool: p.pool, research: gateLedgerLookup(ledger, p.name) })),
+			featured: playerList.map((p) => ({ name: p.name, abbr: p.abbr, ig: p.ig, pool: p.pool, research: gateLedgerLookup(ledger, p.name) })),
 			candidates: { needsResearch, researched },
 			drops: { players: drops, note: "not on any NWSL roster — verify (ESPN name variant lands here too) before applying" },
 			grandfathered,
