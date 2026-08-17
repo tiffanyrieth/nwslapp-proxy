@@ -5508,6 +5508,11 @@ const ANALYTICS_EVENTS = new Set([
 	"fanzone_game_opened",
 	"feed_item_tapped",
 	"feed_chip_tapped",
+	// Phase 3 reporter discovery (2026-08-17): param "TEAM|handle" — which club FANBASE added
+	// which Bluesky handle, never which fan (anonymous Level-3 law). The reporter-audit
+	// endpoint aggregates these into addSignals; threshold judgment lives in the routine.
+	"reporter_added",
+	"reporter_add_session", // denominator: sessions that added ANY reporter
 ]);
 
 /** Anonymous Level-3 usage counters: `POST /analytics` with a pre-summed per-session batch
@@ -5533,9 +5538,12 @@ async function handleAnalyticsIngest(request: Request, env: Env, ctx: ExecutionC
 		.map((e) => {
 			const ev = e as { event?: unknown; param?: unknown; n?: unknown };
 			const n = typeof ev.n === "number" && Number.isFinite(ev.n) ? Math.floor(ev.n) : 0;
+			const event = String(ev.event ?? "");
+			// reporter_added carries "TEAM|handle" — bsky handles alone run past 32 ("GFC|" +
+			// girlssoccernetwork.bsky.social = 34), so this event gets 64; everything else keeps 32.
 			return {
-				event: String(ev.event ?? ""),
-				param: String(ev.param ?? "").slice(0, 32),
+				event,
+				param: String(ev.param ?? "").slice(0, event === "reporter_added" ? 64 : 32),
 				n: Math.min(Math.max(n, 0), 10_000),
 			};
 		})
