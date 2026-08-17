@@ -3946,6 +3946,10 @@ async function nwslNameMap(env: Env, ctx: ExecutionContext, opts?: { live?: bool
 	return map;
 }
 
+function gateLedgerLookup(ledger: Record<string, LedgerEntry>, name: string): LedgerEntry["research"] | undefined {
+	return ledger[normalizeName(name)]?.research;
+}
+
 /** Read the ledger; if it doesn't exist yet, seed it from the current featured 34 (all
  *  NT-caliber by curation → earned). Returns the in-memory object for the caller to merge + write. */
 async function readNtLedger(env: Env): Promise<Record<string, LedgerEntry>> {
@@ -4191,6 +4195,9 @@ async function handlePlayerAudit(request: Request, env: Env, ctx: ExecutionConte
 				note: "ceiling is a CEILING, never a target — carry exactly who qualifies",
 			},
 			clubCoverage,
+			// The live featured list WITH each player's research/gate record — what the
+			// re-curation + backfill passes read (candidates below exclude featured by definition).
+			featured: playerList.map((p) => ({ name: p.name, abbr: p.abbr, ig: p.ig, bsky: p.bsky, research: gateLedgerLookup(ledger, p.name) })),
 			candidates: { needsResearch, researched },
 			drops: { players: drops, note: "not on any NWSL roster — verify (ESPN name variant lands here too) before applying" },
 			grandfathered,
