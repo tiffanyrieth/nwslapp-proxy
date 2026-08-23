@@ -159,7 +159,7 @@ test("isKnowHerWeek: pre-anchor weeks are off; unset/invalid anchor fails open t
 // The rule lives in BOTH validators because both are publish-adjacent: this one guards
 // /knowher/ingest + the admin paste, the loader's guards the routine's dry-run.
 
-import { clubCompletenessError, KNOWN_CLUB_ABBRS, validateKnowHerPool } from "../src/knowher.ts";
+import { clubCompletenessError, KNOWN_CLUB_ABBRS, validateKnowHerPool, scrubEmDashesInPool } from "../src/knowher.ts";
 
 test("clubCompletenessError: a complete pool is clean", () => {
 	assert.equal(clubCompletenessError([...KNOWN_CLUB_ABBRS]), null);
@@ -206,4 +206,39 @@ test("validateKnowHerPool: a one-player frame passes by default (the upsertPlaye
 test("validateKnowHerPool: the same frame FAILS with requireAllClubs (the publish path)", () => {
 	const v = validateKnowHerPool(onePlayerFrame, { requireAllClubs: true });
 	assert.ok("error" in v && v.error.includes("missing 15 club(s)"), JSON.stringify(v));
+});
+
+// The em-dash scrub runs at the publish chokepoint so reader-facing copy never ships the AI-tell em-dash,
+// without asking the generator/verifier routines to police punctuation.
+test("scrubEmDashesInPool: strips em-dashes from tagline / prompt / options / revealFact, leaves source + en-dashes", () => {
+	const pool = {
+		weekKey: "2026-W40", season: 2026,
+		players: [{
+			teamAbbreviation: "POR", espnAthleteId: "id-por", playerName: "Player POR",
+			jerseyNumber: 7, position: "Defender",
+			tagline: "From the beaches — she rose to the top.",
+			questions: [{
+				id: "por-0", category: "herStory",
+				prompt: "Where did she grow up — before moving?",
+				options: ["A — town", "B", "C", "D"],
+				correctIndex: 0,
+				revealFact: "She trained hard 24/7 — and it paid off.",
+				source: "https://example.com/a—b",   // an em-dash inside a URL must NOT be touched
+			}],
+		}],
+	} as unknown as Parameters<typeof scrubEmDashesInPool>[0];
+
+	scrubEmDashesInPool(pool);
+	const p = pool.players[0];
+	const q = p.questions[0];
+	assert.equal(p.tagline, "From the beaches, she rose to the top.");
+	assert.equal(q.prompt, "Where did she grow up, before moving?");
+	assert.equal(q.options[0], "A, town");
+	assert.equal(q.revealFact, "She trained hard 24/7, and it paid off.");
+	assert.equal(q.source, "https://example.com/a—b");
+	// Idempotent + en-dash (–) left alone.
+	const before = { ...q, prompt: "range 2018–2019 stays", revealFact: undefined };
+	p.questions[0] = before as typeof q;
+	scrubEmDashesInPool(pool);
+	assert.equal(pool.players[0].questions[0].prompt, "range 2018–2019 stays");
 });

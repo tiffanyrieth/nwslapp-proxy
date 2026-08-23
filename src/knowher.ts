@@ -421,6 +421,33 @@ export async function handleKnowHerAdmin(request: Request, env: KnowHerEnv): Pro
   }
 }
 
+/** Strip the em-dash (U+2014) from a single reader-facing string. The app bans em-dashes in user-facing
+ *  copy — it's the single clearest "AI wrote this" tell (docs: no-em-dashes-in-UI) — but the KHG generator
+ *  and verifier routines are DELIBERATELY not burdened with that style rule: their whole budget stays on
+ *  question QUALITY (generator) and ACCURACY (verifier), and models re-emit em-dashes no matter the prompt.
+ *  So we handle it deterministically here instead, where a mechanical transform is perfect and can NEVER
+ *  regress a fact. Every observed use is the spaced clause-break `A — B`, which reads correctly as `A, B`,
+ *  so we collapse any whitespace around a U+2014 to a single comma. En-dashes (–, e.g. ranges) and hyphens
+ *  are LEFT untouched, per the rule. Idempotent (post-scrub text has no em-dash left to match). */
+function deEmDash(s: string): string {
+  return s.replace(/\s*—\s*/g, ", ");
+}
+
+/** Apply {@link deEmDash} to every reader-facing string in a pool, IN PLACE: each player's `tagline` and
+ *  each question's `prompt`, `options`, and `revealFact`. Never touches `source` (a URL) or any non-text
+ *  field. Runs at the publish chokepoint (below), AFTER validation — the swap only changes punctuation, so
+ *  it can't break a validated invariant (option counts, non-empty strings, etc.). */
+export function scrubEmDashesInPool(pool: KnowHerPool): void {
+  for (const p of pool.players) {
+    if (p.tagline) p.tagline = deEmDash(p.tagline);
+    for (const q of p.questions) {
+      if (q.prompt) q.prompt = deEmDash(q.prompt);
+      if (Array.isArray(q.options)) q.options = q.options.map((o) => (typeof o === "string" ? deEmDash(o) : o));
+      if (q.revealFact) q.revealFact = deEmDash(q.revealFact);
+    }
+  }
+}
+
 /** The ONE publish path: validate → replace the live pool in KV → mark this pool's players
  *  featured-this-season (idempotent) so they drop out of future eligibility. Shared by the operator's
  *  admin `pasteContent` op AND the automated weekly `/knowher/ingest` — publishing must always run
@@ -437,6 +464,9 @@ export async function publishKnowHerPool(
   // only one that makes a pool live — so it's where a short edition has to be stopped.
   const v = validateKnowHerPool(poolInput, { requireAllClubs: true, requireSource: opts.requireSource });
   if ("error" in v) return { error: v.error };
+  // Strip em-dashes from reader-facing copy at the single publish chokepoint, so every live edition reads
+  // human-crafted without asking the generator/verifier to police punctuation (see scrubEmDashesInPool).
+  scrubEmDashesInPool(v.pool);
   // Stamp each player's numeric ESPN team id (abbr→id via the shared teams map) so the match-watcher can
   // target the team's followers for the biweekly KHG push without its own abbr→id table. Best-effort: a
   // lookup miss just leaves espnTeamId undefined (the watcher skips that team + logs), never blocks publish.
