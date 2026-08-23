@@ -57,6 +57,7 @@ export const ADMIN_PORTAL_HTML = `<!doctype html>
   <button data-tab="status">Status</button>
   <button data-tab="bracket">The Bracket</button>
   <button data-tab="knowher">Know Her Game</button>
+  <button data-tab="analytics">Analytics</button>
 </nav>
 
 <div class="panel on" id="roster">
@@ -71,6 +72,7 @@ export const ADMIN_PORTAL_HTML = `<!doctype html>
 <div class="panel" id="status"><iframe data-src="/admin/status" title="Status"></iframe></div>
 <div class="panel" id="bracket"><iframe data-src="/bracket/admin" title="The Bracket admin"></iframe></div>
 <div class="panel" id="knowher"><iframe data-src="/knowher/admin" title="Know Her Game admin"></iframe></div>
+<div class="panel" id="analytics"><iframe data-src="/analytics/admin" title="Analytics"></iframe></div>
 
 <script>
 const $ = (s) => document.querySelector(s);

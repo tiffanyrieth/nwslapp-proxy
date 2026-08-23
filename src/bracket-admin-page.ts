@@ -50,16 +50,43 @@ export const ADMIN_PAGE_HTML = `<!doctype html>
 
 <h2>Edition control</h2>
 <div class="row">
-  <button class="go" onclick="doAction('start_edition','Start the NEXT rotation edition?')">Start next (rotation)</button>
   <select id="startPick"></select>
-  <button class="go" onclick="startSpecific()">Start specific</button>
+  <label class="muted">size
+    <select id="startPool">
+      <option value="">default (128)</option>
+      <option value="16">16 · short (4 rounds)</option>
+      <option value="32">32 · short (5 rounds)</option>
+      <option value="64">64 · medium (6 rounds)</option>
+      <option value="128">128 · extended (byes + upsets)</option>
+    </select>
+  </label>
+  <button class="go" onclick="startSpecific()">Start</button>
 </div>
 <div class="row">
   <button onclick="doAction('advance_round','Advance the current round? This tallies votes and opens the next round.')">Advance round</button>
   <button class="danger" onclick="doAction('close_edition','Close + complete the active edition? This finishes the game.')">Close / complete</button>
-  <button onclick="doAction('pause')">Pause</button>
-  <button onclick="doAction('resume')">Resume</button>
 </div>
+
+<h2>Community suggestions</h2>
+<div class="row muted" id="suggMeta">—</div>
+<div class="row">
+  <input id="suggPrompt" placeholder="Optional write-in prompt (e.g. Suggest an end-of-year award)" style="min-width:340px">
+  <button class="go" onclick="setSuggPrompt()">Set prompt</button>
+  <button onclick="clearSuggPrompt()">Clear</button>
+</div>
+<h3 style="margin:12px 0 4px">Pending review</h3>
+<div id="suggPending">—</div>
+<h3 style="margin:12px 0 4px">Approved — the people's pick (top by votes)</h3>
+<div class="row"><label class="muted">start at size
+  <select id="suggPool">
+    <option value="">default (128)</option>
+    <option value="16">16 · short</option>
+    <option value="32">32 · short</option>
+    <option value="64">64 · medium</option>
+    <option value="128">128 · extended</option>
+  </select>
+</label></div>
+<div id="suggApproved">—</div>
 
 <h2>Library — creative</h2>
 <div class="row">
@@ -112,7 +139,7 @@ function renderState(s){
   if (a){
     html += '<div class="row"><b>Active:</b> '+esc(a.title)+' <span class="muted">('+esc(a.type)+')</span></div>'+
       '<table><tr><th>round</th><th>total rounds</th><th>pool</th><th>votes this round</th><th>round closes</th><th>active</th></tr>'+
-      '<tr><td>'+esc(a.current_round)+'</td><td>'+esc(a.total_rounds)+'</td><td>'+esc(a.pool_size)+'</td><td>'+esc(a.thisRoundVotes)+'</td><td>'+fmt(a.round_closes_at)+'</td><td>'+esc(a.is_active)+'</td></tr></table>';
+      '<tr><td>'+esc(a.roundLabel||a.current_round)+'</td><td>'+esc(a.total_rounds)+'</td><td>'+esc(a.pool_size)+'</td><td>'+esc(a.thisRoundVotes)+'</td><td>'+fmt(a.round_closes_at)+'</td><td>'+esc(a.is_active)+'</td></tr></table>';
   } else {
     html += '<div class="row muted">No active edition.</div>';
   }
@@ -134,7 +161,41 @@ function renderState(s){
     '<div class="row"><b>Used this season:</b> <span class="muted">'+((c.usedThemes&&c.usedThemes.length)?c.usedThemes.map(esc).join(', '):'(none)')+'</span> '+
     '<button onclick="clearUsed()">Clear used themes</button></div>';
 
+  renderSuggestions(s, c);
+
   document.getElementById('history').innerHTML = histTable(s.history||[]);
+}
+
+function renderSuggestions(s, c){
+  const sg = s.suggestions || { pending:[], approved:[] };
+  const sched = c.scheduledStart;
+  let meta = sg.editionId ? ('Collection window: <b>'+esc(sg.editionId)+'</b>') : 'No edition yet — write-ins open once an edition is live.';
+  if (c.suggestionPrompt) meta += ' · prompt: <b>'+esc(c.suggestionPrompt)+'</b>';
+  if (sched) meta += ' · <span class="pill parked">scheduled</span> '+esc(sched.themeId)+' @ '+fmt(sched.startAt);
+  document.getElementById('suggMeta').innerHTML = meta;
+  document.getElementById('suggPrompt').value = c.suggestionPrompt || '';
+
+  const pend = sg.pending || [];
+  document.getElementById('suggPending').innerHTML = pend.length
+    ? '<table><tr><th>write-in</th><th>submitted</th><th></th></tr>'+pend.map(function(x){
+        return '<tr><td>'+esc(x.text)+'</td><td class="muted">'+fmt(x.created_at)+'</td><td>'+
+          '<button class="go" onclick="approveSugg(\\''+esc(x.id)+'\\')">Approve</button> '+
+          '<button onclick="rejectSugg(\\''+esc(x.id)+'\\')">Reject</button></td></tr>';
+      }).join('')+'</table>'
+    : '<div class="muted">Nothing awaiting review.</div>';
+
+  const appr = sg.approved || [];
+  document.getElementById('suggApproved').innerHTML = appr.length
+    ? '<table><tr><th>#</th><th>write-in</th><th>votes</th><th>start next edition</th></tr>'+appr.map(function(x,i){
+        // The top row is the people's-pick WINNER once it has real votes (list is vote_count desc).
+        var isWinner = i === 0 && (x.vote_count||0) > 0;
+        var badge = isWinner ? ' <span class="pill ready">people\\'s pick</span>' : '';
+        return '<tr'+(isWinner?' style="background:rgba(80,200,120,.08)"':'')+'><td>'+(i+1)+'</td><td>'+esc(x.text)+badge+'</td><td>'+esc(x.vote_count||0)+'</td><td>'+
+          '<button class="go" onclick="startSugg(\\''+esc(x.id)+'\\',\\'now\\')">Start now</button> '+
+          '<button onclick="startSugg(\\''+esc(x.id)+'\\',\\'monday\\')">Schedule next Monday</button></td></tr>';
+      }).join('')+'</table>'
+      +'<div class="muted" style="margin-top:6px">Voting happens in-app on the final round. The top row is the community winner once votes are in; you can still start any theme (operator override).</div>'
+    : '<div class="muted">No approved suggestions yet — approve write-ins above to open them for voting.</div>';
 }
 
 function statusPill(st){ return '<span class="pill '+esc(st)+'">'+esc(st)+'</span>'; }
@@ -163,13 +224,26 @@ function histTable(rows){
 }
 
 async function doAction(action, confirmText){ if (confirmText && !confirm(confirmText)) return; const r = await api('action',{action}); if (r && r.message) setMsg(r.message); refresh(); }
-async function startSpecific(){ const id = document.getElementById('startPick').value; if (!id){ setMsg('Pick a ready theme first.', true); return; } if (!confirm('Start "'+id+'" now?')) return; const r = await api('action',{action:'start_edition:'+id}); if (r && r.message) setMsg(r.message); refresh(); }
+async function startSpecific(){ const id = document.getElementById('startPick').value; if (!id){ setMsg('Pick a ready theme first.', true); return; } var pool = document.getElementById('startPool').value; if (!confirm('Start "'+id+'"'+(pool?' at pool size '+pool:'')+' now?')) return; const r = await api('action',{action:'start_edition:'+id, poolSize: pool?Number(pool):undefined}); if (r && r.message) setMsg(r.message); refresh(); }
 async function setMode(mode){ await api('setMode',{mode}); refresh(); }
 async function addCreative(){ const el=document.getElementById('newTitle'); const title=el.value.trim(); if(!title){ setMsg('Enter a title.', true); return; } await api('themeAdd',{title}); el.value=''; refresh(); }
 async function editTitle(kind,id){ const title=prompt('New title:'); if(title==null) return; const t=title.trim(); if(!t) return; await api('themeEditTitle',{kind,id,title:t}); refresh(); }
 async function setStatus(kind,id,status){ await api('themeStatus',{kind,id,status}); refresh(); }
 async function delTheme(kind,id){ if(!confirm('Delete theme "'+id+'"?')) return; await api('themeDelete',{kind,id}); refresh(); }
 async function clearUsed(){ if(!confirm('Clear used_themes_this_season (reset rotation)?')) return; await api('clearUsedThemes'); refresh(); }
+async function approveSugg(id){ await api('suggestionApprove',{id}); refresh(); }
+async function rejectSugg(id){ if(!confirm('Reject this write-in?')) return; await api('suggestionReject',{id}); refresh(); }
+async function setSuggPrompt(){ const el=document.getElementById('suggPrompt'); await api('suggestionSetPrompt',{prompt:el.value.trim()}); refresh(); }
+async function clearSuggPrompt(){ await api('suggestionSetPrompt',{prompt:''}); refresh(); }
+async function startSugg(id, when){
+  var pool = (document.getElementById('suggPool')||{}).value || '';
+  const label = when==='monday' ? 'Schedule this as the next edition for next Monday?' : 'Start this as the next edition NOW?';
+  if(!confirm(label+(pool?' (pool size '+pool+')':''))) return;
+  const r = await api('startFromSuggestion',{id, when, poolSize: pool?Number(pool):undefined});
+  if (r && r.message) setMsg(r.message);
+  else if (r && r.scheduled) setMsg('Scheduled '+r.themeId+' for '+new Date(r.scheduled).toLocaleString());
+  refresh();
+}
 
 // Next cron tick (the */5 bracket cron) — pure client clock, no server call.
 setInterval(()=>{

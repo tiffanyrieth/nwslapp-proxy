@@ -75,6 +75,13 @@ export interface BracketConfig {
   /// 50 subrequests/invocation; default keeps the whole generation under it). Raise via
   /// bracket_config on the Workers Paid plan (1000 cap) for full-pool exact seeding.
   statFetchBudget: number;
+  /// Optional operator prompt shown above the community write-in field (e.g. "Suggest an
+  /// end-of-year award"). null = open-ended (the default).
+  suggestionPrompt: string | null;
+  /// A community-pick edition the operator scheduled to start LATER (the "Schedule next Monday"
+  /// admin action). runBracketTick starts it once `startAt` passes and there's no active edition —
+  /// The Bracket is operator-started, never auto (owner 2026-08-22). null = nothing scheduled.
+  scheduledStart: { themeId: string; startAt: string; poolSize?: number } | null;
 }
 
 async function getConfig(env: BracketEnv): Promise<BracketConfig> {
@@ -94,7 +101,21 @@ async function getConfig(env: BracketEnv): Promise<BracketConfig> {
     themeRotation: str("theme_rotation", "alternate") === "sequential" ? "sequential" : "alternate",
     usedThemesThisSeason: Array.isArray(m.get("used_themes_this_season")) ? (m.get("used_themes_this_season") as string[]) : [],
     statFetchBudget: num("stat_fetch_budget", 20),
+    suggestionPrompt: typeof m.get("suggestion_prompt") === "string" ? (m.get("suggestion_prompt") as string) : null,
+    scheduledStart: parseScheduledStart(m.get("scheduled_start")),
   };
+}
+
+/** Parse the `scheduled_start` config value: `{themeId, startAt}` (both non-empty strings) or null. */
+function parseScheduledStart(v: unknown): { themeId: string; startAt: string; poolSize?: number } | null {
+  if (v && typeof v === "object") {
+    const o = v as Record<string, unknown>;
+    if (typeof o.themeId === "string" && o.themeId && typeof o.startAt === "string" && o.startAt) {
+      const poolSize = Number.isFinite(Number(o.poolSize)) ? Math.floor(Number(o.poolSize)) : undefined;
+      return { themeId: o.themeId, startAt: o.startAt, ...(poolSize ? { poolSize } : {}) };
+    }
+  }
+  return null;
 }
 
 async function setConfigValue(env: BracketEnv, key: string, value: unknown): Promise<void> {
@@ -503,6 +524,22 @@ export function roundCloseISO(code: number, now: number, config: BracketConfig):
   return new Date(now + days * 24 * 3600 * 1000).toISOString();
 }
 
+/** The Bracket's standard Monday start slot (UTC hour) — matched to when Fan Zone content goes live
+ *  (KHG/Trivia publish Monday 10:00 UTC; the watcher's KNOWHER_PUBLISH_HOUR_UTC). */
+export const BRACKET_START_HOUR_UTC = 10;
+
+/** Next Monday at the standard start hour (UTC), as ISO — the "Schedule next Monday" target. If it's
+ *  already Monday but before the start hour, schedules for TODAY; on/after it, the following Monday. */
+export function nextMondayStartISO(now: number): string {
+  const d = new Date(now);
+  const day = d.getUTCDay();                 // 0=Sun … 1=Mon … 6=Sat
+  let add = (1 - day + 7) % 7;               // days until Monday (0 if today is Monday)
+  if (add === 0 && d.getUTCHours() >= BRACKET_START_HOUR_UTC) add = 7;
+  return new Date(Date.UTC(
+    d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate() + add, BRACKET_START_HOUR_UTC, 0, 0,
+  )).toISOString();
+}
+
 async function writeEdition(
   env: BracketEnv,
   ed: { id: string; themeLabel: string; title: string; type: "statsSeeded" | "creative" },
@@ -704,6 +741,17 @@ export async function runBracketTick(env: BracketEnv, now: number = Date.now()):
   }
   const config = await getConfig(env);
   const active = await getActiveEdition(env);
+
+  // A community-pick edition the operator scheduled for later ("Schedule next Monday"). Runs in
+  // EITHER mode, before the mode dispatch, but only when nothing is live — so it never collides
+  // with an in-flight edition. Clear-before-start (like handleManual) so a failed start can't
+  // re-fire every tick. The scheduled theme is a creative-library row the promote step created.
+  if (!active && config.scheduledStart && new Date(config.scheduledStart.startAt).getTime() <= now) {
+    const { themeId, poolSize } = config.scheduledStart;
+    await setConfigValue(env, "scheduled_start", null);
+    return await generateTheme(env, withPoolSize(config, poolSize), now, themeId);
+  }
+
   return config.mode === "manual"
     ? await handleManual(env, config, active, now)
     : await handleAuto(env, config, active, now);
@@ -770,11 +818,11 @@ export function startEditionThemeId(action: string): string | null {
 /** Auto mode: generate after the break, tally + advance when the open round closes. */
 async function handleAuto(env: BracketEnv, config: BracketConfig, active: EditionRow | null, now: number): Promise<string> {
   if (!active) {
-    const last = await sbGet<{ created_at: string }[]>(env, "bracket_editions?select=created_at&order=created_at.desc&limit=1");
-    if (last.length && now - new Date(last[0].created_at).getTime() < config.breakDays * 24 * 3600 * 1000) {
-      return "auto: in the break between editions";
-    }
-    return await generateNext(env, config, now);
+    // Auto NEVER STARTS an edition (owner 2026-08-22): The Bracket is a special, occasional,
+    // operator-started event, not a fixed-cadence auto-rotation. Auto mode may only ADVANCE a
+    // live edition's rounds. A community-pick start is operator-triggered (Start now) or handled
+    // by the scheduled-start check in runBracketTick (Schedule next Monday) — never generateNext here.
+    return "auto: no active edition — auto never starts one (operator-started only)";
   }
   // Defense-in-depth: a manual-mode edition is NEVER auto-advanced, even if the global config
   // is somehow 'auto'. Only an explicit manual_action (handleManual) may step it.
@@ -1000,7 +1048,34 @@ async function pruneCompletedEditionVotes(env: BracketEnv): Promise<void> {
     env, `bracket_editions?is_active=eq.false&completed_at=not.is.null&select=id`);
   for (const old of editions) {
     await sbDelete(env, "bracket_votes", `edition_id=eq.${old.id}`);
+    // The community write-in board is per-edition and "starts over" each new edition — prune the
+    // finished edition's suggestions + their votes so they don't accumulate (the winner already became
+    // a library theme via startFromSuggestion, and the results-day reveal has already shown).
+    await sbDelete(env, "bracket_suggestion_votes", `edition_id=eq.${old.id}`);
+    await sbDelete(env, "bracket_theme_suggestions", `edition_id=eq.${old.id}`);
   }
+}
+
+/** Operator-facing round name for the admin dashboard (the "no Round of X" rule is app-user-facing only). */
+function bracketRoundLabel(code: number): string {
+  if (code < 0) return `Qualifying round ${code + 5}`;   // q1=-4 → 1 … q4=-1 → 4
+  switch (code) {
+    case 2: return "Final";
+    case 4: return "Semifinals";
+    case 8: return "Quarterfinals";
+    case 16: return "Round of 16";
+    case 32: return "Round of 32";
+    case 64: return "Round of 64";
+    default: return `Round (${code})`;
+  }
+}
+
+/** Apply an operator-chosen pool size (short vs extended) for THIS start, else the config default. The
+ *  engine scales rounds + qualifying byes to pool size, so this is the whole short/extended control. */
+function withPoolSize(config: BracketConfig, poolSize: unknown): BracketConfig {
+  const n = Number(poolSize);
+  if (Number.isFinite(n) && n >= 4 && n <= 192) return { ...config, defaultPoolSize: Math.floor(n) };
+  return config;
 }
 
 /** How many user ids to put in one `id=in.(...)` filter. PostgREST takes the filter in the URL, so an
@@ -1172,7 +1247,8 @@ async function bracketAdminOp(env: AdminEnv, op: string, body: Record<string, un
       return { ok: true, mode, edition: active.id, roundClosesAt: patch.round_closes_at };
     }
     case "action": {
-      const config = await getConfig(env);
+      // An operator-chosen pool size (short vs extended) applies only to a START; advance/close ignore it.
+      const config = withPoolSize(await getConfig(env), body.poolSize);
       const active = await getActiveEdition(env);
       const message = await executeManualAction(env, String(body.action ?? ""), active, Date.now(), config);
       return { ok: true, message };
@@ -1204,6 +1280,61 @@ async function bracketAdminOp(env: AdminEnv, op: string, body: Record<string, un
     case "clearUsedThemes":
       await setConfigValue(env, "used_themes_this_season", []);
       return { ok: true };
+    case "suggestionApprove": {
+      // No-repeat guard: a suggestion whose theme was already RUN this season can't go up for a vote.
+      const rows = await sbGet<{ text: string }[]>(
+        env, `bracket_theme_suggestions?id=eq.${encodeURIComponent(String(body.id))}&select=text&limit=1`);
+      const text = rows[0]?.text;
+      if (text) {
+        const config = await getConfig(env);
+        const season = Number(config.season) || new Date().getUTCFullYear();
+        if (config.usedThemesThisSeason.includes(`${slug(text)}-${season}`)) {
+          return { error: `"${text}" was already run this season — not opening it for a vote.` };
+        }
+      }
+      await sbPatch(env, "bracket_theme_suggestions", `id=eq.${encodeURIComponent(String(body.id))}`, { status: "approved" });
+      return { ok: true };
+    }
+    case "suggestionReject":
+      await sbPatch(env, "bracket_theme_suggestions", `id=eq.${encodeURIComponent(String(body.id))}`, { status: "rejected" });
+      return { ok: true };
+    case "suggestionSetPrompt": {
+      const p = String(body.prompt ?? "").trim();
+      await setConfigValue(env, "suggestion_prompt", p ? p : null);
+      return { ok: true, prompt: p || null };
+    }
+    case "startFromSuggestion": {
+      // Promote a community write-in to the next edition. Turns the suggestion into a startable
+      // creative-library theme (status 'ready'), then either starts it NOW (testing/immediate) or
+      // SCHEDULES it for next Monday (production). The Bracket is operator-started — this is the go button.
+      const id = String(body.id ?? "");
+      const when = body.when === "monday" ? "monday" : "now";
+      const rows = await sbGet<{ id: string; text: string }[]>(
+        env, `bracket_theme_suggestions?id=eq.${encodeURIComponent(id)}&select=id,text&limit=1`);
+      const s = rows[0];
+      if (!s) return { error: "suggestion not found" };
+      const season = Number((await getConfig(env)).season) || new Date().getUTCFullYear();
+      const themeId = `${slug(s.text)}-${season}`;
+      // Upsert the library row (a re-promote of the same phrase must not duplicate-key).
+      const existing = await sbGet<{ id: string }[]>(
+        env, `bracket_creative_editions?id=eq.${encodeURIComponent(themeId)}&select=id&limit=1`);
+      const themeRow = { id: themeId, theme_label: s.text.toUpperCase(), title: s.text, description: "Community pick", status: "ready", season };
+      if (existing[0]) {
+        await sbPatch(env, "bracket_creative_editions", `id=eq.${encodeURIComponent(themeId)}`, themeRow);
+      } else {
+        await sbInsert(env, "bracket_creative_editions", [themeRow]);
+      }
+      const poolSize = Number.isFinite(Number(body.poolSize)) ? Math.floor(Number(body.poolSize)) : null;
+      if (when === "monday") {
+        const startAt = nextMondayStartISO(Date.now());
+        await setConfigValue(env, "scheduled_start", poolSize ? { themeId, startAt, poolSize } : { themeId, startAt });
+        return { ok: true, scheduled: startAt, themeId };
+      }
+      const active = await getActiveEdition(env);
+      const config = withPoolSize(await getConfig(env), body.poolSize);
+      const message = await executeManualAction(env, `start_edition:${themeId}`, active, Date.now(), config);
+      return { ok: true, message, themeId };
+    }
     default:
       return { error: `unknown op "${op}"` };
   }
@@ -1236,19 +1367,39 @@ async function adminState(env: BracketEnv): Promise<unknown> {
   if (active) {
     const votes = await sbGet<{ user_id: string }[]>(
       env, `bracket_votes?edition_id=eq.${encodeURIComponent(String(active.id))}&round=eq.${active.current_round}&select=user_id`);
-    activeOut = { ...active, thisRoundVotes: votes.length };
+    activeOut = { ...active, thisRoundVotes: votes.length, roundLabel: bracketRoundLabel(Number(active.current_round)) };
   }
   const creative = await sbGet<unknown[]>(env, "bracket_creative_editions?select=id,title,theme_label,status,created_at&order=created_at.asc");
   const stats = await sbGet<unknown[]>(env, "bracket_stats_editions?select=id,title,theme_label,status,position_filter,seeding_stat,created_at&order=created_at.asc");
   const nextPick = await nextRotationPick(env, config);
   const history = await adminHistory(env);
+
+  // Community write-ins for the current collection window: the active edition, or (between editions)
+  // the most-recent one so the operator can promote the people's pick before starting the next.
+  let suggestionEditionId = active ? String(active.id) : null;
+  if (!suggestionEditionId) {
+    const recent = await sbGet<{ id: string }[]>(env, "bracket_editions?select=id&order=created_at.desc&limit=1");
+    suggestionEditionId = recent[0]?.id ?? null;
+  }
+  let pending: unknown[] = [];
+  let approved: unknown[] = [];
+  if (suggestionEditionId) {
+    const enc = encodeURIComponent(suggestionEditionId);
+    pending = await sbGet<unknown[]>(
+      env, `bracket_theme_suggestions?edition_id=eq.${enc}&status=eq.pending&select=id,text,created_at&order=created_at.asc`);
+    approved = await sbGet<unknown[]>(
+      env, `bracket_theme_suggestions?edition_id=eq.${enc}&status=eq.approved&select=id,text,vote_count,created_at&order=vote_count.desc,created_at.asc`);
+  }
+
   return {
     config: {
       mode: config.mode, season: config.season, themeRotation: config.themeRotation,
       usedThemes: config.usedThemesThisSeason, manualAction: config.manualAction,
-      defaultPoolSize: config.defaultPoolSize,
+      defaultPoolSize: config.defaultPoolSize, suggestionPrompt: config.suggestionPrompt,
+      scheduledStart: config.scheduledStart,
     },
     active: activeOut, nextPick, creative, stats, history,
+    suggestions: { editionId: suggestionEditionId, pending, approved },
   };
 }
 

@@ -32,6 +32,7 @@ import {
 } from "./bracket-engine.ts";
 import { buildHeadshotMap, handleHeadshots, normalizeName } from "./headshots.ts";
 import { adminAuthed, adminRealm } from "./admin-auth.ts";
+import { handleAnalyticsAdmin } from "./analytics-admin.ts";
 import { ADMIN_PORTAL_HTML } from "./admin-portal.ts";
 import {
 	runRosterTruth,
@@ -783,6 +784,13 @@ export default {
 		}
 		if (url.pathname === "/admin/status") {
 			return handleAdminStatus(request, env);
+		}
+		// Owner-only analytics dashboard: GET the page, POST /api the computed metrics. Admin-key gated
+		// inside the handler; registered before the GET-only guard (it serves POST too).
+		if (url.pathname === "/analytics/admin" || url.pathname === "/analytics/admin/api") {
+			return handleAnalyticsAdmin(request, env as unknown as {
+				SUPABASE_URL?: string; SUPABASE_SERVICE_ROLE_KEY?: string; BRACKET_ADMIN_KEY?: string;
+			});
 		}
 		// Attendance backstop ops: the ledger + sweep state; `?sweep=1` forces a run.
 		if (url.pathname === "/admin/attendance") {
@@ -5597,6 +5605,10 @@ const ANALYTICS_EVENTS = new Set([
 	// endpoint aggregates these into addSignals; threshold judgment lives in the routine.
 	"reporter_added",
 	"reporter_add_session", // denominator: sessions that added ANY reporter
+	// Engagement counters (2026-08-22): all coarse buckets, self-deduped per window on-device, no identity.
+	"active_week",       // param new/returning — once per ISO week per device → sum = WAU
+	"days_active_week",  // param 1/2/3to4/5to7 — prior week's distinct-day count
+	"session_length",    // param lt1m/1to5m/5to15m/15to30m/gt30m — this launch's foreground length
 ]);
 
 /** Anonymous Level-3 usage counters: `POST /analytics` with a pre-summed per-session batch
