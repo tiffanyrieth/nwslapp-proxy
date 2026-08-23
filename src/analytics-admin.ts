@@ -65,7 +65,7 @@ function sumByParam(rows: CounterRow[], event: string, sinceDay: string): Record
   return out;
 }
 
-async function computeMetrics(env: Env): Promise<unknown> {
+export async function computeMetrics(env: Env): Promise<unknown> {
   const now = Date.now();
   const since60 = daysAgoISO(60, now);
   const since30 = daysAgoISO(30, now);
