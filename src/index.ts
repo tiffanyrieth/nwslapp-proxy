@@ -32,7 +32,7 @@ import {
 } from "./bracket-engine.ts";
 import { buildHeadshotMap, handleHeadshots, normalizeName } from "./headshots.ts";
 import { adminAuthed, adminRealm } from "./admin-auth.ts";
-import { handleAnalyticsAdmin } from "./analytics-admin.ts";
+import { handleAnalyticsAdmin, computeMetrics } from "./analytics-admin.ts";
 import { ADMIN_PORTAL_HTML } from "./admin-portal.ts";
 import {
 	runRosterTruth,
@@ -803,6 +803,12 @@ export default {
 			return handleAdminAttendance(env, (kind, detail) => emitDiag(env, ctx, kind, detail),
 				url.searchParams.get("sweep") === "1");
 		}
+		// Alerting self-test (A-verification): force each PUSH path on demand so email delivery can be
+		// proven without waiting for the ~30-min gates or the Monday digest window. Admin-gated. `?do=`
+		// email | synthetic | aggregate | digest | heartbeat.
+		if (url.pathname === "/admin/selftest") {
+			return handleAlertSelfTest(request, env, ctx);
+		}
 
 		// Admin/routine-keyed social self-tuning audit surface: GET ?nt= (ledger populate),
 		// GET ?section=nwsl (decision report), POST /research + /apply (routine write-back).
@@ -1004,7 +1010,7 @@ export default {
 			return handleKnowHer(url, env, ctx);
 		}
 		if (url.pathname === "/knowher/eligible") {
-			return handleKnowHerEligible(url, env);
+			return handleKnowHerEligible(url, env, ctx);
 		}
 		if (url.pathname === "/knowher/todo") {
 			return handleKnowHerTodo(url, env, ctx);
@@ -1103,6 +1109,35 @@ export default {
 				await checkErrorSpike(env, ctx);
 			} catch {
 				/* swallow — best-effort; next tick retries */
+			}
+			// Proxy self-heartbeat (A3, 2026-08-23): the ONE external backstop, extended to the proxy. A
+			// dead */5 cron stops these pings → healthchecks.io emails the owner — the failure class no
+			// self-hosted alert can cover (a dead worker can't email itself). The watcher pings its own
+			// check every minute; this covers the proxy's cron the same way.
+			try {
+				const hc = (env as unknown as { HEALTHCHECK_URL_PROXY?: string }).HEALTHCHECK_URL_PROXY;
+				if (hc) await fetch(hc);
+			} catch {
+				/* best-effort; a missed ping just delays a dead-cron alert by one tick */
+			}
+			// Scheduled synthetic checks (A4) + client crash/feature aggregate (A5), each internally gated
+			// to ~30 min so they ride the shared tick without a new cron trigger, and isolated so an
+			// alerting bug can never affect the bracket engine.
+			try {
+				if (await dueByMarker(env, "synthetic:due", 30 * 60 * 1000)) await runSyntheticChecks(env, ctx);
+			} catch {
+				/* best-effort; the next gated tick retries */
+			}
+			try {
+				if (await dueByMarker(env, "clientagg:due", 30 * 60 * 1000)) await scanClientAggregate(env, ctx);
+			} catch {
+				/* best-effort; the next gated tick retries */
+			}
+			// Weekly digest (A6) — self-gated to the Monday 09:xx UTC window, once/week.
+			try {
+				await maybeSendWeeklyDigest(env, ctx);
+			} catch {
+				/* best-effort; retries next Monday tick */
 			}
 			// Attendance backstop: internally gated to ~every 6h (attendance-sweep:last), so this
 			// is a no-op on almost every tick. Isolated like the pager — a sweep bug can never
@@ -1355,6 +1390,18 @@ async function serveStale(cache: Cache, cacheKey: Request): Promise<Response | n
 function upstreamError(status?: number): Response {
 	const detail = status ? ` (ESPN returned ${status})` : "";
 	return new Response(`Upstream ESPN request failed${detail}.`, { status: 502 });
+}
+
+/** The stale-or-502 fallback WITH no-silent-failures telemetry (A2, 2026-08-23): serve a stale edge copy
+ *  if one exists, else emit a pageable `apiFailure` diag and 502. Before this, the `serveStale(...) ??
+ *  upstreamError()` sites returned a BARE 502 with no diagnostic, so an outage on those routes (team
+ *  videos, feed, spotlight, trivia, know-her) was invisible to the error-spike pager. `route` is the
+ *  request pathname, so the diag says WHICH surface is down. */
+async function serveStaleOr502(env: Env, ctx: ExecutionContext, cache: Cache, cacheKey: Request, route: string): Promise<Response> {
+	const stale = await serveStale(cache, cacheKey);
+	if (stale) return stale;
+	emitDiag(env, ctx, "apiFailure", `${route} upstream failed (no fallback)`);
+	return upstreamError();
 }
 
 /**
@@ -1617,7 +1664,7 @@ async function handleTeamVideos(
 	} catch {
 		// A YouTube outage serves a stale copy if we have one, else 502 (the app
 		// falls back to its seed on any non-2xx).
-		return (await serveStale(cache, cacheKey)) ?? upstreamError();
+		return serveStaleOr502(env, ctx, cache, cacheKey, url.pathname);
 	}
 
 	const headers = new Headers();
@@ -2632,6 +2679,33 @@ async function statusCheckErrors(env: Env): Promise<StatusSection> {
 	return { title: "Recent proxy diagnostics (last 24h)", note: "The catch-all: every unexpected condition (fallback / API fail / parse / empty) logs here first.", checks };
 }
 
+/** The ACTIVE half of monitoring (A7, 2026-08-23): the pull view of what the scheduled PUSH checks last
+ *  saw — the synthetic core-availability checks (A4) and the client crash/feature aggregate (A5). Reads
+ *  only the two summary KV keys those passes write, so it's cheap. */
+async function statusCheckAlerting(env: Env): Promise<StatusSection> {
+	const checks: StatusCheck[] = [];
+	const synth = (await env.FEED_TAGS.get(SYNTHETIC_LAST_KEY, "json").catch(() => null)) as { at?: number; fails?: number; checks?: { label: string; status: string; detail: string }[] } | null;
+	if (!synth) {
+		checks.push({ label: "Synthetic checks", status: "warn", detail: "no run yet (runs every ~30 min on the */5 cron)" });
+	} else {
+		checks.push({ label: "Synthetic checks", status: synth.fails ? "fail" : "ok", detail: `${synth.fails ? `${synth.fails} FAILING` : "all clear"} · ${ageLabel(Date.now() - (synth.at ?? 0))}` });
+		for (const c of synth.checks ?? []) if (c.status !== "ok") checks.push({ label: `  ${c.label}`, status: c.status as StatusCheck["status"], detail: c.detail });
+	}
+	const agg = (await env.FEED_TAGS.get(CLIENTAGG_LAST_KEY, "json").catch(() => null)) as { at?: number; crashes24h?: number; features60m?: Record<string, number> } | null;
+	if (!agg) {
+		checks.push({ label: "Client aggregate", status: "info", detail: "no data yet (needs client /telemetry traffic)" });
+	} else {
+		const crashes = agg.crashes24h ?? 0;
+		checks.push({ label: "Client crashes (24h)", status: crashes >= 5 ? "fail" : crashes > 0 ? "info" : "ok", detail: `${crashes} report${crashes === 1 ? "" : "s"} · ${ageLabel(Date.now() - (agg.at ?? 0))}` });
+		checks.push({ label: "Client feature errors (60m)", status: "info", detail: Object.entries(agg.features60m ?? {}).map(([k, n]) => `${k} x${n}`).join(", ") || "none" });
+	}
+	return {
+		title: "Alerting — the scheduled checks that PUSH (email on failure)",
+		note: "The ACTIVE half of monitoring: synthetic core-availability checks + the client crash/feature aggregate run on the cron and email the owner on a hard failure. This board is the pull view of what they last saw.",
+		checks,
+	};
+}
+
 const statusEsc = (x: string) => x.replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c] as string));
 
 /** Render ONE section as an HTML fragment (the shell fetches these per section and injects them).
@@ -2649,6 +2723,7 @@ const STATUS_SECTIONS: Record<string, { label: string; run: (env: Env) => Promis
 	espn: { label: "ESPN core", run: () => statusCheckESPN() },
 	feeds: { label: "Feed sources", run: (env) => statusCheckFeedSources(env) },
 	ig: { label: "Instagram", run: (env) => statusCheckIG(env) },
+	alerting: { label: "Alerting", run: (env) => statusCheckAlerting(env) },
 	errors: { label: "Diagnostics", run: (env) => statusCheckErrors(env) },
 };
 
@@ -3330,7 +3405,7 @@ async function handleFeed(url: URL, env: Env, ctx: ExecutionContext): Promise<Re
 		// Free anti-flood cap (no API): no single account may dominate the feed.
 		cards = capPerHandle(cards, MAX_PER_HANDLE);
 	} catch {
-		return (await serveStale(cache, cacheKey)) ?? upstreamError();
+		return serveStaleOr502(env, ctx, cache, cacheKey, url.pathname);
 	}
 
 	const headers = new Headers();
@@ -4941,7 +5016,7 @@ async function handleSpotlight(url: URL, env: Env, ctx: ExecutionContext): Promi
 			// A total scoreboard outage serves a stale copy if we have one, else 502
 			// (the app falls back to its seed on any non-2xx). Per-team failures are
 			// isolated inside buildSpotlightCards and never reach here.
-			return (await serveStale(cache, cacheKey)) ?? upstreamError();
+			return serveStaleOr502(env, ctx, cache, cacheKey, url.pathname);
 		}
 	}
 
@@ -4982,7 +5057,7 @@ async function handleTrivia(url: URL, env: Env, ctx: ExecutionContext): Promise<
 	try {
 		doc = (await env.FEED_TAGS.get(TRIVIA_POOL_V2_KEY, "json")) as TriviaPoolDoc | null;
 	} catch {
-		return (await serveStale(cache, cacheKey)) ?? upstreamError();
+		return serveStaleOr502(env, ctx, cache, cacheKey, url.pathname);
 	}
 
 	const resolved = resolveRound(doc, round);
@@ -5046,7 +5121,7 @@ async function handleTriviaLegacyFlat(url: URL, env: Env, ctx: ExecutionContext)
 	} catch {
 		// A KV read failure serves a stale copy if we have one, else 502 (the app
 		// falls back to its seed on any non-2xx).
-		return (await serveStale(cache, cacheKey)) ?? upstreamError();
+		return serveStaleOr502(env, ctx, cache, cacheKey, url.pathname);
 	}
 
 	const headers = new Headers();
@@ -5090,7 +5165,7 @@ async function handleKnowHer(url: URL, env: Env, ctx: ExecutionContext): Promise
 	} catch {
 		// A KV read failure serves a stale copy if we have one, else 502 (the app treats any
 		// non-2xx as "couldn't load" and hides the game — no seed fallback, online-only).
-		return (await serveStale(cache, cacheKey)) ?? upstreamError();
+		return serveStaleOr502(env, ctx, cache, cacheKey, url.pathname);
 	}
 
 	const filtered = pool ? filterPoolByTeams(pool, teams) : { weekKey: "", season: 0, players: [] };
@@ -5345,7 +5420,7 @@ async function handleKnowHerPublishVerified(request: Request, env: Env, ctx: Exe
 /** Roster-learning eligibility for one team (docs §4): `?team=WAS` → the players who started
  *  ≥ 1 match this season, ranked core-starters-first. Powers the admin's "who's pickable" view
  *  and the deferred auto generator's weekly selection. */
-async function handleKnowHerEligible(url: URL, env: Env): Promise<Response> {
+async function handleKnowHerEligible(url: URL, env: Env, ctx: ExecutionContext): Promise<Response> {
 	const team = (url.searchParams.get("team") ?? "").toUpperCase();
 	if (!team) return new Response(`Missing ?team=`, { status: 400 });
 	const year = Number(url.searchParams.get("year")) || new Date().getUTCFullYear();
@@ -5360,7 +5435,10 @@ async function handleKnowHerEligible(url: URL, env: Env): Promise<Response> {
 		const featured = await readFeaturedIds(env as unknown as KnowHerEnv, year);
 		featuredCount = featured.size;
 		players = await computeEligiblePlayers(env as unknown as KnowHerEnv, team, year, featured);
-	} catch {
+	} catch (e) {
+		// NO SILENT FAILURES: this route's bare upstreamError() emitted nothing, so an ESPN/roster
+		// failure behind /knowher/eligible was invisible to the pager (the same class as the KHG-todo bug).
+		emitDiag(env, ctx, "knowherEligibleError", `team=${team}: ${e instanceof Error ? e.message : String(e)}`);
 		return upstreamError();
 	}
 	const headers = new Headers();
@@ -5709,16 +5787,52 @@ function diagKeyTime(name: string): number {
 	return Number.isFinite(inv) ? 1e15 - inv : 0;
 }
 
-async function checkErrorSpike(env: Env, ctx: ExecutionContext): Promise<void> {
+/** The ONE owner-email primitive (Resend). Every alerting path — the error-spike pager, the scheduled
+ *  synthetic checks, the client crash/feature aggregate, and the weekly digest — sends through here, so
+ *  there is a single sender, a single `NWSLApp:` subject prefix, and ONE config guard. Returns true iff
+ *  Resend accepted the message. Unconfigured (no RESEND_API_KEY / ALERT_EMAIL) → false, silent no-op. A
+ *  non-email ALERT_EMAIL (a common setup slip: pasting the API key into it) emits `alertEmailMisconfig`
+ *  (NO SILENT FAILURES) and returns false, never leaking the value. Callers own their OWN throttle (a KV
+ *  marker) — this primitive always attempts the send. Sender is the `onboarding@resend.dev` sandbox for
+ *  now (delivers to the owner's own verified Resend address); a verified Crestside sender is a later item. */
+async function sendOwnerEmail(env: Env, ctx: ExecutionContext, subject: string, text: string): Promise<boolean> {
 	const cfg = env as unknown as { RESEND_API_KEY?: string; ALERT_EMAIL?: string };
-	if (!cfg.RESEND_API_KEY || !cfg.ALERT_EMAIL) return; // not set up yet → no-op
-	// Config sanity (NO SILENT FAILURES): a common setup slip is pasting the API key into
-	// ALERT_EMAIL (→ Resend 422 "invalid to field"). Catch a non-email value here and surface it
-	// as a clear diag instead of a cryptic per-incident 422 — and never leak the value.
+	if (!cfg.RESEND_API_KEY || !cfg.ALERT_EMAIL) return false;
 	if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(cfg.ALERT_EMAIL.trim())) {
 		emitDiag(env, ctx, "alertEmailMisconfig", "ALERT_EMAIL is not an email address — check the secret");
-		return;
+		return false;
 	}
+	const res = await fetch("https://api.resend.com/emails", {
+		method: "POST",
+		headers: { Authorization: `Bearer ${cfg.RESEND_API_KEY}`, "Content-Type": "application/json" },
+		body: JSON.stringify({
+			from: "NWSL App Alerts <onboarding@resend.dev>",
+			to: [cfg.ALERT_EMAIL.trim()],
+			subject: `NWSLApp: ${subject}`,
+			text,
+		}),
+	});
+	if (res.ok) { console.log(`[alert] email sent: ${subject}`); return true; }
+	// Capture Resend's reason, not just the code — a bare status is useless mid-incident.
+	console.log(`[alert] resend send failed: ${res.status} ${(await res.text()).slice(0, 300)}`);
+	return false;
+}
+
+/** Once-per-interval gate on the shared 5-min cron: returns true (and stamps `key`) at most once per
+ *  `intervalMs`. Lets several slow passes (synthetic checks, the client-aggregate scan, the weekly
+ *  digest) ride the one every-5-min tick without each needing its own cron trigger — the free plan caps
+ *  cron triggers per account (we're already at 5). Not perfectly atomic across concurrent ticks, but the
+ *  cron fires single-threaded per schedule, so a double-run is not a real risk. */
+async function dueByMarker(env: Env, key: string, intervalMs: number): Promise<boolean> {
+	const last = await env.FEED_TAGS.get(key);
+	if (last && Date.now() - Number(last) < intervalMs) return false;
+	await env.FEED_TAGS.put(key, String(Date.now()), { expirationTtl: 60 * 60 * 24 * 40 });
+	return true;
+}
+
+async function checkErrorSpike(env: Env, ctx: ExecutionContext): Promise<void> {
+	const cfg = env as unknown as { RESEND_API_KEY?: string; ALERT_EMAIL?: string };
+	if (!cfg.RESEND_API_KEY || !cfg.ALERT_EMAIL) return; // not set up yet → skip the scan entirely
 	const last = await env.FEED_TAGS.get(ALERT_SENT_KEY);
 	if (last && Date.now() - Number(last) < ALERT_THROTTLE_MS) return;
 
@@ -5760,26 +5874,220 @@ async function checkErrorSpike(env: Env, ctx: ExecutionContext): Promise<void> {
 
 	// Mark BEFORE sending (a Resend hiccup shouldn't re-fire every 5 min for the same incident).
 	await env.FEED_TAGS.put(ALERT_SENT_KEY, String(Date.now()), { expirationTtl: 24 * 3600 });
-	const res = await fetch("https://api.resend.com/emails", {
-		method: "POST",
-		headers: { Authorization: `Bearer ${cfg.RESEND_API_KEY}`, "Content-Type": "application/json" },
-		body: JSON.stringify({
-			from: "NWSL App Alerts <onboarding@resend.dev>",
-			to: [cfg.ALERT_EMAIL.trim()],
-			subject: `NWSLApp: ${count} error events in the last 15 min`,
-			text:
-				`Telemetry error spike (threshold ${ALERT_THRESHOLD} in ${ALERT_WINDOW_MS / 60000} min).\n\n` +
-				`Recent samples:\n${samples.map((s) => `  • ${s}`).join("\n")}\n\n` +
-				`Where to look: GET /telemetry/recent (x-admin-key) · the in-app Diagnostics screen · ` +
-				`the Cloudflare dashboards (proxy + watcher).\n` +
-				`Throttled to at most one email per hour.`,
-		}),
-	});
-	if (res.ok) {
-		console.log(`[alert] error-spike email sent (${count} events)`);
-	} else {
-		// Capture Resend's reason, not just the code — a bare status is useless mid-incident.
-		console.log(`[alert] resend send failed: ${res.status} ${(await res.text()).slice(0, 300)}`);
+	await sendOwnerEmail(env, ctx, `${count} error events in the last 15 min`,
+		`Telemetry error spike (threshold ${ALERT_THRESHOLD} in ${ALERT_WINDOW_MS / 60000} min).\n\n` +
+		`Recent samples:\n${samples.map((s) => `  • ${s}`).join("\n")}\n\n` +
+		`Where to look: GET /telemetry/recent (x-admin-key) · the in-app Diagnostics screen · ` +
+		`the Cloudflare dashboards (proxy + watcher).\n` +
+		`Throttled to at most one email per hour.`);
+}
+
+// ── Scheduled synthetic health checks (A4, 2026-08-23) ────────────────────────────────────────
+// The deploy-time health_check_*.mjs scripts assert real data, but ONLY at deploy. A source that breaks
+// mid-week (an ESPN outage, an emptied KV pool, a dead IG snapshot) was invisible to PUSH alerting until
+// it happened to spike the error pager. This runs the CRITICAL-availability assertions on the */5 cron
+// (gated to ~30 min) and pages IMMEDIATELY on any hard failure — the definitive "the app's core data is
+// actually down" signal, with no ≥8-spike wait. Kept LIGHT (2 ESPN fetches + a few KV reads) so it never
+// approaches the per-invocation subrequest budget. Editorial drift (a dormant reporter, a club on press
+// fallback) is deliberately NOT checked here — that stays in the pull Status tab + the weekly digest;
+// only genuine outages page.
+const SYNTHETIC_LAST_KEY = "synthetic:last";
+const SYNTHETIC_PAGE_KEY = "synthetic:last-page";
+const SYNTHETIC_PAGE_THROTTLE_MS = 60 * 60 * 1000; // at most one synthetic-fail email/hour
+
+async function runSyntheticChecks(env: Env, ctx: ExecutionContext): Promise<void> {
+	const checks: StatusCheck[] = [];
+	// ESPN core (the Aug-4 outage path: a scoreboard failure takes Home + Schedule dark).
+	checks.push(await statusFetch("ESPN scoreboard", ESPN_SCOREBOARD, ESPN_UA,
+		(d) => Array.isArray((d as { events?: unknown[] }).events) && ((d as { events?: unknown[] }).events?.length ?? 0) > 0,
+		(d) => `${(d as { events?: unknown[] }).events?.length ?? 0} events`));
+	checks.push(await statusFetch("ESPN standings", "https://site.api.espn.com/apis/v2/sports/soccer/usa.nwsl/standings", ESPN_UA,
+		(d) => JSON.stringify(d).length > 200, () => "reachable"));
+	// Fan Zone content pools live in KV — an emptied/expired pool = the game opens to nothing.
+	const khg = (await env.FEED_TAGS.get(KNOWHER_POOL_KEY, "json").catch(() => null)) as { players?: unknown[] } | null;
+	checks.push({ label: "Know Her Game pool", status: (khg?.players?.length ?? 0) > 0 ? "ok" : "fail",
+		detail: khg?.players?.length ? `${khg.players.length} players` : "MISSING/empty in KV" });
+	const triviaV2 = await env.FEED_TAGS.get(TRIVIA_POOL_V2_KEY, "json").catch(() => null);
+	const triviaFlat = triviaV2 ? null : ((await env.FEED_TAGS.get(TRIVIA_POOL_KEY, "json").catch(() => null)) as unknown[] | null);
+	checks.push({ label: "Trivia pool", status: triviaV2 || (Array.isArray(triviaFlat) && triviaFlat.length > 0) ? "ok" : "fail",
+		detail: triviaV2 ? "grouped pool present" : Array.isArray(triviaFlat) && triviaFlat.length ? `${triviaFlat.length} (legacy flat)` : "MISSING/empty in KV" });
+	// IG snapshots (the fragile scrape path).
+	for (const [label, k] of [["IG players A", poolKey("A")], ["IG players B", poolKey("B")], ["IG clubs", SOCIAL_CLUB_KEY]] as [string, string][]) {
+		const raw = await env.FEED_TAGS.get(k).catch(() => null);
+		checks.push({ label, status: raw ? "ok" : "fail", detail: raw ? `${Math.round(raw.length / 1024)}KB` : "snapshot MISSING (cron failed or KV expired)" });
+	}
+
+	const fails = checks.filter((c) => c.status === "fail");
+	await env.FEED_TAGS.put(SYNTHETIC_LAST_KEY,
+		JSON.stringify({ at: Date.now(), fails: fails.length, checks: checks.map((c) => ({ label: c.label, status: c.status, detail: c.detail })) }),
+		{ expirationTtl: 60 * 60 * 24 * 7 });
+	if (fails.length === 0) return;
+
+	// A hard failure is definitive (not editorial drift): record it + page immediately (own throttle).
+	emitDiag(env, ctx, "syntheticCheckFail", fails.map((c) => c.label).join(", "));
+	if (await dueByMarker(env, SYNTHETIC_PAGE_KEY, SYNTHETIC_PAGE_THROTTLE_MS)) {
+		await sendOwnerEmail(env, ctx, `${fails.length} core check(s) FAILING`,
+			`Scheduled synthetic health check found a HARD failure — the app's core data may be down:\n\n` +
+			fails.map((c) => `  ✗ ${c.label}: ${c.detail}`).join("\n") +
+			`\n\nAll checks:\n` + checks.map((c) => `  ${c.status === "ok" ? "✓" : "✗"} ${c.label}: ${c.detail}`).join("\n") +
+			`\n\nWhere to look: the /admin Status tab · GET /telemetry/recent (x-admin-key).\nThrottled to at most one email/hour.`);
+	}
+}
+
+// ── Client crash + broken-feature aggregate paging (A5, 2026-08-23) ────────────────────────────
+// Client /telemetry lands in the un-paged, spoofable `diag:` sink. This scan (gated ~30 min on the */5
+// cron) reads a BOUNDED sample of recent client records and pages when a signal crosses a threshold:
+// (1) a CRASH wave — metricKitDiagnostic crumbs (rare + serious → low bar); (2) a BROADLY-FAILING FEATURE
+// — many clients reporting the SAME error kind (the "everyone assumes it's broken and I never knew" case).
+// Spoof note: /telemetry is per-IP rate-limited (20/60s) but anonymous, so a determined spoofer could fake
+// a burst — the worst outcome is a spurious EMAIL (noise, never a mutation), so thresholds sit above
+// organic small-scale noise and each category is throttled. (MetricKit delivers on next app launch, so a
+// crash wave reflects roughly the past day, not real-time — an accepted limit of the platform.)
+const CLIENTAGG_LAST_KEY = "clientagg:last";
+const CLIENTAGG_CRASH_PAGE_KEY = "clientagg:crash-page";
+const CLIENTAGG_FEAT_PAGE_KEY = "clientagg:feat-page";
+const CLIENT_FEATURE_KINDS = new Set(["apiFailure", "parseError", "unexpectedEmpty", "staleServe"]);
+const CRASH_WINDOW_MS = 24 * 60 * 60 * 1000, CRASH_THRESHOLD = 5;   // ≥5 crash reports / 24h → page
+const FEATURE_WINDOW_MS = 60 * 60 * 1000, FEATURE_THRESHOLD = 25;   // ≥25 reports of ONE kind / 60min → page
+const CLIENTAGG_PAGE_THROTTLE_MS = 3 * 60 * 60 * 1000;             // per category, at most one / 3h
+
+async function scanClientAggregate(env: Env, ctx: ExecutionContext): Promise<void> {
+	const now = Date.now();
+	const crashCut = now - CRASH_WINDOW_MS, featCut = now - FEATURE_WINDOW_MS;
+	// Bounded: newest client records (reverse-time keys), filtered by age from the KEY (no read) so a quiet
+	// window costs one list + few reads. At small scale this spans days; the caps keep it cheap at any scale.
+	const list = await env.FEED_TAGS.list({ prefix: "diag:", limit: 150 });
+	const fresh = list.keys.filter((k) => diagKeyTime(k.name) >= crashCut).slice(0, 120);
+	let crashes = 0;
+	const featCounts: Record<string, number> = {};
+	for (const k of fresh) {
+		const t = diagKeyTime(k.name);
+		const rec = (await env.FEED_TAGS.get(k.name, "json").catch(() => null)) as { events?: { kind?: string; detail?: string }[] } | null;
+		for (const e of rec?.events ?? []) {
+			if (e.kind === "metricKitDiagnostic") { crashes++; continue; }
+			if (!e.kind || !CLIENT_FEATURE_KINDS.has(e.kind) || t < featCut) continue;
+			// Same exclusion as the spike pager: expected image-CDN flakiness (IG/thumbnail URLs expire &
+			// rotate; a.espncdn.com hotlink-blocks) rides apiFailure but is an honest placeholder fallback,
+			// NOT an incident — it would otherwise dominate the count and false-page at fleet scale.
+			if (e.kind === "apiFailure" && (e.detail ?? "").startsWith("image fetch ")) continue;
+			featCounts[e.kind] = (featCounts[e.kind] ?? 0) + 1;
+		}
+	}
+	const worstFeat = Object.entries(featCounts).sort((a, b) => b[1] - a[1])[0];
+	await env.FEED_TAGS.put(CLIENTAGG_LAST_KEY, JSON.stringify({ at: now, crashes24h: crashes, features60m: featCounts }), { expirationTtl: 60 * 60 * 24 * 7 });
+
+	if (crashes >= CRASH_THRESHOLD) {
+		emitDiag(env, ctx, "clientCrashWave", `${crashes} crash reports in 24h`);
+		if (await dueByMarker(env, CLIENTAGG_CRASH_PAGE_KEY, CLIENTAGG_PAGE_THROTTLE_MS)) {
+			await sendOwnerEmail(env, ctx, `crash wave — ${crashes} reports in 24h`,
+				`${crashes} MetricKit crash/hang reports arrived from devices in the last 24h (threshold ${CRASH_THRESHOLD}).\n` +
+				`MetricKit delivers on the app's next launch, so this reflects crashes over roughly the past day.\n\n` +
+				`Where to look: GET /telemetry/recent (x-admin-key) · App Store Connect → Crashes.\nThrottled to at most one / 3h.`);
+		}
+	}
+	if (worstFeat && worstFeat[1] >= FEATURE_THRESHOLD) {
+		emitDiag(env, ctx, "clientFeatureFailing", `${worstFeat[0]} x${worstFeat[1]} in 60m`);
+		if (await dueByMarker(env, CLIENTAGG_FEAT_PAGE_KEY, CLIENTAGG_PAGE_THROTTLE_MS)) {
+			await sendOwnerEmail(env, ctx, `a feature is failing across the fleet — ${worstFeat[0]}`,
+				`${worstFeat[1]} client reports of "${worstFeat[0]}" in the last 60 min (threshold ${FEATURE_THRESHOLD}) — a feature may be broadly broken in the app.\n\n` +
+				`All client error kinds (60m): ${Object.entries(featCounts).map(([k, n]) => `${k} x${n}`).join(", ") || "none"}\n\n` +
+				`Where to look: the in-app Diagnostics screen · GET /telemetry/recent (x-admin-key).\nThrottled to at most one / 3h.`);
+		}
+	}
+}
+
+// ── Weekly digest (A6, 2026-08-23) ─────────────────────────────────────────────────────────────
+// The chronic-failure catch + the week's product pulse, in one Monday email. Self-gated to fire once a
+// week (Monday, ~09:xx UTC) via a KV marker on the */5 cron — no new cron trigger (free-plan cap). The
+// definitive real-time signals are the synthetic checks + the aggregate scan (which page as they happen);
+// this digest is the PULSE — a BOUNDED health rollup (the last synthetic + aggregate results, plus a
+// newest-N diagnostics sample) alongside the analytics numbers the owner values. Never an unbounded 7-day
+// scan (that would blow the subrequest budget at scale).
+const DIGEST_MARKER_KEY = "digest:last-week";
+
+async function maybeSendWeeklyDigest(env: Env, ctx: ExecutionContext): Promise<void> {
+	const cfg = env as unknown as { RESEND_API_KEY?: string; ALERT_EMAIL?: string };
+	if (!cfg.RESEND_API_KEY || !cfg.ALERT_EMAIL) return;
+	const d = new Date();
+	if (d.getUTCDay() !== 1 || d.getUTCHours() !== 9) return; // Monday 09:xx UTC window only
+	if (!(await dueByMarker(env, DIGEST_MARKER_KEY, 6 * 24 * 60 * 60 * 1000))) return; // once/week
+	await sendDigest(env, ctx);
+}
+
+/** Build + send the weekly digest UNCONDITIONALLY (the once/week gating lives in maybeSendWeeklyDigest;
+ *  the /admin/selftest hook calls this directly to preview the digest on demand). */
+async function sendDigest(env: Env, ctx: ExecutionContext): Promise<void> {
+	const synth = (await env.FEED_TAGS.get(SYNTHETIC_LAST_KEY, "json").catch(() => null)) as { at?: number; fails?: number } | null;
+	const agg = (await env.FEED_TAGS.get(CLIENTAGG_LAST_KEY, "json").catch(() => null)) as { crashes24h?: number } | null;
+	// Recent diagnostics sample (bounded newest-30, same as the Status tab) → kind histogram.
+	const list = await env.FEED_TAGS.list({ prefix: "sdiag:", limit: 60 });
+	const kinds: Record<string, number> = {};
+	const recs = await Promise.all(list.keys.slice(0, 30).map((k) => env.FEED_TAGS.get(k.name, "json").catch(() => null)));
+	for (const rec of recs) for (const e of (rec as { events?: { kind?: string }[] } | null)?.events ?? []) if (e.kind) kinds[e.kind] = (kinds[e.kind] ?? 0) + 1;
+	const kindLines = Object.entries(kinds).sort((a, b) => b[1] - a[1]).map(([k, n]) => `  ${k}: ${n}`).join("\n") || "  (none)";
+
+	// Analytics pulse (reuse the dashboard's computeMetrics).
+	let pulse = "  (analytics unavailable)";
+	try {
+		const m = (await computeMetrics(env)) as { weeks?: { week: string; wau: number; new: number; returning: number }[]; sessions30d?: number; gameOpens?: Record<string, number>; engagement?: Record<string, number> };
+		const wk = m.weeks?.[0];
+		const games = Object.values(m.gameOpens ?? {}).reduce((a, b) => a + b, 0);
+		pulse = [
+			wk ? `  WAU (${wk.week}): ${wk.wau}  (new ${wk.new}, returning ${wk.returning})` : "  WAU: n/a",
+			`  Sessions (30d): ${m.sessions30d ?? 0}`,
+			`  Fan Zone opens (30d): ${games}`,
+			`  Game plays (7d): ${Object.entries(m.engagement ?? {}).map(([k, n]) => `${k}=${n}`).join(", ") || "n/a"}`,
+		].join("\n");
+	} catch { /* keep the fallback line */ }
+
+	const synthLine = synth ? `${synth.fails ? `⚠️ ${synth.fails} FAILING` : "all clear"} (checked ${ageLabel(Date.now() - (synth.at ?? 0))})` : "no run yet";
+	await sendOwnerEmail(env, ctx, "weekly digest",
+		`NWSLApp weekly digest.\n\n` +
+		`— HEALTH —\n` +
+		`Synthetic checks: ${synthLine}\n` +
+		`Client crashes (24h): ${agg?.crashes24h ?? 0} reports\n` +
+		`Recent proxy diagnostics (sample, by kind):\n${kindLines}\n\n` +
+		`— ANALYTICS —\n${pulse}\n\n` +
+		`Full detail: the /admin Status + Analytics tabs.`);
+}
+
+/** GET /admin/selftest?do=… — force each PUSH alerting path on demand (admin-gated) so email delivery
+ *  and each detector can be proven end-to-end without waiting for the gates. Returns a small JSON report.
+ *  `email` sends a test email; `synthetic`/`aggregate` run the scans NOW (bypassing the ~30-min gate) and
+ *  return what they stored; `digest` builds + sends the weekly digest immediately; `heartbeat` pings the
+ *  proxy healthchecks.io URL. */
+async function handleAlertSelfTest(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
+	const key = (env as unknown as { BRACKET_ADMIN_KEY?: string }).BRACKET_ADMIN_KEY;
+	if (!adminAuthed(request, key)) {
+		return new Response("Authentication required.", { status: 401, headers: { "WWW-Authenticate": adminRealm("NWSLApp Admin") } });
+	}
+	const doWhat = new URL(request.url).searchParams.get("do") ?? "email";
+	const json = (b: unknown) => new Response(JSON.stringify(b, null, 2), { headers: { "Content-Type": "application/json" } });
+	switch (doWhat) {
+		case "email": {
+			const sent = await sendOwnerEmail(env, ctx, "self-test", "This is a self-test alert from /admin/selftest?do=email. If you received it, owner-email delivery works.");
+			return json({ do: "email", sent, note: sent ? "sent — check your inbox" : "NOT sent — RESEND_API_KEY / ALERT_EMAIL unset or ALERT_EMAIL not an email (see the alertEmailMisconfig diag)" });
+		}
+		case "synthetic": {
+			await runSyntheticChecks(env, ctx);
+			return json({ do: "synthetic", ran: true, last: await env.FEED_TAGS.get(SYNTHETIC_LAST_KEY, "json").catch(() => null), note: "ran now (bypassing the 30-min gate); emails ONLY on a hard failure (throttled 1/hr)" });
+		}
+		case "aggregate": {
+			await scanClientAggregate(env, ctx);
+			return json({ do: "aggregate", ran: true, last: await env.FEED_TAGS.get(CLIENTAGG_LAST_KEY, "json").catch(() => null), note: "ran now; emails ONLY above threshold (5 crashes/24h or 25 of one kind/60m)" });
+		}
+		case "digest": {
+			await sendDigest(env, ctx);
+			return json({ do: "digest", sent: true, note: "the weekly digest was built + sent now (bypassing the Monday gate) — check your inbox" });
+		}
+		case "heartbeat": {
+			const hc = (env as unknown as { HEALTHCHECK_URL_PROXY?: string }).HEALTHCHECK_URL_PROXY;
+			if (!hc) return json({ do: "heartbeat", pinged: false, note: "HEALTHCHECK_URL_PROXY is unset — set it to a healthchecks.io check URL to arm the proxy dead-cron backstop" });
+			let ok = false; try { ok = (await fetch(hc)).ok; } catch { /* ok stays false */ }
+			return json({ do: "heartbeat", pinged: true, ok, note: "pinged the proxy healthchecks.io check" });
+		}
+		default:
+			return json({ error: "unknown ?do=", allowed: ["email", "synthetic", "aggregate", "digest", "heartbeat"] });
 	}
 }
 
