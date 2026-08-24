@@ -355,7 +355,13 @@ const CC_IMMUTABLE = "public, max-age=31536000, immutable";
 const CC_NOT_FINISHED = "public, max-age=60";     // flips fast once the match hits full-time
 const CC_UNKNOWN_VENUE = "public, max-age=3600";  // a table fix serves within the hour
 const CC_ERROR = "no-store";
-const CC_FORECAST = `public, max-age=${FORECAST_TTL_SECONDS}`;  // 8h — see FORECAST_TTL_SECONDS
+// SPLIT TTLs (2026-08-23): edge keeps the 8h economy (`s-maxage` — the Cache API honors it for the
+// shared cache), but the CLIENT drops to 15 min. WHY: a device that fetched the forecast PRE-KICKOFF
+// held it in URLCache for 8h, so re-opening the match AFTER full-time served the stale forecast
+// instead of the historical stamp — the app's past-match rail gates on `roundedTemp`, which is nil in
+// forecast mode, so the weather line silently vanished for up to 8h post-FT (owner-reported, the
+// 8/23 BAY-HOU + LA-GFC evening games). A 15-min client re-check is an edge HIT (zero Open-Meteo).
+const CC_FORECAST = `public, max-age=900, s-maxage=${FORECAST_TTL_SECONDS}`;
 const CC_TOO_FAR = "public, max-age=3600";        // re-check hourly as the match enters the horizon
 
 // A minimal shape of the fields we read out of ESPN's /summary payload.
