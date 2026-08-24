@@ -26,6 +26,15 @@
 			"namespace_id": "1001",
 			"simple": { "limit": 20, "period": 60 },
 		},
+		// Per-IP throttle on FAILED admin-auth attempts only (Part B hardening 2026-08-24): a
+		// brute-forcer gets 10 guesses/min then 429s; authenticated requests never touch this
+		// limiter, so the owner's multi-fetch Status tab can't self-throttle. Fails OPEN in code
+		// (adminGate) when absent.
+		{
+			"name": "ADMIN_LIMITER",
+			"namespace_id": "1002",
+			"simple": { "limit": 10, "period": 60 },
+		},
 	],
 	// B3b — Instagram scrape → KV social snapshot, EVERY OTHER DAY at 12:00 UTC (~7am ET).
 	// Decoupled from user requests. LOAD-BALANCED (2026-07-05): clubs via Apify (~192
