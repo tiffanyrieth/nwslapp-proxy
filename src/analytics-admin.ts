@@ -3,7 +3,7 @@
 // POST /analytics/admin/api = the computed metrics as JSON. Everything shown is AGGREGATE — the
 // anonymous counters carry no identity, and the engagement RPC returns only COUNTS. No per-person data.
 
-import { adminAuthed, adminRealm } from "./admin-auth.ts";
+import { adminGate, type AdminAuthEnv } from "./admin-auth.ts";
 import { fetchTeamAbbrs } from "./bracket-engine.ts";
 
 interface Env {
@@ -125,11 +125,9 @@ export async function computeMetrics(env: Env): Promise<unknown> {
 }
 
 export async function handleAnalyticsAdmin(request: Request, env: Env): Promise<Response> {
-  if (!adminAuthed(request, env.BRACKET_ADMIN_KEY)) {
-    return new Response("Authentication required.", {
-      status: 401, headers: { "WWW-Authenticate": adminRealm("NWSLApp Admin") },
-    });
-  }
+  // Portal surface → the full gate (key + throttle + the Access JWT once armed). Part B 2026-08-24.
+  const gate = await adminGate(request, env as unknown as AdminAuthEnv, { jwt: true });
+  if (gate) return gate;
   const url = new URL(request.url);
   if (url.pathname === "/analytics/admin/api") {
     try {

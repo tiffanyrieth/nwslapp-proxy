@@ -31,7 +31,7 @@ import {
 	type BracketEnv,
 } from "./bracket-engine.ts";
 import { buildHeadshotMap, handleHeadshots, normalizeName } from "./headshots.ts";
-import { adminAuthed, adminRealm } from "./admin-auth.ts";
+import { adminAuthed, adminGate, safeEqual, type AdminAuthEnv } from "./admin-auth.ts";
 import { handleAnalyticsAdmin, computeMetrics } from "./analytics-admin.ts";
 import { ADMIN_PORTAL_HTML } from "./admin-portal.ts";
 import {
@@ -727,10 +727,11 @@ export default {
 		// Admin-only: run one Bracket engine tick on demand (the hourly cron does this
 		// automatically; this is for verification). Guarded by the BRACKET_ADMIN_KEY secret.
 		if (url.pathname === "/bracket/run") {
-			const key = (env as unknown as { BRACKET_ADMIN_KEY?: string }).BRACKET_ADMIN_KEY;
-			if (request.method !== "POST" || !key || request.headers.get("x-admin-key") !== key) {
-				return new Response("forbidden", { status: 403 });
-			}
+			if (request.method !== "POST") return new Response("forbidden", { status: 403 });
+			// Curl-style key endpoint (never behind Access) → constant-time key + failure throttle only.
+			const gate = await adminGate(request, env as unknown as AdminAuthEnv, { jwt: false },
+				(kind, detail) => emitDiag(env, ctx, kind, detail));
+			if (gate) return gate;
 			try {
 				const bEnv = env as unknown as BracketEnv;
 				// ?force=close → close the open round now, so this same tick tallies it
@@ -754,10 +755,10 @@ export default {
 		// automatically; this is for verification + auditing the unmatched list). Guarded by
 		// the same BRACKET_ADMIN_KEY secret as /bracket/run.
 		if (url.pathname === "/headshots/run") {
-			const key = (env as unknown as { BRACKET_ADMIN_KEY?: string }).BRACKET_ADMIN_KEY;
-			if (request.method !== "POST" || !key || request.headers.get("x-admin-key") !== key) {
-				return new Response("forbidden", { status: 403 });
-			}
+			if (request.method !== "POST") return new Response("forbidden", { status: 403 });
+			const gate = await adminGate(request, env as unknown as AdminAuthEnv, { jwt: false },
+				(kind, detail) => emitDiag(env, ctx, kind, detail));
+			if (gate) return gate;
 			try {
 				const meta = await buildHeadshotMap(env);
 				return new Response(`${JSON.stringify(meta, null, 2)}\n`, {
@@ -794,12 +795,9 @@ export default {
 		}
 		// Attendance backstop ops: the ledger + sweep state; `?sweep=1` forces a run.
 		if (url.pathname === "/admin/attendance") {
-			const adminKey = (env as unknown as { BRACKET_ADMIN_KEY?: string }).BRACKET_ADMIN_KEY;
-			if (!adminAuthed(request, adminKey)) {
-				return new Response("Authentication required.", {
-					status: 401, headers: { "WWW-Authenticate": adminRealm("NWSLApp Admin") },
-				});
-			}
+			const gate = await adminGate(request, env as unknown as AdminAuthEnv, { jwt: true },
+				(kind, detail) => emitDiag(env, ctx, kind, detail));
+			if (gate) return gate;
 			return handleAdminAttendance(env, (kind, detail) => emitDiag(env, ctx, kind, detail),
 				url.searchParams.get("sweep") === "1");
 		}
@@ -841,10 +839,10 @@ export default {
 		// this automatically; this forces an immediate pull after a token swap or an aborted
 		// run). Same BRACKET_ADMIN_KEY gate as /headshots/run.
 		if (url.pathname === "/refresh-social") {
-			const key = (env as unknown as { BRACKET_ADMIN_KEY?: string }).BRACKET_ADMIN_KEY;
-			if (request.method !== "POST" || !key || request.headers.get("x-admin-key") !== key) {
-				return new Response("forbidden", { status: 403 });
-			}
+			if (request.method !== "POST") return new Response("forbidden", { status: 403 });
+			const gate = await adminGate(request, env as unknown as AdminAuthEnv, { jwt: false },
+				(kind, detail) => emitDiag(env, ctx, kind, detail));
+			if (gate) return gate;
 			try {
 				const summary = await refreshSocialCache(env, ctx);
 				return new Response(`${JSON.stringify(summary)}\n`, {
@@ -2773,10 +2771,9 @@ Promise.all(NAMES.map(async (name) => {
  *  No `section` → the shell (which fetches each section separately); `?section=NAME` → that one
  *  section's fragment, run live in this request's own subrequest budget. */
 async function handleAdminStatus(request: Request, env: Env): Promise<Response> {
-	const key = (env as unknown as { BRACKET_ADMIN_KEY?: string }).BRACKET_ADMIN_KEY;
-	if (!adminAuthed(request, key)) {
-		return new Response("Authentication required.", { status: 401, headers: { "WWW-Authenticate": adminRealm("NWSLApp Admin") } });
-	}
+	// Portal surface → the full gate (key + throttle + the Access JWT once armed). Part B 2026-08-24.
+	const gate = await adminGate(request, env as unknown as AdminAuthEnv, { jwt: true });
+	if (gate) return gate;
 	const section = new URL(request.url).searchParams.get("section");
 	if (section) {
 		const entry = STATUS_SECTIONS[section];
@@ -2787,13 +2784,10 @@ async function handleAdminStatus(request: Request, env: Env): Promise<Response> 
 }
 
 async function handleAdminPortal(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
-	const key = (env as unknown as { BRACKET_ADMIN_KEY?: string }).BRACKET_ADMIN_KEY;
-	if (!adminAuthed(request, key)) {
-		return new Response("Authentication required.", {
-			status: 401,
-			headers: { "WWW-Authenticate": adminRealm("NWSLApp Admin") },
-		});
-	}
+	// Portal surface → the full gate (key + throttle + the Access JWT once armed). Part B 2026-08-24.
+	const gate = await adminGate(request, env as unknown as AdminAuthEnv, { jwt: true },
+		(kind, detail) => emitDiag(env, ctx, kind, detail));
+	if (gate) return gate;
 	const url = new URL(request.url);
 	if (request.method === "GET" && url.pathname === "/admin") {
 		return new Response(ADMIN_PORTAL_HTML, { headers: { "Content-Type": "text/html; charset=utf-8" } });
@@ -3983,7 +3977,8 @@ function auditAuthed(request: Request, env: Env): boolean {
 	const adminKey = (env as unknown as { BRACKET_ADMIN_KEY?: string }).BRACKET_ADMIN_KEY;
 	if (adminAuthed(request, adminKey)) return true;
 	const auditKey = (env as unknown as { SOCIAL_AUDIT_KEY?: string }).SOCIAL_AUDIT_KEY;
-	return !!auditKey && request.headers.get("x-audit-key") === auditKey;
+	const provided = request.headers.get("x-audit-key");
+	return !!auditKey && provided !== null && safeEqual(provided, auditKey);
 }
 
 type LedgerEntry = {
@@ -6057,10 +6052,11 @@ async function sendDigest(env: Env, ctx: ExecutionContext): Promise<void> {
  *  return what they stored; `digest` builds + sends the weekly digest immediately; `heartbeat` pings the
  *  proxy healthchecks.io URL. */
 async function handleAlertSelfTest(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
-	const key = (env as unknown as { BRACKET_ADMIN_KEY?: string }).BRACKET_ADMIN_KEY;
-	if (!adminAuthed(request, key)) {
-		return new Response("Authentication required.", { status: 401, headers: { "WWW-Authenticate": adminRealm("NWSLApp Admin") } });
-	}
+	// Portal surface (under /admin*) → the full gate. Once Access is armed, run selftests from the
+	// browser (a raw curl won't carry the Access JWT) — or mint an Access service token for scripts.
+	const gate = await adminGate(request, env as unknown as AdminAuthEnv, { jwt: true },
+		(kind, detail) => emitDiag(env, ctx, kind, detail));
+	if (gate) return gate;
 	const doWhat = new URL(request.url).searchParams.get("do") ?? "email";
 	const json = (b: unknown) => new Response(JSON.stringify(b, null, 2), { headers: { "Content-Type": "application/json" } });
 	switch (doWhat) {
@@ -6094,10 +6090,9 @@ async function handleAlertSelfTest(request: Request, env: Env, ctx: ExecutionCon
 /** Owner view of recent telemetry: `GET /telemetry/recent` (newest first), gated by the same
  *  `x-admin-key`/`BRACKET_ADMIN_KEY` secret as the other admin routes. */
 async function handleTelemetryRecent(request: Request, env: Env): Promise<Response> {
-	const key = (env as unknown as { BRACKET_ADMIN_KEY?: string }).BRACKET_ADMIN_KEY;
-	if (!key || request.headers.get("x-admin-key") !== key) {
-		return new Response("forbidden", { status: 403 });
-	}
+	// Curl-style key endpoint (never behind Access) → constant-time key + failure throttle only.
+	const gate = await adminGate(request, env as unknown as AdminAuthEnv, { jwt: false });
+	if (gate) return gate;
 	// Merge BOTH streams newest-first: server diagnostics (`sdiag:`) + client telemetry (`diag:`). They
 	// live under separate prefixes so the pager can scan server errors without client burial; the owner
 	// view still shows everything. (`diag:` prefix does NOT match `sdiag:` — no double-count.)

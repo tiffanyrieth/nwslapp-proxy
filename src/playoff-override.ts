@@ -25,7 +25,14 @@
 //     ]
 //   }
 //
-// KV key: `playoff-override:<season>` in FEED_TAGS. No TTL — persists until cleared.
+// KV key: `playoff-override:<season>` in FEED_TAGS. TTL 180 days (Part B hardening 2026-08-24):
+// long enough to carry a set-in-October override through the whole postseason + offseason reference,
+// short enough that a forgotten (or maliciously planted) override can't shadow the bracket FOREVER.
+// Re-POSTing refreshes the clock; `clear=1` still deletes immediately.
+
+import { adminGate, type AdminAuthEnv } from "./admin-auth.ts";
+
+const OVERRIDE_TTL_S = 180 * 24 * 3600;
 
 interface OverrideEnv {
   FEED_TAGS: KVNamespace;
@@ -52,10 +59,9 @@ export async function handlePlayoffOverride(request: Request, url: URL, env: Ove
   }
 
   if (request.method === "POST") {
-    const key = env.BRACKET_ADMIN_KEY;
-    if (!key || request.headers.get("x-admin-key") !== key) {
-      return new Response("forbidden", { status: 403 });
-    }
+    // Curl-style key endpoint (never behind Access) → constant-time key + failure throttle.
+    const gate = await adminGate(request, env as unknown as AdminAuthEnv, { jwt: false });
+    if (gate) return gate;
     if (url.searchParams.get("clear") === "1") {
       await env.FEED_TAGS.delete(kvKey);
       return json({ ok: true, cleared: true, season: Number(season) });
@@ -69,8 +75,8 @@ export async function handlePlayoffOverride(request: Request, url: URL, env: Ove
     if (typeof body !== "object" || body === null || Array.isArray(body)) {
       return json({ ok: false, error: "override must be a JSON object" }, 400);
     }
-    await env.FEED_TAGS.put(kvKey, JSON.stringify(body));
-    return json({ ok: true, season: Number(season), stored: body });
+    await env.FEED_TAGS.put(kvKey, JSON.stringify(body), { expirationTtl: OVERRIDE_TTL_S });
+    return json({ ok: true, season: Number(season), stored: body, expiresInDays: OVERRIDE_TTL_S / 86400 });
   }
 
   return new Response("method not allowed", { status: 405 });

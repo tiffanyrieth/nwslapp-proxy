@@ -28,6 +28,17 @@ interface Env {
 	// code (overIngestLimit) rather than dropping legit telemetry.
 	INGEST_LIMITER?: RateLimit;
 
+	// Part B hardening (2026-08-24). ADMIN_LIMITER throttles FAILED admin-auth attempts per IP
+	// (adminGate — authenticated requests never touch it). The two ACCESS_* values ARM the
+	// Cloudflare Access JWT check on the human portal paths (admin-auth.ts verifyAccessJwt):
+	// both unset → key-only auth (the pre-Access behavior); both set → a valid
+	// Cf-Access-Jwt-Assertion is REQUIRED in addition to the key. Set as plain vars or secrets:
+	//   ACCESS_TEAM_DOMAIN  e.g. "<team>.cloudflareaccess.com" (Zero Trust dashboard URL)
+	//   ACCESS_AUD          the Access application's Audience (aud) tag (app Overview page)
+	ADMIN_LIMITER?: RateLimit;
+	ACCESS_TEAM_DOMAIN?: string;
+	ACCESS_AUD?: string;
+
 	// Secret, set via `wrangler secret put APIFY_TOKEN`. Backs the B3b IG social pipe's
 	// CLUB side: the cron calls Apify's low-cost IG scraper for the 16 club handles (and,
 	// until BRIGHTDATA_TOKEN is set, the 34 player handles too — pre-split fallback) and

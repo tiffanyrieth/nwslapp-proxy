@@ -18,7 +18,7 @@ import {
   fetchStatsForMany,
   type BracketEnv,
 } from "./bracket-engine.ts";
-import { adminAuthed, adminRealm } from "./admin-auth.ts";
+import { adminGate, type AdminAuthEnv } from "./admin-auth.ts";
 import { buildStatQuestionsN, weaveStats, type StatInput } from "./knowher-stats.ts";
 
 export const KNOWHER_POOL_KEY = "knowher-pool-v1"; // KV: the live pool document (this week's players)
@@ -392,13 +392,11 @@ export interface KnowHerEnv {
   KNOWHER_CANDIDATE_KEY_SECRET?: string;
 }
 
-const ADMIN_REALM = adminRealm("Know Her Game Admin");
-
 export async function handleKnowHerAdmin(request: Request, env: KnowHerEnv): Promise<Response> {
   const url = new URL(request.url);
-  if (!adminAuthed(request, env.BRACKET_ADMIN_KEY)) {
-    return new Response("Authentication required.", { status: 401, headers: { "WWW-Authenticate": ADMIN_REALM } });
-  }
+  // Portal surface → the full gate (key + throttle + the Access JWT once armed). Part B 2026-08-24.
+  const gate = await adminGate(request, env as unknown as AdminAuthEnv, { jwt: true, realm: "Know Her Game Admin" });
+  if (gate) return gate;
   if (request.method === "GET" && url.pathname === "/knowher/admin") {
     return new Response(KNOWHER_ADMIN_HTML, { headers: { "Content-Type": "text/html; charset=utf-8" } });
   }

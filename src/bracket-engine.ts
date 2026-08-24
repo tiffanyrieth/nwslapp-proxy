@@ -40,7 +40,7 @@ import {
 } from "./bracket.ts";
 import { ESPN_HEADERS } from "./espn-ua.ts";
 import { ADMIN_PAGE_HTML } from "./bracket-admin-page.ts";
-import { adminAuthed, adminRealm } from "./admin-auth.ts";
+import { adminGate, adminRealm, type AdminAuthEnv } from "./admin-auth.ts";
 
 export interface BracketEnv {
   SUPABASE_URL: string;
@@ -1184,7 +1184,6 @@ async function accumulateUserStats(
 
 type AdminEnv = BracketEnv & { BRACKET_ADMIN_KEY?: string };
 
-const ADMIN_REALM = adminRealm("Bracket Admin");
 
 /** Slug a theme title into an id segment (e.g. "Best Celebration" → "best-celebration"). */
 export function slug(s: string): string {
@@ -1193,11 +1192,10 @@ export function slug(s: string): string {
 
 export async function handleBracketAdmin(request: Request, env: AdminEnv): Promise<Response> {
   const url = new URL(request.url);
-  // 401 + WWW-Authenticate triggers the browser's native password dialog (and re-prompts on a
-  // stale credential) — for both the page navigation and any unauthenticated API call.
-  if (!adminAuthed(request, env.BRACKET_ADMIN_KEY)) {
-    return new Response("Authentication required.", { status: 401, headers: { "WWW-Authenticate": ADMIN_REALM } });
-  }
+  // Portal surface → the full gate (constant-time key + failed-attempt throttle + the Access JWT
+  // once armed) — for both the page navigation and any unauthenticated API call. Part B 2026-08-24.
+  const gate = await adminGate(request, env as unknown as AdminAuthEnv, { jwt: true, realm: "Bracket Admin" });
+  if (gate) return gate;
   if (request.method === "GET" && url.pathname === "/bracket/admin") {
     return new Response(ADMIN_PAGE_HTML, { headers: { "Content-Type": "text/html; charset=utf-8" } });
   }
