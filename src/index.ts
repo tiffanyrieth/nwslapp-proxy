@@ -5890,13 +5890,34 @@ const SYNTHETIC_LAST_KEY = "synthetic:last";
 const SYNTHETIC_PAGE_KEY = "synthetic:last-page";
 const SYNTHETIC_PAGE_THROTTLE_MS = 60 * 60 * 1000; // at most one synthetic-fail email/hour
 
+/**
+ * Retry wrapper for the synthetic PAGER's ESPN HTTP checks ONLY. A transient upstream blip (e.g. a
+ * Cloudflare 525 SSL-handshake hiccup on ESPN's edge) self-heals in seconds; without this a single
+ * momentary fetch failure pages the owner even though the app is fine (proven 2026-08-26: a 525 on
+ * standings emailed a HARD-failure page while the endpoint returned 200 seconds later and the app's
+ * Standings served normally). We re-fetch a FAILED check once, ~2.5s later, before it counts toward
+ * `fails`. A recovery emits a `syntheticCheckFlaky` breadcrumb (no silent swallow, per the loud-to-
+ * engineer rule) but does NOT page. Deliberately NOT used by the live /admin ESPN-core board
+ * (`statusCheckESPN` keeps calling `statusFetch` single-shot, so that board still shows real-time
+ * truth incl. blips), and NOT applied to the KV pool checks or the "200-but-empty" warn case — those
+ * failures are real, not transient network, so a retry must not paper over them.
+ */
+async function statusFetchPaging(env: Env, ctx: ExecutionContext, label: string, url: string, ua: string, ok: (d: unknown) => boolean, detail: (d: unknown) => string): Promise<StatusCheck> {
+	const first = await statusFetch(label, url, ua, ok, detail);
+	if (first.status !== "fail") return first;
+	await new Promise((r) => setTimeout(r, 2500));
+	const retry = await statusFetch(label, url, ua, ok, detail);
+	if (retry.status !== "fail") emitDiag(env, ctx, "syntheticCheckFlaky", `${label}: transient "${first.detail}" recovered on retry`);
+	return retry;
+}
+
 async function runSyntheticChecks(env: Env, ctx: ExecutionContext): Promise<void> {
 	const checks: StatusCheck[] = [];
 	// ESPN core (the Aug-4 outage path: a scoreboard failure takes Home + Schedule dark).
-	checks.push(await statusFetch("ESPN scoreboard", ESPN_SCOREBOARD, ESPN_UA,
+	checks.push(await statusFetchPaging(env, ctx, "ESPN scoreboard", ESPN_SCOREBOARD, ESPN_UA,
 		(d) => Array.isArray((d as { events?: unknown[] }).events) && ((d as { events?: unknown[] }).events?.length ?? 0) > 0,
 		(d) => `${(d as { events?: unknown[] }).events?.length ?? 0} events`));
-	checks.push(await statusFetch("ESPN standings", "https://site.api.espn.com/apis/v2/sports/soccer/usa.nwsl/standings", ESPN_UA,
+	checks.push(await statusFetchPaging(env, ctx, "ESPN standings", "https://site.api.espn.com/apis/v2/sports/soccer/usa.nwsl/standings", ESPN_UA,
 		(d) => JSON.stringify(d).length > 200, () => "reachable"));
 	// Fan Zone content pools live in KV — an emptied/expired pool = the game opens to nothing.
 	const khg = (await env.FEED_TAGS.get(KNOWHER_POOL_KEY, "json").catch(() => null)) as { players?: unknown[] } | null;
