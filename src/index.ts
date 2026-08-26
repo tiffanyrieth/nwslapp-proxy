@@ -2591,17 +2591,23 @@ async function bskySourceHealth(env: Env): Promise<BskyHealth[]> {
 	const bsky = (await loadFeedHandles(env)).filter((h) => h.kind === "reporter" || h.kind === "league");
 	return Promise.all(bsky.map(async (h): Promise<BskyHealth> => {
 		const kind = h.kind as "reporter" | "league";
-		try {
-			const feed = await bskyAuthorFeed(h.handle, 15); // deeper sample so reposts don't mask an active handle
-			const age = latestOriginalAgeMs(feed, now);
-			if (age === null) return { handle: h.handle, kind, tier: "empty", lastPostDays: null };
-			const days = Math.floor(age / 86_400_000);
-			if (age < BSKY_COOLING_MS) return { handle: h.handle, kind, tier: "ok", lastPostDays: days };
-			if (age <= BSKY_DORMANT_MS) return { handle: h.handle, kind, tier: "cooling", lastPostDays: days };
-			return { handle: h.handle, kind, tier: "dormant", lastPostDays: days };
-		} catch {
-			return { handle: h.handle, kind, tier: "dead", lastPostDays: null };
+		// One retry before declaring "dead". The keyless AT-Proto API blips transiently (same class as
+		// the ESPN 525 that false-paged 2026-08-26); this audit feeds the Status board + /social/
+		// reporter-audit, so a momentary hiccup would wrongly mark a LIVE reporter a "drop candidate".
+		// A genuinely dead/renamed handle fails both attempts. Health path only — the live feed fetch
+		// (bskyAuthorFeed elsewhere) is untouched. `deeper sample` (15) so reposts don't mask activity.
+		let feed: BskyItem[] | null = null;
+		for (let attempt = 0; attempt < 2; attempt++) {
+			try { feed = await bskyAuthorFeed(h.handle, 15); break; }
+			catch { if (attempt === 0) await new Promise((r) => setTimeout(r, 2500)); }
 		}
+		if (feed === null) return { handle: h.handle, kind, tier: "dead", lastPostDays: null };
+		const age = latestOriginalAgeMs(feed, now);
+		if (age === null) return { handle: h.handle, kind, tier: "empty", lastPostDays: null };
+		const days = Math.floor(age / 86_400_000);
+		if (age < BSKY_COOLING_MS) return { handle: h.handle, kind, tier: "ok", lastPostDays: days };
+		if (age <= BSKY_DORMANT_MS) return { handle: h.handle, kind, tier: "cooling", lastPostDays: days };
+		return { handle: h.handle, kind, tier: "dormant", lastPostDays: days };
 	}));
 }
 
@@ -5890,13 +5896,34 @@ const SYNTHETIC_LAST_KEY = "synthetic:last";
 const SYNTHETIC_PAGE_KEY = "synthetic:last-page";
 const SYNTHETIC_PAGE_THROTTLE_MS = 60 * 60 * 1000; // at most one synthetic-fail email/hour
 
+/**
+ * Retry wrapper for the synthetic PAGER's ESPN HTTP checks ONLY. A transient upstream blip (e.g. a
+ * Cloudflare 525 SSL-handshake hiccup on ESPN's edge) self-heals in seconds; without this a single
+ * momentary fetch failure pages the owner even though the app is fine (proven 2026-08-26: a 525 on
+ * standings emailed a HARD-failure page while the endpoint returned 200 seconds later and the app's
+ * Standings served normally). We re-fetch a FAILED check once, ~2.5s later, before it counts toward
+ * `fails`. A recovery emits a `syntheticCheckFlaky` breadcrumb (no silent swallow, per the loud-to-
+ * engineer rule) but does NOT page. Deliberately NOT used by the live /admin ESPN-core board
+ * (`statusCheckESPN` keeps calling `statusFetch` single-shot, so that board still shows real-time
+ * truth incl. blips), and NOT applied to the KV pool checks or the "200-but-empty" warn case — those
+ * failures are real, not transient network, so a retry must not paper over them.
+ */
+async function statusFetchPaging(env: Env, ctx: ExecutionContext, label: string, url: string, ua: string, ok: (d: unknown) => boolean, detail: (d: unknown) => string): Promise<StatusCheck> {
+	const first = await statusFetch(label, url, ua, ok, detail);
+	if (first.status !== "fail") return first;
+	await new Promise((r) => setTimeout(r, 2500));
+	const retry = await statusFetch(label, url, ua, ok, detail);
+	if (retry.status !== "fail") emitDiag(env, ctx, "syntheticCheckFlaky", `${label}: transient "${first.detail}" recovered on retry`);
+	return retry;
+}
+
 async function runSyntheticChecks(env: Env, ctx: ExecutionContext): Promise<void> {
 	const checks: StatusCheck[] = [];
 	// ESPN core (the Aug-4 outage path: a scoreboard failure takes Home + Schedule dark).
-	checks.push(await statusFetch("ESPN scoreboard", ESPN_SCOREBOARD, ESPN_UA,
+	checks.push(await statusFetchPaging(env, ctx, "ESPN scoreboard", ESPN_SCOREBOARD, ESPN_UA,
 		(d) => Array.isArray((d as { events?: unknown[] }).events) && ((d as { events?: unknown[] }).events?.length ?? 0) > 0,
 		(d) => `${(d as { events?: unknown[] }).events?.length ?? 0} events`));
-	checks.push(await statusFetch("ESPN standings", "https://site.api.espn.com/apis/v2/sports/soccer/usa.nwsl/standings", ESPN_UA,
+	checks.push(await statusFetchPaging(env, ctx, "ESPN standings", "https://site.api.espn.com/apis/v2/sports/soccer/usa.nwsl/standings", ESPN_UA,
 		(d) => JSON.stringify(d).length > 200, () => "reachable"));
 	// Fan Zone content pools live in KV — an emptied/expired pool = the game opens to nothing.
 	const khg = (await env.FEED_TAGS.get(KNOWHER_POOL_KEY, "json").catch(() => null)) as { players?: unknown[] } | null;
