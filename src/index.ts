@@ -2591,17 +2591,23 @@ async function bskySourceHealth(env: Env): Promise<BskyHealth[]> {
 	const bsky = (await loadFeedHandles(env)).filter((h) => h.kind === "reporter" || h.kind === "league");
 	return Promise.all(bsky.map(async (h): Promise<BskyHealth> => {
 		const kind = h.kind as "reporter" | "league";
-		try {
-			const feed = await bskyAuthorFeed(h.handle, 15); // deeper sample so reposts don't mask an active handle
-			const age = latestOriginalAgeMs(feed, now);
-			if (age === null) return { handle: h.handle, kind, tier: "empty", lastPostDays: null };
-			const days = Math.floor(age / 86_400_000);
-			if (age < BSKY_COOLING_MS) return { handle: h.handle, kind, tier: "ok", lastPostDays: days };
-			if (age <= BSKY_DORMANT_MS) return { handle: h.handle, kind, tier: "cooling", lastPostDays: days };
-			return { handle: h.handle, kind, tier: "dormant", lastPostDays: days };
-		} catch {
-			return { handle: h.handle, kind, tier: "dead", lastPostDays: null };
+		// One retry before declaring "dead". The keyless AT-Proto API blips transiently (same class as
+		// the ESPN 525 that false-paged 2026-08-26); this audit feeds the Status board + /social/
+		// reporter-audit, so a momentary hiccup would wrongly mark a LIVE reporter a "drop candidate".
+		// A genuinely dead/renamed handle fails both attempts. Health path only — the live feed fetch
+		// (bskyAuthorFeed elsewhere) is untouched. `deeper sample` (15) so reposts don't mask activity.
+		let feed: BskyItem[] | null = null;
+		for (let attempt = 0; attempt < 2; attempt++) {
+			try { feed = await bskyAuthorFeed(h.handle, 15); break; }
+			catch { if (attempt === 0) await new Promise((r) => setTimeout(r, 2500)); }
 		}
+		if (feed === null) return { handle: h.handle, kind, tier: "dead", lastPostDays: null };
+		const age = latestOriginalAgeMs(feed, now);
+		if (age === null) return { handle: h.handle, kind, tier: "empty", lastPostDays: null };
+		const days = Math.floor(age / 86_400_000);
+		if (age < BSKY_COOLING_MS) return { handle: h.handle, kind, tier: "ok", lastPostDays: days };
+		if (age <= BSKY_DORMANT_MS) return { handle: h.handle, kind, tier: "cooling", lastPostDays: days };
+		return { handle: h.handle, kind, tier: "dormant", lastPostDays: days };
 	}));
 }
 
