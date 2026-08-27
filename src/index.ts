@@ -106,6 +106,15 @@ import {
 const MIN_APP_VERSION = "0.4.5";
 const MIN_APP_BUILD = 31;
 
+// Fan Zone card ordering — the owner's re-merchandising lever (2026-08-27). The app's Home
+// carousel reads `fanZoneOrder` from /config; the value lives in KV so flipping it (e.g.
+// promoting The Bracket in the offseason) needs NO deploy and NO app update. Managed via the
+// Access-gated GET /admin/fanzone-order (?set=csv | ?clear=1). Absent/invalid → /config omits
+// the field and the app uses its built-in default order. The ids are the cross-repo contract
+// with HomeView's FanGame mapping — never rename them.
+const FANZONE_ORDER_KEY = "config:fanzone_order";
+const FANZONE_GAME_IDS = ["predict", "knowHer", "trivia", "bracket"] as const;
+
 const ESPN_SCOREBOARD =
 	"https://site.api.espn.com/apis/site/v2/sports/soccer/usa.nwsl/scoreboard";
 const ESPN_SUMMARY =
@@ -808,6 +817,62 @@ export default {
 			return handleAlertSelfTest(request, env, ctx);
 		}
 
+		// Owner lever: inspect/set the Fan Zone card order served by /config. Browser-friendly
+		// GETs through the Access-gated portal: no param = show current · ?set=predict,knowHer,
+		// trivia,bracket (any unique subset — the app appends omitted games in its default order,
+		// so "bracket,trivia" is a valid "promote these for the offseason") · ?clear=1 = back to
+		// the app default. Validation is strict (known ids, no dupes) so a typo can never ship a
+		// broken order to /config.
+		if (url.pathname === "/admin/fanzone-order") {
+			const gate = await adminGate(request, env as unknown as AdminAuthEnv, { jwt: true },
+				(kind, detail) => emitDiag(env, ctx, kind, detail));
+			if (gate) return gate;
+			const escapeHtml = (s: string) =>
+				s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+			// Tiny self-contained page (renders inside the portal's iframe tab): shows the live
+			// value, one-click presets, and the custom-set recipe. Every action is a GET link
+			// back to this same URL, so the whole lever works without a terminal.
+			const page = (status: string, current: string) => new Response(`<!doctype html>
+<html><head><meta charset="utf-8"><style>
+body{background:#111;color:#ddd;font:14px -apple-system,sans-serif;padding:18px;max-width:640px}
+a{color:#9ad} code{background:#1c1c1e;padding:1px 5px;border-radius:4px;font-size:12px}
+.cur{color:#fff;font-weight:600} .ok{color:#8c8} p{line-height:1.5}
+</style></head><body>
+<p class="ok">${escapeHtml(status)}</p>
+<p>Home-carousel order served to the app: <span class="cur">${escapeHtml(current)}</span></p>
+<p>Presets:
+<a href="/admin/fanzone-order?clear=1">Season default (Predict · Know Her · Trivia · Bracket)</a> ·
+<a href="/admin/fanzone-order?set=bracket,trivia,predict,knowHer">Offseason (Bracket · Trivia first)</a></p>
+<p>Custom: <code>?set=</code> a comma list of unique ids from <code>${FANZONE_GAME_IDS.join(", ")}</code>.
+A partial list promotes those games; the rest follow in the default order.
+Apps apply it on their next launch (config cache under 5 min).</p>
+</body></html>`, { headers: { "Content-Type": "text/html; charset=utf-8" } });
+			const currentLabel = async () => {
+				const raw = await env.FEED_TAGS.get(FANZONE_ORDER_KEY);
+				return raw ?? "(not set — app default)";
+			};
+			if (url.searchParams.get("clear") === "1") {
+				await env.FEED_TAGS.delete(FANZONE_ORDER_KEY);
+				emitDiag(env, ctx, "fanZoneOrderSet", "cleared (app default order)");
+				return page("Cleared — the app uses its built-in default order.", "(not set — app default)");
+			}
+			const set = url.searchParams.get("set");
+			if (set !== null) {
+				const order = set.split(",").map((s) => s.trim()).filter(Boolean);
+				const valid = order.length > 0 && order.length <= FANZONE_GAME_IDS.length &&
+					order.every((g) => (FANZONE_GAME_IDS as readonly string[]).includes(g)) &&
+					new Set(order).size === order.length;
+				if (!valid) {
+					return page(`Invalid order "${set}" — nothing changed. Use unique ids from the list below.`,
+						await currentLabel());
+				}
+				await env.FEED_TAGS.put(FANZONE_ORDER_KEY, JSON.stringify(order));
+				emitDiag(env, ctx, "fanZoneOrderSet", order.join(","));
+				return page(`Order set: ${order.join(" → ")}`, JSON.stringify(order));
+			}
+			return page("Fan Zone card order", await currentLabel());
+		}
+
 		// Admin/routine-keyed social self-tuning audit surface: GET ?nt= (ledger populate),
 		// GET ?section=nwsl (decision report), POST /research + /apply (routine write-back).
 		// Prefix match + registered BEFORE the GET-only guard (the two POSTs need it).
@@ -939,12 +1004,33 @@ export default {
 			});
 		}
 
-		// Forced-update version gate. The app calls this at launch and blocks itself if its
-		// CFBundleVersion < minBuild. Deliberately trivial: two hardcoded numbers, no KV/DB — to
-		// force an update, bump these + redeploy. minBuild is the integer compared (monotonic
-		// per-upload); minVersion is informational. Short cache so a bump propagates within the hour.
+		// Forced-update version gate + the Fan Zone order lever. The app calls this at launch and
+		// blocks itself if its CFBundleVersion < minBuild. The gate numbers stay hardcoded (bump +
+		// redeploy, deliberately trivial); `fanZoneOrder` rides KV so the owner can re-merchandise
+		// the Home shelf with no deploy. Short cache so either change propagates within minutes;
+		// the app applies the order on its next launch.
 		if (url.pathname === "/config") {
-			return new Response(JSON.stringify({ minVersion: MIN_APP_VERSION, minBuild: MIN_APP_BUILD }), {
+			const body: Record<string, unknown> = { minVersion: MIN_APP_VERSION, minBuild: MIN_APP_BUILD };
+			try {
+				const raw = await env.FEED_TAGS.get(FANZONE_ORDER_KEY);
+				if (raw) {
+					const order: unknown = JSON.parse(raw);
+					if (
+						Array.isArray(order) && order.length > 0 &&
+						order.every((g) => (FANZONE_GAME_IDS as readonly string[]).includes(g as string))
+					) {
+						body.fanZoneOrder = order;
+					} else {
+						// Invalid stored value: omit the field (app falls back) but say so — a
+						// silently-ignored lever reads as "the lever is broken".
+						emitDiag(env, ctx, "fanZoneOrderInvalid", `stored value rejected: ${raw.slice(0, 120)}`);
+					}
+				}
+			} catch (e) {
+				emitDiag(env, ctx, "fanZoneOrderInvalid",
+					`read/parse failed: ${e instanceof Error ? e.message : String(e)}`);
+			}
+			return new Response(JSON.stringify(body), {
 				status: 200,
 				headers: { "Content-Type": "application/json", "Cache-Control": "public, max-age=300" },
 			});
