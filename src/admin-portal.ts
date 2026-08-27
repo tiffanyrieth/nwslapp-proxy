@@ -58,6 +58,7 @@ export const ADMIN_PORTAL_HTML = `<!doctype html>
   <button data-tab="bracket">The Bracket</button>
   <button data-tab="knowher">Know Her Game</button>
   <button data-tab="analytics">Analytics</button>
+  <button data-tab="fanzone">Fan Zone</button>
 </nav>
 
 <div class="panel on" id="roster">
@@ -73,6 +74,7 @@ export const ADMIN_PORTAL_HTML = `<!doctype html>
 <div class="panel" id="bracket"><iframe data-src="/bracket/admin" title="The Bracket admin"></iframe></div>
 <div class="panel" id="knowher"><iframe data-src="/knowher/admin" title="Know Her Game admin"></iframe></div>
 <div class="panel" id="analytics"><iframe data-src="/analytics/admin" title="Analytics"></iframe></div>
+<div class="panel" id="fanzone"><iframe data-src="/admin/fanzone-order" title="Fan Zone card order"></iframe></div>
 
 <script>
 const $ = (s) => document.querySelector(s);
