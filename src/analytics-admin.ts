@@ -89,6 +89,21 @@ export async function computeMetrics(env: Env): Promise<unknown> {
     .sort((a, b) => (a.week < b.week ? 1 : -1))
     .slice(0, 8);
 
+  // MAU by calendar month from active_month (each device counts once/month → sum = MAU), split new/returning.
+  // The honest reach measure — a soccer app people don't open every week. 60-day pull gives ~2-3 months.
+  const monthMap: Record<string, { new: number; returning: number }> = {};
+  for (const r of rows) {
+    if (r.event !== "active_month") continue;
+    const m = r.day.slice(0, 7);                    // YYYY-MM
+    (monthMap[m] ??= { new: 0, returning: 0 });
+    if (r.param === "new") monthMap[m].new += Number(r.count);
+    else monthMap[m].returning += Number(r.count);
+  }
+  const months = Object.entries(monthMap)
+    .map(([month, v]) => ({ month, mau: v.new + v.returning, new: v.new, returning: v.returning }))
+    .sort((a, b) => (a.month < b.month ? 1 : -1))
+    .slice(0, 3);
+
   // Resilient: if the engagement RPC isn't applied yet, still render the counter metrics.
   let engagement: Record<string, number> = {};
   try {
@@ -110,7 +125,7 @@ export async function computeMetrics(env: Env): Promise<unknown> {
   return {
     generatedAt: new Date(now).toISOString(),
     weeks,
-    sessionLength: sumByParam(rows, "session_length", since30),
+    months,
     daysActive: sumByParam(rows, "days_active_week", since60),
     tabs: sumByParam(rows, "tab_opened", since30),
     gameOpens: sumByParam(rows, "fanzone_game_opened", since30),
@@ -167,15 +182,24 @@ async function load(){
   let d; try { const r = await fetch('/analytics/admin/api',{method:'POST'}); d = await r.json(); } catch(e){ document.getElementById('out').innerHTML='<div class="err">Failed to load.</div>'; return; }
   if (d.error){ document.getElementById('out').innerHTML='<div class="err">Error: '+esc(d.error)+'</div>'; return; }
   const wk = (d.weeks||[])[0] || {wau:0,new:0,returning:0,week:'—'};
+  const mo = (d.months||[])[0] || {mau:0,new:0,returning:0,month:'—'};
   const e = d.engagement||{};
-  const sl = d.sessionLength||{}; const slTotal = Object.values(sl).reduce((a,b)=>a+b,0);
+  // Coarsen the days-opened-per-week buckets (1/2/3to4/5to7) to the owner's once/twice/3+ view.
+  const cadence = (obj) => { const o={'1 day':0,'2 days':0,'3+ days':0}; for(const [k,v] of Object.entries(obj||{})){ if(k==='1')o['1 day']+=v; else if(k==='2')o['2 days']+=v; else o['3+ days']+=v; } return o; };
   let h = '';
   h += '<h2>This week ('+esc(wk.week)+')</h2><div class="grid">';
-  h += '<div class="card"><div class="big">'+(wk.wau||0)+'</div><div class="sub">weekly active (all users)</div></div>';
-  h += '<div class="card"><div class="big">'+(wk.returning||0)+'</div><div class="sub">returning · '+(wk.new||0)+' new</div></div>';
+  h += '<div class="card"><div class="big">'+(wk.wau||0)+'</div><div class="sub">weekly active users (devices)</div></div>';
+  h += '<div class="card"><div class="big">'+(wk.returning||0)+'</div><div class="sub">returning (opened before) · '+(wk.new||0)+' new (first time ever)</div></div>';
   h += '<div class="card"><div class="big">'+(e.fanzone_players||0)+'</div><div class="sub">played Fan Zone (signed-in)</div></div>';
-  h += '<div class="card"><div class="big">'+(e.new_players||0)+'</div><div class="sub">new signed-in players</div></div>';
+  h += '<div class="card"><div class="big">'+(e.new_players||0)+'</div><div class="sub">new signed-in accounts (7d)</div></div>';
   h += '</div>';
+  h += '<div class="muted">"Active users" above = anonymous device opens. "New signed-in accounts" is a separate server count of profiles created — currently inflated by test/seed accounts until the pre-launch purge, and not comparable to the device numbers.</div>';
+  h += '<h2>This month ('+esc(mo.month)+')</h2><div class="grid">';
+  h += '<div class="card"><div class="big">'+(mo.mau||0)+'</div><div class="sub">monthly active users (30-day reach)</div></div>';
+  h += '<div class="card"><div class="big">'+(mo.returning||0)+'</div><div class="sub">returning (opened before) · '+(mo.new||0)+' new (first time ever)</div></div>';
+  h += '</div>';
+  h += '<h2>Monthly active (last months)</h2><table><tr><th>month</th><th>MAU</th><th>new</th><th>returning</th></tr>'+
+       (d.months||[]).map(m=>'<tr><td>'+esc(m.month)+'</td><td>'+m.mau+'</td><td>'+m.new+'</td><td>'+m.returning+'</td></tr>').join('')+'</table>';
   h += '<h2>Weekly active (last weeks)</h2><table><tr><th>week</th><th>WAU</th><th>new</th><th>returning</th></tr>'+
        (d.weeks||[]).map(w=>'<tr><td>'+esc(w.week)+'</td><td>'+w.wau+'</td><td>'+w.new+'</td><td>'+w.returning+'</td></tr>').join('')+'</table>';
   h += '<h2>Fan Zone plays this week (signed-in players)</h2><table><tr><th>game</th><th>players</th></tr>'+
@@ -201,9 +225,10 @@ async function load(){
     h += '<h2>Most-followed clubs</h2><table><tr><th>club</th><th>followers</th><th>% of followers</th></tr>'+
          (Object.entries(f.by_team||{}).sort((a,b)=>b[1]-a[1]).map(([t,c])=>'<tr><td>'+esc(t)+'</td><td>'+c+'</td><td>'+pct(c,f.total_followers)+'</td></tr>').join('')||'<tr><td class="muted" colspan=3>no follows yet</td></tr>')+'</table>';
   }
-  h += '<h2>Session length (30d)</h2><table><tr><th>bucket</th><th>sessions</th><th>%</th></tr>'+
-       ['lt1m','1to5m','5to15m','15to30m','gt30m'].map(b=>'<tr><td>'+b+'</td><td>'+(sl[b]||0)+'</td><td>'+pct(sl[b]||0,slTotal)+'</td></tr>').join('')+'</table>';
-  h += '<h2>Days opened / week</h2><table><tr><th>days</th><th>devices</th></tr>'+rows(d.daysActive)+'</table>';
+  const cad = cadence(d.daysActive);
+  h += '<h2>How often people open the app (per week)</h2><table><tr><th>days opened</th><th>weeks</th></tr>'+
+       ['1 day','2 days','3+ days'].map(k=>'<tr><td>'+esc(k)+'</td><td>'+(cad[k]||0)+'</td></tr>').join('')+'</table>'+
+       '<div class="muted">Distinct days a device opened the app in a week — a once-a-week app, or 3+?</div>';
   h += '<h2>Most-opened tabs (30d)</h2><table><tr><th>tab</th><th>opens</th></tr>'+rows(d.tabs)+'</table>';
   h += '<h2>Fan Zone opens (30d)</h2><table><tr><th>game</th><th>opens</th></tr>'+rows(d.gameOpens)+'</table>';
   h += '<h2>Social</h2><table><tr><th>filter</th><th>taps</th></tr>'+rows(d.feedChips)+'</table><div class="muted">content taps (30d): '+(d.feedItemTaps||0)+'</div>';
