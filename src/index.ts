@@ -5772,8 +5772,9 @@ const ANALYTICS_EVENTS = new Set([
 	"reporter_add_session", // denominator: sessions that added ANY reporter
 	// Engagement counters (2026-08-22): all coarse buckets, self-deduped per window on-device, no identity.
 	"active_week",       // param new/returning — once per ISO week per device → sum = WAU
-	"days_active_week",  // param 1/2/3to4/5to7 — prior week's distinct-day count
-	"session_length",    // param lt1m/1to5m/5to15m/15to30m/gt30m — this launch's foreground length
+	"active_month",      // param new/returning — once per calendar month per device → sum = MAU (2026-08-28)
+	"days_active_week",  // param 1/2/3to4/5to7 — prior week's distinct-day count (the "days a week" cadence)
+	// NOTE: session_length was retired 2026-08-28 (not useful for this app) — the app no longer emits it.
 ]);
 
 /** Anonymous Level-3 usage counters: `POST /analytics` with a pre-summed per-session batch
