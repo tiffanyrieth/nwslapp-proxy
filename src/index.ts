@@ -1372,20 +1372,20 @@ async function proxyAndCache(
 		// Step 2 — stale copy under the same key (expired-but-not-evicted edge entry).
 		const stale = await serveStale(cache, cacheKey);
 		if (stale) {
-			emitDiag(env, ctx, "staleServe", `${failDetail} — served stale`);
+			emitDiagCoalesced(env, ctx, "staleServe", `${failDetail} — served stale`, url.pathname);
 			return withClientTTL(stale);
 		}
 		// Step 3 — the last-known-good snapshot (normalized key, see snapshotKeyURL). Short client
 		// TTL: a device must not pin outage-era data for the usual hour once ESPN recovers.
 		const snap = await cache.match(new Request(snapshotKeyURL(url), { method: "GET" }));
 		if (snap) {
-			emitDiag(env, ctx, "staleServe", `${failDetail} — served snapshot`);
+			emitDiagCoalesced(env, ctx, "staleServe", `${failDetail} — served snapshot`, url.pathname);
 			const out = new Response(snap.body, snap);
 			out.headers.set("Cache-Control", "public, max-age=30");
 			return withCacheStatus(out, "STALE");
 		}
 		// Step 4 — nothing to serve. This is the only outcome the caller sees as an error.
-		emitDiag(env, ctx, "apiFailure", `${failDetail} (no fallback)`);
+		emitDiagCoalesced(env, ctx, "apiFailure", `${failDetail} (no fallback)`, url.pathname);
 		return upstreamError(espnResponse?.status);
 	}
 
@@ -1486,7 +1486,7 @@ function upstreamError(status?: number): Response {
 async function serveStaleOr502(env: Env, ctx: ExecutionContext, cache: Cache, cacheKey: Request, route: string): Promise<Response> {
 	const stale = await serveStale(cache, cacheKey);
 	if (stale) return stale;
-	emitDiag(env, ctx, "apiFailure", `${route} upstream failed (no fallback)`);
+	emitDiagCoalesced(env, ctx, "apiFailure", `${route} upstream failed (no fallback)`, route);
 	return upstreamError();
 }
 
@@ -2481,6 +2481,30 @@ export function emitDiag(env: Env, ctx: ExecutionContext, kind: string, detail: 
 	// flood can never bury them in the newest-N list window. The owner view (/telemetry/recent) merges both.
 	const key = `sdiag:${1e15 - Date.now()}:${crypto.randomUUID().slice(0, 8)}`;
 	ctx.waitUntil(env.FEED_TAGS.put(key, JSON.stringify(record), { expirationTtl: 60 * 60 * 24 * 30 }));
+}
+
+// In-memory (per-isolate) coalescer for the HOT ESPN failure-ladder diags. During an outage every
+// polling request hits staleServe/apiFailure → one `sdiag:` KV write EACH (100-300 in a 2-min blip at
+// 1k users). This writes at most one `sdiag:` per (kind, route) per window, carrying the suppressed
+// count so the incident's SCALE still surfaces and the error-spike pager still trips on a sustained
+// outage (≥8/15min accrues across windows + multiple routes; brief single-route blips no longer
+// storm it, and synthetic checks catch a real down independently). Per-isolate + route-bounded, so
+// the Map stays tiny. (2026-08-30 KV write-budget pass, docs/stress-testing.md §7.)
+const diagCoalesce = new Map<string, { windowStart: number; count: number }>();
+const DIAG_COALESCE_WINDOW_MS = 60 * 1000;
+
+function emitDiagCoalesced(env: Env, ctx: ExecutionContext, kind: string, detail: string, route: string): void {
+	const now = Date.now();
+	const mapKey = `${kind}|${route}`;
+	const e = diagCoalesce.get(mapKey);
+	if (!e || now - e.windowStart >= DIAG_COALESCE_WINDOW_MS) {
+		const suppressed = e ? e.count - 1 : 0; // the prior window's count minus the one already written at its start
+		const note = suppressed > 0 ? ` [+${suppressed} suppressed in prior ${DIAG_COALESCE_WINDOW_MS / 1000}s]` : "";
+		emitDiag(env, ctx, kind, `${detail}${note}`);
+		diagCoalesce.set(mapKey, { windowStart: now, count: 1 });
+	} else {
+		e.count += 1; // within the window → count only, no KV write
+	}
 }
 
 /** Many events, ONE KV write. For a job that produces a burst of findings at once (the nightly
