@@ -1958,7 +1958,20 @@ async function handleClubNewsDeviceReport(request: Request, env: Env, ctx: Execu
 		at: Date.now(),
 		error: typeof body.error === "string" ? body.error.slice(0, 200) : undefined,
 	};
-	ctx.waitUntil(env.FEED_TAGS.put(clubDeviceHealthKey(abbr), JSON.stringify(record), { expirationTtl: 7 * 24 * 3600 }));
+	// KV-write budget guard: every active device POSTs this beacon (a 6h sweep + per-Home-load), so at
+	// launch scale it was ~2-4k unconditional writes/day for just 2 keys (CHI/POR). Write ONLY when the
+	// health VERDICT flips (`ok && count>0` — the exact predicate deviceFallbackCheck grades on) OR the
+	// beacon hasn't refreshed in 12h. The refresh keeps `at` well inside deviceFallbackCheck's 3-day
+	// stale window so a continuously-healthy club stays 🟢, while a genuine failure still writes
+	// immediately and a SILENT stop still ages to stale/🔴. ~4k/day → ~4/day, no monitoring lost.
+	const key = clubDeviceHealthKey(abbr);
+	const prev = (await env.FEED_TAGS.get(key, "json").catch(() => null)) as ClubDeviceHealth | null;
+	const healthy = (r: ClubDeviceHealth) => r.ok && r.count > 0;
+	const flipped = !prev || healthy(prev) !== healthy(record);
+	const staleRefresh = !prev || record.at - (prev.at ?? 0) >= 12 * 3600 * 1000;
+	if (flipped || staleRefresh) {
+		ctx.waitUntil(env.FEED_TAGS.put(key, JSON.stringify(record), { expirationTtl: 7 * 24 * 3600 }));
+	}
 	return jsonResponse({ ok: true }, 200);
 }
 
