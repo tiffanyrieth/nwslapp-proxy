@@ -1207,13 +1207,15 @@ Apps apply it on their next launch (config cache under 5 min).</p>
 			// Scheduled synthetic checks (A4) + client crash/feature aggregate (A5), each internally gated
 			// to ~30 min so they ride the shared tick without a new cron trigger, and isolated so an
 			// alerting bug can never affect the bracket engine.
+			// Gate on each pass's own `:last` result key (written every run) instead of a separate
+			// `:due` marker — one KV write/cycle, not two (KV budget; see dueBySnapshot).
 			try {
-				if (await dueByMarker(env, "synthetic:due", 30 * 60 * 1000)) await runSyntheticChecks(env, ctx);
+				if (await dueBySnapshot(env, SYNTHETIC_LAST_KEY, 30 * 60 * 1000)) await runSyntheticChecks(env, ctx);
 			} catch {
 				/* best-effort; the next gated tick retries */
 			}
 			try {
-				if (await dueByMarker(env, "clientagg:due", 30 * 60 * 1000)) await scanClientAggregate(env, ctx);
+				if (await dueBySnapshot(env, CLIENTAGG_LAST_KEY, 30 * 60 * 1000)) await scanClientAggregate(env, ctx);
 			} catch {
 				/* best-effort; the next gated tick retries */
 			}
@@ -5929,6 +5931,17 @@ async function dueByMarker(env: Env, key: string, intervalMs: number): Promise<b
 	if (last && Date.now() - Number(last) < intervalMs) return false;
 	await env.FEED_TAGS.put(key, String(Date.now()), { expirationTtl: 60 * 60 * 24 * 40 });
 	return true;
+}
+
+/** Cadence gate that reuses a pass's OWN result key (`…:last`, which it already rewrites every run
+ *  with a fresh `at`) as the throttle — so the pass costs ONE KV write/cycle instead of two (the
+ *  separate `dueByMarker` `:due` marker + the `:last` payload). Returns true when the pass is due
+ *  (never run, or `at` older than intervalMs). Read-only, so a due pass still writes exactly its one
+ *  `:last`. Nothing reads the old `:due` markers, so dropping them is invisible. (2026-08-30 KV
+ *  write-budget pass, docs/stress-testing.md §7 — cuts the alerting bookkeeping floor 192→96/day.) */
+async function dueBySnapshot(env: Env, lastKey: string, intervalMs: number): Promise<boolean> {
+	const snap = (await env.FEED_TAGS.get(lastKey, "json").catch(() => null)) as { at?: number } | null;
+	return !snap?.at || Date.now() - snap.at >= intervalMs;
 }
 
 async function checkErrorSpike(env: Env, ctx: ExecutionContext): Promise<void> {
