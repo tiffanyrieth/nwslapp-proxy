@@ -191,7 +191,10 @@ const CLIENT_MAX_TTL = 3600; // 1h
 // to evict settled-zero summaries pinned IMMUTABLE by the 14-day give-up (and any re-pinned via
 // ESPN's own stale CDN before /summary busted upstream) — the frozen-attendance regression.
 const CACHE_EPOCH = "3";
-const TEAM_VIDEOS_TTL = 3600; // 1hr — a club's recent uploads change at most a few times/day
+const TEAM_VIDEOS_TTL = 7200; // 2hr (read-load pass 2026-09-02: raised 1h→2h to match the club-news KV floor
+// CLUBNEWS_TTL below — club news is already 2h-bounded so this adds ZERO club-news staleness, only ~2h vs ~1h
+// YouTube-upload freshness; ~2× fewer /team-videos hits. NOT higher: club news is demand-refreshed at 2h with
+// no cron to align a longer TTL to, so >2h would stale breaking club news across the shared cache key.)
 const TEAM_STATS_TTL = 3600; // 1hr — a squad's season stat totals only move after a match (a few times/week);
 // 1h keeps the shared cache warm so the team page's ~27-athlete stat bundle is one edge-cached call, not 27
 // per-device ESPN calls. Not a live surface — the live match card is elsewhere.
@@ -1944,36 +1947,12 @@ async function handleClubNewsNormalize(request: Request, url: URL): Promise<Resp
 	return jsonResponse(cards, 200);
 }
 
-/** POST /club-news/device-report — the app reports the RESULT of a device-IP club-news fetch so the
- *  admin Status tab can verify the device-fallback clubs (CHI/POR). Without this a URL move on a
- *  blocked club looks identical to the normal block (a masked 🔵); with it the beacon goes stale/🔴.
- *  Body `{abbr, ok, count, error?}`. Open + best-effort (like /telemetry): informational, owner-only
- *  display, one KV row per club (latest wins), 7-day TTL so a silent stop shows as stale. */
-async function handleClubNewsDeviceReport(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
-	let body: { abbr?: string; ok?: boolean; count?: number; error?: string };
-	try { body = await request.json(); } catch { return jsonResponse({ ok: false }, 400); }
-	const abbr = String(body.abbr ?? "").toUpperCase();
-	if (!DEVICE_FALLBACK_CLUBS.has(abbr)) return jsonResponse({ ok: false }, 400); // only the known device clubs
-	const record: ClubDeviceHealth = {
-		ok: body.ok === true,
-		count: Math.max(0, Math.min(500, Math.floor(Number(body.count) || 0))),
-		at: Date.now(),
-		error: typeof body.error === "string" ? body.error.slice(0, 200) : undefined,
-	};
-	// KV-write budget guard: every active device POSTs this beacon (a 6h sweep + per-Home-load), so at
-	// launch scale it was ~2-4k unconditional writes/day for just 2 keys (CHI/POR). Write ONLY when the
-	// health VERDICT flips (`ok && count>0` — the exact predicate deviceFallbackCheck grades on) OR the
-	// beacon hasn't refreshed in 12h. The refresh keeps `at` well inside deviceFallbackCheck's 3-day
-	// stale window so a continuously-healthy club stays 🟢, while a genuine failure still writes
-	// immediately and a SILENT stop still ages to stale/🔴. ~4k/day → ~4/day, no monitoring lost.
-	const key = clubDeviceHealthKey(abbr);
-	const prev = (await env.FEED_TAGS.get(key, "json").catch(() => null)) as ClubDeviceHealth | null;
-	const healthy = (r: ClubDeviceHealth) => r.ok && r.count > 0;
-	const flipped = !prev || healthy(prev) !== healthy(record);
-	const staleRefresh = !prev || record.at - (prev.at ?? 0) >= 12 * 3600 * 1000;
-	if (flipped || staleRefresh) {
-		ctx.waitUntil(env.FEED_TAGS.put(key, JSON.stringify(record), { expirationTtl: 7 * 24 * 3600 }));
-	}
+/** POST /club-news/device-report — RETIRED 2026-09-02. The device beacon moved to Supabase
+ *  (`club_news_device_health`, upserted by the app directly), off the Worker request budget. This route
+ *  is kept as a harmless 200 no-op ONLY so app builds <=39 (which still POST here) don't error during
+ *  the transition; the admin Status tab now reads the beacon from Supabase (see fetchDeviceBeacon).
+ *  Retire this route entirely once the fleet is on build 40+. */
+async function handleClubNewsDeviceReport(_request: Request, _env: Env, _ctx: ExecutionContext): Promise<Response> {
 	return jsonResponse({ ok: true }, 200);
 }
 
@@ -2633,12 +2612,38 @@ function ageLabel(ms: number): string {
 	return `${Math.round(h / 24)}d ago`;
 }
 
-/** The device-fallback health for one blocked club (CHI/POR), from the beacon the app POSTs. */
-async function deviceFallbackCheck(abbr: string, url: string | undefined, env: Env): Promise<StatusCheck> {
+/** Read one blocked club's device beacon. SOURCE OF TRUTH = Supabase `club_news_device_health`
+ *  (2026-09-02: the app now upserts it there directly, off the Worker request budget). Falls back to
+ *  the legacy KV beacon (`clubnews-devhealth-*`) during the transition, since app builds <=39 still
+ *  POST to the (now no-op) /club-news/device-report and their last KV value stays valid until it ages
+ *  out. Returns the unified {ok,count,at,error} shape so the grading below is unchanged. */
+async function fetchDeviceBeacon(abbr: string, env: Env): Promise<ClubDeviceHealth | null> {
+	const cfg = env as unknown as SupabaseAdminEnv;
+	if (cfg.SUPABASE_URL && cfg.SUPABASE_SERVICE_ROLE_KEY) {
+		try {
+			const base = cfg.SUPABASE_URL.replace(/\/$/, "");
+			const r = await fetch(
+				`${base}/rest/v1/club_news_device_health?abbr=eq.${encodeURIComponent(abbr)}&select=ok,card_count,reported_at,error`,
+				{ headers: { apikey: cfg.SUPABASE_SERVICE_ROLE_KEY, Authorization: `Bearer ${cfg.SUPABASE_SERVICE_ROLE_KEY}` } },
+			);
+			if (r.ok) {
+				const rows = (await r.json()) as Array<{ ok: boolean; card_count: number; reported_at: string; error: string | null }>;
+				if (rows.length > 0) {
+					const row = rows[0];
+					return { ok: row.ok, count: row.card_count, at: Date.parse(row.reported_at) || 0, error: row.error ?? undefined };
+				}
+			}
+		} catch { /* fall through to the legacy KV beacon */ }
+	}
 	const raw = await env.FEED_TAGS.get(clubDeviceHealthKey(abbr)).catch(() => null);
-	if (!raw) return { label: abbr, status: "warn", detail: "device-fallback club — NO device check yet (open the app on a device to verify its URL)" };
-	let rec: ClubDeviceHealth;
-	try { rec = JSON.parse(raw) as ClubDeviceHealth; } catch { return { label: abbr, status: "warn", detail: "device-fallback club — unreadable beacon" }; }
+	if (!raw) return null;
+	try { return JSON.parse(raw) as ClubDeviceHealth; } catch { return null; }
+}
+
+/** The device-fallback health for one blocked club (CHI/POR), from the Supabase beacon (KV fallback). */
+async function deviceFallbackCheck(abbr: string, url: string | undefined, env: Env): Promise<StatusCheck> {
+	const rec = await fetchDeviceBeacon(abbr, env);
+	if (!rec) return { label: abbr, status: "warn", detail: "device-fallback club — NO device check yet (open the app on a device to verify its URL)" };
 	const age = Date.now() - (rec.at ?? 0);
 	if (!rec.ok || rec.count <= 0) {
 		return { label: abbr, status: "fail", detail: `device-fetch got NOTHING (${ageLabel(age)}) — URL MOVED/blocked? ${rec.error ? `[${rec.error}] ` : ""}CHECK: ${url ?? "—"}` };
