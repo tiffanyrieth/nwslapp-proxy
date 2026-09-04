@@ -906,12 +906,23 @@ Apps apply it on their next launch (config cache under 5 min).</p>
 		// Admin-only: refresh the IG social snapshot on demand (the every-2-day cron does
 		// this automatically; this forces an immediate pull after a token swap or an aborted
 		// run). Same BRACKET_ADMIN_KEY gate as /headshots/run.
+		// `?side=clubs` triggers ONLY the Bright Data club scrape — same capped `num_of_posts`
+		// per club the cron uses (16 clubs × BD_POSTS_PER_PROFILE ≈ 96 records), NO Apify player
+		// run. The safe manual catch-up for a missed biweekly cron: a raw BD /trigger omits the
+		// cap and over-fetches (owner hit >1k). Default (no `side`) does BOTH, exactly like the cron.
 		if (url.pathname === "/refresh-social") {
 			if (request.method !== "POST") return new Response("forbidden", { status: 403 });
 			const gate = await adminGate(request, env as unknown as AdminAuthEnv, { jwt: false },
 				(kind, detail) => emitDiag(env, ctx, kind, detail));
 			if (gate) return gate;
+			const side = url.searchParams.get("side");
 			try {
+				if (side === "clubs") {
+					const clubs = await triggerBrightDataClubs(env, ctx);
+					return new Response(`${JSON.stringify({ clubs })}\n`, {
+						headers: { "Content-Type": "application/json" },
+					});
+				}
 				const summary = await refreshSocialCache(env, ctx);
 				return new Response(`${JSON.stringify(summary)}\n`, {
 					headers: { "Content-Type": "application/json" },
