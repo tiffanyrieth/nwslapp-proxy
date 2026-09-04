@@ -31,6 +31,65 @@ function daysAgoISO(n: number, now: number): string {
   return new Date(now - n * 86400000).toISOString().slice(0, 10);
 }
 
+// ── Human-readable period labels (owner's 2026-09-05 relabel: business shorthand, never ISO keys) ──
+// Deterministic (no Intl/locale) so node --test pins them exactly.
+const MONTH_SHORT = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"];
+const MONTH_LONG  = ["January","February","March","April","May","June","July","August","September","October","November","December"];
+
+/** Monday (UTC) of ISO week "YYYY-Www". ISO week 1 is the week containing Jan 4. */
+export function isoWeekMonday(weekKey: string): Date {
+  const [y, w] = weekKey.split("-W").map(Number);
+  const jan4 = new Date(Date.UTC(y, 0, 4));
+  const dow = (jan4.getUTCDay() + 6) % 7;            // Mon=0 … Sun=6
+  const week1Mon = Date.UTC(y, 0, 4 - dow);
+  return new Date(week1Mon + (w - 1) * 7 * 86400000);
+}
+
+/** "Aug 25–31" or, across a month boundary, "Aug 30 – Sep 5". */
+export function isoWeekDateRange(weekKey: string): string {
+  const mon = isoWeekMonday(weekKey);
+  const sun = new Date(mon.getTime() + 6 * 86400000);
+  const m1 = MONTH_SHORT[mon.getUTCMonth()], m2 = MONTH_SHORT[sun.getUTCMonth()];
+  return m1 === m2
+    ? `${m1} ${mon.getUTCDate()}–${sun.getUTCDate()}`
+    : `${m1} ${mon.getUTCDate()} – ${m2} ${sun.getUTCDate()}`;
+}
+
+/** "2026-09" → "September". */
+export function monthLabel(yyyymm: string): string {
+  const m = Number(yyyymm.slice(5, 7));
+  return MONTH_LONG[m - 1] ?? yyyymm;
+}
+
+export interface WeekRow { week: string; wau: number; new: number; returning: number }
+export interface MonthRow { month: string; mau: number; new: number; returning: number }
+
+/** The headline periods (owner's A2 layout, 2026-09-05 — "last week + month to date", the way a
+ *  business dashboard reads): the most recent COMPLETED ISO week (strictly before the current key),
+ *  the current week so far (personal-reflection only), and the current month to date. `weeks` /
+ *  `months` are newest-first; keys compare lexicographically (zero-padded), incl. year rollover. */
+export function pickHeadline(weeks: WeekRow[], months: MonthRow[], todayISO: string) {
+  const currentWeekKey = isoWeek(todayISO);
+  const currentMonthKey = todayISO.slice(0, 7);
+  return {
+    currentWeekKey,
+    currentMonthKey,
+    lastCompletedWeek: weeks.find((w) => w.week < currentWeekKey) ?? null,
+    currentWeekSoFar: weeks.find((w) => w.week === currentWeekKey) ?? null,
+    monthToDate: months.find((m) => m.month === currentMonthKey) ?? null,
+  };
+}
+
+/** The Feed filters that exist in the app TODAY (FeedViewModel.ContentFilter: all/reporters/players).
+ *  The "clubs" chip was removed, but its taps linger in the 30-day counters from older builds — hide
+ *  any param not in this set so the dashboard never shows a ghost filter. Add here when the app adds one. */
+const LIVE_FEED_FILTERS = new Set(["all", "reporters", "players"]);
+export function onlyLiveFilters(chips: Record<string, number>): Record<string, number> {
+  const out: Record<string, number> = {};
+  for (const [k, v] of Object.entries(chips)) if (LIVE_FEED_FILTERS.has(k)) out[k] = v;
+  return out;
+}
+
 async function sbGet<T>(env: Env, path: string): Promise<T> {
   const r = await fetch(`${env.SUPABASE_URL}/rest/v1/${path}`, {
     headers: {
@@ -85,7 +144,7 @@ export async function computeMetrics(env: Env): Promise<unknown> {
     else weekMap[w].returning += Number(r.count);
   }
   const weeks = Object.entries(weekMap)
-    .map(([week, v]) => ({ week, wau: v.new + v.returning, new: v.new, returning: v.returning }))
+    .map(([week, v]) => ({ week, range: isoWeekDateRange(week), wau: v.new + v.returning, new: v.new, returning: v.returning }))
     .sort((a, b) => (a.week < b.week ? 1 : -1))
     .slice(0, 8);
 
@@ -100,7 +159,7 @@ export async function computeMetrics(env: Env): Promise<unknown> {
     else monthMap[m].returning += Number(r.count);
   }
   const months = Object.entries(monthMap)
-    .map(([month, v]) => ({ month, mau: v.new + v.returning, new: v.new, returning: v.returning }))
+    .map(([month, v]) => ({ month, name: monthLabel(month), mau: v.new + v.returning, new: v.new, returning: v.returning }))
     .sort((a, b) => (a.month < b.month ? 1 : -1))
     .slice(0, 3);
 
@@ -124,12 +183,24 @@ export async function computeMetrics(env: Env): Promise<unknown> {
 
   return {
     generatedAt: new Date(now).toISOString(),
+    // Headline periods: last COMPLETED week + month to date (the calendar cards reset at the
+    // boundary by design — a device self-counts once per ISO week / calendar month — so the
+    // honest glance is the finished week, not the partial one).
+    headline: (() => {
+      const h = pickHeadline(weeks, months, new Date(now).toISOString().slice(0, 10));
+      return {
+        ...h,
+        lastCompletedWeekRange: h.lastCompletedWeek ? isoWeekDateRange(h.lastCompletedWeek.week) : null,
+        currentWeekRange: isoWeekDateRange(h.currentWeekKey),
+        monthName: monthLabel(h.currentMonthKey),
+      };
+    })(),
     weeks,
     months,
     daysActive: sumByParam(rows, "days_active_week", since60),
     tabs: sumByParam(rows, "tab_opened", since30),
     gameOpens: sumByParam(rows, "fanzone_game_opened", since30),
-    feedChips: sumByParam(rows, "feed_chip_tapped", since30),
+    feedChips: onlyLiveFilters(sumByParam(rows, "feed_chip_tapped", since30)),
     feedItemTaps: Object.values(sumByParam(rows, "feed_item_tapped", since30)).reduce((a, b) => a + b, 0),
     sessions30d: Object.values(sumByParam(rows, "session_start", since30)).reduce((a, b) => a + b, 0),
     versions: sumByParam(rows, "session_start", since30),
@@ -181,61 +252,71 @@ async function load(){
   document.getElementById('msg').textContent = 'Loading…';
   let d; try { const r = await fetch('/analytics/admin/api',{method:'POST'}); d = await r.json(); } catch(e){ document.getElementById('out').innerHTML='<div class="err">Failed to load.</div>'; return; }
   if (d.error){ document.getElementById('out').innerHTML='<div class="err">Error: '+esc(d.error)+'</div>'; return; }
-  const wk = (d.weeks||[])[0] || {wau:0,new:0,returning:0,week:'—'};
-  const mo = (d.months||[])[0] || {mau:0,new:0,returning:0,month:'—'};
+  // Owner's 2026-09-05 relabel: business shorthand ("last week", "month to date", "last 30 days"),
+  // scope on EVERY section, human date ranges — never ISO keys, never wordy explainers.
+  const H = d.headline||{};
+  const lw = H.lastCompletedWeek || {wau:0,new:0,returning:0};
+  const cw = H.currentWeekSoFar || {wau:0,new:0,returning:0};
+  const mtd = H.monthToDate || {mau:0,new:0,returning:0};
   const e = d.engagement||{};
+  const card = (big, sub) => '<div class="card"><div class="big">'+big+'</div><div class="sub">'+sub+'</div></div>';
   // Coarsen the days-opened-per-week buckets (1/2/3to4/5to7) to the owner's once/twice/3+ view.
   const cadence = (obj) => { const o={'1 day':0,'2 days':0,'3+ days':0}; for(const [k,v] of Object.entries(obj||{})){ if(k==='1')o['1 day']+=v; else if(k==='2')o['2 days']+=v; else o['3+ days']+=v; } return o; };
   let h = '';
-  h += '<h2>This week ('+esc(wk.week)+')</h2><div class="grid">';
-  h += '<div class="card"><div class="big">'+(wk.wau||0)+'</div><div class="sub">weekly active users (devices)</div></div>';
-  h += '<div class="card"><div class="big">'+(wk.returning||0)+'</div><div class="sub">returning (opened before) · '+(wk.new||0)+' new (first time ever)</div></div>';
-  h += '<div class="card"><div class="big">'+(e.fanzone_players||0)+'</div><div class="sub">played Fan Zone (signed-in)</div></div>';
-  h += '<div class="card"><div class="big">'+(e.new_players||0)+'</div><div class="sub">new signed-in accounts (7d)</div></div>';
+  // ── Headline: last COMPLETED week (the honest glance) + month to date ──
+  h += '<h2>Active users — last week ('+esc(H.lastCompletedWeekRange||'no completed week yet')+')</h2><div class="grid">';
+  h += card(lw.wau||0, 'active devices');
+  h += card(lw.returning||0, 'returning · '+(lw.new||0)+' new');
+  h += card(e.fanzone_players||0, 'played Fan Zone (signed-in, last 7 days)');
+  h += card(e.new_players||0, 'new signed-in accounts (last 7 days)');
   h += '</div>';
-  h += '<div class="muted">"Active users" above = anonymous device opens. "New signed-in accounts" is a separate server count of profiles created — currently inflated by test/seed accounts until the pre-launch purge, and not comparable to the device numbers.</div>';
-  h += '<h2>This month ('+esc(mo.month)+')</h2><div class="grid">';
-  h += '<div class="card"><div class="big">'+(mo.mau||0)+'</div><div class="sub">monthly active users (30-day reach)</div></div>';
-  h += '<div class="card"><div class="big">'+(mo.returning||0)+'</div><div class="sub">returning (opened before) · '+(mo.new||0)+' new (first time ever)</div></div>';
+  h += '<div class="muted">This week so far ('+esc(H.currentWeekRange||'')+'): '+(cw.wau||0)+' active devices · '+(cw.returning||0)+' returning · '+(cw.new||0)+' new</div>';
+  h += '<h2>Active users — '+esc(H.monthName||'this month')+' (month to date)</h2><div class="grid">';
+  h += card(mtd.mau||0, 'active devices');
+  h += card(mtd.returning||0, 'returning · '+(mtd.new||0)+' new');
   h += '</div>';
-  h += '<h2>Monthly active (last months)</h2><table><tr><th>month</th><th>MAU</th><th>new</th><th>returning</th></tr>'+
-       (d.months||[]).map(m=>'<tr><td>'+esc(m.month)+'</td><td>'+m.mau+'</td><td>'+m.new+'</td><td>'+m.returning+'</td></tr>').join('')+'</table>';
-  h += '<h2>Weekly active (last weeks)</h2><table><tr><th>week</th><th>WAU</th><th>new</th><th>returning</th></tr>'+
-       (d.weeks||[]).map(w=>'<tr><td>'+esc(w.week)+'</td><td>'+w.wau+'</td><td>'+w.new+'</td><td>'+w.returning+'</td></tr>').join('')+'</table>';
-  h += '<h2>Fan Zone plays this week (signed-in players)</h2><table><tr><th>game</th><th>players</th></tr>'+
+  h += '<div class="muted">Active devices = anonymous app opens (no identity). New signed-in accounts = profiles created; inflated by test accounts until the pre-launch purge.</div>';
+  // ── History (completed periods) ──
+  h += '<h2>Monthly active (last months)</h2><table><tr><th>month</th><th>active devices</th><th>new</th><th>returning</th></tr>'+
+       (d.months||[]).map(m=>'<tr><td>'+esc(m.name||m.month)+'</td><td>'+m.mau+'</td><td>'+m.new+'</td><td>'+m.returning+'</td></tr>').join('')+'</table>';
+  h += '<h2>Weekly active (last 8 weeks)</h2><table><tr><th>week</th><th>active devices</th><th>new</th><th>returning</th></tr>'+
+       (d.weeks||[]).map(w=>'<tr><td>'+esc(w.range||w.week)+(w.week===H.currentWeekKey?' <span class="muted">(so far)</span>':'')+'</td><td>'+w.wau+'</td><td>'+w.new+'</td><td>'+w.returning+'</td></tr>').join('')+'</table>';
+  h += '<h2>Fan Zone plays (signed-in, last 7 days)</h2><table><tr><th>game</th><th>players</th></tr>'+
        '<tr><td>Predict</td><td>'+(e.predict_players||0)+'</td></tr>'+
        '<tr><td>Bracket</td><td>'+(e.bracket_players||0)+'</td></tr>'+
        '<tr><td>Know Her Game</td><td>'+(e.khg_players||0)+'</td></tr>'+
        '<tr><td>Trivia</td><td>'+(e.trivia_players||0)+'</td></tr></table>'+
-       '<div class="muted">Opens (last 30d) below include signed-out browsing — compare to plays for the funnel.</div>';
+       '<div class="muted">Fan Zone opens (last 30 days) below include signed-out browsing.</div>';
+  // ── Following: signed-in accounts ACTIVE in the last 180 days (a count-only scope; nothing is deleted) ──
   const f = d.follows||{};
   if (f.total_followers){
     const m = f.multi||{};
     const avgTeams = f.total_followers>0 ? (f.total_follows/f.total_followers).toFixed(1) : '—';
     const multiPct = f.total_followers>0 ? Math.round(((m['2']||0)+(m['3']||0)+(m['4plus']||0))/f.total_followers*100) : 0;
     const alertPct = f.total_follows>0 ? Math.round((f.alerts_on||0)/f.total_follows*100) : 0;
-    h += '<h2>Following (signed-in users)</h2><div class="grid">';
-    h += '<div class="card"><div class="big">'+(f.total_followers||0)+'</div><div class="sub">people following a club</div></div>';
-    h += '<div class="card"><div class="big">'+avgTeams+'</div><div class="sub">avg clubs / person</div></div>';
-    h += '<div class="card"><div class="big">'+multiPct+'%</div><div class="sub">follow 2+ clubs</div></div>';
-    h += '<div class="card"><div class="big">'+alertPct+'%</div><div class="sub">of follows have match alerts on</div></div>';
+    h += '<h2>Following (signed-in accounts active in the last 180 days)</h2><div class="grid">';
+    h += card(f.total_followers||0, 'people following a club');
+    h += card(avgTeams, 'avg clubs per person');
+    h += card(multiPct+'%', 'follow 2+ clubs');
+    h += card(alertPct+'%', 'of follows have match alerts on');
     h += '</div>';
-    h += '<h2>Clubs followed per person</h2><table><tr><th>clubs</th><th>people</th></tr>'+
-         ['1','2','3','4plus'].map(k=>'<tr><td>'+k+'</td><td>'+(m[k]||0)+'</td></tr>').join('')+'</table>';
-    h += '<h2>Most-followed clubs</h2><table><tr><th>club</th><th>followers</th><th>% of followers</th></tr>'+
+    h += '<h2>Clubs followed per person (current)</h2><table><tr><th>clubs</th><th>people</th></tr>'+
+         ['1','2','3','4plus'].map(k=>'<tr><td>'+(k==='4plus'?'4+':k)+'</td><td>'+(m[k]||0)+'</td></tr>').join('')+'</table>';
+    h += '<h2>Most-followed clubs (current)</h2><table><tr><th>club</th><th>followers</th><th>% of followers</th></tr>'+
          (Object.entries(f.by_team||{}).sort((a,b)=>b[1]-a[1]).map(([t,c])=>'<tr><td>'+esc(t)+'</td><td>'+c+'</td><td>'+pct(c,f.total_followers)+'</td></tr>').join('')||'<tr><td class="muted" colspan=3>no follows yet</td></tr>')+'</table>';
   }
   const cad = cadence(d.daysActive);
-  h += '<h2>How often people open the app (per week)</h2><table><tr><th>days opened</th><th>weeks</th></tr>'+
-       ['1 day','2 days','3+ days'].map(k=>'<tr><td>'+esc(k)+'</td><td>'+(cad[k]||0)+'</td></tr>').join('')+'</table>'+
-       '<div class="muted">Distinct days a device opened the app in a week — a once-a-week app, or 3+?</div>';
-  h += '<h2>Most-opened tabs (30d)</h2><table><tr><th>tab</th><th>opens</th></tr>'+rows(d.tabs)+'</table>';
-  h += '<h2>Fan Zone opens (30d)</h2><table><tr><th>game</th><th>opens</th></tr>'+rows(d.gameOpens)+'</table>';
-  h += '<h2>Social</h2><table><tr><th>filter</th><th>taps</th></tr>'+rows(d.feedChips)+'</table><div class="muted">content taps (30d): '+(d.feedItemTaps||0)+'</div>';
-  h += '<h2>Reach (30d)</h2><div class="muted">sessions: '+(d.sessions30d||0)+'</div>'+
-       '<table><tr><th>version</th><th>sessions</th></tr>'+rows(d.versions)+'</table>'+
+  h += '<h2>Days opened per week (last 8 weeks)</h2><table><tr><th>days opened</th><th>device-weeks</th></tr>'+
+       ['1 day','2 days','3+ days'].map(k=>'<tr><td>'+esc(k)+'</td><td>'+(cad[k]||0)+'</td></tr>').join('')+'</table>';
+  h += '<h2>Most-opened tabs (last 30 days)</h2><table><tr><th>tab</th><th>opens</th></tr>'+rows(d.tabs)+'</table>';
+  h += '<h2>Fan Zone opens (last 30 days)</h2><table><tr><th>game</th><th>opens</th></tr>'+rows(d.gameOpens)+'</table>';
+  // Two different meters, kept apart: switching a filter chip vs opening a piece of content.
+  h += '<h2>Feed filter taps (last 30 days)</h2><table><tr><th>filter</th><th>taps</th></tr>'+rows(d.feedChips)+'</table>';
+  h += '<h2>Content opens (last 30 days)</h2><div class="grid">'+card(d.feedItemTaps||0, 'feed posts opened')+'</div>';
+  h += '<h2>Sessions (last 30 days)</h2><div class="grid">'+card(d.sessions30d||0, 'sessions')+'</div>'+
+       '<table><tr><th>app version</th><th>sessions</th></tr>'+rows(d.versions)+'</table>'+
        '<table style="margin-top:8px"><tr><th>iOS</th><th>sessions</th></tr>'+rows(d.os)+'</table>';
-  h += '<div class="muted" style="margin-top:16px">Aggregate only — anonymous counters carry no identity; player counts are distinct-user aggregates, never a person. Generated '+esc(d.generatedAt)+'.</div>';
+  h += '<div class="muted" style="margin-top:16px">Aggregate only — anonymous counters carry no identity; account counts are aggregates, never a person. Generated '+esc(d.generatedAt)+'.</div>';
   document.getElementById('out').innerHTML = h;
   document.getElementById('msg').textContent = '';
 }
