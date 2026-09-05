@@ -2075,7 +2075,11 @@ async function clubApiCards(abbr: string, url: string): Promise<NewsCard[]> {
 		if (!title || !link || !timestamp || isPlaceholderArticle(title)) continue;
 		const summary = typeof it.summary === "string" ? it.summary : undefined;
 		const thumb = it.thumbnail as { templateUrl?: string; thumbnailUrl?: string } | undefined;
-		const image = thumb?.templateUrl?.replace("{formatInstructions}", "t_w_768") ?? thumb?.thumbnailUrl;
+		// `{formatInstructions}` is a Cloudinary transformation string, NOT a named transform: the
+		// width transform is `w_768`. A `t_` prefix means "named transformation called w_768", which
+		// this account doesn't define → Cloudinary 400s (a 0-byte error gif) and the card renders a
+		// broken image. Live-verified 2026-09-04: `t_w_768` → 400, `w_768` → 200. (NC Courage.)
+		const image = thumb?.templateUrl?.replace("{formatInstructions}", "w_768") ?? thumb?.thumbnailUrl;
 		cards.push(clubNewsCard(abbr, link, title, summary, name, image, timestamp, "club"));
 		if (cards.length >= CLUBNEWS_PER_CLUB) break;
 	}
@@ -2140,6 +2144,15 @@ function clubNewsMatcher(abbr: string): (text: string) => boolean {
 
 /** One Home club-news card (newsArticle layout). `sourceType` is "club" for the club's
  *  own site, "news" for the outlet fallback. */
+/** Upgrade a cleartext `http://` image URL to `https://`. iOS App Transport Security blocks
+ *  cleartext image loads by DEFAULT, so an `http://` thumbnail never loads in-app (silent blank
+ *  box) — and since it can't load either way, upgrading is strictly safe. Live-verified 2026-09-04:
+ *  Seattle Reign's Squarespace og:image is `http://static1.squarespace.com/...`, which 301s to the
+ *  same asset on `https://images.squarespace-cdn.com/...` (200). Leaves https/relative/undefined as-is. */
+function httpsImage(url: string | undefined): string | undefined {
+	return url?.startsWith("http://") ? "https://" + url.slice("http://".length) : url;
+}
+
 function clubNewsCard(
 	abbr: string,
 	url: string,
@@ -2150,6 +2163,7 @@ function clubNewsCard(
 	timestamp: string,
 	sourceType: "club" | "news",
 ): NewsCard {
+	image = httpsImage(image);
 	return {
 		id: `clubnews-${hashId(url)}`,
 		layout: "newsArticle",
@@ -3315,7 +3329,7 @@ async function enrichNewsOG(cards: NewsCard[], env: Env, ctx: ExecutionContext):
 					og = {};
 				}
 			}
-			if (!c.thumbnailURL && og.image) c.thumbnailURL = og.image;
+			if (!c.thumbnailURL && og.image) c.thumbnailURL = httpsImage(og.image); // http og:image → ATS-blocked in-app
 			if (!c.blurb && og.description) c.blurb = stripHtml(og.description).slice(0, 240);
 		}),
 	);
