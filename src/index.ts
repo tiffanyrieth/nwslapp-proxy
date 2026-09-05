@@ -5797,16 +5797,39 @@ async function handleTelemetryIngest(request: Request, env: Env, ctx: ExecutionC
 		.filter((e) => e.kind);
 	if (events.length === 0) return new Response(null, { status: 204 });
 
-	const record = {
-		at: new Date().toISOString(),
-		app: String(body.app ?? "").slice(0, 20),
-		os: String(body.os ?? "").slice(0, 20),
-		events,
-	};
-	console.log("telemetry", JSON.stringify(record));
-	// Reverse-time key so a later list() returns newest-first. NO client IP stored.
-	const key = `diag:${1e15 - Date.now()}:${crypto.randomUUID().slice(0, 8)}`;
-	ctx.waitUntil(env.FEED_TAGS.put(key, JSON.stringify(record), { expirationTtl: 60 * 60 * 24 * 30 }));
+	const app = String(body.app ?? "").slice(0, 20);
+	const os = String(body.os ?? "").slice(0, 20);
+	console.log("telemetry", JSON.stringify({ app, os, events }));
+
+	// Fold each anomaly into the DEDUPED Supabase rollup (client_diagnostics) instead of a per-POST KV
+	// `diag:` write: that write scaled with SESSIONS and blew the 1k/day KV cap. Pre-sum by signature
+	// (kind + truncated detail) so identical errors in this batch collapse to one counted row and the
+	// RPC's ON CONFLICT never touches a row twice. Same rail + privacy posture as /analytics; 0 KV
+	// writes. (2026-08-30 KV budget pass — app now flushes anomalies only; docs/stress-testing.md §7.)
+	const bySig = new Map<string, { signature: string; kind: string; detail: string; app: string; os: string; n: number }>();
+	for (const e of events) {
+		const signature = `${e.kind}|${e.detail}`.slice(0, 100);
+		const cur = bySig.get(signature);
+		if (cur) cur.n += 1;
+		else bySig.set(signature, { signature, kind: e.kind, detail: e.detail, app, os, n: 1 });
+	}
+	const sb = env as unknown as { SUPABASE_URL?: string; SUPABASE_SERVICE_ROLE_KEY?: string };
+	if (!sb.SUPABASE_URL || !sb.SUPABASE_SERVICE_ROLE_KEY) return new Response(null, { status: 204 }); // local dev, unconfigured → quiet no-op
+	const base = sb.SUPABASE_URL.replace(/\/$/, ""), svcKey = sb.SUPABASE_SERVICE_ROLE_KEY;
+	ctx.waitUntil(
+		(async () => {
+			try {
+				const r = await fetch(`${base}/rest/v1/rpc/record_client_diagnostics`, {
+					method: "POST",
+					headers: { apikey: svcKey, Authorization: `Bearer ${svcKey}`, "Content-Type": "application/json" },
+					body: JSON.stringify({ p_events: [...bySig.values()] }),
+				});
+				if (!r.ok) emitDiag(env, ctx, "telemetryRpcFail", `record_client_diagnostics ${r.status}`);
+			} catch (err) {
+				emitDiag(env, ctx, "telemetryRpcFail", String(err).slice(0, 80));
+			}
+		})(),
+	);
 	return new Response(null, { status: 204 });
 }
 
@@ -6121,7 +6144,8 @@ async function runSyntheticChecks(env: Env, ctx: ExecutionContext): Promise<void
 const CLIENTAGG_LAST_KEY = "clientagg:last";
 const CLIENTAGG_CRASH_PAGE_KEY = "clientagg:crash-page";
 const CLIENTAGG_FEAT_PAGE_KEY = "clientagg:feat-page";
-const CLIENT_FEATURE_KINDS = new Set(["apiFailure", "parseError", "unexpectedEmpty", "staleServe"]);
+// The feature-failure kinds counted by the rollup now live in the client_diagnostics_rollup SQL
+// (migration_client_diagnostics.sql): apiFailure, parseError, unexpectedEmpty, staleServe.
 const CRASH_WINDOW_MS = 24 * 60 * 60 * 1000, CRASH_THRESHOLD = 5;   // ≥5 crash reports / 24h → page
 const FEATURE_WINDOW_MS = 60 * 60 * 1000, FEATURE_THRESHOLD = 25;   // ≥25 reports of ONE kind / 60min → page
 const CLIENTAGG_PAGE_THROTTLE_MS = 3 * 60 * 60 * 1000;             // per category, at most one / 3h
@@ -6129,23 +6153,30 @@ const CLIENTAGG_PAGE_THROTTLE_MS = 3 * 60 * 60 * 1000;             // per catego
 async function scanClientAggregate(env: Env, ctx: ExecutionContext): Promise<void> {
 	const now = Date.now();
 	const crashCut = now - CRASH_WINDOW_MS, featCut = now - FEATURE_WINDOW_MS;
-	// Bounded: newest client records (reverse-time keys), filtered by age from the KEY (no read) so a quiet
-	// window costs one list + few reads. At small scale this spans days; the caps keep it cheap at any scale.
-	const list = await env.FEED_TAGS.list({ prefix: "diag:", limit: 150 });
-	const fresh = list.keys.filter((k) => diagKeyTime(k.name) >= crashCut).slice(0, 120);
+	// Read the DEDUPED Supabase rollup (client_diagnostics) instead of KV-listing the old `diag:` stream
+	// — telemetry now lands in Supabase (docs/stress-testing.md §7). One RPC returns the crash count
+	// (24h) + per-kind feature-failure counts (60m), with the image-CDN exclusion applied in SQL. The
+	// windows are hour-bucketed there (an accepted heuristic; thresholds already sit above noise).
 	let crashes = 0;
-	const featCounts: Record<string, number> = {};
-	for (const k of fresh) {
-		const t = diagKeyTime(k.name);
-		const rec = (await env.FEED_TAGS.get(k.name, "json").catch(() => null)) as { events?: { kind?: string; detail?: string }[] } | null;
-		for (const e of rec?.events ?? []) {
-			if (e.kind === "metricKitDiagnostic") { crashes++; continue; }
-			if (!e.kind || !CLIENT_FEATURE_KINDS.has(e.kind) || t < featCut) continue;
-			// Same exclusion as the spike pager: expected image-CDN flakiness (IG/thumbnail URLs expire &
-			// rotate; a.espncdn.com hotlink-blocks) rides apiFailure but is an honest placeholder fallback,
-			// NOT an incident — it would otherwise dominate the count and false-page at fleet scale.
-			if (e.kind === "apiFailure" && (e.detail ?? "").startsWith("image fetch ")) continue;
-			featCounts[e.kind] = (featCounts[e.kind] ?? 0) + 1;
+	let featCounts: Record<string, number> = {};
+	const sb = env as unknown as { SUPABASE_URL?: string; SUPABASE_SERVICE_ROLE_KEY?: string };
+	if (sb.SUPABASE_URL && sb.SUPABASE_SERVICE_ROLE_KEY) {
+		try {
+			const base = sb.SUPABASE_URL.replace(/\/$/, ""), svcKey = sb.SUPABASE_SERVICE_ROLE_KEY;
+			const r = await fetch(`${base}/rest/v1/rpc/client_diagnostics_rollup`, {
+				method: "POST",
+				headers: { apikey: svcKey, Authorization: `Bearer ${svcKey}`, "Content-Type": "application/json" },
+				body: JSON.stringify({ p_crash_since: new Date(crashCut).toISOString(), p_feat_since: new Date(featCut).toISOString() }),
+			});
+			if (r.ok) {
+				const roll = (await r.json()) as { crashes?: number; features?: Record<string, number> };
+				crashes = Number(roll?.crashes ?? 0);
+				featCounts = roll?.features ?? {};
+			} else {
+				emitDiag(env, ctx, "clientAggRpcFail", `client_diagnostics_rollup ${r.status}`);
+			}
+		} catch (err) {
+			emitDiag(env, ctx, "clientAggRpcFail", String(err).slice(0, 80));
 		}
 	}
 	const worstFeat = Object.entries(featCounts).sort((a, b) => b[1] - a[1])[0];
@@ -6273,20 +6304,31 @@ async function handleTelemetryRecent(request: Request, env: Env): Promise<Respon
 	// Curl-style key endpoint (never behind Access) → constant-time key + failure throttle only.
 	const gate = await adminGate(request, env as unknown as AdminAuthEnv, { jwt: false });
 	if (gate) return gate;
-	// Merge BOTH streams newest-first: server diagnostics (`sdiag:`) + client telemetry (`diag:`). They
-	// live under separate prefixes so the pager can scan server errors without client burial; the owner
-	// view still shows everything. (`diag:` prefix does NOT match `sdiag:` — no double-count.)
-	const [server, client] = await Promise.all([
-		env.FEED_TAGS.list({ prefix: "sdiag:", limit: 100 }),
-		env.FEED_TAGS.list({ prefix: "diag:", limit: 100 }),
-	]);
-	const names = [...server.keys, ...client.keys]
+	// Server diagnostics stay in KV (`sdiag:`); client telemetry now lives in the DEDUPED Supabase
+	// rollup (client_diagnostics). Merge both for the owner view — server records carry `at`, client
+	// rows carry `last_seen` + a `count`. The client half degrades to empty (never 5xx) if Supabase
+	// is unreachable.
+	const server = await env.FEED_TAGS.list({ prefix: "sdiag:", limit: 100 });
+	const serverNames = server.keys
 		.sort((a, b) => diagKeyTime(b.name) - diagKeyTime(a.name)) // newest first
 		.slice(0, 100)
 		.map((k) => k.name);
-	const records = await Promise.all(names.map((n) => env.FEED_TAGS.get(n)));
-	const parsed = records.filter((s): s is string => s !== null).map((s) => JSON.parse(s));
-	return Response.json(parsed);
+	const serverRecords = (await Promise.all(serverNames.map((n) => env.FEED_TAGS.get(n))))
+		.filter((s): s is string => s !== null)
+		.map((s) => JSON.parse(s));
+
+	let clientRecords: unknown[] = [];
+	const sb = env as unknown as { SUPABASE_URL?: string; SUPABASE_SERVICE_ROLE_KEY?: string };
+	if (sb.SUPABASE_URL && sb.SUPABASE_SERVICE_ROLE_KEY) {
+		try {
+			const base = sb.SUPABASE_URL.replace(/\/$/, ""), svcKey = sb.SUPABASE_SERVICE_ROLE_KEY;
+			const r = await fetch(`${base}/rest/v1/client_diagnostics?select=last_seen,hour,kind,detail,count,app,os&order=last_seen.desc&limit=100`, {
+				headers: { apikey: svcKey, Authorization: `Bearer ${svcKey}` },
+			});
+			if (r.ok) clientRecords = (await r.json()) as unknown[];
+		} catch { /* owner view degrades to server-only, never 5xx */ }
+	}
+	return Response.json([...serverRecords, ...clientRecords]);
 }
 
 /** Serve a team's NWSL crest as a transparent PNG: `GET /crest?team=WAS`. The PNGs are
