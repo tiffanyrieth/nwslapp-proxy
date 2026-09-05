@@ -1880,6 +1880,15 @@ async function clubNewsFor(abbr: string, env: Env, ctx: ExecutionContext): Promi
 	const src = CLUB_NEWS[abbr];
 	if (!src) return [];
 
+	// CHI/POR block our datacenter IP, so the proxy can NEVER fetch their official club news — the APP
+	// fetches it from the device's residential IP instead (ClubNewsFallbackService). Hand Club News to
+	// that device path by returning [] here, and deliberately DON'T inject the outlet press fallback: it
+	// duplicated the outlet NEWS already shown in Social → Reporters (`buildNewsCards`, placement "feed").
+	// Their YT/IG (a separate, unblocked scrape) still fills the section, so it's never blank; a doomed
+	// official fetch + its "fallback/empty" diags are pure noise, and device-fallback health is tracked
+	// by the Status tab's deviceFallbackCheck (line ~2693), not a per-request diag.
+	if (DEVICE_FALLBACK_CLUBS.has(abbr)) return [];
+
 	const cacheKey = `clubnews-${abbr}`;
 	const cached = (await env.FEED_TAGS.get(cacheKey, "json")) as NewsCard[] | null;
 	if (cached) return cached;
@@ -1998,10 +2007,17 @@ function indexHtmlToClubCards(abbr: string, html: string, sourceUrl: string, art
 
 /** Decode the handful of HTML entities a scraped title actually carries. */
 function decodeBasicEntities(s: string): string {
+	// Named-punctuation replaces run after `&amp;`→"&" so double-encoded `&amp;mdash;` resolves
+	// (same fix as decodeEntities). `&#8211;`/`&#8212;` cover the numeric en/em-dash; the named
+	// `&mdash;`/`&ndash;` cover the entity form outlets also emit.
 	return s
 		.replace(/&amp;/g, "&").replace(/&#0?39;/g, "'").replace(/&#8217;/g, "’")
 		.replace(/&quot;/g, '"').replace(/&#8211;/g, "–").replace(/&#8212;/g, "—")
-		.replace(/&lt;/g, "<").replace(/&gt;/g, ">");
+		.replace(/&lt;/g, "<").replace(/&gt;/g, ">")
+		.replace(/&mdash;/g, "—").replace(/&ndash;/g, "–")
+		.replace(/&rsquo;/g, "’").replace(/&lsquo;/g, "‘")
+		.replace(/&ldquo;/g, "“").replace(/&rdquo;/g, "”")
+		.replace(/&hellip;/g, "…").replace(/&nbsp;/g, " ");
 }
 
 /** Strategy: the club's own RSS/Atom feed → cards (structured, dated; no scraping). */
@@ -3144,6 +3160,9 @@ export function isPlaceholderArticle(title: string): boolean {
 
 /** Decode the handful of HTML entities OG `content` attrs carry (e.g. `&#x27;`). */
 function decodeEntities(s: string): string {
+	// The named-punctuation replaces run AFTER `&amp;`→"&" on purpose: outlet titles arrive
+	// double-encoded (`&amp;mdash;`), so decoding `&amp;` first leaves a literal `&mdash;` that these
+	// then resolve. Without them a headline like "…race &amp;mdash; two pushers" leaked `&mdash;` to the UI.
 	return s
 		.replace(/&#x([0-9a-f]+);/gi, (_, h) => String.fromCodePoint(parseInt(h, 16)))
 		.replace(/&#(\d+);/g, (_, d) => String.fromCodePoint(parseInt(d, 10)))
@@ -3151,7 +3170,15 @@ function decodeEntities(s: string): string {
 		.replace(/&quot;/g, '"')
 		.replace(/&#39;/g, "'")
 		.replace(/&lt;/g, "<")
-		.replace(/&gt;/g, ">");
+		.replace(/&gt;/g, ">")
+		.replace(/&mdash;/g, "—")
+		.replace(/&ndash;/g, "–")
+		.replace(/&rsquo;/g, "’")
+		.replace(/&lsquo;/g, "‘")
+		.replace(/&ldquo;/g, "“")
+		.replace(/&rdquo;/g, "”")
+		.replace(/&hellip;/g, "…")
+		.replace(/&nbsp;/g, " ");
 }
 
 // ---------------------------------------------------------------------------
