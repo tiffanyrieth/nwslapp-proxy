@@ -2160,13 +2160,21 @@ function clubNewsMatcher(abbr: string): (text: string) => boolean {
 
 /** One Home club-news card (newsArticle layout). `sourceType` is "club" for the club's
  *  own site, "news" for the outlet fallback. */
-/** Upgrade a cleartext `http://` image URL to `https://`. iOS App Transport Security blocks
- *  cleartext image loads by DEFAULT, so an `http://` thumbnail never loads in-app (silent blank
- *  box) — and since it can't load either way, upgrading is strictly safe. Live-verified 2026-09-04:
- *  Seattle Reign's Squarespace og:image is `http://static1.squarespace.com/...`, which 301s to the
- *  same asset on `https://images.squarespace-cdn.com/...` (200). Leaves https/relative/undefined as-is. */
+/** Normalize a club-news thumbnail: (a) a BLANK/whitespace image → `undefined` so the field is
+ *  OMITTED, never emitted as `""`. An empty-string `thumbnailURL` crashes the app's decode
+ *  (Swift's `URL: Decodable` throws on ""), and because the content routes decode `[ContentCard]`
+ *  all-or-nothing, one thumbnail-less article blanked a follower's whole Club News module
+ *  (live 2026-09-06, NC Courage). The app now also coerces "" → nil defensively, but the field
+ *  should never leave here blank. (b) Upgrade a cleartext `http://` image to `https://`: iOS App
+ *  Transport Security blocks cleartext image loads by DEFAULT, so an `http://` thumbnail never
+ *  loads in-app (silent blank box) — and since it can't load either way, upgrading is strictly
+ *  safe. Live-verified 2026-09-04: Seattle Reign's Squarespace og:image is
+ *  `http://static1.squarespace.com/...`, which 301s to the same asset on
+ *  `https://images.squarespace-cdn.com/...` (200). Leaves https/relative as-is. */
 function httpsImage(url: string | undefined): string | undefined {
-	return url?.startsWith("http://") ? "https://" + url.slice("http://".length) : url;
+	const u = url?.trim();
+	if (!u) return undefined;
+	return u.startsWith("http://") ? "https://" + u.slice("http://".length) : u;
 }
 
 function clubNewsCard(
