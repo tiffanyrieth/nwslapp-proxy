@@ -1,6 +1,12 @@
 <!--
   Know Her Game — CANONICAL weekly generation template (automation).
 
+  ⛔ SUPERSEDED 2026-09-07: the single-generator content model below (INVERTED mix / uncapped bio / no-floor
+  fun) caused a bio-only regression and was ROLLED BACK. Generation is now SPLIT into two isolated routines,
+  derived from the last-known-good OG language (commit 6e4374f): knowher-bio-TEMPLATE.md (career/bio, target
+  ~7-8) + knowher-fun-TEMPLATE.md (fun facts, target ~4-5). This file is kept only as the assembler's default
+  template for the existing tests; the LIVE pipeline fills the two split templates. Do not run this one.
+
   Provenance: this is the PROVEN Rodman-WORKING query (scripts/knowher-prompt-rodman-WORKING.md — the
   gold standard, keep untouched) scaled to 16 players, with the owner's 2026-07-13 fidelity rulings
   applied: ">=6 MUST be human" (not "should"), NO web-search cap, thin-coverage anti-fabrication rule

@@ -33,6 +33,25 @@ const STATS_PATH = (() => {
   return i > -1 && process.argv[i + 1] ? process.argv[i + 1] : "/tmp/knowher-stats.json";
 })();
 
+// Which template to fill. Default = the weekly template (unchanged for existing callers/tests). The
+// 2026-09-07 3-routine split fills two derived templates instead: the BIO routine passes
+// `--template knowher-bio-TEMPLATE.md`, the FUN routine `--template knowher-fun-TEMPLATE.md`.
+const TEMPLATE_FILE = (() => {
+  const i = process.argv.indexOf("--template");
+  return i > -1 && process.argv[i + 1] ? process.argv[i + 1] : "knowher-weekly-TEMPLATE.md";
+})();
+
+// FUN-routine mode: build the player list from a staged BIO PARTIAL (its exact roster + weekKey) instead of
+// a fresh /knowher/todo fetch. This guarantees the fun pass operates on the SAME 16 players the bio pass
+// staged — /knowher/todo is a live (drifting) set, so re-fetching it between the two weekend runs could
+// silently pick a different player for a club. In roster mode the assembler skips the /knowher/todo fetch,
+// the stat sidecar, and the biweekly gate (a staged bio partial already proves it's a KHG week), and stamps
+// the roster's own weekKey so bio + fun share it exactly.
+const ROSTER_PATH = (() => {
+  const i = process.argv.indexOf("--roster");
+  return i > -1 && process.argv[i + 1] ? process.argv[i + 1] : null;
+})();
+
 // The canonical 16 (matches src/index.ts TEAM list + DesignTeamColors in the app).
 const CLUBS = [
   ["LA", "Angel City FC"],
@@ -162,6 +181,53 @@ function playerBlock(clubName, abbr, season, p) {
   return `- ${head}\n  ${season} season: ${stats.join(", ")}`;
 }
 
+/** One player block for FUN (roster) mode, from a staged bio-partial player. Identity only — the fun hunt is
+ *  off-pitch, so the season-stats line the weekly block carries is deliberately omitted (the bio partial
+ *  doesn't carry those numbers anyway). `position` is already the human word ("Forward") in the partial. */
+function rosterPlayerBlock(clubName, abbr, p) {
+  const position = p.position || "Player";
+  return [
+    `${p.playerName} — ${clubName} (${abbr})`,
+    p.jerseyNumber != null ? `${position}, #${p.jerseyNumber}` : position,
+    `espnAthleteId ${p.espnAthleteId}`,
+  ].filter(Boolean).join(" — ");
+}
+
+/** FUN-routine assembly: fill the fun template from a staged bio partial's roster (no /knowher/todo, no stat
+ *  sidecar, no biweekly gate). Player order follows the canonical CLUBS list so the prompt reads consistently. */
+function assembleFromRoster(template) {
+  const roster = JSON.parse(readFileSync(ROSTER_PATH, "utf8"));
+  const players = Array.isArray(roster?.players) ? roster.players : [];
+  if (players.length === 0) {
+    console.error(`❌ Roster file ${ROSTER_PATH} has no players — nothing to assemble for the fun pass. No prompt emitted.`);
+    process.exit(1);
+  }
+  const byAbbr = new Map(players.map((p) => [String(p.teamAbbreviation).toUpperCase(), p]));
+  const clubName = new Map(CLUBS.map(([abbr, name]) => [abbr, name]));
+  const blocks = [];
+  const gaps = [];
+  for (const [abbr] of CLUBS) {
+    const p = byAbbr.get(abbr);
+    if (p) blocks.push(rosterPlayerBlock(clubName.get(abbr), abbr, p));
+    else gaps.push(`${abbr}: not in the bio partial (bio pass skipped it — the fun pass skips it too)`);
+  }
+  for (const g of gaps) console.error(`⚠️  GAP — ${g}`);
+
+  const weekKey = String(roster.weekKey ?? "");
+  const season = roster.season ?? new Date().getUTCFullYear();
+  if (!weekKey) {
+    console.error("❌ Roster file is missing weekKey — cannot stamp the fun pool. No prompt emitted.");
+    process.exit(1);
+  }
+  process.stdout.write(
+    template
+      .replaceAll("<<WEEK_KEY>>", weekKey)
+      .replaceAll("<<SEASON>>", String(season))
+      .replace("<<PLAYER_LIST>>", blocks.join("\n")),
+  );
+  console.error(`✅ Assembled ${blocks.length}-player FUN prompt for ${weekKey} (season ${season}) from ${ROSTER_PATH}.`);
+}
+
 async function fetchPick(abbr) {
   // Cache-buster (`_cb`): the assembler is the GENERATION feed and must see LIVE eligibility, never a
   // stale edge copy. /knowher/todo edge-caches 1h keyed on the full URL; without a buster, a same-day
@@ -179,6 +245,16 @@ if (import.meta.url === pathToFileURL(process.argv[1] ?? "").href) {
 }
 
 async function main() {
+// FUN-routine mode (2026-09-07 split): build from the staged bio partial's roster, not /knowher/todo, and
+// return. No biweekly gate (a staged bio partial already proves it's a KHG week), no stat sidecar.
+if (ROSTER_PATH) {
+  const template = readFileSync(
+    join(dirname(fileURLToPath(import.meta.url)), TEMPLATE_FILE),
+    "utf8",
+  ).replace(/^<!--[\s\S]*?-->\s*/, "");
+  assembleFromRoster(template);
+  return;
+}
 // Biweekly cadence: on a NWSL Trivia week, emit no prompt and exit cleanly — the routine no-ops and the
 // current 2-week KHG pool stays live. Checked BEFORE fetching 16 teams (no work on an off week). The gate +
 // the weekKey are computed from the edition's PUBLISH Monday (the coming Monday for a weekend run), not the
@@ -189,7 +265,7 @@ if (!isKnowHerWeek(publishMonday, process.env.KHG_SEASON_ANCHOR ?? SEASON_ANCHOR
   process.exit(0);
 }
 const template = readFileSync(
-  join(dirname(fileURLToPath(import.meta.url)), "knowher-weekly-TEMPLATE.md"),
+  join(dirname(fileURLToPath(import.meta.url)), TEMPLATE_FILE),
   "utf8",
 ).replace(/^<!--[\s\S]*?-->\s*/, ""); // strip the operator comment — the model sees only the query
 

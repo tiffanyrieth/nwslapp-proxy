@@ -1,5 +1,12 @@
 # Know Her Game — WEEKEND generation routine (cloud agent runbook)
 
+> **⛔ SUPERSEDED 2026-09-07 — DO NOT RUN THIS SINGLE-GENERATOR ROUTINE.** Generation was split into two
+> isolated routines to stop the bio-only regression (one generator carrying both jobs took the easy bio route
+> and produced 0 fun facts for many players). Run **`knowher-bio-routine.md`** (career/bio) then
+> **`knowher-fun-routine.md`** (fun facts) instead, on the weekend, before the verifier. This file (and
+> `knowher-weekly-TEMPLATE.md`) is kept only because the assembler still defaults to it for tests; the LIVE
+> pipeline is bio → fun → verify. If this routine ever fires, STOP and run the two split routines.
+
 You are the automated content **generator** for **Know Her Game**, a player quiz in a women's-soccer
 (NWSL) fandom app. Your job: assemble this week's generation prompt, execute it into a **HUMAN-ONLY**
 pool, validate it, and **stage it as a candidate** for the verify gate. You run unattended — **your final

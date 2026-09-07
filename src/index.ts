@@ -59,6 +59,8 @@ import {
 	publishKnowHerPool,
 	stageKnowHerCandidate,
 	readKnowHerCandidate,
+	stageBioCandidate,
+	readBioCandidate,
 	stageVerifiedCandidate,
 	publishVerifiedPool,
 	isoWeekKey,
@@ -974,6 +976,11 @@ Apps apply it on their next launch (config cache under 5 min).</p>
 		}
 		if (url.pathname === "/knowher/candidate") {
 			return handleKnowHerCandidate(request, env, ctx);
+		}
+		// The 3-routine split (2026-09-07): the BIO routine stages its career/bio-only partial here; the FUN
+		// routine reads it back, appends its fun facts, and stages the combined pool at /knowher/candidate.
+		if (url.pathname === "/knowher/candidate/bio") {
+			return handleKnowHerBioCandidate(request, env, ctx);
 		}
 		// The weekend/Monday split (2026-08-12): the VERIFIER stages its cleaned human-only pool here;
 		// the MONDAY watcher pass reads it, injects fresh stats + Lever 1, and publishes.
@@ -5469,6 +5476,42 @@ async function handleKnowHerCandidate(request: Request, env: Env, ctx: Execution
 		return json({ ...result, note: "Staged for the verify gate — NOT live. The verifier re-confirms each fact, then publishes." });
 	}
 	return new Response("Method not allowed. Use GET (verifier) or POST (generator).", { status: 405, headers: { Allow: "GET, POST" } });
+}
+
+/** `POST /knowher/candidate/bio` — the BIO routine stages its career/bio-only partial (auth: the weaker
+ *  x-candidate-key). `GET /knowher/candidate/bio` — the FUN routine reads it back (SAME candidate key: both
+ *  are the generation half, and neither publishes; only the verifier holds the ingest key). The fun routine
+ *  appends its fun facts and stages the COMBINED pool at /knowher/candidate, which the verifier reads
+ *  unchanged. This is the intermediate hand-off of the 2026-09-07 3-routine split (bio → fun → verify): two
+ *  isolated generators instead of one, so neither carries both jobs in a single context window. */
+async function handleKnowHerBioCandidate(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
+	const kenv = env as unknown as KnowHerEnv;
+	const json = (b: unknown, s = 200) => new Response(JSON.stringify(b), { status: s, headers: { "Content-Type": "application/json" } });
+	// Both methods are the GENERATION tier — gated by the WEAKER candidate key (can stage/read the partial,
+	// never publish). The verifier's stronger ingest key never touches this intermediate artifact.
+	const key = kenv.KNOWHER_CANDIDATE_KEY_SECRET;
+	if (!key || request.headers.get("x-candidate-key") !== key) {
+		emitDiag(env, ctx, "knowherBioAuth", key ? "bad x-candidate-key" : "KNOWHER_CANDIDATE_KEY_SECRET unset");
+		return json({ error: "unauthorized" }, 401);
+	}
+	if (request.method === "GET") {
+		const cand = await readBioCandidate(kenv);
+		if (!cand) return json({ error: "no bio partial staged" }, 404);
+		return json(cand);
+	}
+	if (request.method === "POST") {
+		let body: Record<string, unknown>;
+		try { body = (await request.json()) as Record<string, unknown>; }
+		catch { emitDiag(env, ctx, "knowherBioReject", "body is not JSON"); return json({ error: "body must be JSON" }, 400); }
+		const result = await stageBioCandidate(kenv, body.pool ?? body);
+		if ("error" in result) {
+			emitDiag(env, ctx, "knowherBioReject", result.error.slice(0, 70));
+			return json(result, 400);
+		}
+		emitDiag(env, ctx, "knowherBioStaged", `${result.weekKey} players=${result.playerCount} bio=${result.bioQuestions}`);
+		return json({ ...result, note: "Bio partial staged — NOT live. The fun routine appends fun facts, then stages the combined pool at /knowher/candidate." });
+	}
+	return new Response("Method not allowed. Use GET (fun routine) or POST (bio routine).", { status: 405, headers: { Allow: "GET, POST" } });
 }
 
 /** `POST /trivia/ingest` — the VERIFIER routine (or the owner, supervised) publishes the yearly Trivia pool.

@@ -89,13 +89,18 @@ export function clubCompletenessError(teamAbbrs) {
  * (8 human is a complete human half; the merged Monday pool reaches the 10 app-floor via stats) and REQUIRES
  * zero stat questions (a stray herGame means the generator injected stats it shouldn't have). Every other
  * rule — sources, all-16-clubs, T/F balance, human minimum — still applies.
+ *
+ * `opts.minQuestions` / `opts.minHuman` override the per-player floors — the BIO PARTIAL of the 2026-09-07
+ * 3-routine split uses `{ humanOnly: true, minQuestions: 3, minHuman: 3 }`: it's an intermediate artifact
+ * (career/bio only, ~7–8 target), so the real 8-per-player floor is enforced on the COMBINED pool after the
+ * fun facts merge in. Everything else — sources, all-16-clubs, no-stats, T/F balance — still applies.
  */
 export function validatePool(doc, opts = {}) {
   const errors = [];
   const warnings = [];
   const fail = (m) => errors.push(m);
   const warn = (m) => warnings.push(m);
-  const minQuestions = opts.humanOnly ? 8 : MIN_QUESTIONS;
+  const minQuestions = opts.minQuestions ?? (opts.humanOnly ? 8 : MIN_QUESTIONS);
 
   // --- Schema (same rules as src/knowher.ts) ---
   if (!doc || typeof doc !== "object" || Array.isArray(doc)) {
@@ -173,8 +178,9 @@ export function validatePool(doc, opts = {}) {
     // Per-player content-quality lints (human-first, not a stat sheet)
     if (opts.humanOnly && stat > 0) fail(`${at}: ${stat} stat (herGame) question(s) in a HUMAN-ONLY candidate — Monday's publish injects stats; the weekend pool must be human-only`);
     if (stat > MAX_STAT_QUESTIONS) fail(`${at}: ${stat} stat (herGame) questions — max ${MAX_STAT_QUESTIONS}; Know Her Game is human-first, not a stat sheet`);
-    if (human < MIN_HUMAN_QUESTIONS) fail(`${at}: only ${human} human (story/personality) questions — need ≥ ${MIN_HUMAN_QUESTIONS}`);
-    else if (human < TARGET_HUMAN_QUESTIONS) warn(`${at}: ${human} human questions (aim ≥ ${TARGET_HUMAN_QUESTIONS})`);
+    const minHuman = opts.minHuman ?? MIN_HUMAN_QUESTIONS;
+    if (human < minHuman) fail(`${at}: only ${human} human (story/personality) questions — need ≥ ${minHuman}`);
+    else if (!opts.minHuman && human < TARGET_HUMAN_QUESTIONS) warn(`${at}: ${human} human questions (aim ≥ ${TARGET_HUMAN_QUESTIONS})`);
     if (playerTf >= 3 && playerTfTrue === playerTf) warn(`${at}: all ${playerTf} True/False answers are "True" — vary them (some plausibly FALSE), a lone true fact should be an MC "which has she actually done?"`);
   });
 
@@ -200,6 +206,9 @@ if (import.meta.url === pathToFileURL(process.argv[1] ?? "").href) {
   const dryRun = args.includes("--dry-run");
   // The weekend generator + verifier dry-run their HUMAN-ONLY pool with this: floor 8, no stats yet.
   const humanOnly = args.includes("--human-only");
+  // The 2026-09-07 3-routine split: the BIO routine dry-runs its career/bio PARTIAL with this — human-only
+  // rules but a floor of 3 per player (the 8-floor is applied to the combined pool after the fun merge).
+  const bioPartial = args.includes("--bio-partial");
   // The KV-direct write skips markFeatured (see LEDGER BYPASS above), so it must be asked for
   // explicitly. Validation (--dry-run) stays the default, unflagged path — that's what the
   // weekly routine runs.
@@ -214,7 +223,10 @@ if (import.meta.url === pathToFileURL(process.argv[1] ?? "").href) {
     process.exit(1);
   }
 
-  const { errors, warnings } = validatePool(doc, { humanOnly });
+  const { errors, warnings } = validatePool(
+    doc,
+    bioPartial ? { humanOnly: true, minQuestions: 3, minHuman: 3 } : { humanOnly },
+  );
   warnings.forEach((w) => console.error(`⚠️  ${w}`));
   if (errors.length) {
     errors.forEach((e) => console.error(`✗ ${e}`));
