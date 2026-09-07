@@ -5,11 +5,12 @@
   gold standard, keep untouched) scaled to 16 players, with the owner's 2026-07-13 fidelity rulings
   applied: ">=6 MUST be human" (not "should"), NO web-search cap, thin-coverage anti-fabrication rule
   kept, and all operator notes moved into THIS comment so the model receives exactly the Rodman-shaped
-  query. Owner ruling 2026-09-07 applied: inverted the content mix — career/life STORY is now the deep,
-  UNCAPPED majority and fun facts are the smaller opportunistic bucket (removed the old >=4 personality quota
-  and the ~2-3 career cap); and replaced the source rules with a strict A-TIER allow-list (single source) plus
-  a fun-facts-only escape hatch requiring >=2 sources, banning all local news. The wording below is DELICATE
-  and owner-owned — never change it without an explicit owner decision (query fidelity is the product).
+  query. Owner ruling 2026-09-07 applied: career/life STORY is now the deep, UNCAPPED majority — ONLY the old
+  ~2-3 CAREER CAP was removed (the bio cap, not the fun-fact floor, was what starved thin players like SD). The
+  fun-fact FLOOR is KEPT: produce ~4-5 fun facts (verifier trims to ~2-3), so fun facts stay mandatory. Also
+  replaced the source rules with a strict A-TIER allow-list (single source) plus a fun-facts-only escape hatch
+  requiring >=2 sources, banning all local news. The wording below is DELICATE and owner-owned — never change it
+  without an explicit owner decision (query fidelity is the product).
 
   Usage: scripts/assemble_knowher_prompt.mjs strips this comment and substitutes the two placeholders —
   <<WEEK_KEY>> (ISO week, e.g. 2026-W29) and <<PLAYER_LIST>> (one block per team from /knowher/todo).
@@ -44,8 +45,8 @@ stat questions itself from these exact numbers.
 per player (goals, minutes, saves, and the like) from the verified numbers above.** Every question you write
 is a story question, so spend the whole budget there.
 
-- **The 8–9 human questions are TWO buckets: her career/life STORY (the majority) + a few fun facts**
-  (`herStory` / `herWorld` / `trueOrFalse`). This is a fandom quiz, not a stat sheet — but "story" is NOT a dry
+- **The human questions are TWO buckets: her career/life STORY (the majority, ~5–6) + a real ~4–5 fun-fact set
+  (the verifier trims fun to ~2–3)** (`herStory` / `herWorld` / `trueOrFalse`). This is a fandom quiz, not a stat sheet — but "story" is NOT a dry
   résumé. Her STORY is narrative and celebratory: where she grew up and how she started, her youth academy and
   college, how she arrived (the signing-announcement story), her national-team path, her records, milestones, and
   last season's big moments. THAT is the backbone and should be the **largest share (~5–6 per player)**. Mine it
