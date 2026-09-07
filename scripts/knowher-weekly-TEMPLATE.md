@@ -52,13 +52,13 @@ is a story question, so spend the whole budget there.
   DEEPLY from the A-tier sources below — a club's signing announcement alone introduces her whole pre-club story,
   and her Wikipedia / NWSL / U.S. Soccer / college pages are rich with verifiable career facts. (This reverses the
   old rule that capped career facts — career/life STORY is now the core of the quiz, not a fallback.)
-- **FUN FACTS — no required COUNT, but the fun-fact HUNT is MANDATORY (never optional, never a "bonus").**
-  Off-pitch personality: a hobby, a relatable habit, a pre-game ritual, a pet, a second passion, an unusual
-  skill, a get-to-know-her answer (the "she travels with her PS5" kind — warm, surprising, makes you smile).
-  **Aim to SURFACE ~4–5 quality fun facts per player in your hunt** — the verifier trims to a final ~2–3, so
-  overshoot on purpose. That ~4–5 is a SEARCH AMBITION, **not** an output floor: a player who genuinely yields
-  fewer after a real, documented hunt ships bio-led, and you must NEVER pad or invent to hit a number. **BUT
-  uncapping bio is NOT permission to skip the hunt.** Fun facts are the
+- **FUN FACTS — TARGET ~4–5 per player (a real requirement, not a soft suggestion).** Off-pitch personality: a
+  hobby, a relatable habit, a pre-game ritual, a pet, a second passion, an unusual skill, a get-to-know-her
+  answer (the "she travels with her PS5" kind — warm, surprising, makes you smile). **Produce ~4–5 fun facts**
+  (the verifier trims to a final ~2–3, so overshoot on purpose). This is the FLOOR that makes the game work —
+  hold to it. **Falling short of ~4 is acceptable ONLY when a documented hunt genuinely came up short**: then
+  flag her in your report, and her **(now UNCAPPED)** career story fills the rest — never pad or invent to hit
+  the number. But "I didn't really look" is NOT a shortfall. Uncapping bio is NOT permission to skip the hunt. Fun facts are the
   HARD part and the whole point of this game (the Rodman standard); bio is the fast, always-there route, so the
   trap is to fill up on bio and phone in the fun facts — DO NOT do that. Run a GENUINE, EXHAUSTIVE off-pitch hunt
   for EVERY player in the pro-women interview wells (Girls Soccer Network, Just Women's Sports, Beats & Rhymes FC,
