@@ -36,6 +36,16 @@ export const KNOWHER_CANDIDATE_TTL = 24 * 3600;
 // Monday 3am publish, plus margin.
 export const KNOWHER_CANDIDATE_VERIFIED_KEY = "knowher:candidate-verified-v1";
 export const KNOWHER_CANDIDATE_VERIFIED_TTL = 72 * 3600;
+// KV: the BIO/CAREER partial the bio routine stages (2026-09-07, the 3-routine split). It carries ONLY each
+// player's career/bio questions. The FUN routine reads it back, appends its off-pitch fun facts, and stages
+// the COMBINED pool at KNOWHER_CANDIDATE_KEY for the verifier — which is unchanged. An intermediate artifact:
+// never live, never touches the featured ledger, 24h TTL (must survive the gap between the bio run and the
+// fun run, both on the same weekend). Splitting generation into two isolated routines (bio, then fun) keeps
+// each routine's context on ONE job — which cuts the cross-fact contamination and the easy-bio-route
+// degradation a single combined generator showed (proxy #121–#125: it filled up on bio and phoned in the
+// fun facts). Same rationale that moved stats out of the routine and batches players in 4s.
+export const KNOWHER_CANDIDATE_BIO_KEY = "knowher:candidate-bio-v1";
+export const KNOWHER_CANDIDATE_BIO_TTL = 24 * 3600;
 export const KNOWHER_MODE_KEY = "knowher:mode"; // KV: "manual" | "auto" (default manual)
 // Per-season "already featured" ledger (docs §4 "once per season, hard"): key `knowher:featured:{season}`.
 // A player featured this season is removed from the eligible pool so the weekly pick advances through the
@@ -567,6 +577,30 @@ export async function stageKnowHerCandidate(
 /** Read back the staged candidate for the verifier. Null if none staged (or it expired). */
 export async function readKnowHerCandidate(env: KnowHerEnv): Promise<KnowHerPool | null> {
   return (await env.FEED_TAGS.get(KNOWHER_CANDIDATE_KEY, "json")) as KnowHerPool | null;
+}
+
+/** Stage the BIO/CAREER partial (2026-09-07, the 3-routine split). The bio routine writes ONLY career/bio
+ *  questions here; the fun routine reads it back, appends its off-pitch fun facts, and stages the COMBINED
+ *  pool at KNOWHER_CANDIDATE_KEY (the existing verifier feed). Validated like a candidate — shape +
+ *  all-16-clubs + a per-fact `source` — but with a LOW per-player floor (minQuestions: 3), because this is a
+ *  PARTIAL: the real 8-per-player floor is applied to the COMBINED pool at /knowher/candidate, and the
+ *  verifier is the quality gate. Not live, no featured-ledger touch, 24h TTL. Returns a summary for the
+ *  routine's report. */
+export async function stageBioCandidate(
+  env: KnowHerEnv,
+  poolInput: unknown,
+): Promise<{ ok: true; weekKey: string; playerCount: number; bioQuestions: number } | { error: string }> {
+  const v = validateKnowHerPool(poolInput, { requireAllClubs: true, requireSource: true, minQuestions: 3 });
+  if ("error" in v) return { error: v.error };
+  await env.FEED_TAGS.put(KNOWHER_CANDIDATE_BIO_KEY, JSON.stringify(v.pool), { expirationTtl: KNOWHER_CANDIDATE_BIO_TTL });
+  const bioQuestions = v.pool.players.reduce(
+    (n, p) => n + p.questions.filter((q) => q.category !== "herGame").length, 0);
+  return { ok: true, weekKey: v.pool.weekKey, playerCount: v.pool.players.length, bioQuestions };
+}
+
+/** Read back the bio partial for the fun routine. Null if none staged (or it expired). */
+export async function readBioCandidate(env: KnowHerEnv): Promise<KnowHerPool | null> {
+  return (await env.FEED_TAGS.get(KNOWHER_CANDIDATE_BIO_KEY, "json")) as KnowHerPool | null;
 }
 
 /** Stage the VERIFIED, HUMAN-ONLY candidate the verifier produces on the weekend (2026-08-12 split). Same
