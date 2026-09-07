@@ -52,14 +52,18 @@ is a story question, so spend the whole budget there.
   DEEPLY from the A-tier sources below — a club's signing announcement alone introduces her whole pre-club story,
   and her Wikipedia / NWSL / U.S. Soccer / college pages are rich with verifiable career facts. (This reverses the
   old rule that capped career facts — career/life STORY is now the core of the quiz, not a fallback.)
-- **FUN FACTS are the smaller, OPPORTUNISTIC bucket — aim ~2–3, NO minimum, never padded.** Off-pitch
-  personality: a hobby, a relatable habit, a pre-game ritual, a pet, a second passion, an unusual skill, a
-  get-to-know-her answer (the "she travels with her PS5" kind — warm, surprising, makes you smile). INCLUDE
-  these when they genuinely exist (a player rich in them can carry more), and search the off-pitch angle
-  ("<player> off the pitch / hobbies / fun facts / get to know") in the A-tier interview wells. But there is
-  **no quota** — a player with few or no findable fun facts is completely fine; her career story carries the
-  quiz. VARY questions throughout — don't cluster all the True/False together, don't save the best fact for last.
-  (The system weaves its 2 stat questions in at the one-third and two-thirds marks, so leave no room for them.)
+- **FUN FACTS — no required COUNT, but the fun-fact HUNT is MANDATORY (never optional, never a "bonus").**
+  Off-pitch personality: a hobby, a relatable habit, a pre-game ritual, a pet, a second passion, an unusual
+  skill, a get-to-know-her answer (the "she travels with her PS5" kind — warm, surprising, makes you smile).
+  There is **no required number** — a player with few genuinely-findable fun facts ships bio-led, and you must
+  NEVER pad or invent to hit a count. **BUT uncapping bio is NOT permission to skip the hunt.** Fun facts are the
+  HARD part and the whole point of this game (the Rodman standard); bio is the fast, always-there route, so the
+  trap is to fill up on bio and phone in the fun facts — DO NOT do that. Run a GENUINE, EXHAUSTIVE off-pitch hunt
+  for EVERY player in the pro-women interview wells (Girls Soccer Network, Just Women's Sports, Beats & Rhymes FC,
+  Fangirl Sports Network) plus the club "get to know" / Q&A features, and include EVERY quality fun fact you find.
+  A player who HAS findable fun facts but comes back all-bio because bio was easier is a FAILURE. VARY questions
+  throughout — don't cluster all the True/False, don't save the best fact for last. (The system weaves its 2 stat
+  questions in at the one-third and two-thirds marks, so leave no room for them.)
 - ⚠️ **NEVER fabricate** — a stretched or invented fun fact is the worst failure. A **bio-led player is a normal,
   successful outcome, not a gap to paper over**: if a low-coverage player yields few off-pitch facts after a
   genuine look, use what exists and let her career story carry her. (Note what you searched in your report if you
@@ -100,11 +104,14 @@ she's dating or which relative is famous.
   can't verify, drop it.
 - **Disambiguate:** confirm each fact is about THIS player (the correct NWSL player + her CURRENT club as
   listed above / her national team) — discard same-or-similar-name namesakes.
-- **Search effort — spend it on DEPTH, bio-first.** Do **at least ~5–6 searches per player.** Go DEEP on the
-  A-tier bio sources first — mine one source THOROUGHLY (her signing story, her club / NWSL / U.S. Soccer bio,
-  Wikipedia, her college page routinely hold many solid facts) before moving on, rather than skimming one fact
-  off each. THEN do a focused off-pitch pass for the ~2–3 fun facts in the interview wells. Bio depth is the
-  goal; fun facts are the bonus. Never stop at a shallow skim, and never backfill a thin fun-fact count with padding.
+- **Search effort — deep bio AND an exhaustive fun-fact hunt (NOT either/or; NOT bio-then-a-token-pass).** Do
+  **at least ~5–6 searches per player**, and a real share MUST target the off-pitch angle: actually search each
+  player in the interview wells by name — "<player> Beats and Rhymes FC", "<player> Girls Soccer Network",
+  "<player> Just Women's Sports", "<player> get to know / off the pitch / interview" — and OPEN them; do not
+  claim "no off-pitch content" after a shallow look. Mine the A-tier bio sources deeply for the career story AND
+  dig just as hard for the fun facts; do NOT let the easy bio route crowd out the hard hunt. Under-searching the
+  off-pitch angle and filling up on quick bio is the #1 way this game degrades — err toward one more off-pitch
+  search, not one more career fact. Never stop at a shallow skim; never pad a thin fun-fact count.
 
 ## Format — fix the True/False trap
 
@@ -182,10 +189,12 @@ describes facts the player's quiz doesn't contain. So build it mechanically, per
    line: the fact it tests, tagged `[P]` off-pitch personality or `[C]` career/identity — taken VERBATIM
    from that question's own `prompt`/`revealFact`, not from memory. If you can't point to the question in
    the JSON that a report line describes, DELETE the line — it's a hallucination.
-2. **Mix tally** = the count of `[P]` (fun fact) vs `[C]` (career/bio) lines you just wrote (e.g. "Sams: 3 fun /
-   6 career"). It must equal her real question mix, because you counted the actual questions. Career/bio is the
-   expected MAJORITY now — a `[C]`-heavy player is NORMAL and good; only flag a player if you found genuine fun
-   facts you couldn't fit, or her bio itself was thin after a deep look.
+2. **Mix tally + off-pitch hunt log** = per player, the `[P]` (fun fact) vs `[C]` (career/bio) count (e.g.
+   "Sams: 3 fun / 6 career"), PLUS a one-line note of the OFF-PITCH wells/searches you ACTUALLY ran and what each
+   yielded (e.g. "GSN: 2 quotes; Beats&Rhymes: none; club get-to-know: 1"). It must equal her real question mix.
+   Career/bio can be the majority — but a LOW fun-fact count MUST be justified by that documented hunt: a thin
+   count with a real, listed off-pitch search behind it is fine; a thin count with "no off-pitch content" and no
+   wells actually searched is the FAILURE to catch. Bio-heavy is only OK when the fun facts genuinely weren't there.
 3. **Source(s)** per player — the A-tier / escape-hatch pages you actually retrieved, so I can spot-check.
 4. **Rejected facts** — any interesting fact you FOUND in research but did NOT put in a question, and why
    (couldn't verify / banned source / failed a guardrail / too private). "None rejected" is fine. A fact you
