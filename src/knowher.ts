@@ -446,6 +446,60 @@ export function scrubEmDashesInPool(pool: KnowHerPool): void {
   }
 }
 
+// --- Answer-order shuffle at publish (2026-09-07) ------------------------------------------------
+// The generator can emit the correct answer at the same position for a whole edition (W37: option 1 for
+// all 69 MC questions), which would let a player tap the first option every time. Fix it in CODE at the
+// single publish chokepoint — immunizes every edition regardless of what the model emits (a prompt
+// instruction is the same model-dependent fragility). Deterministic + seeded per question so re-publishing
+// the same pool yields the identical layout. Mirrors Trivia's splitmix64 + Fisher-Yates (src/trivia.ts);
+// duplicated here to keep that module untouched.
+function khgSplitmix64(seed: bigint): () => number {
+  const MASK = (1n << 64n) - 1n;
+  let s = seed & MASK;
+  return () => {
+    s = (s + 0x9e3779b97f4a7c15n) & MASK;
+    let z = s;
+    z = ((z ^ (z >> 30n)) * 0xbf58476d1ce4e5b9n) & MASK;
+    z = ((z ^ (z >> 27n)) * 0x94d049bb133111ebn) & MASK;
+    z = (z ^ (z >> 31n)) & MASK;
+    return Number(z >> 11n) / 2 ** 53;
+  };
+}
+
+// FNV-1a over the question id, mixed with the season → a stable per-question seed.
+function khgSeedFor(season: number, id: string): bigint {
+  const MASK = (1n << 64n) - 1n;
+  let h = 0xcbf29ce484222325n;
+  for (let i = 0; i < id.length; i++) {
+    h = ((h ^ BigInt(id.charCodeAt(i))) * 0x100000001b3n) & MASK;
+  }
+  return (h ^ (BigInt(season >>> 0) * 0x9e3779b97f4a7c15n)) & MASK;
+}
+
+function khgShuffleInPlace<T>(arr: T[], rng: () => number): void {
+  for (let i = arr.length - 1; i > 0; i--) {
+    const j = Math.floor(rng() * (i + 1));
+    [arr[i], arr[j]] = [arr[j], arr[i]];
+  }
+}
+
+/** Randomize each question's option ORDER (MC and True/False), preserving the answer by rewriting
+ *  `correctIndex` to the correct option's new position. Deterministic per (season, question id). The app
+ *  renders options in stored order and grades by `selectedIndex == correctIndex`, so this is answer-safe.
+ *  Stat (`herGame`) questions ride along harmlessly (their options are number strings). */
+export function shuffleKnowHerOptions(pool: KnowHerPool): void {
+  for (const p of pool.players) {
+    for (const q of p.questions) {
+      if (!Array.isArray(q.options) || q.options.length < 2) continue;
+      if (q.correctIndex < 0 || q.correctIndex >= q.options.length) continue; // malformed → leave as-is
+      const correct = q.options[q.correctIndex];
+      khgShuffleInPlace(q.options, khgSplitmix64(khgSeedFor(pool.season, q.id)));
+      const newIdx = q.options.indexOf(correct);
+      if (newIdx >= 0) q.correctIndex = newIdx;
+    }
+  }
+}
+
 /** The ONE publish path: validate → replace the live pool in KV → mark this pool's players
  *  featured-this-season (idempotent) so they drop out of future eligibility. Shared by the operator's
  *  admin `pasteContent` op AND the automated weekly `/knowher/ingest` — publishing must always run
@@ -465,6 +519,9 @@ export async function publishKnowHerPool(
   // Strip em-dashes from reader-facing copy at the single publish chokepoint, so every live edition reads
   // human-crafted without asking the generator/verifier to police punctuation (see scrubEmDashesInPool).
   scrubEmDashesInPool(v.pool);
+  // Randomize each question's option order (answer-preserving) at this single publish chokepoint, so the
+  // correct answer is never fixed at option 1 regardless of what the generator emits (see shuffleKnowHerOptions).
+  shuffleKnowHerOptions(v.pool);
   // Stamp each player's numeric ESPN team id (abbr→id via the shared teams map) so the match-watcher can
   // target the team's followers for the biweekly KHG push without its own abbr→id table. Best-effort: a
   // lookup miss just leaves espnTeamId undefined (the watcher skips that team + logs), never blocks publish.
