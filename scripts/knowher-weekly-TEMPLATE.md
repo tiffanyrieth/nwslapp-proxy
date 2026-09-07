@@ -5,8 +5,11 @@
   gold standard, keep untouched) scaled to 16 players, with the owner's 2026-07-13 fidelity rulings
   applied: ">=6 MUST be human" (not "should"), NO web-search cap, thin-coverage anti-fabrication rule
   kept, and all operator notes moved into THIS comment so the model receives exactly the Rodman-shaped
-  query. The wording below is DELICATE and owner-owned — never change it without an explicit owner
-  decision (query fidelity is the product).
+  query. Owner ruling 2026-09-07 applied: inverted the content mix — career/life STORY is now the deep,
+  UNCAPPED majority and fun facts are the smaller opportunistic bucket (removed the old >=4 personality quota
+  and the ~2-3 career cap); and replaced the source rules with a strict A-TIER allow-list (single source) plus
+  a fun-facts-only escape hatch requiring >=2 sources, banning all local news. The wording below is DELICATE
+  and owner-owned — never change it without an explicit owner decision (query fidelity is the product).
 
   Usage: scripts/assemble_knowher_prompt.mjs strips this comment and substitutes the two placeholders —
   <<WEEK_KEY>> (ISO week, e.g. 2026-W29) and <<PLAYER_LIST>> (one block per team from /knowher/todo).
@@ -41,35 +44,26 @@ stat questions itself from these exact numbers.
 per player (goals, minutes, saves, and the like) from the verified numbers above.** Every question you write
 is a story question, so spend the whole budget there.
 
-- **All 8–9 must be HUMAN / STORY questions** (`herStory` / `herWorld` / `trueOrFalse`):
-  personality, relatable quirks, life beyond soccer, origin story, career milestones. Most featured players
-  have *tons* of these — but you have to SEARCH FOR PERSONALITY, not a résumé. Lead with terms like
-  "<player> off the pitch / hobbies / fun facts / get to know / what she's like", NOT "<player> background"
-  (that just returns draft position, college, and transfer fees — the stat-sheet trap). **Mine the official
-  NWSL.com and her club's site** — their player Q&As, "get to know her" features, and her SIGNING-
-  ANNOUNCEMENT story are gold-tier AND rich with the human detail you want (the PS5-in-the-suitcase kind).
-  Warm, surprising, makes-you-smile details. VARY them throughout — don't cluster all the True/False
-  together, and don't save the single best fact for last. (The system weaves its 2 stat questions into your
-  run at the one-third and two-thirds marks, so you don't need to leave room for them.)
-- ⭐ **PERSONALITY QUOTA — the whole point of this game (non-negotiable).** At least **4 of each player's
-  questions MUST come from OFF-PITCH personality / quirk / human-interest material** — a hobby, a relatable
-  habit, a life-beyond-soccer detail, a get-to-know-her answer, a superstition, a pre-game ritual, a pet, a
-  second passion, an unusual skill (the right-to-left-note-writer, the PS5-in-the-suitcase, the pregame-artist
-  kind). These facts EXIST for almost every professional — they're in the "get to know", the club Q&A, the
-  feature interview, the signing-day human-interest angle, the local paper. Your job is to GO FIND THEM. A
-  quiz where every "human" question is really about college / draft / transfers / clubs is a FAILED quiz, even
-  if every fact is true — that is the stat-sheet trap wearing a disguise.
-- ⚠️ **Career/identity questions are a LAST RESORT, capped — not a safe default.** Previous clubs, college,
-  how she arrived (draft/transfer/signing), caps, a debut, an honor ARE legitimate and NOT fabrication — but
-  they are the FALLBACK you reach for ONLY after a genuine personality hunt comes up short, and **no more than
-  ~2–3 per player.** If you catch yourself filling a player mostly with where-she-went-to-school facts, STOP:
-  that means you bailed on the hunt too early. Go back and search the off-pitch angle harder before settling.
-- ⚠️ **NEVER fabricate to reach the count** — a stretched or invented fun fact is still the worst failure. But
-  "I couldn't find personality facts" is almost always "I didn't search the right way," not "they don't
-  exist." If a genuinely low-coverage player (a just-signed backup, an obscure international) truly yields
-  fewer than 4 off-pitch facts after a REAL hunt, use what exists, fall back within the ~2–3 career cap, and
-  **say so in your report** (name her + what you searched) — do NOT paper over the gap with more résumé facts.
-  A reported gap is useful; a quiz silently padded with college trivia hides the problem.
+- **The 8–9 human questions are TWO buckets: her career/life STORY (the majority) + a few fun facts**
+  (`herStory` / `herWorld` / `trueOrFalse`). This is a fandom quiz, not a stat sheet — but "story" is NOT a dry
+  résumé. Her STORY is narrative and celebratory: where she grew up and how she started, her youth academy and
+  college, how she arrived (the signing-announcement story), her national-team path, her records, milestones, and
+  last season's big moments. THAT is the backbone and should be the **largest share (~5–6 per player)**. Mine it
+  DEEPLY from the A-tier sources below — a club's signing announcement alone introduces her whole pre-club story,
+  and her Wikipedia / NWSL / U.S. Soccer / college pages are rich with verifiable career facts. (This reverses the
+  old rule that capped career facts — career/life STORY is now the core of the quiz, not a fallback.)
+- **FUN FACTS are the smaller, OPPORTUNISTIC bucket — aim ~2–3, NO minimum, never padded.** Off-pitch
+  personality: a hobby, a relatable habit, a pre-game ritual, a pet, a second passion, an unusual skill, a
+  get-to-know-her answer (the "she travels with her PS5" kind — warm, surprising, makes you smile). INCLUDE
+  these when they genuinely exist (a player rich in them can carry more), and search the off-pitch angle
+  ("<player> off the pitch / hobbies / fun facts / get to know") in the A-tier interview wells. But there is
+  **no quota** — a player with few or no findable fun facts is completely fine; her career story carries the
+  quiz. VARY questions throughout — don't cluster all the True/False together, don't save the best fact for last.
+  (The system weaves its 2 stat questions in at the one-third and two-thirds marks, so leave no room for them.)
+- ⚠️ **NEVER fabricate** — a stretched or invented fun fact is the worst failure. A **bio-led player is a normal,
+  successful outcome, not a gap to paper over**: if a low-coverage player yields few off-pitch facts after a
+  genuine look, use what exists and let her career story carry her. (Note what you searched in your report if you
+  like — but "bio-heavy" is a success here, not a shortfall.)
 
 ## THE FIVE-LAYER GUARDRAIL (every human question — non-negotiable)
 
@@ -84,28 +78,33 @@ is a story question, so spend the whole budget there.
 Framing test: WOULD ask her hobbies, quirks, a relatable travel habit, a career first. WOULD NOT ask who
 she's dating or which relative is famous.
 
-## Sourcing — GOLD-TIER sources can be a SINGLE source
+## Sourcing — the A-TIER allow-list (single source) + a fun-facts-only escape hatch (≥2)
 
-- **GOLD-TIER (one of these alone is enough — trusted editorial desks):** Just Women's Sports, Girls
-  Soccer Network, The Athletic, ESPN, Sports Illustrated, AP, Reuters, official NWSL / club /
-  U.S. Soccer / Olympics.com / a player's own national federation, and major national outlets (NYT,
-  Washington Post, People). A fact from any ONE of these is trusted — do NOT drop it for lack of a second source.
-  ⭐ **For PERSONALITY, the official NWSL.com and club sites are your best gold-tier well** — "get to know",
-  player Q&As, and signing-announcement features carry the warm/relatable detail a Wikipedia career summary never will.
-- **General web (anything not gold-tier):** needs ≥2 DISTINCT reputable domains that agree.
-- **NEVER:** fan wikis, gossip/tabloid, video-game DBs (futbin), retailer/sponsor pages, random YouTube/
-  social, unsourced blogs. Only cite URLs you actually retrieved — if you can't verify, drop it.
+- **A-TIER — one of these ALONE is enough** (trusted, no independent corroboration needed). Use for CAREER/BIO,
+  and for a fun-fact quote the player gives DIRECTLY in an A-tier interview:
+  - **Authoritative:** Wikipedia · official club sites · NWSL.com · ESPN · U.S. Soccer · Olympics.com ·
+    college / university athletics sites · FIFA.com · CAF / UEFA / Concacaf · a player's national federation.
+  - **Major outlets:** The Athletic · Sports Illustrated · AP · Reuters · NYT · Washington Post · People ·
+    NBC (NBC Olympics / Sports) · CBS Sports · Yahoo Sports · BBC.
+  - **Pro-women interview wells:** Girls Soccer Network · Just Women's Sports · Beats & Rhymes FC · Fangirl Sports Network.
+  - **Approved editorial extras:** Nike (about.nike.com magazine) · CLIF (athlete features) · Grant Wahl ("Fútbol with Grant Wahl").
+  ⭐ For CAREER/BIO, lead with the authoritative sources (her signing story, her club / NWSL / U.S. Soccer bio,
+  Wikipedia, her college page). For FUN FACTS, the club "get to know" / Q&A features and the interview wells are best.
+- **ESCAPE HATCH — FUN FACTS ONLY, and only with ≥2 independent agreeing sources.** For a genuine off-pitch fun
+  fact on a REPUTABLE source NOT on the A-tier list (e.g. a reputable foreign-language outlet for an international
+  player), use it ONLY if **two independent reputable sources agree** on it. **CAREER/BIO must come from A-tier —
+  never from the escape hatch.** (The verifier enforces the ≥2 rule.)
+- **NEVER (banned outright, even via the escape hatch):** ALL local news (TV or paper) · social media / TikTok /
+  random YouTube · fan wikis · gossip / tabloid / celebrity-lifestyle sites · rage-bait outlets · video-game DBs
+  (futbin) · e-commerce / merch / product pages · unsourced blogs. Only cite URLs you actually retrieved — if you
+  can't verify, drop it.
 - **Disambiguate:** confirm each fact is about THIS player (the correct NWSL player + her CURRENT club as
   listed above / her national team) — discard same-or-similar-name namesakes.
-- **Search effort — a FLOOR, not a ceiling (spend it on personality):** do **at least ~5–6 searches per
-  player**, and they must be aimed at the OFF-PITCH angle — a first pass ("<player> get to know / off the
-  pitch / hobbies / fun facts / what she's like"), then follow the specific threads it surfaces (her club's
-  player Q&A, a feature interview, a local-paper profile, her signing-day human-interest story). One generic
-  "<player> background" search that returns a résumé is NOT a hunt — it's the thing to avoid. ⚠️ Do not treat
-  the budget as permission to stop early: under-searching, then backfilling with college/draft facts, is the
-  #1 way this game degrades. Only after a genuine personality hunt is exhausted do you fall back (within the
-  ~2–3 career cap above). The failure mode to design against is quitting the hunt while easy personality facts
-  are still one thread away — err toward one more targeted search, not one more college question.
+- **Search effort — spend it on DEPTH, bio-first.** Do **at least ~5–6 searches per player.** Go DEEP on the
+  A-tier bio sources first — mine one source THOROUGHLY (her signing story, her club / NWSL / U.S. Soccer bio,
+  Wikipedia, her college page routinely hold many solid facts) before moving on, rather than skimming one fact
+  off each. THEN do a focused off-pitch pass for the ~2–3 fun facts in the interview wells. Bio depth is the
+  goal; fun facts are the bonus. Never stop at a shallow skim, and never backfill a thin fun-fact count with padding.
 
 ## Format — fix the True/False trap
 
@@ -125,13 +124,13 @@ she's dating or which relative is famous.
   "learn"/delight payoff), and a **`source`** — the exact URL you verified that fact from (⚠️ REQUIRED on
   every question you write; the publish is now gated on it). The `source` is what lets an independent VERIFY
   pass re-confirm each fact before it goes live, and it keeps every published fact auditable. Cite the page
-  you actually retrieved the fact from — a gold-tier club/NWSL/editorial URL, not a search-results page.
+  you actually retrieved the fact from — an A-tier club/NWSL/editorial URL, not a search-results page.
   **8–9 questions per player — 8 is the FLOOR.** The system appends 2 stat questions,
   so the published quiz lands at 10–11; a richer player may go to 13 (published 15). One player per team.
   ⚠️ Fewer than 8 and the merged quiz falls under the app's 10-question floor and the whole run is rejected.
-  ⚠️ **Hitting 8 is NOT "done" — the count is the floor, the personality quota is the bar.** A player with 8
-  questions where fewer than 4 are genuine off-pitch personality is INCOMPLETE, not finished — go back and
-  find more before moving on. And **no two questions per player may test the SAME fact** (e.g. an MC "where
+  ⚠️ **Hitting 8 is NOT "done" — the count is the floor, DEPTH is the bar.** A player with 8 SHALLOW questions
+  (one fact skimmed off each source) is INCOMPLETE — go back and mine her career story deeper before moving on;
+  a rich player should go well past 8. And **no two questions per player may test the SAME fact** (e.g. an MC "where
   did she grow up?" and a T/F re-asking the same hometown, or three questions all restating one comeback
   story) — vary the SUBJECT, not just the phrasing. Repetition is the tell that the hunt stopped early.
 - Also write a warm one-line `tagline` for each player.
@@ -163,7 +162,7 @@ Output ONLY this JSON (no prose around it), **every player above included** in t
           "options": ["<true one>", "<plausible false>", "<plausible false>", "<plausible false>"],
           "correctIndex": 0,
           "revealFact": "<one warm sentence>",
-          "source": "https://<the exact gold-tier page you verified this fact from>"
+          "source": "https://<the exact A-tier page you verified this fact from>"
         }
       ]
     }
@@ -183,10 +182,11 @@ describes facts the player's quiz doesn't contain. So build it mechanically, per
    line: the fact it tests, tagged `[P]` off-pitch personality or `[C]` career/identity — taken VERBATIM
    from that question's own `prompt`/`revealFact`, not from memory. If you can't point to the question in
    the JSON that a report line describes, DELETE the line — it's a hallucination.
-2. **Personality count** = the tally of `[P]` vs `[C]` lines you just wrote (e.g. "Sams: 5 personality / 3
-   career"). It must equal her real question mix, because you counted the actual questions. A player heavy
-   on `[C]` tells me the hunt fell short for her.
-3. **Source(s)** per player — the gold-tier / general-web pages you actually retrieved, so I can spot-check.
+2. **Mix tally** = the count of `[P]` (fun fact) vs `[C]` (career/bio) lines you just wrote (e.g. "Sams: 3 fun /
+   6 career"). It must equal her real question mix, because you counted the actual questions. Career/bio is the
+   expected MAJORITY now — a `[C]`-heavy player is NORMAL and good; only flag a player if you found genuine fun
+   facts you couldn't fit, or her bio itself was thin after a deep look.
+3. **Source(s)** per player — the A-tier / escape-hatch pages you actually retrieved, so I can spot-check.
 4. **Rejected facts** — any interesting fact you FOUND in research but did NOT put in a question, and why
    (couldn't verify / banned source / failed a guardrail / too private). "None rejected" is fine. A fact you
    never used does NOT go in the count above — only published questions are counted.

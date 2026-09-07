@@ -36,33 +36,50 @@ curl -sS "https://nwslapp-proxy.tiffany-rieth.workers.dev/knowher/candidate" \
 - A pool JSON → proceed. Note its `weekKey`. Every question is a HUMAN question and carries a `source` URL.
 
 ### 2. Re-confirm the facts — TIERED by risk (the effort goes where the danger is)
-Classify each question yourself as you read it, and spend your search budget accordingly:
+Classify each question yourself as you read it, and spend your search budget accordingly.
+
+**A-TIER sources — a single one is trusted (mirrors the generator's allow-list; anything NOT on this list is
+NOT A-tier):** Wikipedia · official club sites · NWSL.com · ESPN · U.S. Soccer · Olympics.com · college /
+university athletics · FIFA / CAF / UEFA / Concacaf · national federations · The Athletic · Sports Illustrated ·
+AP · Reuters · NYT · Washington Post · People · NBC (Olympics / Sports) · CBS Sports · Yahoo Sports · BBC · Girls
+Soccer Network · Just Women's Sports · Beats & Rhymes FC · Fangirl Sports Network · Nike (about.nike.com) · CLIF ·
+Grant Wahl ("Fútbol with Grant Wahl").
 
 **A. FUN FACTS / personality (off-field): the HIGH-RISK tier → HEAVY independent re-search.**
 These are the novel prose claims a model can invent: hobbies, pets, family, tastes, pre-soccer life,
 side businesses, nicknames, "she once did X". For each:
 - **Do a FRESH web search of the claim itself** (e.g. `"Perle Morroni" pets dogs cats`) — do **NOT** just
   re-open the generator's `source` URL. The whole point is independence: if the generator misread a page,
-  re-reading that same page inherits the error. You may check the `source` too, but your confirmation must
-  rest on a search YOU ran, ideally a second agreeing reputable source.
+  re-reading that same page inherits the error.
+- **SOURCE-TIER rule for fun facts (mandatory — NOT a judgment call):**
+  - From an **A-TIER** source (e.g. a direct quote she gave in an A-tier interview) → a **single** A-tier source
+    confirms it.
+  - From **anything NOT on the A-tier list** → it needs **≥2 INDEPENDENT reputable sources that agree.** One
+    source alone — even a quote — can be a fabricated or parody claim you can't detect at scale, so the two-source
+    wall is structural. Found on only ONE non-A-tier source → **UNCONFIRMED → DROP.**
 
 **B. CAREER / identity / bio (on-field): the LOW-RISK tier → LIGHT source-consistency check.**
 These are structured, verifiable facts already carrying a source: previous clubs, college/youth club,
 draft, caps/national team, position, honours, on-field milestones/records. For each:
 - **Open the cited `source` and confirm it actually supports the claim** (right player, right fact). If the
   source is weak, missing, or doesn't support it, do ONE quick search to confirm — and if that still can't
-  confirm it, treat it like tier A and DROP.
+  confirm it, DROP.
+- **Career/bio must rest on an A-TIER source.** If the cited source is NOT A-tier, confirm the fact on an
+  A-tier source or DROP. Career/bio never rides the ≥2 escape hatch — it must be A-tier.
 
 For every question, apply the **five-layer guardrail** (public; about HER; sourced; holds-even-when-true; the
 answer isn't another person's identity) and **disambiguate** — confirm the fact is about THIS exact player
 (right club/nationality), not a namesake. Classify each as:
-- **CONFIRMED** — verified true and about the right player (tier A: via your own search; tier B: the source supports it).
-- **UNCONFIRMED** — you could not verify it (no agreeing source, sources disagree, only the generator's page). Default here in doubt.
+- **CONFIRMED** — verified true and about the right player, AND it clears the source-tier rule above (A-tier: one
+  trusted source; non-A-tier fun fact: ≥2 independent agreeing sources; career/bio: an A-tier source).
+- **UNCONFIRMED** — you could not verify it, sources disagree, or it fails the source-tier rule (e.g. a fun fact
+  on only ONE non-A-tier source). Default here in doubt.
 - **WRONG** — false, about a different player, or fails a guardrail.
 
 ⚙️ Cost rule: the heavy tier is FUN FACTS only — usually ~2–3 per player. Career facts get the light
-source-check, not a from-scratch re-research. You're checking, not re-writing — a single solid confirmation
-is enough. Don't grind.
+source-check, not a from-scratch re-research. You're checking, not re-writing — for an A-tier source (or a
+career/bio fact) a single solid confirmation is enough; only the non-A-tier fun facts need a second agreeing
+source. Don't grind.
 
 ### 3. Repair — drop the bad, backfill from her own confirmed facts, flag anyone left short
 - **Drop** every UNCONFIRMED and WRONG question (remove the question object entirely).
