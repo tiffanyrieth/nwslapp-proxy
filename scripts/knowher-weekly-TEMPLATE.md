@@ -55,8 +55,10 @@ is a story question, so spend the whole budget there.
 - **FUN FACTS — no required COUNT, but the fun-fact HUNT is MANDATORY (never optional, never a "bonus").**
   Off-pitch personality: a hobby, a relatable habit, a pre-game ritual, a pet, a second passion, an unusual
   skill, a get-to-know-her answer (the "she travels with her PS5" kind — warm, surprising, makes you smile).
-  There is **no required number** — a player with few genuinely-findable fun facts ships bio-led, and you must
-  NEVER pad or invent to hit a count. **BUT uncapping bio is NOT permission to skip the hunt.** Fun facts are the
+  **Aim to SURFACE ~4–5 quality fun facts per player in your hunt** — the verifier trims to a final ~2–3, so
+  overshoot on purpose. That ~4–5 is a SEARCH AMBITION, **not** an output floor: a player who genuinely yields
+  fewer after a real, documented hunt ships bio-led, and you must NEVER pad or invent to hit a number. **BUT
+  uncapping bio is NOT permission to skip the hunt.** Fun facts are the
   HARD part and the whole point of this game (the Rodman standard); bio is the fast, always-there route, so the
   trap is to fill up on bio and phone in the fun facts — DO NOT do that. Run a GENUINE, EXHAUSTIVE off-pitch hunt
   for EVERY player in the pro-women interview wells (Girls Soccer Network, Just Women's Sports, Beats & Rhymes FC,
@@ -112,6 +114,12 @@ she's dating or which relative is famous.
   dig just as hard for the fun facts; do NOT let the easy bio route crowd out the hard hunt. Under-searching the
   off-pitch angle and filling up on quick bio is the #1 way this game degrades — err toward one more off-pitch
   search, not one more career fact. Never stop at a shallow skim; never pad a thin fun-fact count.
+- **International players — extend the hunt to her language/country.** For a non-US player (or one who played
+  abroad), her off-pitch color often lives in **reputable foreign-language outlets** the English wells miss —
+  search in her language too (e.g. Spanish for Maitane/Palacios/Ascanio's Venezuelan side, German for a Bundesliga
+  player). Those are the **escape hatch**, so a fun fact from them needs **≥2 independent agreeing sources**
+  (career/bio still comes from A-tier only). Don't leave an international player fun-fact-less just because the
+  English wells were quiet.
 
 ## Format — fix the True/False trap
 
