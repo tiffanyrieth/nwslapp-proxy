@@ -106,7 +106,8 @@ search, then GO GET the story from the wells it points you to:
 - **Her CURRENT club's official site** — ONLY her club (e.g. sandiegowavefc.com for an SD player, angelcity.com
   for an Angel City player; never search the other 15). Its bio / "get to know" / signing-announcement pages
   carry her arrival story and how she's played since.
-- **NWSL.com** — her league bio and features.
+- **nwslsoccer.com** (the official NWSL league site — NOT nwsl.com, which is now an unrelated model-railroad
+  site) — her league bio and features.
 - **U.S. Soccer — OR her national federation** if she isn't American (e.g. the Zambia FA for a Zambian player).
   National-team pages carry her international career.
 - **Her college athletics page** if she played college (e.g. a UCLA / UNC athletics bio) — these often carry a
