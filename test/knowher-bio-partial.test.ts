@@ -32,10 +32,17 @@ function mockEnv(): { env: KnowHerEnv; store: Map<string, string>; ttl: Map<stri
   return { env: { FEED_TAGS } as KnowHerEnv, store, ttl };
 }
 
-/** One bio/career question carrying an A-tier source. */
+// A spread of trusted wells so the default fixtures satisfy the source-diversity gate (a substantial player
+// must draw from >1 domain). The last char of the id picks a well, so a player's questions span 3–4 domains.
+const WELLS = [
+  "https://en.wikipedia.org/wiki/x", "https://nwslsoccer.com/p",
+  "https://ussoccer.com/p", "https://sandiegowavefc.com/p",
+];
+
+/** One bio/career question carrying a trusted source, spread across WELLS by id (unless overridden). */
 const q = (id: string, over: Record<string, unknown> = {}) => ({
   id, category: "herStory", prompt: `Q ${id}?`, options: ["a", "b", "c", "d"], correctIndex: 0,
-  revealFact: "fact", source: "https://en.wikipedia.org/wiki/x", ...over,
+  revealFact: "fact", source: WELLS[id.charCodeAt(id.length - 1) % WELLS.length], ...over,
 });
 
 /** A complete BIO PARTIAL: all 16 clubs, `bio` career questions each, no stat/fun questions. */
@@ -103,4 +110,25 @@ test("readBioCandidate: round-trips what stageBioCandidate stored", async () => 
 test("readBioCandidate: null when nothing staged", async () => {
   const { env } = mockEnv();
   assert.equal(await readBioCandidate(env), null);
+});
+
+test("stageBioCandidate: REJECTS a player sourced 100% from one domain (the ~95%-Wikipedia failure)", async () => {
+  const { env } = mockEnv();
+  const pool = bioPartial(7);
+  // Force one player's whole set onto a single well.
+  pool.players[3].questions = pool.players[3].questions.map((qq) => ({
+    ...qq, source: "https://en.wikipedia.org/wiki/only",
+  }));
+  const res = await stageBioCandidate(env, pool);
+  assert.ok("error" in res && /single source domain/i.test(res.error), `expected a diversity rejection, got ${JSON.stringify(res)}`);
+});
+
+test("stageBioCandidate: a THIN player (<5 questions) all one domain is fine — too small to judge", async () => {
+  const { env } = mockEnv();
+  const pool = bioPartial(3);
+  pool.players[2].questions = pool.players[2].questions.map((qq) => ({
+    ...qq, source: "https://en.wikipedia.org/wiki/only",
+  }));
+  const res = await stageBioCandidate(env, pool);
+  assert.ok("ok" in res && res.ok, `a 3-question single-domain player must pass, got ${JSON.stringify(res)}`);
 });

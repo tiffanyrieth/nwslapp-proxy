@@ -48,19 +48,23 @@ JSON shape. Honor every rule in it, including:
 - USE the provided stats verbatim as context; never look stats up; never write stat questions.
 - Write NO off-pitch fun facts — that is the fun routine's job. If you stumble on a great fun fact, note it in
   your report for the fun routine, but do NOT put it in a question here.
-- Career/bio must rest on an **A-tier source** (no escape hatch). If a career fact isn't on A-tier, drop it.
+- Career/bio must rest on a **trusted well** (no escape hatch). If a career fact isn't on one, drop it.
+- **GATHER broadly, then CURATE** (the template's two-phase mandate): for each player, work the must-search wells
+  (Wikipedia as the map → her club site, NWSL, U.S. Soccer / her federation, her college page, Girls Soccer
+  Network, previous clubs) and collect EVERY genuine career fact — don't stop at a number — then SELECT the
+  ~8–10 most varied/interesting and DROP the dry/duplicate ones. The kept set must span **several wells, not one**.
 
 ⚙️ **HOW to work through the 16 players — keep it LEAN:**
 - **Do NOT spawn a separate sub-agent per player.** Research and write the players YOURSELF, sequentially or in
   small groups. Spinning up 16 parallel agents multiplies token cost ~16× for no quality gain.
 - ⚠️ **BUILD THE PARTIAL INCREMENTALLY — never emit all 16 players in one response.** Work in **batches of ~4
-  players**: research a batch, then WRITE that batch's player objects to `/tmp/knowher-bio.json` — appending to
-  the `players` array (start the file `{"weekKey":…,"season":…,"players":[` on the first batch, append objects
-  each batch, close `]}` at the end) — before moving on. No single response should carry more than ~4 players'
-  JSON. (A one-shot 16-player emit blows the output-token cap and pressures you to shorten players.)
-- **Target ~7–8 career questions per player** (an overshoot — the verifier trims to ~5–6). Go DEEP: don't skim
-  one fact off each source. A rich player may go past 8; a genuinely thin one may only support ~5–6 — that's
-  fine, flag her. Never fabricate to hit the number.
+  players**: gather + curate a batch, then WRITE that batch's CURATED player objects to `/tmp/knowher-bio.json` —
+  appending to the `players` array (start the file `{"weekKey":…,"season":…,"players":[` on the first batch,
+  append objects each batch, close `]}` at the end) — before moving on. Only the curated ~8–10 get written as
+  full JSON; the gathered-but-dropped stay as short notes for your report. No single response should carry more
+  than ~4 players' JSON. (A one-shot 16-player emit blows the output-token cap.)
+- ⚠️ **A single-source player is REJECTED by the dry-run** — a player with ≥5 questions all from one domain
+  (e.g. 100% Wikipedia) fails validation. Spread across the wells; that's the whole point of gathering broadly.
 
 Build the JSON incrementally until `/tmp/knowher-bio.json` holds ONLY the finished BIO partial (nothing around
 it). Keep the per-player source list separately for your report.
