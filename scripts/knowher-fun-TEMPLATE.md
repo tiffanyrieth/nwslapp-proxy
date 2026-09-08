@@ -89,7 +89,7 @@ she's dating or which relative is famous.
 
 - **A-TIER — one of these ALONE is enough** (trusted, no independent corroboration needed). Use for a fun-fact
   quote the player gives DIRECTLY in an A-tier interview:
-  - **Authoritative:** Wikipedia · official club sites · NWSL.com · ESPN · U.S. Soccer · Olympics.com ·
+  - **Authoritative:** Wikipedia · official club sites · nwslsoccer.com (the NWSL league site, NOT nwsl.com) · ESPN · U.S. Soccer · Olympics.com ·
     college / university athletics sites · FIFA.com · CAF / UEFA / Concacaf · a player's national federation.
   - **Major outlets:** The Athletic · Sports Illustrated · AP · Reuters · NYT · Washington Post · People ·
     NBC (NBC Olympics / Sports) · CBS Sports · Yahoo Sports · BBC.

@@ -39,7 +39,7 @@ curl -sS "https://nwslapp-proxy.tiffany-rieth.workers.dev/knowher/candidate" \
 Classify each question yourself as you read it, and spend your search budget accordingly.
 
 **A-TIER sources — a single one is trusted (mirrors the generator's allow-list; anything NOT on this list is
-NOT A-tier):** Wikipedia · official club sites · NWSL.com · ESPN · U.S. Soccer · Olympics.com · college /
+NOT A-tier):** Wikipedia · official club sites · nwslsoccer.com (the NWSL league site, NOT nwsl.com) · ESPN · U.S. Soccer · Olympics.com · college /
 university athletics · FIFA / CAF / UEFA / Concacaf · national federations · The Athletic · Sports Illustrated ·
 AP · Reuters · NYT · Washington Post · People · NBC (Olympics / Sports) · CBS Sports · Yahoo Sports · BBC · Girls
 Soccer Network · Just Women's Sports · Beats & Rhymes FC · Fangirl Sports Network · Nike (about.nike.com) · CLIF ·
