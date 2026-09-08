@@ -41,17 +41,20 @@ club drafted her". Your ONLY job is the off-pitch fun facts.)
 
 <<PLAYER_LIST>>
 
-## What to produce PER PLAYER (~4–5 fun facts) — HUMAN, OFF-PITCH ONLY
+## What to produce PER PLAYER (~3–4 fun facts) — HUMAN, OFF-PITCH ONLY
 
 **Write ONLY off-pitch fun facts. Do NOT write career/bio questions (that routine already ran) and do NOT
 write any `herGame` / stat questions (the system adds those in code).**
 
-- **Produce ~4–5 off-pitch fun facts per player** (`herWorld` / `trueOrFalse`): a hobby, a relatable habit, a
+- **Produce ~3–4 off-pitch fun facts per player** (`herWorld` / `trueOrFalse`): a hobby, a relatable habit, a
   life-beyond-soccer detail, a get-to-know-her answer, a superstition, a pre-game ritual, a pet, a second
   passion, an unusual skill (the right-to-left-note-writer, the PS5-in-the-suitcase, the pregame-artist kind).
   These facts EXIST for almost every professional — they're in the "get to know", the club Q&A, the feature
-  interview, the signing-day human-interest angle. Your job is to **GO FIND THEM.** (The verifier trims to a
-  final ~2–3, so ~4–5 is the aim.)
+  interview, the signing-day human-interest angle. Your job is to **GO FIND THEM.** ⚠️ **~3–4 is a SOFT aim, not
+  a hard quota** — the final quiz wants only ~2–3 fun questions, so this is a light overshoot for the verifier.
+  Whatever your bounded hunt (below) turns up is what you keep. **For a lesser-known / thin-coverage player, 2
+  real fun facts is a SUCCESS** — do NOT grind extra searches, and do NOT reach for the escape hatch, just to
+  force a 3rd or 4th. Her bio/career already carries the quiz.
 - ⭐ **You have to SEARCH FOR PERSONALITY, not a résumé.** Lead with terms like "<player> off the pitch / hobbies
   / fun facts / get to know / what she's like", NOT "<player> background" (that just returns draft position,
   college, and transfer fees — the stat-sheet trap). Mine the club "get to know" / Q&A features and the
@@ -116,9 +119,11 @@ she's dating or which relative is famous.
   follow the specific threads it surfaces (her club Q&A, a feature interview, her signing-day human-interest
   story, the interview wells by name — "<player> Girls Soccer Network", "<player> Just Women's Sports"). For an
   international, add her-language searches. One generic "<player> background" search that returns a résumé is NOT
-  a hunt — it's the thing to avoid. ⚠️ **Do the ~5–6, follow the good threads, then STOP.** Do NOT exhaustively
-  sweep every well for every player — that's a token sink and it's not needed. Err toward one more targeted
-  search ONLY when an easy personality fact is clearly one thread away, not endless searching.
+  a hunt — it's the thing to avoid. ⚠️ **The ~5–6 is your SEARCH budget — NOT a fun-fact quota; do not confuse them.** Do the first pass + follow
+  the good threads (~5–6 searches), then STOP and keep whatever fun facts you found — even if it's only 2. Do
+  NOT do a 7th / 8th / 9th search, and do NOT lean on the escape hatch, just to manufacture one more fact for a
+  thin player. Spent the budget, found 2? That's her count — move to the next player. Do NOT exhaustively sweep
+  every well; that's the token sink to avoid.
 
 ## Format — fix the True/False trap
 
