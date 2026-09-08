@@ -43,26 +43,28 @@ and report FAILURE (empty or broken roster). Treat the assembled prompt's wordin
 
 ### 3. Execute the FUN prompt — write the fun-ONLY pool
 
-Read `/tmp/knowher-fun-prompt.md` and carry out its instructions exactly. It tells you to run an exhaustive
+Read `/tmp/knowher-fun-prompt.md` and carry out its instructions exactly. It tells you to run a **BOUNDED**
 OFF-PITCH hunt for each player and write ONLY her fun-fact questions (no career/bio, no stats), with A-tier +
 escape-hatch (≥2) sourcing and the exact JSON shape. Honor every rule, including:
-- **GATHER broadly, then CURATE to ~4–5 per player** (the template's two-phase mandate): hunt every off-pitch
-  fun fact you can find across the wells — don't stop at a number — then keep the ~4–5 most fun and varied and
-  drop the dull/duplicate ones (the verifier trims further to ~2–3). ~4–5 kept is the floor that makes the game
-  work; hunt hard for it.
+- **~5–6 searches per player, a FLOOR not a ceiling — then STOP.** Do the first pass + follow the good threads,
+  keep ~4–5 fun facts (the verifier trims to ~2–3), and move on. Do NOT exhaustively sweep every well for every
+  player — that's a token sink. Fun is LIGHTER than the bio pass, not heavier.
 - **NO career/bio questions** — the bio routine already wrote those. No "where did she go to college."
+- **Do NOT re-read the bio partial's questions to avoid overlap** — off-pitch fun facts don't collide with career
+  facts. The partial is just your roster + the merge target; don't spend budget cross-checking it.
 - Fun facts from a non-A-tier source need **≥2 independent agreeing sources** (the escape hatch). For an
   international player, extend the hunt to her language/country.
 - NEVER fabricate. A thin count after a REAL, documented hunt is acceptable (flag her); a thin count because the
   hunt stopped early is a FAILURE.
 
-⚙️ **HOW to work — keep it LEAN:**
-- **Do NOT spawn a sub-agent per player.** Research + write yourself, sequentially or in small groups.
-- ⚠️ **BUILD INCREMENTALLY in batches of ~4 players** → append to `/tmp/knowher-fun.json` (start
-  `{"weekKey":…,"season":…,"players":[`, append objects each batch, close `]}`). Each player object keeps the
-  `teamAbbreviation` / `espnAthleteId` / `playerName` / `jerseyNumber` / `position` / `tagline` from the roster
-  verbatim (the merge matches on `espnAthleteId`), with a `questions` array of ONLY her fun facts. No single
-  response should carry more than ~4 players' JSON.
+⚙️ **HOW to work — keep it LEAN (this is a cost rule):**
+- **Do NOT spawn a sub-agent per player.** Research + write yourself.
+- ⚠️ **Work in batches of ~4: research a batch → WRITE those 4 players' fun facts to `/tmp/knowher-fun.json` →
+  THEN the next batch.** Do NOT research all 16 players up front before writing — that upfront sweep is exactly
+  the token blow-up to avoid. Append each batch (start `{"weekKey":…,"season":…,"players":[`, append objects each
+  batch, close `]}`). Each player object keeps the `teamAbbreviation` / `espnAthleteId` / `playerName` /
+  `jerseyNumber` / `position` / `tagline` from the roster verbatim (the merge matches on `espnAthleteId`), with a
+  `questions` array of ONLY her fun facts. No single response should carry more than ~4 players' JSON.
 
 Build until `/tmp/knowher-fun.json` holds ONLY the finished fun-only pool. Keep the source list for your report.
 

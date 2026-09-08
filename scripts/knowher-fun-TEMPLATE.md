@@ -3,11 +3,15 @@
 
   Provenance: derived from the last-known-good weekly template (commit 6e4374f — the #91 verify-gate state,
   the proven Rodman-shaped query) by SPLITTING generation into isolated routines. This is the FUN-FACTS half:
-  off-pitch personality is now the WHOLE job. The wording is the OG's PERSONALITY language — the hunt-hard,
-  follow-the-player, "go FIND them" floor logic — carried over, with two frames applied:
-    (1) TARGET ~4–5 fun facts per player (overshoot; the verifier trims to ~2–3), the OG personality floor;
-    (2) career/bio is BANNED here — a separate BIO routine already wrote her career story, so this routine
-        writes NO "where did she go to college" questions. Fun facts only.
+  off-pitch personality is now the WHOLE job. The wording is the OG's PERSONALITY language — the "SEARCH FOR
+  PERSONALITY not a résumé" hunt, the "go FIND them" list, and the OG's BOUNDED "~5–6 searches, a FLOOR not a
+  ceiling" search effort — carried over VERBATIM (2026-09-08: a prior gather-broad/"exhaust the wells" rewrite
+  made this routine a token hog; reverted to the OG's bounded hunt). Three frames applied:
+    (1) TARGET ~4–5 fun facts per player (the verifier trims to ~2–3), the OG personality floor;
+    (2) career/bio is BANNED here — a separate BIO routine already wrote her career story, so this routine writes
+        NO "where did she go to college" questions, AND does NOT re-read the bio to avoid overlap (off-pitch ≠
+        career, no collision);
+    (3) LIGHTER than bio: a bounded hunt, not an exhaustive sweep. Do the ~5–6, follow good threads, then stop.
   Sourcing is the finalized A-TIER allow-list PLUS the fun-facts-only escape hatch (≥2 independent agreeing
   sources for anything not A-tier) — the escape-hatch wording is UNCHANGED because it works. Everything else —
   the five-layer guardrail, the True/False format rules, the OUTPUT JSON shape, the report discipline — is the
@@ -42,27 +46,27 @@ club drafted her". Your ONLY job is the off-pitch fun facts.)
 **Write ONLY off-pitch fun facts. Do NOT write career/bio questions (that routine already ran) and do NOT
 write any `herGame` / stat questions (the system adds those in code).**
 
-- ⭐ **FUN FACTS — GATHER broadly, then CURATE to the ~4–5 best.** Work in two phases, same as the bio routine:
-  first **GATHER** every genuine off-pitch fun fact you can find across the wells below (don't stop at a number —
-  a count is a stop signal); then **CURATE** to the **~4–5 most fun and varied** for the quiz, dropping the dull
-  or duplicate ones (the verifier trims further to ~2–3). Off-pitch personality only: a hobby, a relatable habit,
-  a pre-game ritual, a pet, a second passion, an unusual skill, a get-to-know-her answer (the "she travels with
-  her PS5" kind). ~4–5 kept is the floor that makes the game work — hold to it.
-- ⭐ **You have to GO FIND them — SEARCH FOR PERSONALITY, not a résumé.** These facts EXIST for almost every
-  professional — they're in the "get to know", the club Q&A, the feature interview, the pro-women interview
-  wells. Your job is to hunt them out. **Run a GENUINE, EXHAUSTIVE off-pitch hunt for EVERY player** in the
+- **Produce ~4–5 off-pitch fun facts per player** (`herWorld` / `trueOrFalse`): a hobby, a relatable habit, a
+  life-beyond-soccer detail, a get-to-know-her answer, a superstition, a pre-game ritual, a pet, a second
+  passion, an unusual skill (the right-to-left-note-writer, the PS5-in-the-suitcase, the pregame-artist kind).
+  These facts EXIST for almost every professional — they're in the "get to know", the club Q&A, the feature
+  interview, the signing-day human-interest angle. Your job is to **GO FIND THEM.** (The verifier trims to a
+  final ~2–3, so ~4–5 is the aim.)
+- ⭐ **You have to SEARCH FOR PERSONALITY, not a résumé.** Lead with terms like "<player> off the pitch / hobbies
+  / fun facts / get to know / what she's like", NOT "<player> background" (that just returns draft position,
+  college, and transfer fees — the stat-sheet trap). Mine the club "get to know" / Q&A features and the
   pro-women interview wells (Girls Soccer Network, Just Women's Sports, Beats & Rhymes FC, Fangirl Sports
-  Network) plus the club "get to know" / Q&A features — actually search each player by name in them and OPEN the
-  results; do not claim "no off-pitch content" after a shallow look. Lead with terms like "<player> off the
-  pitch / hobbies / fun facts / get to know / what she's like", and follow the specific threads each surfaces.
-- ⚠️ **Falling short of ~4 is acceptable ONLY when a documented hunt genuinely came up short** — then flag her
-  in your report (name her + the wells you actually searched + what each yielded). But "I didn't really look" is
-  NOT a shortfall. A player who HAS findable fun facts but comes back thin because the hunt stopped early is a
-  FAILURE. Under-searching the off-pitch angle is the #1 way this game degrades — err toward one more targeted
-  search, not one fewer fun fact.
-- ⚠️ **NEVER fabricate to reach the count** — a stretched or invented fun fact is the worst failure. If a
-  genuinely low-coverage player truly yields fewer than ~4 off-pitch facts after a REAL hunt, use what exists
-  and say so in your report — do NOT pad. (Her career story already carries her; you don't need to backfill.)
+  Network) — their player Q&As and "get to know her" features carry the warm/relatable detail (the
+  PS5-in-the-suitcase kind). **VARY them throughout** — don't cluster all the True/False together, and don't save
+  the single best fact for last.
+- **You already fetched her bio partial — but you do NOT need to read her bio questions to avoid overlap.**
+  Off-pitch fun facts are categorically different from career facts (the bio routine's job), so they won't
+  collide. Spend your budget HUNTING fun facts, not cross-checking the bio. (The partial is just your roster +
+  the merge target.)
+- ⚠️ **NEVER fabricate to reach the count** — a stretched or invented fun fact is the worst failure. But "I
+  couldn't find personality facts" is almost always "I didn't search the right way," not "they don't exist." If a
+  genuinely low-coverage player truly yields fewer than ~4 off-pitch facts after a REAL hunt, use what exists and
+  **say so in your report** (name her + what you searched) — do NOT pad. (Her career story already carries her.)
 - **International players — extend the hunt to her language/country.** For a non-US player (or one who played
   abroad), her off-pitch color often lives in **reputable foreign-language outlets** the English wells miss —
   search in her language too (e.g. Spanish for a Venezuelan player, German for a Bundesliga player). Those are
@@ -107,10 +111,14 @@ she's dating or which relative is famous.
   can't verify, drop it.
 - **Disambiguate:** confirm each fact is about THIS player (the correct NWSL player + her CURRENT club as
   listed above / her national team) — discard same-or-similar-name namesakes.
-- **Search effort — an exhaustive off-pitch hunt:** do **at least ~5–6 searches per player**, aimed at the
-  off-pitch angle — search each player by name in the interview wells ("<player> Beats and Rhymes FC", "<player>
-  Girls Soccer Network", "<player> Just Women's Sports", "<player> get to know / off the pitch / interview") and
-  OPEN them; for an international, add her-language searches. Never stop at a shallow skim; never pad a thin count.
+- **Search effort — a FLOOR, not a ceiling:** do **at least ~5–6 searches per player**, aimed at the OFF-PITCH
+  angle — a first pass ("<player> get to know / off the pitch / hobbies / fun facts / what she's like"), then
+  follow the specific threads it surfaces (her club Q&A, a feature interview, her signing-day human-interest
+  story, the interview wells by name — "<player> Girls Soccer Network", "<player> Just Women's Sports"). For an
+  international, add her-language searches. One generic "<player> background" search that returns a résumé is NOT
+  a hunt — it's the thing to avoid. ⚠️ **Do the ~5–6, follow the good threads, then STOP.** Do NOT exhaustively
+  sweep every well for every player — that's a token sink and it's not needed. Err toward one more targeted
+  search ONLY when an easy personality fact is clearly one thread away, not endless searching.
 
 ## Format — fix the True/False trap
 
