@@ -46,8 +46,10 @@ and report FAILURE (empty or broken roster). Treat the assembled prompt's wordin
 Read `/tmp/knowher-fun-prompt.md` and carry out its instructions exactly. It tells you to run an exhaustive
 OFF-PITCH hunt for each player and write ONLY her fun-fact questions (no career/bio, no stats), with A-tier +
 escape-hatch (≥2) sourcing and the exact JSON shape. Honor every rule, including:
-- **Target ~4–5 fun facts per player** (an overshoot — the verifier trims to ~2–3). This is the FLOOR that
-  makes the game work; hunt hard for it.
+- **GATHER broadly, then CURATE to ~4–5 per player** (the template's two-phase mandate): hunt every off-pitch
+  fun fact you can find across the wells — don't stop at a number — then keep the ~4–5 most fun and varied and
+  drop the dull/duplicate ones (the verifier trims further to ~2–3). ~4–5 kept is the floor that makes the game
+  work; hunt hard for it.
 - **NO career/bio questions** — the bio routine already wrote those. No "where did she go to college."
 - Fun facts from a non-A-tier source need **≥2 independent agreeing sources** (the escape hatch). For an
   international player, extend the hunt to her language/country.

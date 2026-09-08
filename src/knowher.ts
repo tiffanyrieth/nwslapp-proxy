@@ -123,6 +123,14 @@ export function clubCompletenessError(teamAbbrs: string[]): string | null {
   return null;
 }
 
+/** Hostname of a source URL, normalized (lowercased, leading "www." stripped) — for the diversity gate.
+ *  Returns "" for a blank/unparseable source (excluded from the domain count). Mirrors load_knowher.mjs. */
+function knowherSourceDomain(url: unknown): string {
+  if (typeof url !== "string" || !url.trim()) return "";
+  try { return new URL(url.trim()).hostname.replace(/^www\./i, "").toLowerCase(); }
+  catch { return ""; }
+}
+
 /** Validate an unknown value against the pool schema. Returns the typed pool or a
  *  human-readable error. The SAME rules run in scripts/load_knowher.mjs (JS copy) and the
  *  admin pasteContent op, so bad content can never reach KV from either path. */
@@ -137,7 +145,11 @@ export function validateKnowHerPool(
    *  HUMAN-ONLY and may carry a player the verifier dropped toward the Lever-1 minimum, so
    *  stageVerifiedCandidate lowers this to 5 (5 human + 5 stat = the app's 10-floor; below 5 can never
    *  ship, so it's the natural stage floor). Every OTHER path keeps the 8 default. */
-  opts: { requireAllClubs?: boolean; requireSource?: boolean; minQuestions?: number } = {},
+  /** `requireDiversity`: ON for the generator stage endpoints (bio partial + combined candidate) — a
+   *   substantial player (≥5 human questions) must draw from more than ONE source domain, so the quiz can't
+   *   ship sourced 100% from a single site (the ~95%-Wikipedia failure). OFF for the verified stage (trimming
+   *   can legitimately narrow a player) and the admin upsert. */
+  opts: { requireAllClubs?: boolean; requireSource?: boolean; minQuestions?: number; requireDiversity?: boolean } = {},
 ): { pool: KnowHerPool } | { error: string } {
   const minQ = opts.minQuestions ?? MIN_QUESTIONS;
   const doc = raw as Partial<KnowHerPool> | null;
@@ -163,6 +175,8 @@ export function validateKnowHerPool(
       return { error: `${at}: must have ${minQ}–${MAX_QUESTIONS} questions (has ${p.questions?.length ?? 0})` };
     }
     const qids = new Set<string>();
+    const domains = new Set<string>(); // distinct source domains across her HUMAN questions (diversity gate)
+    let humanCount = 0;
     for (let j = 0; j < p.questions.length; j++) {
       const q = p.questions[j] as Partial<KnowHerQuestion>;
       const qat = `${at} question ${j} (id=${q?.id ?? "?"})`;
@@ -189,6 +203,15 @@ export function validateKnowHerPool(
       if (opts.requireSource && q.category !== "herGame" && (typeof q.source !== "string" || !q.source.trim())) {
         return { error: `${qat}: human question needs a "source" URL (the verify gate re-confirms each fact from it)` };
       }
+      if (q.category !== "herGame") {
+        humanCount++;
+        const d = knowherSourceDomain(q.source);
+        if (d) domains.add(d);
+      }
+    }
+    // Source diversity — the ~95%-single-source failure. A substantial player must draw from >1 well.
+    if (opts.requireDiversity && humanCount >= 5 && domains.size <= 1) {
+      return { error: `${at}: all ${humanCount} human questions come from a single source domain (${[...domains][0] ?? "none"}) — spread across the wells (club site, NWSL, U.S. Soccer/federation, college, Wikipedia), don't scrape one page` };
     }
   }
   if (opts.requireAllClubs) {
@@ -566,7 +589,8 @@ export async function stageKnowHerCandidate(
   poolInput: unknown,
 ): Promise<{ ok: true; weekKey: string; playerCount: number; humanQuestions: number } | { error: string }> {
   // requireSource: a candidate MUST carry a per-fact source or the verifier has nothing to re-confirm against.
-  const v = validateKnowHerPool(poolInput, { requireAllClubs: true, requireSource: true });
+  // requireDiversity: the combined pool can't ship sourced 100% from one site (the ~95%-Wikipedia failure).
+  const v = validateKnowHerPool(poolInput, { requireAllClubs: true, requireSource: true, requireDiversity: true });
   if ("error" in v) return { error: v.error };
   await env.FEED_TAGS.put(KNOWHER_CANDIDATE_KEY, JSON.stringify(v.pool), { expirationTtl: KNOWHER_CANDIDATE_TTL });
   const humanQuestions = v.pool.players.reduce(
@@ -590,7 +614,7 @@ export async function stageBioCandidate(
   env: KnowHerEnv,
   poolInput: unknown,
 ): Promise<{ ok: true; weekKey: string; playerCount: number; bioQuestions: number } | { error: string }> {
-  const v = validateKnowHerPool(poolInput, { requireAllClubs: true, requireSource: true, minQuestions: 3 });
+  const v = validateKnowHerPool(poolInput, { requireAllClubs: true, requireSource: true, minQuestions: 3, requireDiversity: true });
   if ("error" in v) return { error: v.error };
   await env.FEED_TAGS.put(KNOWHER_CANDIDATE_BIO_KEY, JSON.stringify(v.pool), { expirationTtl: KNOWHER_CANDIDATE_BIO_TTL });
   const bioQuestions = v.pool.players.reduce(

@@ -42,10 +42,12 @@ club drafted her". Your ONLY job is the off-pitch fun facts.)
 **Write ONLY off-pitch fun facts. Do NOT write career/bio questions (that routine already ran) and do NOT
 write any `herGame` / stat questions (the system adds those in code).**
 
-- ⭐ **FUN FACTS — TARGET ~4–5 per player (a real requirement, not a soft suggestion).** This is the FLOOR that
-  makes the game work — hold to it. Produce ~4–5 (the verifier trims to a final ~2–3, so overshoot on purpose;
-  don't go crazy past ~5). Off-pitch personality only: a hobby, a relatable habit, a pre-game ritual, a pet, a
-  second passion, an unusual skill, a get-to-know-her answer (the "she travels with her PS5" kind).
+- ⭐ **FUN FACTS — GATHER broadly, then CURATE to the ~4–5 best.** Work in two phases, same as the bio routine:
+  first **GATHER** every genuine off-pitch fun fact you can find across the wells below (don't stop at a number —
+  a count is a stop signal); then **CURATE** to the **~4–5 most fun and varied** for the quiz, dropping the dull
+  or duplicate ones (the verifier trims further to ~2–3). Off-pitch personality only: a hobby, a relatable habit,
+  a pre-game ritual, a pet, a second passion, an unusual skill, a get-to-know-her answer (the "she travels with
+  her PS5" kind). ~4–5 kept is the floor that makes the game work — hold to it.
 - ⭐ **You have to GO FIND them — SEARCH FOR PERSONALITY, not a résumé.** These facts EXIST for almost every
   professional — they're in the "get to know", the club Q&A, the feature interview, the pro-women interview
   wells. Your job is to hunt them out. **Run a GENUINE, EXHAUSTIVE off-pitch hunt for EVERY player** in the

@@ -55,6 +55,18 @@ const MIN_HUMAN_QUESTIONS = 5;  // human ≥ 5 per player (fail); < 6 is a warn 
 const TARGET_HUMAN_QUESTIONS = 6;
 const TF_MIN_SAMPLE = 6;        // only judge the True/False balance once the pool has this many T/F
 const TF_TRUE_MAX_RATIO = 0.65; // > this share of T/F answering "True" ⇒ the banned "obviously-true" pattern
+// Source-diversity gate (2026-09-08): a bio/career set sourced entirely from one site (the ~95%-Wikipedia
+// failure) plays dry and reads like a scrape. A substantial player must draw from more than one well.
+const DIVERSITY_MIN_QUESTIONS = 5; // below this a player is too small to judge for spread
+const DIVERSITY_WARN_DOMAINS = 3;  // ≥6 human questions from fewer than this many domains ⇒ warn
+
+/** Hostname of a source URL, normalized (lowercased, leading "www." stripped) — for the diversity check.
+ *  Returns "" for a blank/unparseable source, which is excluded from the domain count. */
+function sourceDomain(url) {
+  if (typeof url !== "string" || !url.trim()) return "";
+  try { return new URL(url.trim()).hostname.replace(/^www\./i, "").toLowerCase(); }
+  catch { return ""; }
+}
 
 // The 16 NWSL clubs. TWIN of KNOWN_CLUB_ABBRS in src/knowher.ts — expansion changes BOTH.
 // A published edition must cover every club: 2026-W31 shipped 15 teams (ESPN briefly returned an
@@ -138,6 +150,7 @@ export function validatePool(doc, opts = {}) {
     }
 
     const qids = new Set();
+    const domains = new Set(); // distinct source domains across her HUMAN questions (diversity gate)
     let human = 0;
     let stat = 0;
     let playerTf = 0;
@@ -166,7 +179,11 @@ export function validatePool(doc, opts = {}) {
       }
 
       // Quality tallies
-      if (HUMAN_CATEGORIES.has(q?.category)) human++;
+      if (HUMAN_CATEGORIES.has(q?.category)) {
+        human++;
+        const d = sourceDomain(q?.source);
+        if (d) domains.add(d);
+      }
       if (q?.category === "herGame") stat++;
       if (tf) {
         playerTf++;
@@ -182,6 +199,12 @@ export function validatePool(doc, opts = {}) {
     if (human < minHuman) fail(`${at}: only ${human} human (story/personality) questions — need ≥ ${minHuman}`);
     else if (!opts.minHuman && human < TARGET_HUMAN_QUESTIONS) warn(`${at}: ${human} human questions (aim ≥ ${TARGET_HUMAN_QUESTIONS})`);
     if (playerTf >= 3 && playerTfTrue === playerTf) warn(`${at}: all ${playerTf} True/False answers are "True" — vary them (some plausibly FALSE), a lone true fact should be an MC "which has she actually done?"`);
+    // Source diversity — the ~95%-single-source failure. A substantial player must draw from >1 well.
+    if (human >= DIVERSITY_MIN_QUESTIONS && domains.size <= 1) {
+      fail(`${at}: all ${human} human questions come from a single source domain (${[...domains][0] ?? "none"}) — spread across the wells (her club site, NWSL, U.S. Soccer/federation, college, Wikipedia), don't scrape one page`);
+    } else if (human >= DIVERSITY_WARN_DOMAINS * 2 && domains.size < DIVERSITY_WARN_DOMAINS) {
+      warn(`${at}: ${human} human questions from only ${domains.size} source domain(s) — aim for ≥${DIVERSITY_WARN_DOMAINS} different wells so the quiz isn't dry`);
+    }
   });
 
   // Every club must be represented — the dry-run is the routine's gate, so a short pool must

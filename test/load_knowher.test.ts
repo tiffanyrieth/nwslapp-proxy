@@ -7,6 +7,10 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { validatePool } from "../scripts/load_knowher.mjs";
 
+// A spread of trusted wells so fixtures satisfy the source-diversity gate (2026-09-08: a substantial player
+// must draw from >1 domain). The last char of the id picks a well, so a player's questions span 3–4 domains.
+const WELLS = ["en.wikipedia.org", "nwslsoccer.com", "ussoccer.com", "sandiegowavefc.com"];
+
 // Build one question of a given category. T/F answer defaults to True (correctIndex 0).
 function q(id: string, category: string, correctIndex = 0) {
 	const tf = category === "trueOrFalse";
@@ -15,7 +19,8 @@ function q(id: string, category: string, correctIndex = 0) {
 		options: tf ? ["True", "False"] : ["a", "b", "c", "d"],
 		correctIndex, revealFact: "fact",
 		// Human questions carry a source (the verify gate requires it since 2026-08-11); herGame is exempt.
-		...(category === "herGame" ? {} : { source: `https://example.com/${id}` }),
+		// Spread across WELLS by id so a player isn't single-sourced (the diversity gate would fail that).
+		...(category === "herGame" ? {} : { source: `https://${WELLS[id.charCodeAt(id.length - 1) % WELLS.length]}/${id}` }),
 	};
 }
 
@@ -45,6 +50,15 @@ test("a healthy pool (10 Qs/player, mixed T/F) passes clean", () => {
 	const { errors, warnings } = validatePool(pool(ABBRS.map((a) => player(a, { human: 6, stat: 4, tfTrue: 1 }))));
 	assert.deepEqual(errors, []);
 	assert.deepEqual(warnings, []);
+});
+
+test("source diversity: a player sourced 100% from one domain FAILS (the ~95%-Wikipedia failure)", () => {
+	const players = ABBRS.map((a) => player(a, { human: 6, stat: 4, tfTrue: 1 }));
+	// Force ONE player's human questions all onto en.wikipedia.org.
+	players[4].questions = players[4].questions.map((qq) =>
+		qq.category === "herGame" ? qq : { ...qq, source: "https://en.wikipedia.org/wiki/only" });
+	const { errors } = validatePool(pool(players));
+	assert.ok(errors.some((e) => /single source domain/i.test(e)), `expected a diversity error, got ${JSON.stringify(errors)}`);
 });
 
 test("uniform 8-question players fail the 10-question floor", () => {
