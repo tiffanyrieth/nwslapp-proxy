@@ -47,7 +47,7 @@ Read `/tmp/knowher-fun-prompt.md` and carry out its instructions exactly. It tel
 OFF-PITCH hunt for each player and write ONLY her fun-fact questions (no career/bio, no stats), with A-tier +
 escape-hatch (≥2) sourcing and the exact JSON shape. Honor every rule, including:
 - **~5–6 searches per player, a FLOOR not a ceiling — then STOP.** Do the first pass + follow the good threads,
-  keep ~4–5 fun facts (the verifier trims to ~2–3), and move on. Do NOT exhaustively sweep every well for every
+  keep ~3–4 fun facts (the verifier trims to ~2–3; 2 is fine for a thin-coverage player — do NOT grind past the ~5–6 searches or reach for the escape hatch to force more), and move on. Do NOT exhaustively sweep every well for every
   player — that's a token sink. Fun is LIGHTER than the bio pass, not heavier.
 - **NO career/bio questions** — the bio routine already wrote those. No "where did she go to college."
 - **Do NOT re-read the bio partial's questions to avoid overlap** — off-pitch fun facts don't collide with career
