@@ -1221,7 +1221,10 @@ Apps apply it on their next launch (config cache under 5 min).</p>
 			// check every minute; this covers the proxy's cron the same way.
 			try {
 				const hc = (env as unknown as { HEALTHCHECK_URL_PROXY?: string }).HEALTHCHECK_URL_PROXY;
-				if (hc) await fetch(hc);
+				// BOUNDED (2026-09-12 audit): this was a bare `await fetch(hc)` — the only unbounded external
+				// await in the */5 path. A hung healthchecks.io connection would hold the whole scheduled
+				// invocation open. fetchBounded aborts at UPSTREAM_FETCH_MS and frees the connection lane.
+				if (hc) await fetchBounded(hc);
 			} catch {
 				/* best-effort; a missed ping just delays a dead-cron alert by one tick */
 			}
