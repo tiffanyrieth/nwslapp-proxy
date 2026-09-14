@@ -1,0 +1,1442 @@
+[
+{
+"id": "401853857",
+"date": "2026-03-14T00:00Z",
+"seasonType": 14024,
+"seasonSlug": "regular-season"
+},
+{
+"id": "401854039",
+"date": "2026-03-14T16:30Z",
+"seasonType": 14024,
+"seasonSlug": "regular-season"
+},
+{
+"id": "401853858",
+"date": "2026-03-14T20:00Z",
+"seasonType": 14024,
+"seasonSlug": "regular-season"
+},
+{
+"id": "401854040",
+"date": "2026-03-14T22:30Z",
+"seasonType": 14024,
+"seasonSlug": "regular-season"
+},
+{
+"id": "401853859",
+"date": "2026-03-14T23:00Z",
+"seasonType": 14024,
+"seasonSlug": "regular-season"
+},
+{
+"id": "401853860",
+"date": "2026-03-15T00:45Z",
+"seasonType": 14024,
+"seasonSlug": "regular-season"
+},
+{
+"id": "401853861",
+"date": "2026-03-15T20:00Z",
+"seasonType": 14024,
+"seasonSlug": "regular-season"
+},
+{
+"id": "401853862",
+"date": "2026-03-15T23:00Z",
+"seasonType": 14024,
+"seasonSlug": "regular-season"
+},
+{
+"id": "401854041",
+"date": "2026-03-21T00:00Z",
+"seasonType": 14024,
+"seasonSlug": "regular-season"
+},
+{
+"id": "401853863",
+"date": "2026-03-21T00:00Z",
+"seasonType": 14024,
+"seasonSlug": "regular-season"
+},
+{
+"id": "401853864",
+"date": "2026-03-21T02:00Z",
+"seasonType": 14024,
+"seasonSlug": "regular-season"
+},
+{
+"id": "401854042",
+"date": "2026-03-21T20:00Z",
+"seasonType": 14024,
+"seasonSlug": "regular-season"
+},
+{
+"id": "401853865",
+"date": "2026-03-21T22:30Z",
+"seasonType": 14024,
+"seasonSlug": "regular-season"
+},
+{
+"id": "401853866",
+"date": "2026-03-22T00:45Z",
+"seasonType": 14024,
+"seasonSlug": "regular-season"
+},
+{
+"id": "401853867",
+"date": "2026-03-22T18:00Z",
+"seasonType": 14024,
+"seasonSlug": "regular-season"
+},
+{
+"id": "401853868",
+"date": "2026-03-22T23:00Z",
+"seasonType": 14024,
+"seasonSlug": "regular-season"
+},
+{
+"id": "401854043",
+"date": "2026-03-25T23:00Z",
+"seasonType": 14024,
+"seasonSlug": "regular-season"
+},
+{
+"id": "401853869",
+"date": "2026-03-25T23:00Z",
+"seasonType": 14024,
+"seasonSlug": "regular-season"
+},
+{
+"id": "401853870",
+"date": "2026-03-26T00:00Z",
+"seasonType": 14024,
+"seasonSlug": "regular-season"
+},
+{
+"id": "401853871",
+"date": "2026-03-26T01:00Z",
+"seasonType": 14024,
+"seasonSlug": "regular-season"
+},
+{
+"id": "401853872",
+"date": "2026-03-26T02:00Z",
+"seasonType": 14024,
+"seasonSlug": "regular-season"
+},
+{
+"id": "401853873",
+"date": "2026-03-28T02:00Z",
+"seasonType": 14024,
+"seasonSlug": "regular-season"
+},
+{
+"id": "401854044",
+"date": "2026-03-28T16:00Z",
+"seasonType": 14024,
+"seasonSlug": "regular-season"
+},
+{
+"id": "401854045",
+"date": "2026-03-28T18:00Z",
+"seasonType": 14024,
+"seasonSlug": "regular-season"
+},
+{
+"id": "401853874",
+"date": "2026-03-28T20:00Z",
+"seasonType": 14024,
+"seasonSlug": "regular-season"
+},
+{
+"id": "401853875",
+"date": "2026-03-28T22:30Z",
+"seasonType": 14024,
+"seasonSlug": "regular-season"
+},
+{
+"id": "401853876",
+"date": "2026-03-28T23:00Z",
+"seasonType": 14024,
+"seasonSlug": "regular-season"
+},
+{
+"id": "401853877",
+"date": "2026-03-29T00:45Z",
+"seasonType": 14024,
+"seasonSlug": "regular-season"
+},
+{
+"id": "401853878",
+"date": "2026-03-29T23:00Z",
+"seasonType": 14024,
+"seasonSlug": "regular-season"
+},
+{
+"id": "401854046",
+"date": "2026-04-03T23:00Z",
+"seasonType": 14024,
+"seasonSlug": "regular-season"
+},
+{
+"id": "401853879",
+"date": "2026-04-04T00:00Z",
+"seasonType": 14024,
+"seasonSlug": "regular-season"
+},
+{
+"id": "401853880",
+"date": "2026-04-04T00:30Z",
+"seasonType": 14024,
+"seasonSlug": "regular-season"
+},
+{
+"id": "401853881",
+"date": "2026-04-04T01:00Z",
+"seasonType": 14024,
+"seasonSlug": "regular-season"
+},
+{
+"id": "401853882",
+"date": "2026-04-04T20:00Z",
+"seasonType": 14024,
+"seasonSlug": "regular-season"
+},
+{
+"id": "401853883",
+"date": "2026-04-04T22:30Z",
+"seasonType": 14024,
+"seasonSlug": "regular-season"
+},
+{
+"id": "401854047",
+"date": "2026-04-05T00:45Z",
+"seasonType": 14024,
+"seasonSlug": "regular-season"
+},
+{
+"id": "401853884",
+"date": "2026-04-05T21:00Z",
+"seasonType": 14024,
+"seasonSlug": "regular-season"
+},
+{
+"id": "401853885",
+"date": "2026-04-24T21:30Z",
+"seasonType": 14024,
+"seasonSlug": "regular-season"
+},
+{
+"id": "401853886",
+"date": "2026-04-25T00:00Z",
+"seasonType": 14024,
+"seasonSlug": "regular-season"
+},
+{
+"id": "401853887",
+"date": "2026-04-25T17:00Z",
+"seasonType": 14024,
+"seasonSlug": "regular-season"
+},
+{
+"id": "401854048",
+"date": "2026-04-25T22:30Z",
+"seasonType": 14024,
+"seasonSlug": "regular-season"
+},
+{
+"id": "401853888",
+"date": "2026-04-26T00:00Z",
+"seasonType": 14024,
+"seasonSlug": "regular-season"
+},
+{
+"id": "401854049",
+"date": "2026-04-26T00:45Z",
+"seasonType": 14024,
+"seasonSlug": "regular-season"
+},
+{
+"id": "401853889",
+"date": "2026-04-26T22:00Z",
+"seasonType": 14024,
+"seasonSlug": "regular-season"
+},
+{
+"id": "401853890",
+"date": "2026-04-27T00:00Z",
+"seasonType": 14024,
+"seasonSlug": "regular-season"
+},
+{
+"id": "401854050",
+"date": "2026-04-29T23:00Z",
+"seasonType": 14024,
+"seasonSlug": "regular-season"
+},
+{
+"id": "401853891",
+"date": "2026-04-29T23:00Z",
+"seasonType": 14024,
+"seasonSlug": "regular-season"
+},
+{
+"id": "401853892",
+"date": "2026-04-30T00:00Z",
+"seasonType": 14024,
+"seasonSlug": "regular-season"
+},
+{
+"id": "401853893",
+"date": "2026-04-30T02:00Z",
+"seasonType": 14024,
+"seasonSlug": "regular-season"
+},
+{
+"id": "401853894",
+"date": "2026-05-02T00:00Z",
+"seasonType": 14024,
+"seasonSlug": "regular-season"
+},
+{
+"id": "401853895",
+"date": "2026-05-02T20:00Z",
+"seasonType": 14024,
+"seasonSlug": "regular-season"
+},
+{
+"id": "401853896",
+"date": "2026-05-02T22:30Z",
+"seasonType": 14024,
+"seasonSlug": "regular-season"
+},
+{
+"id": "401853897",
+"date": "2026-05-03T00:45Z",
+"seasonType": 14024,
+"seasonSlug": "regular-season"
+},
+{
+"id": "401853898",
+"date": "2026-05-03T17:00Z",
+"seasonType": 14024,
+"seasonSlug": "regular-season"
+},
+{
+"id": "401854051",
+"date": "2026-05-03T19:00Z",
+"seasonType": 14024,
+"seasonSlug": "regular-season"
+},
+{
+"id": "401853899",
+"date": "2026-05-03T21:00Z",
+"seasonType": 14024,
+"seasonSlug": "regular-season"
+},
+{
+"id": "401853900",
+"date": "2026-05-03T23:00Z",
+"seasonType": 14024,
+"seasonSlug": "regular-season"
+},
+{
+"id": "401853901",
+"date": "2026-05-07T02:00Z",
+"seasonType": 14024,
+"seasonSlug": "regular-season"
+},
+{
+"id": "401853902",
+"date": "2026-05-08T22:30Z",
+"seasonType": 14024,
+"seasonSlug": "regular-season"
+},
+{
+"id": "401853903",
+"date": "2026-05-09T00:00Z",
+"seasonType": 14024,
+"seasonSlug": "regular-season"
+},
+{
+"id": "401854052",
+"date": "2026-05-09T22:30Z",
+"seasonType": 14024,
+"seasonSlug": "regular-season"
+},
+{
+"id": "401854053",
+"date": "2026-05-10T00:00Z",
+"seasonType": 14024,
+"seasonSlug": "regular-season"
+},
+{
+"id": "401853904",
+"date": "2026-05-10T00:45Z",
+"seasonType": 14024,
+"seasonSlug": "regular-season"
+},
+{
+"id": "401853905",
+"date": "2026-05-10T16:25Z",
+"seasonType": 14024,
+"seasonSlug": "regular-season"
+},
+{
+"id": "401853906",
+"date": "2026-05-10T20:00Z",
+"seasonType": 14024,
+"seasonSlug": "regular-season"
+},
+{
+"id": "401853907",
+"date": "2026-05-10T23:00Z",
+"seasonType": 14024,
+"seasonSlug": "regular-season"
+},
+{
+"id": "401854054",
+"date": "2026-05-12T23:00Z",
+"seasonType": 14024,
+"seasonSlug": "regular-season"
+},
+{
+"id": "401853908",
+"date": "2026-05-16T00:00Z",
+"seasonType": 14024,
+"seasonSlug": "regular-season"
+},
+{
+"id": "401854055",
+"date": "2026-05-16T02:00Z",
+"seasonType": 14024,
+"seasonSlug": "regular-season"
+},
+{
+"id": "401853909",
+"date": "2026-05-16T02:00Z",
+"seasonType": 14024,
+"seasonSlug": "regular-season"
+},
+{
+"id": "401853910",
+"date": "2026-05-16T02:00Z",
+"seasonType": 14024,
+"seasonSlug": "regular-season"
+},
+{
+"id": "401853911",
+"date": "2026-05-16T22:30Z",
+"seasonType": 14024,
+"seasonSlug": "regular-season"
+},
+{
+"id": "401854056",
+"date": "2026-05-17T00:45Z",
+"seasonType": 14024,
+"seasonSlug": "regular-season"
+},
+{
+"id": "401853912",
+"date": "2026-05-17T22:00Z",
+"seasonType": 14024,
+"seasonSlug": "regular-season"
+},
+{
+"id": "401853913",
+"date": "2026-05-18T00:00Z",
+"seasonType": 14024,
+"seasonSlug": "regular-season"
+},
+{
+"id": "401853914",
+"date": "2026-05-21T00:00Z",
+"seasonType": 14024,
+"seasonSlug": "regular-season"
+},
+{
+"id": "401853916",
+"date": "2026-05-21T02:00Z",
+"seasonType": 14024,
+"seasonSlug": "regular-season"
+},
+{
+"id": "401853915",
+"date": "2026-05-21T02:00Z",
+"seasonType": 14024,
+"seasonSlug": "regular-season"
+},
+{
+"id": "401854057",
+"date": "2026-05-23T00:00Z",
+"seasonType": 14024,
+"seasonSlug": "regular-season"
+},
+{
+"id": "401853917",
+"date": "2026-05-23T20:00Z",
+"seasonType": 14024,
+"seasonSlug": "regular-season"
+},
+{
+"id": "401854058",
+"date": "2026-05-23T22:30Z",
+"seasonType": 14024,
+"seasonSlug": "regular-season"
+},
+{
+"id": "401853918",
+"date": "2026-05-24T00:45Z",
+"seasonType": 14024,
+"seasonSlug": "regular-season"
+},
+{
+"id": "401853919",
+"date": "2026-05-24T17:00Z",
+"seasonType": 14024,
+"seasonSlug": "regular-season"
+},
+{
+"id": "401853920",
+"date": "2026-05-24T21:00Z",
+"seasonType": 14024,
+"seasonSlug": "regular-season"
+},
+{
+"id": "401853921",
+"date": "2026-05-24T23:00Z",
+"seasonType": 14024,
+"seasonSlug": "regular-season"
+},
+{
+"id": "401853922",
+"date": "2026-05-29T23:00Z",
+"seasonType": 14024,
+"seasonSlug": "regular-season"
+},
+{
+"id": "401854059",
+"date": "2026-05-30T00:00Z",
+"seasonType": 14024,
+"seasonSlug": "regular-season"
+},
+{
+"id": "401854060",
+"date": "2026-05-30T17:30Z",
+"seasonType": 14024,
+"seasonSlug": "regular-season"
+},
+{
+"id": "401853923",
+"date": "2026-05-30T20:00Z",
+"seasonType": 14024,
+"seasonSlug": "regular-season"
+},
+{
+"id": "401853924",
+"date": "2026-05-30T22:30Z",
+"seasonType": 14024,
+"seasonSlug": "regular-season"
+},
+{
+"id": "401853925",
+"date": "2026-05-31T17:00Z",
+"seasonType": 14024,
+"seasonSlug": "regular-season"
+},
+{
+"id": "401853926",
+"date": "2026-05-31T19:00Z",
+"seasonType": 14024,
+"seasonSlug": "regular-season"
+},
+{
+"id": "401853927",
+"date": "2026-05-31T23:00Z",
+"seasonType": 14024,
+"seasonSlug": "regular-season"
+},
+{
+"id": "401853928",
+"date": "2026-07-04T00:00Z",
+"seasonType": 14024,
+"seasonSlug": "regular-season"
+},
+{
+"id": "401854061",
+"date": "2026-07-04T01:30Z",
+"seasonType": 14024,
+"seasonSlug": "regular-season"
+},
+{
+"id": "401853929",
+"date": "2026-07-04T02:00Z",
+"seasonType": 14024,
+"seasonSlug": "regular-season"
+},
+{
+"id": "401853930",
+"date": "2026-07-04T23:30Z",
+"seasonType": 14024,
+"seasonSlug": "regular-season"
+},
+{
+"id": "401853931",
+"date": "2026-07-05T00:45Z",
+"seasonType": 14024,
+"seasonSlug": "regular-season"
+},
+{
+"id": "401854062",
+"date": "2026-07-05T16:00Z",
+"seasonType": 14024,
+"seasonSlug": "regular-season"
+},
+{
+"id": "401853932",
+"date": "2026-07-05T21:00Z",
+"seasonType": 14024,
+"seasonSlug": "regular-season"
+},
+{
+"id": "401853933",
+"date": "2026-07-05T23:00Z",
+"seasonType": 14024,
+"seasonSlug": "regular-season"
+},
+{
+"id": "401854063",
+"date": "2026-07-11T00:00Z",
+"seasonType": 14024,
+"seasonSlug": "regular-season"
+},
+{
+"id": "401853935",
+"date": "2026-07-11T00:00Z",
+"seasonType": 14024,
+"seasonSlug": "regular-season"
+},
+{
+"id": "401853934",
+"date": "2026-07-11T01:03Z",
+"seasonType": 14024,
+"seasonSlug": "regular-season"
+},
+{
+"id": "401853936",
+"date": "2026-07-11T02:00Z",
+"seasonType": 14024,
+"seasonSlug": "regular-season"
+},
+{
+"id": "401853937",
+"date": "2026-07-11T22:30Z",
+"seasonType": 14024,
+"seasonSlug": "regular-season"
+},
+{
+"id": "401853938",
+"date": "2026-07-12T00:45Z",
+"seasonType": 14024,
+"seasonSlug": "regular-season"
+},
+{
+"id": "401853939",
+"date": "2026-07-12T20:00Z",
+"seasonType": 14024,
+"seasonSlug": "regular-season"
+},
+{
+"id": "401854064",
+"date": "2026-07-12T23:00Z",
+"seasonType": 14024,
+"seasonSlug": "regular-season"
+},
+{
+"id": "401854065",
+"date": "2026-07-15T23:00Z",
+"seasonType": 14024,
+"seasonSlug": "regular-season"
+},
+{
+"id": "401853940",
+"date": "2026-07-16T00:00Z",
+"seasonType": 14024,
+"seasonSlug": "regular-season"
+},
+{
+"id": "401853941",
+"date": "2026-07-18T00:00Z",
+"seasonType": 14024,
+"seasonSlug": "regular-season"
+},
+{
+"id": "401854066",
+"date": "2026-07-18T18:15Z",
+"seasonType": 14024,
+"seasonSlug": "regular-season"
+},
+{
+"id": "401853942",
+"date": "2026-07-18T18:30Z",
+"seasonType": 14024,
+"seasonSlug": "regular-season"
+},
+{
+"id": "401853943",
+"date": "2026-07-18T20:00Z",
+"seasonType": 14024,
+"seasonSlug": "regular-season"
+},
+{
+"id": "401853944",
+"date": "2026-07-18T22:30Z",
+"seasonType": 14024,
+"seasonSlug": "regular-season"
+},
+{
+"id": "401853946",
+"date": "2026-07-19T00:45Z",
+"seasonType": 14024,
+"seasonSlug": "regular-season"
+},
+{
+"id": "401853945",
+"date": "2026-07-19T01:00Z",
+"seasonType": 14024,
+"seasonSlug": "regular-season"
+},
+{
+"id": "401854067",
+"date": "2026-07-19T23:00Z",
+"seasonType": 14024,
+"seasonSlug": "regular-season"
+},
+{
+"id": "401853948",
+"date": "2026-07-25T00:00Z",
+"seasonType": 14024,
+"seasonSlug": "regular-season"
+},
+{
+"id": "401853947",
+"date": "2026-07-25T00:00Z",
+"seasonType": 14024,
+"seasonSlug": "regular-season"
+},
+{
+"id": "401853949",
+"date": "2026-07-25T02:00Z",
+"seasonType": 14024,
+"seasonSlug": "regular-season"
+},
+{
+"id": "401854068",
+"date": "2026-07-25T21:00Z",
+"seasonType": 14024,
+"seasonSlug": "regular-season"
+},
+{
+"id": "401853950",
+"date": "2026-07-25T23:45Z",
+"seasonType": 14024,
+"seasonSlug": "regular-season"
+},
+{
+"id": "401853951",
+"date": "2026-07-26T21:00Z",
+"seasonType": 14024,
+"seasonSlug": "regular-season"
+},
+{
+"id": "401854069",
+"date": "2026-07-26T23:00Z",
+"seasonType": 14024,
+"seasonSlug": "regular-season"
+},
+{
+"id": "401853952",
+"date": "2026-07-27T01:00Z",
+"seasonType": 14024,
+"seasonSlug": "regular-season"
+},
+{
+"id": "401853953",
+"date": "2026-07-30T00:00Z",
+"seasonType": 14024,
+"seasonSlug": "regular-season"
+},
+{
+"id": "401853954",
+"date": "2026-07-30T01:00Z",
+"seasonType": 14024,
+"seasonSlug": "regular-season"
+},
+{
+"id": "401853955",
+"date": "2026-07-30T02:00Z",
+"seasonType": 14024,
+"seasonSlug": "regular-season"
+},
+{
+"id": "401853956",
+"date": "2026-08-01T00:00Z",
+"seasonType": 14024,
+"seasonSlug": "regular-season"
+},
+{
+"id": "401853957",
+"date": "2026-08-01T20:00Z",
+"seasonType": 14024,
+"seasonSlug": "regular-season"
+},
+{
+"id": "401853958",
+"date": "2026-08-01T22:30Z",
+"seasonType": 14024,
+"seasonSlug": "regular-season"
+},
+{
+"id": "401853959",
+"date": "2026-08-02T00:00Z",
+"seasonType": 14024,
+"seasonSlug": "regular-season"
+},
+{
+"id": "401853960",
+"date": "2026-08-02T00:45Z",
+"seasonType": 14024,
+"seasonSlug": "regular-season"
+},
+{
+"id": "401853961",
+"date": "2026-08-02T20:00Z",
+"seasonType": 14024,
+"seasonSlug": "regular-season"
+},
+{
+"id": "401853962",
+"date": "2026-08-02T23:00Z",
+"seasonType": 14024,
+"seasonSlug": "regular-season"
+},
+{
+"id": "401854070",
+"date": "2026-08-03T01:00Z",
+"seasonType": 14024,
+"seasonSlug": "regular-season"
+},
+{
+"id": "401854071",
+"date": "2026-08-06T02:00Z",
+"seasonType": 14024,
+"seasonSlug": "regular-season"
+},
+{
+"id": "401853965",
+"date": "2026-08-07T23:00Z",
+"seasonType": 14024,
+"seasonSlug": "regular-season"
+},
+{
+"id": "401853963",
+"date": "2026-08-08T00:25Z",
+"seasonType": 14024,
+"seasonSlug": "regular-season"
+},
+{
+"id": "401853964",
+"date": "2026-08-08T22:30Z",
+"seasonType": 14024,
+"seasonSlug": "regular-season"
+},
+{
+"id": "401853966",
+"date": "2026-08-09T00:45Z",
+"seasonType": 14024,
+"seasonSlug": "regular-season"
+},
+{
+"id": "401854072",
+"date": "2026-08-09T02:00Z",
+"seasonType": 14024,
+"seasonSlug": "regular-season"
+},
+{
+"id": "401854073",
+"date": "2026-08-09T20:00Z",
+"seasonType": 14024,
+"seasonSlug": "regular-season"
+},
+{
+"id": "401853967",
+"date": "2026-08-09T23:00Z",
+"seasonType": 14024,
+"seasonSlug": "regular-season"
+},
+{
+"id": "401853968",
+"date": "2026-08-10T01:00Z",
+"seasonType": 14024,
+"seasonSlug": "regular-season"
+},
+{
+"id": "401853969",
+"date": "2026-08-15T00:00Z",
+"seasonType": 14024,
+"seasonSlug": "regular-season"
+},
+{
+"id": "401854074",
+"date": "2026-08-15T02:00Z",
+"seasonType": 14024,
+"seasonSlug": "regular-season"
+},
+{
+"id": "401853970",
+"date": "2026-08-15T02:00Z",
+"seasonType": 14024,
+"seasonSlug": "regular-season"
+},
+{
+"id": "401853971",
+"date": "2026-08-15T02:00Z",
+"seasonType": 14024,
+"seasonSlug": "regular-season"
+},
+{
+"id": "401854075",
+"date": "2026-08-15T22:30Z",
+"seasonType": 14024,
+"seasonSlug": "regular-season"
+},
+{
+"id": "401853972",
+"date": "2026-08-16T00:45Z",
+"seasonType": 14024,
+"seasonSlug": "regular-season"
+},
+{
+"id": "401853973",
+"date": "2026-08-16T23:00Z",
+"seasonType": 14024,
+"seasonSlug": "regular-season"
+},
+{
+"id": "401853974",
+"date": "2026-08-17T01:00Z",
+"seasonType": 14024,
+"seasonSlug": "regular-season"
+},
+{
+"id": "401853975",
+"date": "2026-08-19T22:30Z",
+"seasonType": 14024,
+"seasonSlug": "regular-season"
+},
+{
+"id": "401853976",
+"date": "2026-08-20T00:00Z",
+"seasonType": 14024,
+"seasonSlug": "regular-season"
+},
+{
+"id": "401853977",
+"date": "2026-08-22T02:00Z",
+"seasonType": 14024,
+"seasonSlug": "regular-season"
+},
+{
+"id": "401853978",
+"date": "2026-08-22T22:30Z",
+"seasonType": 14024,
+"seasonSlug": "regular-season"
+},
+{
+"id": "401854076",
+"date": "2026-08-22T23:30Z",
+"seasonType": 14024,
+"seasonSlug": "regular-season"
+},
+{
+"id": "401854077",
+"date": "2026-08-23T00:45Z",
+"seasonType": 14024,
+"seasonSlug": "regular-season"
+},
+{
+"id": "401853979",
+"date": "2026-08-23T18:00Z",
+"seasonType": 14024,
+"seasonSlug": "regular-season"
+},
+{
+"id": "401853980",
+"date": "2026-08-23T20:00Z",
+"seasonType": 14024,
+"seasonSlug": "regular-season"
+},
+{
+"id": "401853981",
+"date": "2026-08-23T22:00Z",
+"seasonType": 14024,
+"seasonSlug": "regular-season"
+},
+{
+"id": "401853982",
+"date": "2026-08-24T00:00Z",
+"seasonType": 14024,
+"seasonSlug": "regular-season"
+},
+{
+"id": "401853983",
+"date": "2026-08-27T00:00Z",
+"seasonType": 14024,
+"seasonSlug": "regular-season"
+},
+{
+"id": "401853984",
+"date": "2026-08-29T00:00Z",
+"seasonType": 14024,
+"seasonSlug": "regular-season"
+},
+{
+"id": "401853985",
+"date": "2026-08-29T02:00Z",
+"seasonType": 14024,
+"seasonSlug": "regular-season"
+},
+{
+"id": "401853986",
+"date": "2026-08-29T22:30Z",
+"seasonType": 14024,
+"seasonSlug": "regular-season"
+},
+{
+"id": "401853987",
+"date": "2026-08-30T00:00Z",
+"seasonType": 14024,
+"seasonSlug": "regular-season"
+},
+{
+"id": "401854078",
+"date": "2026-08-30T00:55Z",
+"seasonType": 14024,
+"seasonSlug": "regular-season"
+},
+{
+"id": "401853988",
+"date": "2026-08-30T16:30Z",
+"seasonType": 14024,
+"seasonSlug": "regular-season"
+},
+{
+"id": "401853989",
+"date": "2026-08-30T23:00Z",
+"seasonType": 14024,
+"seasonSlug": "regular-season"
+},
+{
+"id": "401854079",
+"date": "2026-09-01T00:00Z",
+"seasonType": 14024,
+"seasonSlug": "regular-season"
+},
+{
+"id": "401854080",
+"date": "2026-09-05T01:30Z",
+"seasonType": 14024,
+"seasonSlug": "regular-season"
+},
+{
+"id": "401853990",
+"date": "2026-09-05T02:00Z",
+"seasonType": 14024,
+"seasonSlug": "regular-season"
+},
+{
+"id": "401853991",
+"date": "2026-09-05T22:30Z",
+"seasonType": 14024,
+"seasonSlug": "regular-season"
+},
+{
+"id": "401854081",
+"date": "2026-09-06T18:00Z",
+"seasonType": 14024,
+"seasonSlug": "regular-season"
+},
+{
+"id": "401853992",
+"date": "2026-09-06T20:00Z",
+"seasonType": 14024,
+"seasonSlug": "regular-season"
+},
+{
+"id": "401853993",
+"date": "2026-09-06T20:00Z",
+"seasonType": 14024,
+"seasonSlug": "regular-season"
+},
+{
+"id": "401853994",
+"date": "2026-09-07T00:30Z",
+"seasonType": 14024,
+"seasonSlug": "regular-season"
+},
+{
+"id": "401853995",
+"date": "2026-09-07T01:00Z",
+"seasonType": 14024,
+"seasonSlug": "regular-season"
+},
+{
+"id": "401853996",
+"date": "2026-09-11T22:30Z",
+"seasonType": 14024,
+"seasonSlug": "regular-season"
+},
+{
+"id": "401853997",
+"date": "2026-09-12T00:00Z",
+"seasonType": 14024,
+"seasonSlug": "regular-season"
+},
+{
+"id": "401854082",
+"date": "2026-09-12T02:00Z",
+"seasonType": 14024,
+"seasonSlug": "regular-season"
+},
+{
+"id": "401853999",
+"date": "2026-09-12T22:30Z",
+"seasonType": 14024,
+"seasonSlug": "regular-season"
+},
+{
+"id": "401853998",
+"date": "2026-09-13T00:00Z",
+"seasonType": 14024,
+"seasonSlug": "regular-season"
+},
+{
+"id": "401854000",
+"date": "2026-09-13T00:45Z",
+"seasonType": 14024,
+"seasonSlug": "regular-season"
+},
+{
+"id": "401854083",
+"date": "2026-09-13T17:00Z",
+"seasonType": 14024,
+"seasonSlug": "regular-season"
+},
+{
+"id": "401854001",
+"date": "2026-09-13T23:00Z",
+"seasonType": 14024,
+"seasonSlug": "regular-season"
+},
+{
+"id": "401854084",
+"date": "2026-09-17T01:30Z",
+"seasonType": 14024,
+"seasonSlug": "regular-season"
+},
+{
+"id": "401854002",
+"date": "2026-09-17T02:00Z",
+"seasonType": 14024,
+"seasonSlug": "regular-season"
+},
+{
+"id": "401854003",
+"date": "2026-09-19T02:00Z",
+"seasonType": 14024,
+"seasonSlug": "regular-season"
+},
+{
+"id": "401854004",
+"date": "2026-09-19T20:00Z",
+"seasonType": 14024,
+"seasonSlug": "regular-season"
+},
+{
+"id": "401854005",
+"date": "2026-09-19T22:30Z",
+"seasonType": 14024,
+"seasonSlug": "regular-season"
+},
+{
+"id": "401854085",
+"date": "2026-09-20T00:45Z",
+"seasonType": 14024,
+"seasonSlug": "regular-season"
+},
+{
+"id": "401854086",
+"date": "2026-09-20T18:00Z",
+"seasonType": 14024,
+"seasonSlug": "regular-season"
+},
+{
+"id": "401854006",
+"date": "2026-09-20T21:00Z",
+"seasonType": 14024,
+"seasonSlug": "regular-season"
+},
+{
+"id": "401854007",
+"date": "2026-09-20T23:00Z",
+"seasonType": 14024,
+"seasonSlug": "regular-season"
+},
+{
+"id": "401854008",
+"date": "2026-09-20T23:00Z",
+"seasonType": 14024,
+"seasonSlug": "regular-season"
+},
+{
+"id": "401854009",
+"date": "2026-09-25T22:30Z",
+"seasonType": 14024,
+"seasonSlug": "regular-season"
+},
+{
+"id": "401854010",
+"date": "2026-09-26T00:00Z",
+"seasonType": 14024,
+"seasonSlug": "regular-season"
+},
+{
+"id": "401854087",
+"date": "2026-09-26T00:30Z",
+"seasonType": 14024,
+"seasonSlug": "regular-season"
+},
+{
+"id": "401854088",
+"date": "2026-09-26T16:30Z",
+"seasonType": 14024,
+"seasonSlug": "regular-season"
+},
+{
+"id": "401854011",
+"date": "2026-09-26T22:30Z",
+"seasonType": 14024,
+"seasonSlug": "regular-season"
+},
+{
+"id": "401854012",
+"date": "2026-09-27T00:45Z",
+"seasonType": 14024,
+"seasonSlug": "regular-season"
+},
+{
+"id": "401854013",
+"date": "2026-09-27T21:00Z",
+"seasonType": 14024,
+"seasonSlug": "regular-season"
+},
+{
+"id": "401854014",
+"date": "2026-09-27T23:00Z",
+"seasonType": 14024,
+"seasonSlug": "regular-season"
+},
+{
+"id": "401854015",
+"date": "2026-10-03T00:00Z",
+"seasonType": 14024,
+"seasonSlug": "regular-season"
+},
+{
+"id": "401854016",
+"date": "2026-10-03T02:00Z",
+"seasonType": 14024,
+"seasonSlug": "regular-season"
+},
+{
+"id": "401854017",
+"date": "2026-10-03T20:00Z",
+"seasonType": 14024,
+"seasonSlug": "regular-season"
+},
+{
+"id": "401854018",
+"date": "2026-10-03T22:30Z",
+"seasonType": 14024,
+"seasonSlug": "regular-season"
+},
+{
+"id": "401854089",
+"date": "2026-10-04T00:45Z",
+"seasonType": 14024,
+"seasonSlug": "regular-season"
+},
+{
+"id": "401854019",
+"date": "2026-10-04T16:00Z",
+"seasonType": 14024,
+"seasonSlug": "regular-season"
+},
+{
+"id": "401854090",
+"date": "2026-10-04T20:00Z",
+"seasonType": 14024,
+"seasonSlug": "regular-season"
+},
+{
+"id": "401854020",
+"date": "2026-10-04T23:00Z",
+"seasonType": 14024,
+"seasonSlug": "regular-season"
+},
+{
+"id": "401854091",
+"date": "2026-10-17T00:00Z",
+"seasonType": 14024,
+"seasonSlug": "regular-season"
+},
+{
+"id": "401854021",
+"date": "2026-10-17T16:30Z",
+"seasonType": 14024,
+"seasonSlug": "regular-season"
+},
+{
+"id": "401854022",
+"date": "2026-10-17T22:30Z",
+"seasonType": 14024,
+"seasonSlug": "regular-season"
+},
+{
+"id": "401854023",
+"date": "2026-10-17T23:00Z",
+"seasonType": 14024,
+"seasonSlug": "regular-season"
+},
+{
+"id": "401854092",
+"date": "2026-10-18T00:45Z",
+"seasonType": 14024,
+"seasonSlug": "regular-season"
+},
+{
+"id": "401854024",
+"date": "2026-10-18T17:00Z",
+"seasonType": 14024,
+"seasonSlug": "regular-season"
+},
+{
+"id": "401854025",
+"date": "2026-10-18T21:00Z",
+"seasonType": 14024,
+"seasonSlug": "regular-season"
+},
+{
+"id": "401854026",
+"date": "2026-10-18T23:00Z",
+"seasonType": 14024,
+"seasonSlug": "regular-season"
+},
+{
+"id": "401854027",
+"date": "2026-10-24T00:00Z",
+"seasonType": 14024,
+"seasonSlug": "regular-season"
+},
+{
+"id": "401854028",
+"date": "2026-10-24T01:30Z",
+"seasonType": 14024,
+"seasonSlug": "regular-season"
+},
+{
+"id": "401854029",
+"date": "2026-10-24T02:00Z",
+"seasonType": 14024,
+"seasonSlug": "regular-season"
+},
+{
+"id": "401854093",
+"date": "2026-10-24T22:30Z",
+"seasonType": 14024,
+"seasonSlug": "regular-season"
+},
+{
+"id": "401854030",
+"date": "2026-10-25T00:45Z",
+"seasonType": 14024,
+"seasonSlug": "regular-season"
+},
+{
+"id": "401854031",
+"date": "2026-10-25T19:00Z",
+"seasonType": 14024,
+"seasonSlug": "regular-season"
+},
+{
+"id": "401854032",
+"date": "2026-10-25T21:00Z",
+"seasonType": 14024,
+"seasonSlug": "regular-season"
+},
+{
+"id": "401854094",
+"date": "2026-10-25T23:00Z",
+"seasonType": 14024,
+"seasonSlug": "regular-season"
+},
+{
+"id": "401854095",
+"date": "2026-11-01T22:00Z",
+"seasonType": 14024,
+"seasonSlug": "regular-season"
+},
+{
+"id": "401854033",
+"date": "2026-11-01T22:00Z",
+"seasonType": 14024,
+"seasonSlug": "regular-season"
+},
+{
+"id": "401854034",
+"date": "2026-11-01T22:00Z",
+"seasonType": 14024,
+"seasonSlug": "regular-season"
+},
+{
+"id": "401854038",
+"date": "2026-11-01T22:00Z",
+"seasonType": 14024,
+"seasonSlug": "regular-season"
+},
+{
+"id": "401854096",
+"date": "2026-11-01T22:00Z",
+"seasonType": 14024,
+"seasonSlug": "regular-season"
+},
+{
+"id": "401854036",
+"date": "2026-11-01T22:00Z",
+"seasonType": 14024,
+"seasonSlug": "regular-season"
+},
+{
+"id": "401854037",
+"date": "2026-11-01T22:00Z",
+"seasonType": 14024,
+"seasonSlug": "regular-season"
+},
+{
+"id": "401854035",
+"date": "2026-11-01T22:00Z",
+"seasonType": 14024,
+"seasonSlug": "regular-season"
+}
+]

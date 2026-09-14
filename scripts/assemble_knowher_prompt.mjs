@@ -264,6 +264,33 @@ if (!isKnowHerWeek(publishMonday, process.env.KHG_SEASON_ANCHOR ?? SEASON_ANCHOR
   console.error(`⏸  Not a Know Her Game week for the ${isoWeekKey(publishMonday)} publish (NWSL Trivia's turn) — no prompt emitted; the current 2-week pool stays live.`);
   process.exit(0);
 }
+// THE CALENDAR GATE (2026-09-14): the proxy derives a KHG calendar from the NWSL schedule (/config →
+// `khgCalendar`: drop Mondays whose 14-day round window holds no fixture are PAUSED — offseason, World Cup,
+// Olympics, international windows, the June block — plus the owner's /admin/khg-calendar overrides). On a
+// paused publish Monday there is nothing to generate: exit 0 (a clean no-op, like a Trivia week). The Monday
+// publish pass and the app's nudge consult the SAME calendar, so all three sides agree. Fails OPEN on a fetch
+// error (generate as before) — a derivation blip must never silence a real round. `KHG_IGNORE_CALENDAR=1`
+// = test/CI override.
+if (!process.env.KHG_IGNORE_CALENDAR) {
+  try {
+    const cfg = await (await fetch(`${BASE}/config?_cb=${Date.now()}`)).json();
+    const cal = cfg?.khgCalendar;
+    const monday = publishMonday.toISOString().slice(0, 10);
+    if (cal) {
+      const forcedLive = (cal.overrides?.forceLive ?? []).includes(monday);
+      const paused = !forcedLive && ((cal.seasonEnd && monday >= cal.seasonEnd) || (cal.pausedMondays ?? []).includes(monday));
+      if (paused) {
+        console.error(`⏸  Know Her Game is PAUSED for the ${monday} publish (no NWSL fixtures in the round window${cal.seasonEnd && monday >= cal.seasonEnd ? " — season over" : ""}) — no prompt emitted; the current pool stays live. Override: ${BASE}/admin/khg-calendar?live=${monday}`);
+        process.exit(0);
+      }
+    } else {
+      console.error("⚠️  /config carried no khgCalendar — generating (fail-open).");
+    }
+  } catch (e) {
+    console.error(`⚠️  Calendar check failed (${e.message}) — generating (fail-open).`);
+  }
+}
+
 const template = readFileSync(
   join(dirname(fileURLToPath(import.meta.url)), TEMPLATE_FILE),
   "utf8",
