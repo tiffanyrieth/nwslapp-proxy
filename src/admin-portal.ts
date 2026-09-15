@@ -207,6 +207,31 @@ function render(d) {
     h += '</table>';
   }
 
+  // Duplicate shirt numbers — the GFC-#28 case. ESPN-only (Gate B); neither feed can say who is
+  // wrong, so read the club's official roster and set the correct number on the player who should
+  // change. This is the manual twin of the weekly routine's duplicate-jersey adjudication.
+  const dups = rep.clubs.flatMap((c) => (c.diffs.duplicateJerseys || []).map((g) => ({ ...g, abbr: c.abbr })));
+  const dupCount = dups.reduce((n, g) => n + g.players.length, 0);
+  h += '<h2>Duplicate shirt numbers (' + dups.length + ')</h2>';
+  h += '<div class="note">Two or more players on one club show the same number on ESPN. Check the club\'s official roster, then set the correct number on whoever should change; the other keeps it. A pin lasts ' + d.ttlDays + ' days.</div>';
+  if (!dups.length) h += '<p class="muted small">None.</p>';
+  else {
+    h += '<table><tr><th>Club</th><th>#</th><th>Player</th><th>Set correct #</th></tr>';
+    for (const g of dups) {
+      for (const p of g.players) {
+        const pinned = ov[p.espnAthleteId];
+        const live = pinned && Date.parse(pinned.expiresAt) > now;
+        h += '<tr><td>' + esc(g.abbr) + '</td><td class="muted">#' + g.jersey + '</td><td>' + esc(p.name) + '</td><td>' +
+          (live ? '<span class="pill ok">pinned #' + esc(String(pinned.jersey ?? "")) + '</span>'
+                : '<input id="dj_' + esc(p.espnAthleteId) + '" type="number" min="0" max="99" style="width:4em"> ' +
+                  '<button class="act go" data-dupfix="' + esc(p.espnAthleteId) + '" data-name="' + esc(p.name) + '" data-team="' + esc(g.abbr) + '">Set</button>') +
+          '</td></tr>';
+      }
+    }
+    h += '</table>';
+    if (dupCount) h += '<div class="note muted small">' + dupCount + ' player(s) contend for ' + dups.length + ' number(s).</div>';
+  }
+
   // Active + lapsed rulings.
   const all = Object.values(ov);
   h += '<h2>Your overrides (' + all.length + ')</h2>';
@@ -244,6 +269,20 @@ function wire() {
         jersey: b.dataset.jersey ? Number(b.dataset.jersey) : undefined,
       });
       render(d);
+    };
+  }
+  for (const b of document.querySelectorAll("[data-dupfix]")) {
+    b.onclick = async () => {
+      const inp = document.getElementById("dj_" + b.dataset.dupfix);
+      const val = inp && inp.value !== "" ? Number(inp.value) : NaN;
+      if (!Number.isInteger(val) || val < 0) return; // no valid number entered — do nothing
+      b.disabled = true;
+      render(await api("setOverride", {
+        espnAthleteId: b.dataset.dupfix,
+        playerName: b.dataset.name,
+        teamAbbr: b.dataset.team,
+        jersey: val,
+      }));
     };
   }
   for (const b of document.querySelectorAll("[data-renew]")) {

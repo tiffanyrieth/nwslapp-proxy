@@ -2614,7 +2614,11 @@ async function handleAdjudication(request: Request, env: Env, ctx: ExecutionCont
 		return Response.json({
 			reportRanAt: report?.ranAt ?? null,
 			...pending,
-			counts: { positions: pending.positions.length, jerseys: pending.jerseys.length },
+			counts: {
+				positions: pending.positions.length,
+				jerseys: pending.jerseys.length,
+				duplicateJerseys: pending.duplicateJerseys.length,
+			},
 		});
 	}
 

@@ -3,6 +3,7 @@ import {
 	roleLabelToGroup,
 	gateTeamIdentity,
 	gateShape,
+	duplicateJerseyGroups,
 	gateContinuity,
 	diffPlayers,
 	pairNameVariances,
@@ -144,6 +145,34 @@ describe("gateShape (Gate B)", () => {
 		const r = gateShape(dup);
 		expect(r.ok).toBe(false);
 		expect(r.failures.join(" ")).toContain("duplicate jersey(s): 7");
+	});
+
+	it("exposes the duplicate as a STRUCTURED pair carrying both contenders (routine input)", () => {
+		const dup = espn("GFC", [
+			...Array.from({ length: 18 }, (_, i) => ({ id: `a${i}`, name: `P ${i}`, jersey: i + 10, pos: i < 3 ? "G" : "D" })),
+			{ id: "p1", name: "Player One", jersey: 28, pos: "M" },
+			{ id: "p2", name: "Player Two", jersey: 28, pos: "F" },
+			{ id: "none", name: "No Number", jersey: null, pos: "D" },
+		]);
+		const groups = duplicateJerseyGroups(dup);
+		expect(groups).toHaveLength(1);
+		expect(groups[0].jersey).toBe(28);
+		expect(groups[0].players).toEqual([
+			{ espnAthleteId: "p1", name: "Player One" },
+			{ espnAthleteId: "p2", name: "Player Two" },
+		]);
+		// null-jersey players never form a collision.
+		expect(duplicateJerseyGroups(healthy()).length).toBe(0);
+	});
+
+	it("diffPlayers carries duplicateJerseys even with NO league feed (ESPN-only)", () => {
+		const dup = espn("GFC", [
+			{ id: "p1", name: "Player One", jersey: 28 },
+			{ id: "p2", name: "Player Two", jersey: 28 },
+		]);
+		const d = diffPlayers(dup, null);
+		expect(d.duplicateJerseys).toHaveLength(1);
+		expect(d.duplicateJerseys[0].jersey).toBe(28);
 	});
 });
 
@@ -322,7 +351,8 @@ describe("diffPlayers (Gate D)", () => {
 
 	it("returns empty diffs when the league feed is unavailable", () => {
 		const d = diffPlayers(healthy(), null);
-		expect(d).toEqual({ positionMismatches: [], missingJerseys: [], espnOnly: [], sdpOnlyWithMinutes: [], likelyNameVariances: [] });
+		// duplicateJerseys is ESPN-only, so it is present (and empty for a clean squad) even with no SDP.
+		expect(d).toEqual({ positionMismatches: [], missingJerseys: [], espnOnly: [], sdpOnlyWithMinutes: [], likelyNameVariances: [], duplicateJerseys: [] });
 	});
 
 	it("pairs a name variance instead of double-counting her as an erasure AND an addition", () => {
@@ -632,6 +662,25 @@ describe("applyAutoRulings — the server-side rules the routine's prompt is NOT
 		expect(next.p.jersey).toBe(9);
 		expect(next.p.position).toBeUndefined();       // stale position dropped, mismatch re-surfaces
 	});
+
+	it("refuses to set the SAME jersey for two players on one club in a single batch (duplicate guard)", () => {
+		// Resolving a duplicate must not just move the collision. If a batch tries to put #28 on two
+		// GFC players, the first wins and the second is skipped — the nightly Gate B re-flags the rest.
+		const { accepted, skipped, next } = applyAutoRulings({}, [
+			rule({ espnAthleteId: "p1", playerName: "Player One", teamAbbr: "GFC", position: undefined, jersey: 28, source: "https://gothamfc.com/roster" }),
+			rule({ espnAthleteId: "p2", playerName: "Player Two", teamAbbr: "GFC", position: undefined, jersey: 28, source: "https://gothamfc.com/roster" }),
+		], NOW);
+		expect(accepted).toEqual(["p1"]);
+		expect(skipped.map((s) => s.espnAthleteId)).toEqual(["p2"]);
+		expect(skipped[0].reason).toContain("already set for GFC");
+		expect(next.p2).toBeUndefined();
+		// The SAME number on a DIFFERENT club is fine (numbers only collide within a team).
+		const cross = applyAutoRulings({}, [
+			rule({ espnAthleteId: "x", playerName: "X", teamAbbr: "GFC", position: undefined, jersey: 9, source: "https://gothamfc.com/roster" }),
+			rule({ espnAthleteId: "y", playerName: "Y", teamAbbr: "BAY", position: undefined, jersey: 9, source: "https://bayfc.com/roster" }),
+		], NOW);
+		expect(cross.accepted.sort()).toEqual(["x", "y"]);
+	});
 });
 
 describe("pendingAdjudications", () => {
@@ -670,6 +719,36 @@ describe("pendingAdjudications", () => {
 	});
 
 	it("handles a null report (no run yet)", () => {
-		expect(pendingAdjudications(null, {}, NOW)).toEqual({ positions: [], jerseys: [] });
+		expect(pendingAdjudications(null, {}, NOW)).toEqual({ positions: [], jerseys: [], duplicateJerseys: [] });
+	});
+
+	it("tolerates an OLD-shape report with no duplicateJerseys field (KV backward-compat)", () => {
+		// A report written by the pre-v-this-change nightly run has no `duplicateJerseys` on its diffs.
+		const r = pendingAdjudications(report as never, {}, NOW);
+		expect(r.duplicateJerseys).toEqual([]);
+	});
+
+	it("surfaces a duplicate collision and drops it once a contender is overridden off the number", () => {
+		const dupReport = {
+			ranAt: "", seasonId: "", gateA: { ok: true, failures: [] }, espnNames: {}, summary: {} as never,
+			clubs: [{
+				abbr: "GFC", espnCount: 26, sdpCount: 26, verified: true,
+				gateB: { ok: false, failures: ["duplicate jersey(s): 28"] },
+				gateC: { ok: true, failures: [], sdpOverlap: 1, priorOverlap: null },
+				diffs: {
+					positionMismatches: [], missingJerseys: [], espnOnly: [], sdpOnlyWithMinutes: [], likelyNameVariances: [],
+					duplicateJerseys: [{ jersey: 28, players: [{ espnAthleteId: "p1", name: "Player One" }, { espnAthleteId: "p2", name: "Player Two" }] }],
+				},
+			}],
+		};
+		const open = pendingAdjudications(dupReport as never, {}, NOW);
+		expect(open.duplicateJerseys).toHaveLength(1);
+		expect(open.duplicateJerseys[0]).toMatchObject({ teamAbbr: "GFC", jersey: 28 });
+		expect(open.duplicateJerseys[0].players.map((p) => p.espnAthleteId)).toEqual(["p1", "p2"]);
+		// Pin one contender to a different number → only one contender left → no longer a collision.
+		const resolved = pendingAdjudications(dupReport as never, {
+			p2: { espnAthleteId: "p2", playerName: "Player Two", teamAbbr: "GFC", jersey: 12, setAt: "", expiresAt: overrideExpiry(NOW) },
+		}, NOW);
+		expect(resolved.duplicateJerseys).toHaveLength(0);
 	});
 });
