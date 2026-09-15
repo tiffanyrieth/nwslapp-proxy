@@ -7116,8 +7116,11 @@ A paused Monday publishes nothing (the last edition stays live) and the app sche
 /** Most recent FINISHED (state "post") event id for each wanted team, from one
  *  scoreboard fetch. Scans both competitors of every event; keeps the latest by date. */
 async function recentEventByTeam(year: number, wanted: Set<string>): Promise<Map<string, string>> {
-	const r = await fetch(`${ESPN_SCOREBOARD}?dates=${year}0101-${year}1231&limit=500`, {
-		headers: { "User-Agent": ESPN_UA, Accept: "application/json" },
+	// Footprint (2026-09-15): read the SHARED /scoreboard cache instead of a THIRD full-season ESPN
+	// range-pull (the app's schedule + KHG already warm it). Loopback → edge-cached (1h) → zero net
+	// ESPN fetches; spotlight is weekly content, so cache freshness is ample.
+	const r = await fetch(`${PROXY_PUBLIC_ORIGIN}/scoreboard?dates=${year}0101-${year}1231&limit=500`, {
+		headers: { Accept: "application/json" },
 	});
 	if (!r.ok) throw new Error(`scoreboard ${r.status}`);
 	const json = (await r.json()) as {
