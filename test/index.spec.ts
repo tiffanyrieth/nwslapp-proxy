@@ -10,12 +10,26 @@ import worker, {
 	snapshotKeyURL,
 	dedupeByContent,
 	parseOutletRSS,
-	appearedPlayers,
-	pickWeekly,
-	seasonFormLabel,
 	mapApifyInstagram,
 	mapApifyTikTok,
+	espnBreakerIsOpen,
+	espnBackoffMs,
 } from "../src/index";
+
+describe("ESPN circuit breaker (pure)", () => {
+	it("is open only while openUntil is in the future", () => {
+		expect(espnBreakerIsOpen(1000, 500)).toBe(true);
+		expect(espnBreakerIsOpen(500, 1000)).toBe(false);
+		expect(espnBreakerIsOpen(0, 1000)).toBe(false);
+	});
+	it("backs off exponentially and caps at 60 min", () => {
+		expect(espnBackoffMs(0)).toBe(10 * 60 * 1000); // first open: 10m
+		expect(espnBackoffMs(1)).toBe(20 * 60 * 1000); // 20m
+		expect(espnBackoffMs(2)).toBe(40 * 60 * 1000); // 40m
+		expect(espnBackoffMs(3)).toBe(60 * 60 * 1000); // 80m → capped 60m
+		expect(espnBackoffMs(9)).toBe(60 * 60 * 1000); // stays capped
+	});
+});
 
 // A correctly-typed `Request` to pass to `worker.fetch()`.
 const IncomingRequest = Request<unknown, IncomingRequestCfProperties>;
@@ -323,49 +337,6 @@ describe("parseOutletRSS", () => {
 		expect(items[0].link).toBe("https://www.allforxi.com/nwsl/15385/dudinha-acl");
 		expect(items[0].pubDate).toBe("2026-06-10T19:41:20-04:00");
 		expect(items[0].description).toBe("The forward will miss the rest of the season.");
-	});
-});
-
-// Spotlight (B2) pure helpers: matchday-squad → appeared-only filter, the
-// deterministic weekly pick, and the form label. The full /spotlight route (ESPN
-// fetches + Haiku narrative) is exercised live via `wrangler dev --remote` + curl.
-describe("spotlight helpers", () => {
-	const roster = {
-		team: { abbreviation: "WAS" },
-		roster: [
-			{ starter: true, subbedIn: false, athlete: { id: "300", displayName: "Starter A" } },
-			{ starter: false, subbedIn: true, athlete: { id: "100", displayName: "Sub B" } },
-			{ starter: false, subbedIn: false, athlete: { id: "200", displayName: "Bench C" } }, // DNP
-			{ starter: true, subbedIn: false, athlete: { id: "150" } }, // no name → dropped
-		],
-	};
-
-	it("keeps only players who appeared, sorted by athlete id", () => {
-		const out = appearedPlayers(roster);
-		expect(out.map((p) => p.athlete?.id)).toEqual(["100", "300"]); // Bench C (DNP) + nameless dropped
-	});
-
-	it("returns [] for an undefined roster", () => {
-		expect(appearedPlayers(undefined)).toEqual([]);
-	});
-
-	it("picks deterministically and stably for a given (team, week)", () => {
-		const pool = appearedPlayers(roster);
-		const a = pickWeekly(pool, "WAS", 2950);
-		const b = pickWeekly(pool, "WAS", 2950);
-		expect(a.athlete?.id).toBe(b.athlete?.id); // stable within a week
-		expect(pool).toContainEqual(a); // always an in-pool player
-	});
-
-	it("can change the pick across weeks", () => {
-		const pool = appearedPlayers(roster);
-		const picks = new Set([2950, 2951, 2952, 2953].map((w) => pickWeekly(pool, "WAS", w).athlete?.id));
-		expect(picks.size).toBeGreaterThan(1); // not frozen on one player
-	});
-
-	it("formats the season form label with correct pluralization", () => {
-		expect(seasonFormLabel({ goals: 1, assists: 0, apps: 5 })).toBe("1 goal · 0 assists");
-		expect(seasonFormLabel({ goals: 3, assists: 2, apps: 12 })).toBe("3 goals · 2 assists");
 	});
 });
 

@@ -1137,9 +1137,6 @@ Apps apply it on their next launch (config cache under 5 min).</p>
 		if (url.pathname === "/club-news/sources") {
 			return handleClubNewsSources();
 		}
-		if (url.pathname === "/spotlight") {
-			return handleSpotlight(url, env, ctx);
-		}
 		if (url.pathname === "/trivia") {
 			return handleTrivia(url, env, ctx);
 		}
@@ -1217,7 +1214,7 @@ Apps apply it on their next launch (config cache under 5 min).</p>
 		}
 
 		return new Response(
-			"Not found. This proxy serves GET /scoreboard, /summary, /weather, /team-videos, /feed, /spotlight, /trivia, /knowher, /knowher/eligible, /knowher/todo, /quiz-results, /predict/community, /headshots, /crest, /crest/manifest, /roster, /team-stats, /national-teams, /playoff-override, and POST /telemetry, /analytics.",
+			"Not found. This proxy serves GET /scoreboard, /summary, /weather, /team-videos, /feed, /trivia, /knowher, /knowher/eligible, /knowher/todo, /quiz-results, /predict/community, /headshots, /crest, /crest/manifest, /roster, /team-stats, /national-teams, /playoff-override, and POST /telemetry, /analytics.",
 			{ status: 404 },
 		);
 	},
@@ -1335,7 +1332,7 @@ Apps apply it on their next launch (config cache under 5 min).</p>
 // the block room to lift and keeping our aggregate footprint on the fandom-app side of ESPN's line.
 // GLOBAL via KV so one colo's discovery backs off ALL colos; a per-isolate memo keeps it to ~1 KV read
 // per isolate per 30s, not one per request (which would burn the KV read budget at scale).
-interface EspnBreakerState { openUntil: number; fails: number }
+interface EspnBreakerState { openUntil: number; level: number }
 const ESPN_BREAKER_KEY = "espn:breaker:v1";
 // A DELIBERATE, owner-set pause (kill switch) — distinct from the AUTO breaker so the health alert can
 // page on a real auto-open (ESPN failing) without crying wolf during an intentional maintenance pause.
@@ -1360,7 +1357,13 @@ export async function isEspnManuallyPaused(env: Env): Promise<boolean> {
 }
 
 const ESPN_BREAKER_THRESHOLD = 3; // consecutive upstream failures before opening
-const ESPN_BREAKER_COOLDOWN_MS = 10 * 60 * 1000; // 10 min penalty-box (ESPN's timeouts run 5-15 min)
+// EXPONENTIAL BACKOFF (Gemini: WAF blocks run 15-60 min; polling one WHILE blocked escalates toward a
+// ban). A transient ESPN blip opens the breaker once, its first successful probe closes it and resets
+// `level` → fast recovery; a SUSTAINED block keeps failing its probes → the cooldown doubles each
+// consecutive re-open (10→20→40→60), so we poke the WAF only ~once/hour at steady state.
+const ESPN_BREAKER_BASE_COOLDOWN_MS = 10 * 60 * 1000; // 10 min at level 0
+const ESPN_BREAKER_MAX_COOLDOWN_MS = 60 * 60 * 1000; // capped at 60 min
+const ESPN_BREAKER_KV_TTL = 2 * 60 * 60; // 2h — > max cooldown so `level` survives between probes
 const ESPN_BREAKER_MEMO_TTL_MS = 30 * 1000;
 let espnBreakerMemo: { openUntil: number; at: number } | null = null;
 let espnBreakerFails = 0; // in-isolate consecutive-failure counter (openUntil is the global signal)
@@ -1368,6 +1371,11 @@ let espnBreakerFails = 0; // in-isolate consecutive-failure counter (openUntil i
 /** Pure open/skip decision for a given now vs the last-read openUntil. Exported for tests. */
 export function espnBreakerIsOpen(openUntil: number, now: number): boolean {
 	return openUntil > now;
+}
+
+/** Pure exponential-backoff cooldown for a given re-open level (0 = first open). Exported for tests. */
+export function espnBackoffMs(level: number): number {
+	return Math.min(ESPN_BREAKER_BASE_COOLDOWN_MS * 2 ** Math.max(0, level), ESPN_BREAKER_MAX_COOLDOWN_MS);
 }
 
 /** Is ESPN currently in the penalty box? Reads the global KV flag through a 30s in-isolate memo. */
@@ -1395,18 +1403,27 @@ async function recordEspnResult(env: Env, ctx: ExecutionContext, ok: boolean): P
 		espnBreakerFails = 0;
 		if (espnBreakerMemo && espnBreakerMemo.openUntil > 0) {
 			espnBreakerMemo = { openUntil: 0, at: now };
-			try { await env.FEED_TAGS.put(ESPN_BREAKER_KEY, JSON.stringify({ openUntil: 0, fails: 0 }), { expirationTtl: 3600 }); } catch { /* best-effort */ }
+			// Recovery resets the backoff level to 0 → the next block starts short again.
+			try { await env.FEED_TAGS.put(ESPN_BREAKER_KEY, JSON.stringify({ openUntil: 0, level: 0 } satisfies EspnBreakerState), { expirationTtl: ESPN_BREAKER_KV_TTL }); } catch { /* best-effort */ }
 			emitDiag(env, ctx, "espnBreakerClosed", "ESPN recovered — breaker closed");
 		}
 		return;
 	}
 	espnBreakerFails += 1;
 	if (espnBreakerFails >= ESPN_BREAKER_THRESHOLD) {
-		const openUntil = now + ESPN_BREAKER_COOLDOWN_MS;
 		espnBreakerFails = 0;
+		// Grow the cooldown on a SUSTAINED block: read the current re-open level from KV (a transient
+		// blip closed on its first good probe, so level is back to 0 and recovery is fast).
+		let level = 0;
+		try {
+			const raw = await env.FEED_TAGS.get(ESPN_BREAKER_KEY);
+			if (raw) level = (JSON.parse(raw) as EspnBreakerState).level ?? 0;
+		} catch { /* treat as level 0 */ }
+		const cooldown = espnBackoffMs(level);
+		const openUntil = now + cooldown;
 		espnBreakerMemo = { openUntil, at: now };
-		try { await env.FEED_TAGS.put(ESPN_BREAKER_KEY, JSON.stringify({ openUntil, fails: 0 } satisfies EspnBreakerState), { expirationTtl: 3600 }); } catch { /* best-effort */ }
-		emitDiag(env, ctx, "espnBreakerOpen", `ESPN failing — backing off ${ESPN_BREAKER_COOLDOWN_MS / 60000}m to avoid a WAF escalation`);
+		try { await env.FEED_TAGS.put(ESPN_BREAKER_KEY, JSON.stringify({ openUntil, level: level + 1 } satisfies EspnBreakerState), { expirationTtl: ESPN_BREAKER_KV_TTL }); } catch { /* best-effort */ }
+		emitDiag(env, ctx, "espnBreakerOpen", `ESPN failing — backing off ${Math.round(cooldown / 60000)}m (level ${level}) to avoid a WAF escalation`);
 	}
 }
 
@@ -1680,7 +1697,7 @@ function upstreamError(status?: number): Response {
 /** The stale-or-502 fallback WITH no-silent-failures telemetry (A2, 2026-08-23): serve a stale edge copy
  *  if one exists, else emit a pageable `apiFailure` diag and 502. Before this, the `serveStale(...) ??
  *  upstreamError()` sites returned a BARE 502 with no diagnostic, so an outage on those routes (team
- *  videos, feed, spotlight, trivia, know-her) was invisible to the error-spike pager. `route` is the
+ *  videos, feed, trivia, know-her) was invisible to the error-spike pager. `route` is the
  *  request pathname, so the diag says WHICH surface is down. */
 async function serveStaleOr502(env: Env, ctx: ExecutionContext, cache: Cache, cacheKey: Request, route: string): Promise<Response> {
 	const stale = await serveStale(cache, cacheKey);
@@ -5314,100 +5331,6 @@ async function haikuTagNewsBatch(cards: NewsCard[], apiKey: string, playerMap: s
 	return (JSON.parse(text) as { verdicts?: NewsVerdict[] }).verdicts ?? [];
 }
 
-// ---------------------------------------------------------------------------
-// /spotlight — Home Module 2 "Get to know your players" (B2). For each followed
-// club, pick a real player from that team's MOST RECENT matchday squad (players
-// who actually appeared — starters + subs used), attach real ESPN season stats,
-// and generate a short "why watch" blurb via Claude Haiku. Returns PlayerSpotlight
-// JSON the app decodes directly (its seed is the offline-first fallback). One pick
-// per team per week (deterministic), edge-cached; the blurb is KV-cached weekly.
-//
-// ⚠️ CONTENT GUARDRAIL (non-negotiable): the blurb is ALWAYS about the player's
-// soccer career — NEVER her family, relationships, parents, or "the legacy of
-// someone else" (a systemic way women athletes get framed that men never are;
-// Trinity Rodman has publicly asked media to stop invoking her father). Enforcement
-// is structural: the Haiku prompt receives ONLY soccer fields (name, position,
-// team, age, season stats, recent appearance) — never any biographical/family data
-// — AND the prompt explicitly forbids it. Review generated blurbs before shipping.
-// ---------------------------------------------------------------------------
-
-const ESPN_CORE = "https://sports.core.api.espn.com/v2/sports/soccer/leagues/usa.nwsl";
-const SPOTLIGHT_TTL = 6 * 3600; // 6h edge cache; the weekly pick is stable, stats refresh a few times/day
-const SPOTLIGHT_NARRATIVE_TTL = 7 * 24 * 3600; // the blurb is regenerated at most weekly
-
-// App join-key abbreviation → full club name (for the blurb prompt + seasonForm).
-const TEAM_NAMES: Record<string, string> = {
-	LA: "Angel City FC", BAY: "Bay FC", BOS: "Boston Legacy FC", CHI: "Chicago Stars FC",
-	DEN: "Denver Summit FC", GFC: "Gotham FC", HOU: "Houston Dash", KC: "Kansas City Current",
-	NC: "North Carolina Courage", ORL: "Orlando Pride", POR: "Portland Thorns FC",
-	LOU: "Racing Louisville FC", SD: "San Diego Wave FC", SEA: "Seattle Reign FC",
-	UTA: "Utah Royals FC", WAS: "Washington Spirit",
-};
-
-const SPOTLIGHT_POLICY = `You are writing a short player profile (2-3 sentences) for a women's soccer fan app's weekly "get to know your players" spotlight. The tone is warm and fan-to-fan, like an Olympics broadcast introducing an athlete before her event.
-
-Write about ONLY:
-- Her playing style and what she brings to this team (infer reasonably from her position and stats)
-- How her current season is going, grounded in the stats provided
-- What a fan watching the team's next match should look for from her
-
-Hard rules (non-negotiable):
-- Focus ONLY on the player's soccer career, skills, position, and current form.
-- NEVER mention family members, parents, siblings, partners, or relationships.
-- NEVER frame her as related to, or the legacy of, any other person.
-- NEVER reference anything outside of soccer.
-- Do NOT invent specific facts (former clubs, trophies, nationality, biographical details, named matches, or calendar years/dates) beyond what is given — speak only to playing style and the season stats provided.
-- Length: exactly 2-3 sentences. Output ONLY the profile text, no preamble or quotation marks.`;
-
-interface SummaryRosterPlayer {
-	starter?: boolean;
-	subbedIn?: boolean;
-	jersey?: string;
-	position?: { abbreviation?: string; name?: string };
-	athlete?: { id?: string; displayName?: string };
-}
-interface SummaryRoster {
-	team?: { abbreviation?: string };
-	roster?: SummaryRosterPlayer[];
-}
-interface SpotlightStats {
-	goals: number;
-	assists: number;
-	apps: number;
-}
-
-async function handleSpotlight(url: URL, env: Env, ctx: ExecutionContext): Promise<Response> {
-	const teams = normalizeTeams(url.searchParams.get("teams"));
-
-	const cache = caches.default;
-	const cacheUrl = new URL(url);
-	cacheUrl.searchParams.set("teams", teams.join(","));
-	const cacheKey = new Request(cacheUrl.toString(), { method: "GET" });
-
-	const hit = await cache.match(cacheKey);
-	if (hit) return withCacheStatus(hit, "HIT");
-
-	// No follows → no spotlights (the app shows the module only for followed teams).
-	let cards: unknown[] = [];
-	if (teams.length > 0) {
-		try {
-			cards = await buildSpotlightCards(teams, env, ctx);
-		} catch {
-			// A total scoreboard outage serves a stale copy if we have one, else 502
-			// (the app falls back to its seed on any non-2xx). Per-team failures are
-			// isolated inside buildSpotlightCards and never reach here.
-			return serveStaleOr502(env, ctx, cache, cacheKey, url.pathname);
-		}
-	}
-
-	const headers = new Headers();
-	headers.set("Content-Type", "application/json");
-	headers.set("Cache-Control", `public, max-age=${SPOTLIGHT_TTL}`);
-	const toCache = new Response(JSON.stringify(cards), { status: 200, headers });
-	ctx.waitUntil(cache.put(cacheKey, toCache.clone()));
-	return withCacheStatus(toCache, "MISS");
-}
-
 const TRIVIA_TTL = 6 * 3600; // 6h edge cache — the question pool changes rarely (owner reloads via scripts/load_trivia.mjs)
 const TRIVIA_BRIDGE_TTL = 300; // 5m — a BRIDGE slice (no grouped pool yet) is transitional; short-cache it so a
 // publish becomes visible within minutes instead of being masked by a stale bridge entry for the full 6h.
@@ -6962,337 +6885,3 @@ async function handleRoster(url: URL, env: Env, ctx: ExecutionContext): Promise<
 	return new Response("roster unavailable", { status: 502 });
 }
 
-/** Build one spotlight per requested team (newest matchday squad → weekly pick →
- *  real stats + bio → Haiku blurb). Per-team failures drop only that team. */
-async function buildSpotlightCards(teams: string[], env: Env, ctx: ExecutionContext): Promise<unknown[]> {
-	// 1. One scoreboard fetch → each team's most recent FINISHED event.
-	const year = new Date().getUTCFullYear();
-	const recentEvent = await recentEventByTeam(year, new Set(teams));
-
-	// 2. Per team (parallel, isolated). Summary fetches are de-duped per event id (two
-	//    followed teams that played each other share one summary).
-	const summaryCache = new Map<string, Promise<SummaryRoster[]>>();
-	const weekNum = Math.floor(Date.now() / (7 * 24 * 3600 * 1000));
-
-	const built = await Promise.all(
-		teams.map(async (abbr) => {
-			try {
-				const eventId = recentEvent.get(abbr);
-				if (!eventId) return null;
-
-				let rostersP = summaryCache.get(eventId);
-				if (!rostersP) {
-					rostersP = fetchSummaryRosters(eventId);
-					summaryCache.set(eventId, rostersP);
-				}
-				const rosters = await rostersP;
-				const pool = appearedPlayers(rosters.find((r) => r.team?.abbreviation === abbr));
-				if (pool.length === 0) return null;
-
-				const player = pickWeekly(pool, abbr, weekNum);
-				const athleteId = player.athlete!.id!;
-				const teamName = TEAM_NAMES[abbr] ?? abbr;
-
-				const [stats, bio] = await Promise.all([
-					fetchAthleteSeasonStats(athleteId, year),
-					fetchAthleteBio(athleteId),
-				]);
-
-				// The match-day roster labels bench players "Substitute"; prefer the
-				// athlete record's real position in that case (else keep the richer
-				// match position, e.g. "Attacking Midfielder Right").
-				const matchPos = player.position?.name;
-				const position = matchPos && matchPos !== "Substitute" ? matchPos : bio.position ?? "Player";
-				const playerName = (player.athlete!.displayName ?? "Unknown").trim();
-
-				const blurb = await whyWatchBlurb(
-					{ name: playerName, position, teamName, age: bio.age, stats },
-					abbr,
-					athleteId,
-					weekNum,
-					env,
-					ctx,
-				);
-
-				return {
-					id: `spot-${abbr}-${athleteId}`,
-					teamAbbreviation: abbr,
-					playerName,
-					jerseyNumber: parseInt(player.jersey ?? "0", 10) || 0,
-					position,
-					bioBlurb: blurb,
-					nationality: bio.nationality,
-					age: bio.age,
-					careerHighlights: [],
-					funFacts: [],
-					seasonForm: stats ? seasonFormLabel(stats) : undefined,
-					espnAthleteId: athleteId,
-					seasonStatLine: stats ?? undefined,
-				};
-			} catch {
-				return null;
-			}
-		}),
-	);
-	return built.filter(Boolean);
-}
-
-/** The season's NWSL fixture list reduced to what the KHG calendar needs (date + season slug). One
- *  full-season scoreboard fetch, ≤6h-cached by the calendar loader (KV), so this costs ~4 ESPN reads/day. */
-async function fetchKHGCalendarEvents(year: number): Promise<KHGCalendarEvent[]> {
-	// Footprint fix (2026-09-15): read the SHARED /scoreboard cache instead of issuing a SECOND
-	// full-season ESPN range-pull. The loopback re-enters the proxy → hits the same edge-cached (1h)
-	// full-season scoreboard the app already warms → zero net ESPN fetches for KHG (and it inherits the
-	// circuit breaker + last-known-good fallback, so a KHG derivation can never hammer or fail loudly on
-	// an ESPN blip). Identical query shape, so it shares the cache key with the app's schedule load.
-	const r = await fetch(`${PROXY_PUBLIC_ORIGIN}/scoreboard?dates=${year}0101-${year}1231&limit=500`, {
-		headers: { Accept: "application/json" },
-	});
-	if (!r.ok) throw new Error(`scoreboard ${year} ${r.status}`);
-	const json = (await r.json()) as { events?: Array<{ date?: string; season?: { slug?: string } }> };
-	return (json.events ?? []).map((ev) => ({ date: ev.date, seasonSlug: ev.season?.slug ?? null }));
-}
-
-/** GET /admin/khg-calendar — the owner's calendar hatch. No param = show the derived calendar + overrides;
- *  ?pause=YYYY-MM-DD / ?live=YYYY-MM-DD add a forced Monday; ?unpause= / ?unlive= remove one; ?anchor= pins
- *  the Week-1 Monday; ?clear=1 drops every override; ?recompute=1 forces a fresh derivation now. Every
- *  action is a GET link so the whole lever works from the portal tab, like /admin/fanzone-order. */
-async function handleKHGCalendarAdmin(url: URL, request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
-	const gate = await adminGate(request, env as unknown as AdminAuthEnv, { jwt: true },
-		(kind, detail) => emitDiag(env, ctx, kind, detail));
-	if (gate) return gate;
-	const esc = (s: string) => s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
-	const isYMD = (s: string | null): s is string => !!s && /^\d{4}-\d{2}-\d{2}$/.test(s);
-	const p = url.searchParams;
-	const actionKeys = ["pause", "live", "unpause", "unlive", "anchor"];
-	let status = "Know Her Game calendar";
-	let override = await readKHGOverride(env);
-	if (p.get("clear") === "1") {
-		override = {};
-		await writeKHGOverride(env, override);
-		status = "Overrides cleared — the calendar is purely schedule-derived again.";
-		emitDiag(env, ctx, "khgCalendarOverrideSet", "cleared");
-	} else if (actionKeys.some((k) => isYMD(p.get(k)))) {
-		const paused = new Set(override.forcePaused ?? []);
-		const live = new Set(override.forceLive ?? []);
-		const pause = p.get("pause"), forceLive = p.get("live"), unpause = p.get("unpause"), unlive = p.get("unlive"), anchor = p.get("anchor");
-		if (isYMD(pause)) { paused.add(pause); live.delete(pause); }
-		if (isYMD(forceLive)) { live.add(forceLive); paused.delete(forceLive); }
-		if (isYMD(unpause)) paused.delete(unpause);
-		if (isYMD(unlive)) live.delete(unlive);
-		await writeKHGOverride(env, { forcePaused: [...paused], forceLive: [...live], anchor: isYMD(anchor) ? anchor : override.anchor });
-		override = await readKHGOverride(env);
-		status = `Override saved: ${JSON.stringify(override)}`;
-		emitDiag(env, ctx, "khgCalendarOverrideSet", JSON.stringify(override).slice(0, 120));
-	} else if (actionKeys.some((k) => p.has(k))) {
-		status = "Invalid date — use YYYY-MM-DD (a Monday). Nothing changed.";
-	}
-	const force = p.get("recompute") === "1" || p.has("clear") || actionKeys.some((k) => p.has(k));
-	const cal = await loadKnowHerCalendar(env, fetchKHGCalendarEvents, KHG_COMPILED_ANCHOR, new Date(),
-		(kind, detail) => emitDiag(env, ctx, kind, detail), force);
-	const thisMonday = khgYMD(khgMondayStart(new Date()));
-	const rows = cal ? cal.pausedMondays.map((m) => `<li><code>${m}</code> paused · <a href="/admin/khg-calendar?live=${m}">force live</a></li>`).join("") : "";
-	const calBlock = cal
-		? `<p>Anchor (Week-1 Monday, frozen this season): <span class="cur">${esc(cal.anchor)}</span>${cal.anchor !== KHG_COMPILED_ANCHOR ? ` <span class="warn">≠ compiled ${KHG_COMPILED_ANCHOR} — bump the constants</span>` : ""}<br>
-Season end (first KHG drop after the last fixture): <span class="cur">${esc(cal.seasonEnd ?? "unknown — no fixtures loaded")}</span><br>
-This Monday <code>${thisMonday}</code>: <span class="cur">${isKHGPausedMonday(cal, thisMonday) ? "PAUSED" : "live"}</span> · derived ${esc(cal.derivedAt)} · <a href="/admin/khg-calendar?recompute=1">recompute now</a></p>
-<p>Paused drop Mondays (no NWSL fixture in the 14-day round window):</p><ul>${rows || "<li>none in the horizon</li>"}</ul>`
-		: `<p class="warn">Calendar unavailable (derivation failed — see diagnostics). /config omits it; the app derives from its own schedule; the publish pass proceeds.</p>`;
-	const page = `<!doctype html>
-<html><head><meta charset="utf-8"><style>
-body{background:#111;color:#ddd;font:14px -apple-system,sans-serif;padding:18px;max-width:680px}
-a{color:#9ad} code{background:#1c1c1e;padding:1px 5px;border-radius:4px;font-size:12px}
-.cur{color:#fff;font-weight:600} .ok{color:#8c8} .warn{color:#fc6} p,li{line-height:1.5}
-</style></head><body>
-<p class="ok">${esc(status)}</p>
-${calBlock}
-<p>Overrides: <code>${esc(JSON.stringify(override))}</code> · <a href="/admin/khg-calendar?clear=1">clear all</a></p>
-<p>Force: <code>?pause=YYYY-MM-DD</code> · <code>?live=YYYY-MM-DD</code> · remove: <code>?unpause=</code> / <code>?unlive=</code> · pin anchor: <code>?anchor=YYYY-MM-DD</code>.
-A paused Monday publishes nothing (the last edition stays live) and the app schedules no nudge for it. Apps pick changes up on their next launch (config cache ≤5 min).</p>
-</body></html>`;
-	return new Response(page, { headers: { "Content-Type": "text/html; charset=utf-8" } });
-}
-
-/** Most recent FINISHED (state "post") event id for each wanted team, from one
- *  scoreboard fetch. Scans both competitors of every event; keeps the latest by date. */
-async function recentEventByTeam(year: number, wanted: Set<string>): Promise<Map<string, string>> {
-	// Footprint (2026-09-15): read the SHARED /scoreboard cache instead of a THIRD full-season ESPN
-	// range-pull (the app's schedule + KHG already warm it). Loopback → edge-cached (1h) → zero net
-	// ESPN fetches; spotlight is weekly content, so cache freshness is ample.
-	const r = await fetch(`${PROXY_PUBLIC_ORIGIN}/scoreboard?dates=${year}0101-${year}1231&limit=500`, {
-		headers: { Accept: "application/json" },
-	});
-	if (!r.ok) throw new Error(`scoreboard ${r.status}`);
-	const json = (await r.json()) as {
-		events?: Array<{
-			id?: string;
-			date?: string;
-			status?: { type?: { state?: string } };
-			competitions?: Array<{ competitors?: Array<{ team?: { abbreviation?: string } }> }>;
-		}>;
-	};
-	const best = new Map<string, { id: string; date: string }>();
-	for (const ev of json.events ?? []) {
-		if (ev.status?.type?.state !== "post" || !ev.id || !ev.date) continue;
-		for (const c of ev.competitions?.[0]?.competitors ?? []) {
-			const abbr = c.team?.abbreviation;
-			if (!abbr || !wanted.has(abbr)) continue;
-			const cur = best.get(abbr);
-			if (!cur || cur.date < ev.date) best.set(abbr, { id: ev.id, date: ev.date });
-		}
-	}
-	const out = new Map<string, string>();
-	for (const [abbr, v] of best) out.set(abbr, v.id);
-	return out;
-}
-
-/** One match's two team rosters from the summary endpoint. */
-async function fetchSummaryRosters(eventId: string): Promise<SummaryRoster[]> {
-	const r = await fetch(`${ESPN_SUMMARY}?event=${eventId}`, { headers: { "User-Agent": ESPN_UA, Accept: "application/json" } });
-	if (!r.ok) throw new Error(`summary ${r.status}`);
-	const json = (await r.json()) as { rosters?: SummaryRoster[] };
-	return json.rosters ?? [];
-}
-
-/** Players who actually APPEARED (starters + subs who came on), sorted by athlete id
- *  so the deterministic weekly pick is stable regardless of JSON ordering. */
-export function appearedPlayers(roster?: SummaryRoster): SummaryRosterPlayer[] {
-	return (roster?.roster ?? [])
-		.filter(
-			(p) => (p.starter === true || p.subbedIn === true) && p.athlete?.id && p.athlete?.displayName,
-		)
-		.sort((a, b) => (a.athlete!.id! < b.athlete!.id! ? -1 : 1));
-}
-
-/** Deterministic weekly pick: stable for a given (team, week), so the spotlight
- *  changes once a week and the narrative KV key stays put for that week. */
-export function pickWeekly(pool: SummaryRosterPlayer[], abbr: string, weekNum: number): SummaryRosterPlayer {
-	const key = `${abbr}-${weekNum}`;
-	let seed = 7;
-	for (let i = 0; i < key.length; i++) seed = (seed * 31 + key.charCodeAt(i)) >>> 0;
-	return pool[seed % pool.length];
-}
-
-/** One athlete's season stat line — goals (offensive.totalGoals), assists
- *  (offensive.goalAssists), apps (general.appearances). Best-effort → null. */
-async function fetchAthleteSeasonStats(id: string, year: number): Promise<SpotlightStats | null> {
-	try {
-		const r = await fetch(`${ESPN_CORE}/seasons/${year}/types/1/athletes/${id}/statistics`, {
-			headers: { "User-Agent": ESPN_UA, Accept: "application/json" },
-		});
-		if (!r.ok) return null;
-		const json = (await r.json()) as {
-			splits?: { categories?: Array<{ name?: string; stats?: Array<{ name?: string; value?: number }> }> };
-		};
-		const cats = json.splits?.categories ?? [];
-		const stat = (cat: string, name: string): number => {
-			const s = cats.find((x) => x.name === cat)?.stats?.find((x) => x.name === name);
-			return Math.round(s?.value ?? 0);
-		};
-		return {
-			goals: stat("offensive", "totalGoals"),
-			assists: stat("offensive", "goalAssists"),
-			apps: stat("general", "appearances"),
-		};
-	} catch {
-		return null;
-	}
-}
-
-/** Athlete age, nationality + real position from the Core API athlete record. The
- *  position backs up the match-day roster, whose `position.name` is "Substitute"
- *  for anyone who came off the bench. Best-effort → {}. */
-async function fetchAthleteBio(id: string): Promise<{ age?: number; nationality?: string; position?: string }> {
-	try {
-		const r = await fetch(`${ESPN_CORE}/athletes/${id}`, { headers: { "User-Agent": ESPN_UA, Accept: "application/json" } });
-		if (!r.ok) return {};
-		const json = (await r.json()) as { age?: number; citizenship?: string; position?: { name?: string } };
-		return {
-			age: typeof json.age === "number" ? json.age : undefined,
-			nationality: json.citizenship || undefined,
-			position: json.position?.name || undefined,
-		};
-	} catch {
-		return {};
-	}
-}
-
-/** "3 goals · 1 assist" — the small form line under the stat strip. */
-export function seasonFormLabel(s: SpotlightStats): string {
-	const g = `${s.goals} goal${s.goals === 1 ? "" : "s"}`;
-	const a = `${s.assists} assist${s.assists === 1 ? "" : "s"}`;
-	return `${g} · ${a}`;
-}
-
-/**
- * The Haiku "why watch" blurb. Its input is ONLY soccer fields (the guardrail is
- * structural — no family/biographical data is ever passed) and the prompt forbids
- * relationship/legacy framing. KV-cached per (team, athlete, week) so it's
- * generated at most once a week. Fail-OPEN: no key or any Haiku error → a neutral,
- * soccer-only fallback sentence (bioBlurb is required app-side, never empty).
- */
-async function whyWatchBlurb(
-	p: { name: string; position: string; teamName: string; age?: number; stats: SpotlightStats | null },
-	abbr: string,
-	athleteId: string,
-	weekNum: number,
-	env: Env,
-	ctx: ExecutionContext,
-): Promise<string> {
-	// Versioned key (`spv2-`) so a prompt/policy change rerolls cached blurbs rather
-	// than waiting out each one's weekly TTL (mirrors the news tagger's `nv1-`).
-	const key = `spv2-${abbr}-${athleteId}-${weekNum}`;
-	const cached = await env.FEED_TAGS.get(key, "text");
-	if (cached) return cached;
-
-	const fallback = fallbackBlurb(p);
-	if (!env.ANTHROPIC_API_KEY) return fallback;
-
-	const statsLine = p.stats
-		? `${p.stats.apps} appearances, ${p.stats.goals} goals, ${p.stats.assists} assists this season`
-		: "limited stats available this season";
-	const facts = [
-		`Player: ${p.name}`,
-		`Position: ${p.position}`,
-		`Team: ${p.teamName}`,
-		p.age ? `Age: ${p.age}` : null,
-		`Season stats: ${statsLine}`,
-		`Recent: appeared in the team's most recent match`,
-	]
-		.filter(Boolean)
-		.join("\n");
-
-	try {
-		const r = await fetch(ANTHROPIC_API, {
-			method: "POST",
-			headers: {
-				"Content-Type": "application/json",
-				"x-api-key": env.ANTHROPIC_API_KEY,
-				"anthropic-version": "2023-06-01",
-			},
-			body: JSON.stringify({
-				model: HAIKU_MODEL,
-				max_tokens: 220,
-				messages: [{ role: "user", content: `${SPOTLIGHT_POLICY}\n\n${facts}` }],
-			}),
-		});
-		if (!r.ok) throw new Error(`haiku spotlight ${r.status}`);
-		const json = (await r.json()) as { content?: Array<{ type?: string; text?: string }> };
-		const text = json.content?.find((b) => b.type === "text")?.text?.trim();
-		if (!text) throw new Error("haiku spotlight: no text block");
-		ctx.waitUntil(env.FEED_TAGS.put(key, text, { expirationTtl: SPOTLIGHT_NARRATIVE_TTL }));
-		return text;
-	} catch {
-		return fallback;
-	}
-}
-
-/** Neutral, soccer-only blurb when Haiku is unavailable (never mentions anything
- *  outside the player's season). */
-function fallbackBlurb(p: { name: string; position: string; teamName: string; stats: SpotlightStats | null }): string {
-	const role = p.position.toLowerCase();
-	if (p.stats && (p.stats.goals > 0 || p.stats.assists > 0)) {
-		return `${p.name} has been a contributor for ${p.teamName} this season, with ${p.stats.goals} goals and ${p.stats.assists} assists across ${p.stats.apps} appearances. Keep an eye on the ${role} the next time ${p.teamName} take the pitch.`;
-	}
-	return `${p.name} is one to watch for ${p.teamName} — a ${role} who featured in the team's most recent matchday squad. Catch her in action the next time they play.`;
-}
