@@ -1,5 +1,6 @@
-// Know Her Game — the weekly "how well do you know this player?" quiz that replaces
-// the passive Player Spotlight. This module holds the reusable, testable pieces:
+// Know Her Game — the weekly "how well do you know this player?" quiz that replaced the
+// passive Player Spotlight module (that /spotlight route + its code were removed 2026-09-15).
+// This module holds the reusable, testable pieces:
 //   • the content schema + a single validator (shared shape with scripts/load_knowher.mjs
 //     and the app's KnowHerGame model),
 //   • roster-learning ELIGIBILITY (who's pickable this season — starts ≥ 1), reusing the
@@ -7,7 +8,7 @@
 //   • the operator ADMIN surface (paste content → KV, flip manual/auto mode, view state).
 //
 // The route that SERVES the pool (GET /knowher) lives in index.ts alongside the other
-// cached route handlers (handleTrivia/handleSpotlight) so it reuses their edge-cache
+// cached route handlers (e.g. handleTrivia) so it reuses their edge-cache
 // helpers. Content is MANUAL for launch: the owner pastes vetted Q&A into the admin, which
 // writes KV `knowher-pool-v1`. The AUTO weekly generator is deferred (docs/know-her-game.md
 // §5); its pipe (eligibility, mode flag, admin) is built now so nothing gets retrofitted.
