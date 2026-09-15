@@ -6553,12 +6553,31 @@ async function sendDigest(env: Env, ctx: ExecutionContext): Promise<void> {
 		].join("\n");
 	} catch { /* keep the fallback line */ }
 
+	// Roster cross-check chronic staleness (v2, 2026-09-15) — clubs whose feeds have DISAGREED (Gate C
+	// failing) long enough that the last-known-good is >14d old (fetchedAt = the last time the feeds
+	// agreed, since v2 only archives verified copies). A chronic condition an override can't clear (the
+	// feeds still disagree), so it belongs in the once/week digest, not the 30-min pager. The KC case.
+	let rosterLine = "Roster cross-check: all clubs verified recently";
+	try {
+		const verdicts = await readVerdicts(env);
+		const stale: string[] = [];
+		for (const [espnId, v] of Object.entries(verdicts?.clubs ?? {})) {
+			if (v.gateCOk ?? v.ok) continue; // membership agrees → healthy
+			const rec = (await env.FEED_TAGS.get(`roster:${espnId}`, "json").catch(() => null)) as { fetchedAt?: string } | null;
+			if (!rec?.fetchedAt) continue;
+			const ageMs = Date.now() - Date.parse(rec.fetchedAt);
+			if (ageMs > ROSTER_FALLBACK_STALE_MS) stale.push(`${v.abbr} (${Math.floor(ageMs / 86400000)}d)`);
+		}
+		if (stale.length) rosterLine = `⚠️ Roster cross-check: feeds disagreeing >14d — ${stale.join(", ")}. Investigate the source / pin an owner override in /admin.`;
+	} catch { /* keep the clear line */ }
+
 	const synthLine = synth ? `${synth.fails ? `⚠️ ${synth.fails} FAILING` : "all clear"} (checked ${ageLabel(Date.now() - (synth.at ?? 0))})` : "no run yet";
 	await sendOwnerEmail(env, ctx, "weekly digest",
 		`NWSLApp weekly digest.\n\n` +
 		`— HEALTH —\n` +
 		`Synthetic checks: ${synthLine}\n` +
 		`Client crashes (24h): ${agg?.crashes24h ?? 0} reports\n` +
+		`${rosterLine}\n` +
 		`Recent proxy diagnostics (sample, by kind):\n${kindLines}\n\n` +
 		`— ANALYTICS —\n${pulse}\n\n` +
 		`Full detail: the /admin Status + Analytics tabs.`);
@@ -6689,8 +6708,16 @@ async function handleCrest(url: URL, env: Env, ctx: ExecutionContext): Promise<R
 const ESPN_ROSTER = (id: string) => `https://site.api.espn.com/apis/site/v2/sports/soccer/usa.nwsl/teams/${id}/roster`;
 // ROSTER_GOOD_MIN is imported from bracket-engine.ts — one definition, so this route and the
 // engine's resilient fetch can never disagree about what counts as an implausible squad.
-const ROSTER_CACHE_TTL = 60 * 60 * 24 * 90; // 90d last-known-good
-const ROSTER_EDGE_TTL = 60 * 60 * 6; // 6h upstream edge cache (fan-out); short so a healed roster recovers same-day
+const ROSTER_CACHE_TTL = 60 * 60 * 24 * 90; // 90d last-known-good (long backstop; staleness alert fires first)
+// v2 (2026-09-15): rosters change ~3×/year, so a 6h edge was obsessive. 24h = a healed roster / real
+// transfer still surfaces next-day, at ≤1 ESPN fetch/club/day.
+const ROSTER_EDGE_TTL = 60 * 60 * 24; // 24h upstream edge cache
+// The last-known-good is re-archived at most this often per club: verified-good rosters barely change,
+// so a weekly snapshot keeps the fallback fresh (≤1wk stale when a club breaks) at ~1 KV write/club/week.
+const ROSTER_SNAPSHOT_MIN_AGE_MS = 60 * 60 * 24 * 7 * 1000; // 7d
+// A club held on its fallback longer than this while the feeds still disagree gets a pageable alert —
+// the last-known-good is real, but a weeks-old roster needs a human (an owner override) to heal it.
+const ROSTER_FALLBACK_STALE_MS = 60 * 60 * 24 * 14 * 1000; // 14d
 
 interface RosterCacheRecord {
 	fetchedAt: string; // ISO timestamp of the good fetch (surfaced to the app as proxyCachedAsOf)
@@ -6762,28 +6789,50 @@ export function rosterCacheRefreshDecision(
 	return { refresh: overlap >= ROSTER_CONTINUITY_MIN, overlap };
 }
 
-/** Pure serve/refresh plan for the GOOD path (live payload ≥ ROSTER_GOOD_MIN) — tweak 2,
- *  owner-approved 2026-07-31. Two signals can demote a plausibly-SIZED payload:
+/** Pure serve/refresh plan for the GOOD path (live payload ≥ ROSTER_GOOD_MIN) — v2, 2026-09-15.
  *
- *  - `continuityOk=false` — the live payload shares <50% of its players with the trusted copy.
- *    This is the real-time contamination shield: before this, a wrong-humans roster was refused
- *    the CACHE but still SERVED (paged, yet on screen). Now users keep the trusted copy.
- *  - `verdictOk=false` — the nightly ESPN×NWSL verification failed this club (contamination the
- *    50% bar can't see, keeper-count disagreement, …). Held on last-known-good until it passes;
- *    up to ~24h stale for THAT club only, which the owner accepted over serving wrong data.
+ *  v1 gated the cache on the blind >50%-vs-previous-snapshot continuity AND the nightly verdict,
+ *  ANDed together. Two flaws: (a) a stale/bad previous snapshot could BLOCK a verified refresh
+ *  (locked onto a bad baseline), and (b) the verdict folded Gate B, so a cosmetic duplicate jersey
+ *  froze the whole club. v2 gates on **membership agreement (Gate C) alone** and adds a who-broke
+ *  disambiguator so a broken *league* feed can't freeze a healthy ESPN club (the KC case).
  *
- *  Fail-open by construction: no cache to fall back on, or no/expired verdict ⇒ exactly the old
- *  behavior. The cache is never refreshed from a payload either signal distrusts. */
+ *  Inputs:
+ *  - `gateCOk`   — the nightly ESPN×NWSL MEMBERSHIP verdict for this club (fail-open true if none).
+ *  - `hasCached` — a last-known-good exists.
+ *  - `cacheAgeMs`— age of that last-known-good (null ⇒ none); throttles the weekly snapshot write.
+ *  - `espnVsGoodOverlap` — share of the cached last-known-good still present in LIVE ESPN (1 if none).
+ *
+ *  Three cases, in precedence order:
+ *   1. `espn-diverged` — live ESPN shares <50% with the TRUSTED last-known-good ⇒ ESPN is the broken
+ *      side (contamination). Serve cached; never archive. (Independent of the verdict — real-time.)
+ *   2. `verified` / `verified-recent` — Gate C agrees ⇒ serve live; archive it, but at most weekly.
+ *   3. `disagree-league-suspect` — Gate C disagrees yet ESPN still matches the last-known-good ⇒ the
+ *      LEAGUE feed is the suspect. Keep serving LIVE ESPN (don't freeze on a stale copy); never
+ *      archive a payload the cross-check can't confirm. */
 export function goodPathPlan(opts: {
-	continuityOk: boolean;
-	verdictOk: boolean;
+	gateCOk: boolean;
 	hasCached: boolean;
-}): { serve: "live" | "cached"; refreshCache: boolean } {
-	const { continuityOk, verdictOk, hasCached } = opts;
-	if (hasCached && (!continuityOk || !verdictOk)) return { serve: "cached", refreshCache: false };
-	// No cached copy: live is all there is — serve it, but only ARCHIVE it if nothing distrusts it
-	// (seeding the fallback with suspect data would poison the very net we fall back on).
-	return { serve: "live", refreshCache: continuityOk && verdictOk };
+	cacheAgeMs: number | null;
+	espnVsGoodOverlap: number;
+}): {
+	serve: "live" | "cached";
+	refreshCache: boolean;
+	reason: "espn-diverged" | "verified" | "verified-recent" | "disagree-league-suspect" | "no-cache-fail-open";
+} {
+	const { gateCOk, hasCached, cacheAgeMs, espnVsGoodOverlap } = opts;
+	const espnStable = cacheAgeMs == null || espnVsGoodOverlap >= ROSTER_CONTINUITY_MIN;
+	const weeklyDue = cacheAgeMs == null || cacheAgeMs >= ROSTER_SNAPSHOT_MIN_AGE_MS;
+
+	// 1. Contamination shield (real-time, verdict-independent): ESPN wildly unlike the trusted copy.
+	if (hasCached && !espnStable) return { serve: "cached", refreshCache: false, reason: "espn-diverged" };
+
+	// 2. Membership verified by last night's cross-check (or no verdict → fail open).
+	if (gateCOk) return { serve: "live", refreshCache: weeklyDue, reason: weeklyDue ? "verified" : "verified-recent" };
+
+	// 3. Feeds disagree but ESPN is stable vs the last-known-good → the league feed is the suspect.
+	if (hasCached) return { serve: "live", refreshCache: false, reason: "disagree-league-suspect" };
+	return { serve: "live", refreshCache: false, reason: "no-cache-fail-open" };
 }
 
 /** Serialize a roster body. When served from the last-known-good cache, inject a top-level
@@ -6855,29 +6904,33 @@ async function handleRoster(url: URL, env: Env, ctx: ExecutionContext): Promise<
 	};
 
 	// 2. Plausible squad → decide what to SERVE and whether the payload may become the new
-	//    last-known-good. Two distrust signals (see goodPathPlan): the real-time continuity check,
-	//    and the nightly ESPN×NWSL verification verdict. Either one holds users on the trusted
-	//    cached copy (honest marker) instead of showing suspect data.
+	//    last-known-good (goodPathPlan v2). The cache gates on MEMBERSHIP agreement (Gate C) alone —
+	//    a cosmetic Gate B failure (duplicate jersey) no longer freezes a club — plus a real-time
+	//    contamination shield and a who-broke disambiguator (a broken LEAGUE feed keeps serving live
+	//    ESPN instead of freezing on a stale copy). Snapshot writes are throttled to ~weekly.
 	if (liveCount >= ROSTER_GOOD_MIN) {
-		const { refresh: continuityOk, overlap } = rosterCacheRefreshDecision(live, cached?.body ?? null);
+		const { overlap } = rosterCacheRefreshDecision(live, cached?.body ?? null);
 
-		let verdictOk = true;
+		let gateCOk = true;
 		try {
 			const verdicts = await readVerdicts(env);
 			const v = verdicts?.clubs?.[id];
-			if (v && !v.ok) verdictOk = false;
+			// Gate the cache on membership (gateC) only; fall back to `ok` for an old-shape verdict
+			// still in KV (one cycle, until the next nightly run stamps gateCOk).
+			if (v) gateCOk = v.gateCOk ?? v.ok;
 		} catch {
 			/* fail open — no verdict is not a verdict against */
 		}
 
-		const plan = goodPathPlan({ continuityOk, verdictOk, hasCached: cached != null });
-		if (!continuityOk) {
-			// Loud: contamination-class, not routine churn. If the CACHED copy is ever the bad one,
-			// it self-expires at ROSTER_CACHE_TTL — or delete the key (see docs/backend.md).
+		const cacheAgeMs = cached ? Date.now() - Date.parse(cached.fetchedAt) : null;
+		const plan = goodPathPlan({ gateCOk, hasCached: cached != null, cacheAgeMs, espnVsGoodOverlap: overlap });
+		if (plan.reason === "espn-diverged") {
+			// Loud: contamination-class. ESPN diverged from the trusted copy → users keep last-known-good.
 			emitDiag(env, ctx, "rosterContinuityRefused", `${id} overlap=${Math.round(overlap * 100)}% live=${liveCount}`);
-		} else if (!verdictOk && plan.serve === "cached") {
-			// Quiet-ish: the nightly gate failure already paged; this just records each hold.
-			emitDiag(env, ctx, "rosterVerdictHold", `${id} live=${liveCount} held on cached`);
+		} else if (plan.reason === "disagree-league-suspect") {
+			// Gate C failed but ESPN matches the trusted copy → the LEAGUE feed is the suspect; serve
+			// live ESPN rather than freeze. The staleness alert (synthetic check) pages if this persists.
+			emitDiag(env, ctx, "rosterVerdictHold", `${id} gateC-fail, ESPN stable → serving live (league feed suspect)`);
 		}
 		if (plan.refreshCache) {
 			const record: RosterCacheRecord = { fetchedAt: new Date().toISOString(), body: live };
