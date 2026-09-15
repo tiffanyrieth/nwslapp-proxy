@@ -139,31 +139,37 @@ describe("/roster route guard", () => {
 	});
 });
 
-// Tweak 2 (owner-approved 2026-07-31): the good path can now DEMOTE a plausibly-sized live
-// payload to the trusted cached copy — in real time when continuity fails (contamination was
-// previously paged but still shown), and for up to ~24h when the nightly ESPN×NWSL verification
-// failed the club. Fail-open: no cache or no verdict reproduces the old behavior exactly.
+// v2 (2026-09-15): the roster cache gates on MEMBERSHIP agreement (Gate C) alone — a cosmetic Gate B
+// failure no longer freezes a club — with a real-time contamination shield (ESPN diverged from the
+// trusted copy) and a who-broke disambiguator (a broken LEAGUE feed keeps serving live ESPN instead
+// of freezing on stale). Snapshot writes are throttled to ~weekly. Fail-open with no cache/verdict.
 import { goodPathPlan } from "../src/index";
 
-describe("goodPathPlan", () => {
-	it("healthy: serves live and refreshes the archive", () => {
-		expect(goodPathPlan({ continuityOk: true, verdictOk: true, hasCached: true }))
-			.toEqual({ serve: "live", refreshCache: true });
+describe("goodPathPlan (v2 — membership-gated cache)", () => {
+	const WK = 8 * 86400000; // older than the 7d snapshot throttle → a weekly write is due
+	const RECENT = 1 * 86400000; // younger than the throttle → skip the write
+	it("healthy + weekly due: serves live and re-archives", () => {
+		expect(goodPathPlan({ gateCOk: true, hasCached: true, cacheAgeMs: WK, espnVsGoodOverlap: 0.95 }))
+			.toEqual({ serve: "live", refreshCache: true, reason: "verified" });
 	});
-	it("contamination day-of: serves the trusted copy, never archives the suspect payload", () => {
-		expect(goodPathPlan({ continuityOk: false, verdictOk: true, hasCached: true }))
-			.toEqual({ serve: "cached", refreshCache: false });
+	it("healthy but archived recently: serves live, throttles the write to ~weekly", () => {
+		expect(goodPathPlan({ gateCOk: true, hasCached: true, cacheAgeMs: RECENT, espnVsGoodOverlap: 0.95 }))
+			.toEqual({ serve: "live", refreshCache: false, reason: "verified-recent" });
 	});
-	it("nightly verdict failed: holds the club on its last-known-good until it passes", () => {
-		expect(goodPathPlan({ continuityOk: true, verdictOk: false, hasCached: true }))
-			.toEqual({ serve: "cached", refreshCache: false });
+	it("ESPN diverged from the trusted copy: serves cached, never archives (contamination shield, verdict-independent)", () => {
+		expect(goodPathPlan({ gateCOk: true, hasCached: true, cacheAgeMs: WK, espnVsGoodOverlap: 0.1 }))
+			.toEqual({ serve: "cached", refreshCache: false, reason: "espn-diverged" });
 	});
-	it("fails open with no cache: serves live (all there is) but refuses to seed the archive", () => {
-		expect(goodPathPlan({ continuityOk: true, verdictOk: false, hasCached: false }))
-			.toEqual({ serve: "live", refreshCache: false });
+	it("Gate C disagrees but ESPN is stable (broken LEAGUE feed, the KC case): keeps serving live, no freeze, no archive", () => {
+		expect(goodPathPlan({ gateCOk: false, hasCached: true, cacheAgeMs: WK, espnVsGoodOverlap: 0.95 }))
+			.toEqual({ serve: "live", refreshCache: false, reason: "disagree-league-suspect" });
 	});
-	it("bootstrap: no cache and nothing distrusts the payload — serve and archive", () => {
-		expect(goodPathPlan({ continuityOk: true, verdictOk: true, hasCached: false }))
-			.toEqual({ serve: "live", refreshCache: true });
+	it("bootstrap: no cache + membership agrees → serve live and seed the archive", () => {
+		expect(goodPathPlan({ gateCOk: true, hasCached: false, cacheAgeMs: null, espnVsGoodOverlap: 1 }))
+			.toEqual({ serve: "live", refreshCache: true, reason: "verified" });
+	});
+	it("no cache + disagreement: serve live (all there is), never seed the archive with an unconfirmed payload", () => {
+		expect(goodPathPlan({ gateCOk: false, hasCached: false, cacheAgeMs: null, espnVsGoodOverlap: 1 }))
+			.toEqual({ serve: "live", refreshCache: false, reason: "no-cache-fail-open" });
 	});
 });

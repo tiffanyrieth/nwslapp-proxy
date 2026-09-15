@@ -64,14 +64,19 @@ const SEASON_TTL = 60 * 60 * 24 * 7;
 /** Per-club pass/fail from the latest run — the small key `/roster` consults at serve time
  *  (tweak 2, owner-approved 2026-07-31). A club whose last verification FAILED is held on its
  *  last-known-good copy until it passes again; healthy clubs keep serving live. 48h TTL is the
- *  kill switch: if the cron dies the verdicts expire and serving falls open to live-first. */
+ *  kill switch: if the cron dies the verdicts expire and serving falls open to live-first.
+ *
+ *  ⚠️ v2 (2026-09-15): `/roster` now gates the cache on **`gateCOk` (membership agreement) ALONE**,
+ *  NOT `ok` — a cosmetic Gate B failure (duplicate jersey) must never freeze a club's roster. `ok`
+ *  (`gateB && gateC`) is kept for the report/portal; `gateCOk` is optional so an old-shape verdict
+ *  still in KV falls back to `ok` for one cycle (safe) until the next nightly run stamps it. */
 export const VERDICTS_KEY = "roster-truth-verdicts-v1";
 const VERDICTS_TTL = 60 * 60 * 48;
 
 export interface VerdictMap {
 	at: string;
 	/** Keyed by ESPN team id (the `?team=` param `/roster` receives). */
-	clubs: Record<string, { abbr: string; ok: boolean }>;
+	clubs: Record<string, { abbr: string; ok: boolean; gateCOk?: boolean }>;
 }
 
 /** Owner rulings that outrank BOTH feeds. See `applyOverrides`. */
@@ -1040,7 +1045,7 @@ export async function runRosterTruth(env: RosterTruthEnv, emit: EmitBatch): Prom
 
 			if (!espnRaw) {
 				// Unverified ≠ failed: a fetch blip must not hold a club on its cached copy.
-				verdictClubs[t.id] = { abbr: t.abbr, ok: true };
+				verdictClubs[t.id] = { abbr: t.abbr, ok: true, gateCOk: true };
 				clubs.push({
 					abbr: t.abbr,
 					espnCount: -1,
@@ -1060,7 +1065,8 @@ export async function runRosterTruth(env: RosterTruthEnv, emit: EmitBatch): Prom
 
 			const gateB = gateShape(espn);
 			const gateC = gateContinuity(espn, squad, priorNames[t.abbr] ?? null);
-			verdictClubs[t.id] = { abbr: t.abbr, ok: gateB.ok && gateC.ok };
+			// `ok` keeps its historical meaning (report/portal); `gateCOk` is what /roster's cache gates on.
+			verdictClubs[t.id] = { abbr: t.abbr, ok: gateB.ok && gateC.ok, gateCOk: gateC.ok };
 			clubs.push({
 				abbr: t.abbr,
 				espnCount: espn.players.length,
