@@ -54,15 +54,19 @@ describe("proxyAndCache recovery ladder", () => {
 		expect(await res.text()).toBe(scoreboardBody);
 	});
 
-	it("steps 3-4: a hard ESPN outage serves the last-known-good snapshot, and only 502s bare", async () => {
-		// No snapshot yet + total outage (busted AND retry fail) → the caller sees the 502.
+	it("steps 3-4: a hard ESPN outage serves the last-known-good snapshot; scoreboard falls to an empty-200 floor", async () => {
+		// No snapshot yet + total outage (busted AND retry fail). SCOREBOARD never 502s (2026-09-15
+		// storm fix, step 3.6): with no snapshot for this feed it serves a valid EMPTY 200 so callers
+		// (app + watcher) degrade instead of erroring — a watcher 502 storm is what tripped ESPN's WAF.
 		fetchMock
 			.get(ESPN)
 			.intercept({ path: (p) => p.startsWith(SB_PATH) })
 			.reply(502, "down")
 			.times(2); // busted attempt + un-busted retry
 		const bare = await get("https://proxy.test/scoreboard?dates=20260810&limit=500&_cb=1");
-		expect(bare.status).toBe(502);
+		expect(bare.status).toBe(200);
+		expect(bare.headers.get("X-Proxy-Cache")).toBe("STALE");
+		expect(await bare.json()).toEqual({ events: [] });
 
 		// One successful (busted) fetch writes the snapshot under the normalized key…
 		fetchMock

@@ -101,6 +101,14 @@ async function api(op, extra = {}) {
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ op, ...extra }),
   });
+  // Fail LOUD, never silently blank (2026-09-15). A Cloudflare Access session that has expired makes
+  // this POST 302 to the Access login (HTML, not JSON) so r.json() would throw an opaque parse error
+  // and the caller's then(render) would swallow it into a blank page. Surface the real reason instead.
+  const ct = r.headers.get("content-type") || "";
+  if (!r.ok || !ct.includes("application/json")) {
+    if (r.redirected) throw new Error("Cloudflare Access session expired — re-authenticate (redirected to " + new URL(r.url).host + ")");
+    throw new Error("admin API returned " + r.status + " (" + (ct || "no content-type") + ")");
+  }
   return r.json();
 }
 
@@ -300,7 +308,10 @@ $("#run").onclick = async () => {
   finally { $("#run").disabled = false; $("#run").textContent = "Run verification now"; }
 };
 
-api("state").then(render);
+api("state").then(render).catch(function (e) {
+  $("#gates").innerHTML = '<div class="note">Could not load the roster data: ' + esc(String((e && e.message) || e)) + '</div>';
+  $("#body").innerHTML = "";
+});
 </script>
 </body>
 </html>`;
