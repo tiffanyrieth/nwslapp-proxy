@@ -168,7 +168,13 @@ const summaryUpstream = (slug: string) =>
 
 // Cache TTLs (seconds).
 const LIVE_TTL = 30; // a match is in progress — keep scores/lineups fresh
-const SCOREBOARD_DEFAULT_TTL = 300; // fixture list barely changes between matches
+// v2 (2026-09-15): the STATIC fixture list barely changes (a season's schedule drops ~3×/yr), so
+// re-pulling the full-season `dates=` range every 5 min was ~288 ESPN pulls/day of a "schedule
+// extraction" shape — a WAF trigger. Live freshness is NOT affected: `isLive`/`nearKickoff` below
+// still return LIVE_TTL (30s), so an in-progress or about-to-start match tracks ESPN within ~30s.
+// 1h cuts the full-season pull to ~24/day; the only cost is a schedule *change* taking up to 1h to
+// appear, which is fine for something that changes a few times a year.
+const SCOREBOARD_DEFAULT_TTL = 3600; // 1h — the static fixture list; live windows use LIVE_TTL
 const SUMMARY_DEFAULT_TTL = 3600; // 1hr — safe fallback when summary state can't be read
 const IMMUTABLE_TTL = 31536000; // 1yr — a SETTLED, COMPLETE match's data is final (see chooseSummaryTTL)
 // A settled match whose record is still filling in (attendance lands hours-to-days late for some
@@ -1301,6 +1307,12 @@ Apps apply it on their next launch (config cache under 5 min).</p>
 		// ⚠️ This explicit branch is REQUIRED: the fall-through below runs the Apify social scrape,
 		// so a new cron string without a branch would silently trigger paid scraping every night.
 		if (controller.cron === "0 8 * * *") {
+			// Respect a deliberate ESPN pause (kill switch) — a nightly ~36-fetch cross-check must not
+			// break a maintenance silence. It's observe-only, so skipping a night costs nothing.
+			if (await isEspnManuallyPaused(env)) {
+				emitDiag(env, ctx, "rosterTruthPaused", "ESPN paused — skipped nightly verification");
+				return;
+			}
 			try {
 				await runRosterTruth(env, (events) => emitDiagBatch(env, ctx, events));
 			} catch (e) {
@@ -1315,6 +1327,88 @@ Apps apply it on their next launch (config cache under 5 min).</p>
 		}
 	},
 } satisfies ExportedHandler<Env>;
+
+// ── ESPN upstream circuit breaker (2026-09-15 incident) ───────────────────────────────────────────
+// ESPN's endpoints are unofficial; their WAF penalty-boxes an IP that keeps hitting it WHILE blocked
+// (429/403 → escalation toward a permanent ban — exactly what a retry storm looks like). So after a run
+// of consecutive upstream failures we STOP calling ESPN for a cooldown and serve last-known-good, giving
+// the block room to lift and keeping our aggregate footprint on the fandom-app side of ESPN's line.
+// GLOBAL via KV so one colo's discovery backs off ALL colos; a per-isolate memo keeps it to ~1 KV read
+// per isolate per 30s, not one per request (which would burn the KV read budget at scale).
+interface EspnBreakerState { openUntil: number; fails: number }
+const ESPN_BREAKER_KEY = "espn:breaker:v1";
+// A DELIBERATE, owner-set pause (kill switch) — distinct from the AUTO breaker so the health alert can
+// page on a real auto-open (ESPN failing) without crying wolf during an intentional maintenance pause.
+// Value: `{ until: <ms> }`. Checked by every ESPN path so the pause is COMPLETE, not just scoreboard.
+const ESPN_PAUSE_KEY = "espn:pause:until";
+let espnPauseMemo: { until: number; at: number } | null = null;
+
+/** Is ESPN deliberately paused (owner kill switch)? 30s in-isolate memo, like the breaker. */
+export async function isEspnManuallyPaused(env: Env): Promise<boolean> {
+	const now = Date.now();
+	if (!espnPauseMemo || now - espnPauseMemo.at >= 30_000) {
+		let until = 0;
+		try {
+			const raw = await env.FEED_TAGS.get(ESPN_PAUSE_KEY);
+			if (raw) until = (JSON.parse(raw) as { until?: number }).until ?? 0;
+		} catch {
+			/* fail open — a KV read error must never itself block ESPN */
+		}
+		espnPauseMemo = { until, at: now };
+	}
+	return espnPauseMemo.until > now;
+}
+
+const ESPN_BREAKER_THRESHOLD = 3; // consecutive upstream failures before opening
+const ESPN_BREAKER_COOLDOWN_MS = 10 * 60 * 1000; // 10 min penalty-box (ESPN's timeouts run 5-15 min)
+const ESPN_BREAKER_MEMO_TTL_MS = 30 * 1000;
+let espnBreakerMemo: { openUntil: number; at: number } | null = null;
+let espnBreakerFails = 0; // in-isolate consecutive-failure counter (openUntil is the global signal)
+
+/** Pure open/skip decision for a given now vs the last-read openUntil. Exported for tests. */
+export function espnBreakerIsOpen(openUntil: number, now: number): boolean {
+	return openUntil > now;
+}
+
+/** Is ESPN currently in the penalty box? Reads the global KV flag through a 30s in-isolate memo. */
+async function isEspnBreakerOpen(env: Env): Promise<boolean> {
+	const now = Date.now();
+	if (!espnBreakerMemo || now - espnBreakerMemo.at >= ESPN_BREAKER_MEMO_TTL_MS) {
+		let openUntil = 0;
+		try {
+			const raw = await env.FEED_TAGS.get(ESPN_BREAKER_KEY);
+			if (raw) openUntil = (JSON.parse(raw) as EspnBreakerState).openUntil ?? 0;
+		} catch {
+			/* fail open — a KV read error must never itself block ESPN */
+		}
+		espnBreakerMemo = { openUntil, at: now };
+	}
+	return espnBreakerIsOpen(espnBreakerMemo.openUntil, now);
+}
+
+/** Record the outcome of an ESPN call. Success → reset + close; `ESPN_BREAKER_THRESHOLD` consecutive
+ *  failures → open for the cooldown. KV is written only on the open/close TRANSITION, so a sustained
+ *  block costs a handful of writes, not one per request. */
+async function recordEspnResult(env: Env, ctx: ExecutionContext, ok: boolean): Promise<void> {
+	const now = Date.now();
+	if (ok) {
+		espnBreakerFails = 0;
+		if (espnBreakerMemo && espnBreakerMemo.openUntil > 0) {
+			espnBreakerMemo = { openUntil: 0, at: now };
+			try { await env.FEED_TAGS.put(ESPN_BREAKER_KEY, JSON.stringify({ openUntil: 0, fails: 0 }), { expirationTtl: 3600 }); } catch { /* best-effort */ }
+			emitDiag(env, ctx, "espnBreakerClosed", "ESPN recovered — breaker closed");
+		}
+		return;
+	}
+	espnBreakerFails += 1;
+	if (espnBreakerFails >= ESPN_BREAKER_THRESHOLD) {
+		const openUntil = now + ESPN_BREAKER_COOLDOWN_MS;
+		espnBreakerFails = 0;
+		espnBreakerMemo = { openUntil, at: now };
+		try { await env.FEED_TAGS.put(ESPN_BREAKER_KEY, JSON.stringify({ openUntil, fails: 0 } satisfies EspnBreakerState), { expirationTtl: 3600 }); } catch { /* best-effort */ }
+		emitDiag(env, ctx, "espnBreakerOpen", `ESPN failing — backing off ${ESPN_BREAKER_COOLDOWN_MS / 60000}m to avoid a WAF escalation`);
+	}
+}
 
 /**
  * The shared caching pass-through. Checks the edge cache, and on a MISS forwards
@@ -1394,31 +1488,56 @@ async function proxyAndCache(
 		});
 	};
 
+	// Circuit breaker (ESPN-fragile routes only): if ESPN is in its penalty box, DON'T call it — go
+	// straight to the fallback ladder with the last-known-good. This is what keeps a retry storm from
+	// hammering (and escalating) an active WAF block.
+	const breakerOpen = bustUpstream && (await isEspnBreakerOpen(env) || await isEspnManuallyPaused(env));
 	let espnResponse: Response | null = null;
-	try {
-		espnResponse = await fetchUpstream(bustUpstream);
-	} catch {
-		espnResponse = null;
-	}
-
-	// Recovery ladder step 1 — the `_cb` recompute is what ESPN chokes on under live load, so an
-	// un-busted retry usually succeeds from ESPN's own cache: near-fresh for windowed queries,
-	// strictly better than any snapshot, and it un-blinds a watcher tick that would otherwise skip.
-	if (!espnResponse?.ok && bustUpstream) {
-		const firstFail = espnResponse ? String(espnResponse.status) : "threw";
+	if (breakerOpen) {
+		emitDiagCoalesced(env, ctx, "espnBreakerSkip", `${url.pathname} — ESPN paused/broken, skipped`, url.pathname);
+	} else {
 		try {
-			const retry = await fetchUpstream(false);
-			if (retry.ok) {
-				emitDiag(env, ctx, "espnRetryRecovered", `${url.pathname} upstream ${firstFail}`);
-				espnResponse = retry;
-			}
+			espnResponse = await fetchUpstream(bustUpstream);
 		} catch {
-			// fall through to steps 2-4
+			espnResponse = null;
 		}
+
+		// Recovery ladder step 1 — the `_cb` recompute is what ESPN chokes on under live load, so an
+		// un-busted retry usually succeeds from ESPN's own cache: near-fresh for windowed queries,
+		// strictly better than any snapshot, and it un-blinds a watcher tick that would otherwise skip.
+		if (!espnResponse?.ok && bustUpstream) {
+			const firstFail = espnResponse ? String(espnResponse.status) : "threw";
+			try {
+				const retry = await fetchUpstream(false);
+				if (retry.ok) {
+					emitDiag(env, ctx, "espnRetryRecovered", `${url.pathname} upstream ${firstFail}`);
+					espnResponse = retry;
+				}
+			} catch {
+				// fall through to steps 2-4
+			}
+		}
+
+		// Feed the breaker the definitive ESPN outcome for this call (only when we actually called it).
+		if (bustUpstream) ctx.waitUntil(recordEspnResult(env, ctx, !!espnResponse?.ok));
 	}
 
 	if (!espnResponse?.ok) {
 		const failDetail = `${url.pathname} upstream ${espnResponse ? espnResponse.status : "threw"}`;
+		// Diagnose (2026-09-15): capture a BOUNDED snippet of ESPN's rejection + WAF-signalling headers so
+		// we can tell a WAF pattern-block (self-heals once traffic drops) from an endpoint change (needs a
+		// query fix). Coalesced, so it can't spam; only fires on a real ESPN response (not a throw/skip).
+		if (espnResponse) {
+			try {
+				const body = (await espnResponse.clone().text()).slice(0, 160).replace(/\s+/g, " ").trim();
+				const h = (k: string) => espnResponse!.headers.get(k) ?? "";
+				emitDiagCoalesced(env, ctx, "espnUpstreamBody",
+					`${failDetail} server=${h("server")} retry-after=${h("retry-after")} cf-ray=${h("cf-ray")} body="${body}"`,
+					url.pathname);
+			} catch {
+				/* body read is best-effort — never let it mask the fallback */
+			}
+		}
 		// Step 2 — stale copy under the same key (expired-but-not-evicted edge entry).
 		const stale = await serveStale(cache, cacheKey);
 		if (stale) {
@@ -1433,6 +1552,36 @@ async function proxyAndCache(
 			const out = new Response(snap.body, snap);
 			out.headers.set("Cache-Control", "public, max-age=30");
 			return withCacheStatus(out, "STALE");
+		}
+		// Step 3.5 — SCOREBOARD ONLY: fall back to the FULL-SEASON snapshot for this league. A windowed
+		// live-poll (app) or per-feed watcher query has a snapshot key that SHIFTS daily (dates are kept
+		// in the key), so its own snapshot rarely exists — but the full-season snapshot is stable and kept
+		// warm by the app's `dates=YYYY0101-YYYY1231` load. Serving it (whole schedule, degraded-but-present)
+		// beats 502ing, which is what turns an ESPN scoreboard outage into an app error AND a watcher retry
+		// storm (2026-09-15 incident: ESPN 400'd every fresh fetch; the watcher re-swept all feeds every tick).
+		if (url.pathname === "/scoreboard") {
+			const full = new URL(url.toString());
+			const yr = new Date().getUTCFullYear();
+			full.searchParams.set("dates", `${yr}0101-${yr}1231`);
+			full.searchParams.set("limit", "500");
+			const fullSnap = await cache.match(new Request(snapshotKeyURL(full), { method: "GET" }));
+			if (fullSnap) {
+				emitDiagCoalesced(env, ctx, "staleServe", `${failDetail} — served full-season snapshot`, url.pathname);
+				const out = new Response(fullSnap.body, fullSnap);
+				out.headers.set("Cache-Control", "public, max-age=30");
+				return withCacheStatus(out, "STALE");
+			}
+			// Step 3.6 — no snapshot anywhere for this feed (an aux competition never full-season-loaded, or
+			// a snapshot that expired). Serve a VALID EMPTY scoreboard at 200 rather than 502: the watcher
+			// reads `events ?? []` so its sweep COMPLETES and its fixture index rebuilds (ending the retry
+			// storm), and a feed with no fixtures this window is honestly empty anyway. Never for NWSL in
+			// practice — its full-season snapshot is always warm and answers at Step 3.5 above.
+			emitDiagCoalesced(env, ctx, "staleServe", `${failDetail} — served empty (no snapshot)`, url.pathname);
+			const empty = new Response(JSON.stringify({ events: [] }), {
+				status: 200,
+				headers: { "Content-Type": "application/json", "Cache-Control": "public, max-age=30" },
+			});
+			return withCacheStatus(empty, "STALE");
 		}
 		// Step 4 — nothing to serve. This is the only outcome the caller sees as an error.
 		emitDiagCoalesced(env, ctx, "apiFailure", `${failDetail} (no fallback)`, url.pathname);
@@ -6253,6 +6402,26 @@ async function runSyntheticChecks(env: Env, ctx: ExecutionContext): Promise<void
 		checks.push({ label, status: raw ? "ok" : "fail", detail: raw ? `${Math.round(raw.length / 1024)}KB` : "snapshot MISSING (cron failed or KV expired)" });
 	}
 
+	// ESPN circuit breaker (2026-09-15) — closes the alert gap that let a full scoreboard outage go
+	// un-paged: the base-URL check above passes because ESPN still answers the bare query, but the app
+	// uses a DATED range query ESPN rejects. The AUTO breaker opening IS the direct signal ESPN is
+	// failing our real traffic → page. A deliberate owner PAUSE uses a separate key (not read here), so
+	// intentional maintenance never cries wolf.
+	let breakerOpenUntil = 0;
+	try {
+		const raw = await env.FEED_TAGS.get(ESPN_BREAKER_KEY);
+		if (raw) breakerOpenUntil = (JSON.parse(raw) as { openUntil?: number }).openUntil ?? 0;
+	} catch {
+		/* treat as closed */
+	}
+	checks.push({
+		label: "ESPN upstream (circuit breaker)",
+		status: breakerOpenUntil > Date.now() ? "fail" : "ok",
+		detail: breakerOpenUntil > Date.now()
+			? `breaker OPEN — ESPN is failing our dated scoreboard queries (backed off until ${new Date(breakerOpenUntil).toISOString()})`
+			: "closed",
+	});
+
 	const fails = checks.filter((c) => c.status === "fail");
 	await env.FEED_TAGS.put(SYNTHETIC_LAST_KEY,
 		JSON.stringify({ at: Date.now(), fails: fails.length, checks: checks.map((c) => ({ label: c.label, status: c.status, detail: c.detail })) }),
@@ -6636,22 +6805,27 @@ async function handleRoster(url: URL, env: Env, ctx: ExecutionContext): Promise<
 	if (!id) return new Response("missing ?team", { status: 400 });
 	const kvKey = `roster:${id}`;
 
-	// 1. Fetch ESPN live (briefly edge-cached for fan-out).
+	// 1. Fetch ESPN live (briefly edge-cached for fan-out) — UNLESS ESPN is deliberately paused (kill
+	//    switch): leave `live` null so the last-known-good fallback (step 3) serves, without touching ESPN.
 	let live: unknown = null;
 	let liveCount = -1;
-	try {
-		const r = await fetch(ESPN_ROSTER(id), {
-			headers: { "User-Agent": ESPN_UA, Accept: "application/json" },
-			cf: { cacheEverything: true, cacheTtlByStatus: { "200-299": ROSTER_EDGE_TTL, "404": 0, "500-599": 0 } },
-		});
-		if (r.ok) {
-			live = await r.json();
-			liveCount = athleteCount(live);
-		} else {
-			emitDiag(env, ctx, "rosterUpstreamStatus", `${id} → ${r.status}`);
+	if (await isEspnManuallyPaused(env)) {
+		emitDiagCoalesced(env, ctx, "espnBreakerSkip", `/roster ${id} — ESPN paused, served last-known-good`, "/roster");
+	} else {
+		try {
+			const r = await fetch(ESPN_ROSTER(id), {
+				headers: { "User-Agent": ESPN_UA, Accept: "application/json" },
+				cf: { cacheEverything: true, cacheTtlByStatus: { "200-299": ROSTER_EDGE_TTL, "404": 0, "500-599": 0 } },
+			});
+			if (r.ok) {
+				live = await r.json();
+				liveCount = athleteCount(live);
+			} else {
+				emitDiag(env, ctx, "rosterUpstreamStatus", `${id} → ${r.status}`);
+			}
+		} catch (e) {
+			emitDiag(env, ctx, "rosterUpstreamThrew", `${id}: ${(e as Error).message.slice(0, 40)}`);
 		}
-	} catch (e) {
-		emitDiag(env, ctx, "rosterUpstreamThrew", `${id}: ${(e as Error).message.slice(0, 40)}`);
 	}
 
 	// Read the last-known-good once, up front: step 2 needs it to decide whether the live
@@ -6813,8 +6987,13 @@ async function buildSpotlightCards(teams: string[], env: Env, ctx: ExecutionCont
 /** The season's NWSL fixture list reduced to what the KHG calendar needs (date + season slug). One
  *  full-season scoreboard fetch, ≤6h-cached by the calendar loader (KV), so this costs ~4 ESPN reads/day. */
 async function fetchKHGCalendarEvents(year: number): Promise<KHGCalendarEvent[]> {
-	const r = await fetch(`${ESPN_SCOREBOARD}?dates=${year}0101-${year}1231&limit=500`, {
-		headers: { "User-Agent": ESPN_UA, Accept: "application/json" },
+	// Footprint fix (2026-09-15): read the SHARED /scoreboard cache instead of issuing a SECOND
+	// full-season ESPN range-pull. The loopback re-enters the proxy → hits the same edge-cached (1h)
+	// full-season scoreboard the app already warms → zero net ESPN fetches for KHG (and it inherits the
+	// circuit breaker + last-known-good fallback, so a KHG derivation can never hammer or fail loudly on
+	// an ESPN blip). Identical query shape, so it shares the cache key with the app's schedule load.
+	const r = await fetch(`${PROXY_PUBLIC_ORIGIN}/scoreboard?dates=${year}0101-${year}1231&limit=500`, {
+		headers: { Accept: "application/json" },
 	});
 	if (!r.ok) throw new Error(`scoreboard ${year} ${r.status}`);
 	const json = (await r.json()) as { events?: Array<{ date?: string; season?: { slug?: string } }> };
