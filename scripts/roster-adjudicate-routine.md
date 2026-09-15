@@ -16,9 +16,10 @@ curl -sS "https://nwslapp-proxy.tiffany-rieth.workers.dev/roster-truth/todo" \
   -H "x-adjudicate-key: $ADJUDICATE_KEY"
 ```
 
-Response: `positions` (player, club, ESPN says X, the league feed says Y) and `jerseys` (ESPN has
-no number; the league feed suggests one). If both lists are empty, report "nothing to adjudicate"
-and STOP — that is a success, not a failure.
+Response has three lists: `positions` (player, club, ESPN says X, the league feed says Y),
+`jerseys` (ESPN has no number; the league feed suggests one), and `duplicateJerseys` (two+ players
+on ONE club show the SAME number on ESPN — see §2b). If all three are empty, report "nothing to
+adjudicate" and STOP — that is a success, not a failure.
 
 Club abbreviations: LA=Angel City FC · BAY=Bay FC · BOS=Boston Legacy FC · CHI=Chicago Stars FC ·
 DEN=Denver Summit FC · GFC=Gotham FC · HOU=Houston Dash · KC=Kansas City Current ·
@@ -78,6 +79,25 @@ no number, the league feed still had her old **#21** and both feeds said **Forwa
 own page said **"midfielder #17"** — right on both counts, and the blank jersey was the only clue
 that her position needed checking too.
 
+## 2b. Duplicate shirt numbers — correct the ONE that is wrong
+
+Each `duplicateJerseys` item is a single club, one contested `jersey` number, and the `players`
+(2+, each with `espnAthleteId` and `name`) that ESPN shows wearing it. Only one of them really wears
+that number; ESPN has the other(s) wrong.
+
+- Read the **club's official roster** (the same PRIMARY source as §2) and find the CURRENT number
+  for each contender.
+- Post a jersey ruling ONLY for the player(s) whose number is wrong, setting each to her CORRECT
+  number from the club page. **Leave the rightful wearer alone** — do not post a ruling for her.
+- If the club page is unreachable, doesn't list one of them, or genuinely shows two players with the
+  same number, **DECLINE the whole collision** (post nothing for it). A wrong guess just moves the
+  duplicate somewhere else.
+- ⚠️ Never resolve a collision by giving two players the same number — the server rejects a batch
+  that would set one club's number on two players, but you should never author that in the first place.
+
+Example shape: GFC shows both `p1` and `p2` on **#28**. Gotham's roster says `p1` wears #28 and `p2`
+wears #6 → post only `{espnAthleteId: p2, jersey: 6, source: "https://gothamfc.com/…"}`.
+
 ## 3. Post only what you resolved
 
 ```
@@ -95,6 +115,6 @@ curl -sS -X POST "https://nwslapp-proxy.tiffany-rieth.workers.dev/roster-truth/r
 
 ## 4. Report
 
-State: how many items were pending, how many you ruled (with player → ruling → source domain),
-how many you declined and why, and the server's accepted/skipped counts. Keep it short — this is
-a maintenance log, not an essay.
+State: how many items were pending in each list (positions / jerseys / duplicateJerseys), how many
+you ruled (with player → ruling → source domain), how many you declined and why, and the server's
+accepted/skipped counts. Keep it short — this is a maintenance log, not an essay.

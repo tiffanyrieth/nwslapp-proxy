@@ -217,6 +217,10 @@ export interface PlayerDiffs {
 	 *  same number for the same club. Split out so they stop being double-counted as an erasure
 	 *  AND an addition. See `pairNameVariances`. */
 	likelyNameVariances: { espnAthleteId: string; espnName: string; sdpName: string; jersey: string }[];
+	/** GFC-#28 class: two+ ESPN players share one shirt number. ESPN-only (no SDP needed) — the
+	 *  structured twin of Gate B's `duplicate jersey(s)` string, carrying BOTH contenders so the
+	 *  weekly routine can read the club roster and pin the corrected number on the wrong player. */
+	duplicateJerseys: { jersey: number; players: { espnAthleteId: string; name: string }[] }[];
 }
 
 export interface ClubReport {
@@ -243,6 +247,7 @@ export interface RosterTruthReport {
 		espnOnly: number;
 		sdpOnlyWithMinutes: number;
 		likelyNameVariances: number;
+		duplicateJerseys: number;
 	};
 	/** Per-club normalized ESPN names — the next run's night-over-night continuity baseline. */
 	espnNames: Record<string, string[]>;
@@ -298,6 +303,8 @@ export function applyAutoRulings(
 	const next: OverrideMap = { ...overrides };
 	const accepted: string[] = [];
 	const skipped: { espnAthleteId: string; reason: string }[] = [];
+	// "teamAbbr#jersey" -> espnAthleteId already assigned that number in THIS batch (collision guard).
+	const claimedJerseys = new Map<string, string>();
 
 	for (const r of rulings) {
 		const id = String(r?.espnAthleteId ?? "");
@@ -339,10 +346,23 @@ export function applyAutoRulings(
 		const inForce = existing && existing.auto && Date.parse(existing.expiresAt) > now ? existing : undefined;
 		const position = r.position ?? inForce?.position;
 		const jersey = r.jersey ?? inForce?.jersey;
+		const teamAbbr = String(r.teamAbbr ?? inForce?.teamAbbr ?? "");
+		// Defensive: never let one batch set the SAME jersey for two players on the SAME club — that
+		// would just trade one duplicate collision for another. Guards within-batch only (the full
+		// roster isn't visible here); the nightly Gate B re-detects anything that slips past.
+		if (jersey != null && teamAbbr) {
+			const key = `${teamAbbr}#${jersey}`;
+			const holder = claimedJerseys.get(key);
+			if (holder && holder !== id) {
+				skipped.push({ espnAthleteId: id, reason: `jersey ${jersey} already set for ${teamAbbr} in this batch` });
+				continue;
+			}
+			claimedJerseys.set(key, id);
+		}
 		next[id] = {
 			espnAthleteId: id,
 			playerName: String(r.playerName ?? inForce?.playerName ?? id),
-			teamAbbr: String(r.teamAbbr ?? inForce?.teamAbbr ?? ""),
+			teamAbbr,
 			...(position != null ? { position } : {}),
 			...(jersey != null ? { jersey } : {}),
 			setAt: new Date(now).toISOString(),
@@ -363,10 +383,20 @@ export function pendingAdjudications(
 ): {
 	positions: (PositionMismatch & { teamAbbr: string })[];
 	jerseys: { espnAthleteId: string; name: string; teamAbbr: string; sdpJersey: string }[];
+	duplicateJerseys: {
+		teamAbbr: string;
+		jersey: number;
+		players: { espnAthleteId: string; name: string }[];
+	}[];
 } {
 	const active = activeOverrides(overrides, now);
 	const positions: (PositionMismatch & { teamAbbr: string })[] = [];
 	const jerseys: { espnAthleteId: string; name: string; teamAbbr: string; sdpJersey: string }[] = [];
+	const duplicateJerseys: {
+		teamAbbr: string;
+		jersey: number;
+		players: { espnAthleteId: string; name: string }[];
+	}[] = [];
 	for (const c of report?.clubs ?? []) {
 		for (const m of c.diffs.positionMismatches) {
 			if (!active[m.espnAthleteId]) positions.push({ ...m, teamAbbr: c.abbr });
@@ -374,8 +404,16 @@ export function pendingAdjudications(
 		for (const j of c.diffs.missingJerseys) {
 			if (!active[j.espnAthleteId]) jerseys.push({ ...j, teamAbbr: c.abbr });
 		}
+		for (const d of c.diffs.duplicateJerseys ?? []) {
+			// A contender already carrying an override has been moved off the number (or is owner-pinned),
+			// so drop it; only a collision with 2+ still-unresolved contenders needs adjudication.
+			const contenders = d.players.filter((p) => !active[p.espnAthleteId]);
+			if (contenders.length >= 2) {
+				duplicateJerseys.push({ teamAbbr: c.abbr, jersey: d.jersey, players: contenders });
+			}
+		}
 	}
-	return { positions, jerseys };
+	return { positions, jerseys, duplicateJerseys };
 }
 
 // ── Matchday jersey extraction (pure) ────────────────────────────────────────────
@@ -630,6 +668,26 @@ export function gateTeamIdentity(espnAbbrs: string[], sdpAbbrs: string[]): GateR
 	return { ok: failures.length === 0, failures };
 }
 
+/** Group an ESPN squad by shirt number and return every number worn by 2+ players, with BOTH
+ *  contenders per collision. Pure + ESPN-only (no SDP). Players with a null jersey are excluded —
+ *  two players who both lack a number are not a collision. The single source of truth for both Gate
+ *  B's failure string and the adjudicable `duplicateJerseys` diff, so they can never drift. */
+export function duplicateJerseyGroups(
+	r: EspnTeamRoster,
+): { jersey: number; players: { espnAthleteId: string; name: string }[] }[] {
+	const byNumber = new Map<number, { espnAthleteId: string; name: string }[]>();
+	for (const p of r.players) {
+		if (p.jersey == null) continue;
+		const list = byNumber.get(p.jersey) ?? [];
+		list.push({ espnAthleteId: p.id, name: p.display });
+		byNumber.set(p.jersey, list);
+	}
+	return [...byNumber.entries()]
+		.filter(([, players]) => players.length >= 2)
+		.map(([jersey, players]) => ({ jersey, players }))
+		.sort((a, b) => a.jersey - b.jersey);
+}
+
 /** GATE B — the squad is shaped like a squad. Single-payload, no second source needed.
  *  Catches the collapse class (POR→1, ACFC→1) and the "5 goalkeepers" class. */
 export function gateShape(r: EspnTeamRoster): GateResult {
@@ -640,8 +698,7 @@ export function gateShape(r: EspnTeamRoster): GateResult {
 	const gk = r.players.filter((p) => p.group === "G").length;
 	if (gk < GK_MIN) failures.push(`${gk} goalkeepers (min ${GK_MIN})`);
 	else if (gk > GK_MAX) failures.push(`${gk} goalkeepers (max ${GK_MAX})`);
-	const jerseys = r.players.map((p) => p.jersey).filter((j): j is number => j != null);
-	const dupes = [...new Set(jerseys.filter((j, i) => jerseys.indexOf(j) !== i))].sort((a, b) => a - b);
+	const dupes = duplicateJerseyGroups(r).map((g) => g.jersey);
 	if (dupes.length) failures.push(`duplicate jersey(s): ${dupes.join(", ")}`);
 	return { ok: failures.length === 0, failures };
 }
@@ -712,6 +769,8 @@ export function diffPlayers(espn: EspnTeamRoster, sdp: SdpSquad | null): PlayerD
 		espnOnly: [],
 		sdpOnlyWithMinutes: [],
 		likelyNameVariances: [],
+		// ESPN-only — populated even when there is no league feed to diff against.
+		duplicateJerseys: duplicateJerseyGroups(espn),
 	};
 	if (!sdp) return diffs;
 
@@ -846,6 +905,7 @@ export function assembleReport(args: {
 			espnOnly: sum((c) => c.diffs.espnOnly.length),
 			sdpOnlyWithMinutes: sum((c) => c.diffs.sdpOnlyWithMinutes.length),
 			likelyNameVariances: sum((c) => c.diffs.likelyNameVariances.length),
+			duplicateJerseys: sum((c) => (c.diffs.duplicateJerseys ?? []).length),
 		},
 		espnNames,
 	};
@@ -988,7 +1048,7 @@ export async function runRosterTruth(env: RosterTruthEnv, emit: EmitBatch): Prom
 					verified: false,
 					gateB: { ok: true, failures: [] },
 					gateC: { ok: true, failures: [], sdpOverlap: 1, priorOverlap: null },
-					diffs: { positionMismatches: [], missingJerseys: [], espnOnly: [], sdpOnlyWithMinutes: [], likelyNameVariances: [] },
+					diffs: { positionMismatches: [], missingJerseys: [], espnOnly: [], sdpOnlyWithMinutes: [], likelyNameVariances: [], duplicateJerseys: [] },
 				});
 				return;
 			}
