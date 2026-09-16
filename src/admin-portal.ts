@@ -221,7 +221,7 @@ function render(d) {
   const dups = rep.clubs.flatMap((c) => (c.diffs.duplicateJerseys || []).map((g) => ({ ...g, abbr: c.abbr })));
   const dupCount = dups.reduce((n, g) => n + g.players.length, 0);
   h += '<h2>Duplicate shirt numbers (' + dups.length + ')</h2>';
-  h += '<div class="note">Two or more players on one club show the same number on ESPN. Check the club\'s official roster, then set the correct number on whoever should change; the other keeps it. A pin lasts ' + d.ttlDays + ' days.</div>';
+  h += '<div class="note">Two or more players on one club show the same number on ESPN. Check the club&#39;s official roster, then set the correct number on whoever should change; the other keeps it. A pin lasts ' + d.ttlDays + ' days.</div>';
   if (!dups.length) h += '<p class="muted small">None.</p>';
   else {
     h += '<table><tr><th>Club</th><th>#</th><th>Player</th><th>Set correct #</th></tr>';
