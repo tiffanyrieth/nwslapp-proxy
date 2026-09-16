@@ -86,6 +86,7 @@ import { handlePredictCommunity } from "./predict-community.ts";
 import { handleWeather } from "./weather.ts";
 import { attendanceSweep, enrichSummaryAttendance, handleAdminAttendance } from "./attendance.ts";
 import { handlePlayoffOverride } from "./playoff-override.ts";
+import { classifyScoreboardDates, utcYmd } from "./scoreboard-dates.ts";
 import {
 	exchangeAuthorizationCode,
 	storeAppleRefreshToken,
@@ -1101,9 +1102,23 @@ Apps apply it on their next launch (config cache under 5 min).</p>
 			if (!SCOREBOARD_LEAGUES.has(league)) {
 				return new Response(`Unknown league "${league}".`, { status: 400 });
 			}
+			const upstream = scoreboardUpstream(league);
+			// ESPN broke hyphenated `dates=A-B` ranges (2026-09-16) — rewrite to a form it accepts BEFORE
+			// hitting it. See classifyScoreboardDates. Non-range shapes pass through unchanged.
+			const shape = classifyScoreboardDates(url.searchParams.get("dates"));
+			if (shape.mode === "year") {
+				emitDiagCoalesced(env, ctx, "scoreboardDateRewrite", `${league} full-season range → dates=${shape.year}`, `sb-year-${league}`);
+				const yearURL = new URL(url);
+				yearURL.searchParams.set("dates", shape.year);
+				return proxyAndCache(yearURL, upstream, chooseScoreboardTTL, ctx, env, true);
+			}
+			if (shape.mode === "window") {
+				emitDiagCoalesced(env, ctx, "scoreboardDateRewrite", `${league} window range → ${shape.days.length}-day merge`, `sb-window-${league}`);
+				return proxyScoreboardWindow(url, upstream, chooseScoreboardTTL, ctx, env, shape.days);
+			}
 			// bustUpstream: ESPN serves the full-season scoreboard STALE for tens of minutes during
 			// live games; force a recompute on every MISS so the app's 30s poll gets fresh data.
-			return proxyAndCache(url, scoreboardUpstream(league), chooseScoreboardTTL, ctx, env, true);
+			return proxyAndCache(url, upstream, chooseScoreboardTTL, ctx, env, true);
 		}
 		if (url.pathname === "/summary") {
 			// Missing `?event=` isn't validated here — forwarded verbatim, letting
@@ -1425,6 +1440,64 @@ async function recordEspnResult(env: Env, ctx: ExecutionContext, ok: boolean): P
 		try { await env.FEED_TAGS.put(ESPN_BREAKER_KEY, JSON.stringify({ openUntil, level: level + 1 } satisfies EspnBreakerState), { expirationTtl: ESPN_BREAKER_KV_TTL }); } catch { /* best-effort */ }
 		emitDiag(env, ctx, "espnBreakerOpen", `ESPN failing — backing off ${Math.round(cooldown / 60000)}m (level ${level}) to avoid a WAF escalation`);
 	}
+}
+
+// ─── ESPN scoreboard date-shape rewrite (2026-09-16 incident) ──────────────────────────────────
+// ESPN broke the hyphenated `dates=A-B` RANGE form on the scoreboard endpoint — every range 400s
+// ("Failed to get events endpoint", verified live from a clean IP), which blanked the schedule and the
+// live watcher (both send ranges). NON-range forms still work: year-only `dates=YYYY` (full season)
+// and single-day `dates=YYYYMMDD`. We rewrite the shapes the app + watcher send BEFORE hitting ESPN
+// (classification is pure, in ./scoreboard-dates.ts):
+//   • full-season range `YYYY0101-YYYY1231`  → `dates=YYYY`               (one fetch)
+//   • live window `<yesterday>-<tomorrow>`   → per-UTC-day fetch + MERGE  (proxyScoreboardWindow)
+// This is the central fix: app (all leagues) + watcher all route through /scoreboard, so this one
+// rewrite restores every consumer. Callers get cleaned up to stop sending ranges (app build 43,
+// watcher) as belt-and-suspenders; this stays the safety net.
+
+// Live window: fetch each UTC day the range spans as a single-day query (which ESPN accepts) and MERGE
+// by event id. Cache-bust ONLY the current UTC day — yesterday is settled and tomorrow hasn't started,
+// so they cache cheaply; today stays fresh for live scores. This holds the watcher's per-minute
+// footprint at ~1 fresh ESPN call, NOT a per-day fan-out. ⚠️ Never rewrite this path to
+// `dates=YYYY`-and-filter: a ~2MB uncacheable pull every minute is the wide extraction footprint that
+// tripped the WAF. Merging also covers the West-Coast/UTC-midnight straddle (a Sat-night PT game is
+// dated Sunday-UTC), so a game live across the boundary is never dropped.
+async function proxyScoreboardWindow(
+	url: URL,
+	upstreamBase: string,
+	chooseTTL: (body: ArrayBuffer) => number,
+	ctx: ExecutionContext,
+	env: Env,
+	days: string[],
+): Promise<Response> {
+	const today = utcYmd(new Date());
+	const parts = await Promise.all(
+		days.map(async (day) => {
+			const dayUrl = new URL(url);
+			dayUrl.searchParams.set("dates", day);
+			dayUrl.searchParams.delete("_cb"); // we control per-day busting, not the caller
+			const res = await proxyAndCache(dayUrl, upstreamBase, chooseTTL, ctx, env, day === today);
+			try {
+				return (await res.json()) as { events?: Record<string, unknown>[]; leagues?: unknown };
+			} catch {
+				return { events: [] as Record<string, unknown>[] };
+			}
+		}),
+	);
+	const seen = new Set<string>();
+	const events: Record<string, unknown>[] = [];
+	for (const p of parts) {
+		for (const e of p.events ?? []) {
+			const id = String((e as { id?: unknown }).id ?? "");
+			if (id && seen.has(id)) continue;
+			if (id) seen.add(id);
+			events.push(e);
+		}
+	}
+	const body = JSON.stringify({ leagues: parts.find((p) => p.leagues)?.leagues, events });
+	const buf = new TextEncoder().encode(body);
+	const headers = new Headers({ "Content-Type": "application/json" });
+	headers.set("Cache-Control", `public, max-age=${chooseTTL(buf.buffer as ArrayBuffer)}`);
+	return withClientTTL(new Response(body, { status: 200, headers }));
 }
 
 /**
