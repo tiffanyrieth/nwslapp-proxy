@@ -556,12 +556,18 @@ export async function resolveJerseysFromMatchday(
 	const clubs = new Set(pending.map((p) => p.teamAbbr.toUpperCase()));
 	const end = new Date(now);
 	const start = new Date(now - MATCHDAY_WINDOW_DAYS * 24 * 60 * 60 * 1000);
-	const stamp = (d: Date) => d.toISOString().slice(0, 10).replace(/-/g, "");
+	// ESPN broke the hyphenated `dates=A-B` RANGE shape on 2026-09-16 (every range 400s) — fetch the
+	// year-only form it still accepts, then filter to the matchday window LOCALLY (this cron is nightly,
+	// so the year-only volume is negligible; pickMatchdayEvents itself does not bound by date).
 	const board = await fetchJson<{ events?: ScoreboardEvent[] }>(
-		`${ESPN_SITE}/scoreboard?dates=${stamp(start)}-${stamp(end)}&limit=200`,
+		`${ESPN_SITE}/scoreboard?dates=${end.getUTCFullYear()}&limit=1000`,
 	);
+	const inWindow = (board?.events ?? []).filter((e) => {
+		const t = e.date ? Date.parse(String(e.date)) : NaN;
+		return !isNaN(t) && t >= start.getTime() && t <= end.getTime();
+	});
 
-	const targets = pickMatchdayEvents(board?.events ?? [], clubs);
+	const targets = pickMatchdayEvents(inWindow, clubs);
 	let jerseys = new Map<string, MatchdayJersey>();
 	let matchesRead = 0;
 	// Sequential, newest first, and it STOPS as soon as every question is answered — the common

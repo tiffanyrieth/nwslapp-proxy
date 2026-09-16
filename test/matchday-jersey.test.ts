@@ -158,7 +158,7 @@ test("STOPS fetching as soon as every question is answered", async () => {
 		return HOU_SUMMARY as T;
 	};
 	const r = await resolveJerseysFromMatchday(
-		[{ espnAthleteId: "348028", name: "Khyah Harper", teamAbbr: "HOU" }], Date.now(), fake);
+		[{ espnAthleteId: "348028", name: "Khyah Harper", teamAbbr: "HOU" }], Date.parse("2026-08-03T00:00:00Z"), fake);
 	assert.equal(r.matchesRead, 1, "answered by the newest match — no reason to read the older one");
 	assert.equal(r.rulings[0].jersey, 34);
 	assert.equal(seen.filter((u) => u.includes("summary")).length, 1);
@@ -175,7 +175,7 @@ test("keeps looking back when the newest match doesn't carry the player", async 
 		return (url.includes("event=older") ? SD_SUMMARY : { rosters: [] }) as T;
 	};
 	const r = await resolveJerseysFromMatchday(
-		[{ espnAthleteId: "368728", name: "Brooklyn Courtnall", teamAbbr: "SD" }], Date.now(), fake);
+		[{ espnAthleteId: "368728", name: "Brooklyn Courtnall", teamAbbr: "SD" }], Date.parse("2026-08-03T00:00:00Z"), fake);
 	assert.equal(r.matchesRead, 2);
 	assert.equal(r.rulings[0].jersey, 6);
 });

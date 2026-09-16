@@ -140,7 +140,10 @@ describe("attendance sweep + enrich (mocked upstreams)", () => {
 				{ headers: { "Content-Type": "application/json" } });
 
 		const diags: string[] = [];
-		const report = await attendanceSweep(env, (k, d) => diags.push(`${k}: ${d}`), true);
+		// Pin `now` a few days after the fixture match (2026-08-02) so it falls inside the sweep's
+		// last-30-days window (the year-only fetch is filtered to that window locally, post the
+		// 2026-09-16 ESPN range-shape break).
+		const report = await attendanceSweep(env, (k, d) => diags.push(`${k}: ${d}`), true, Date.parse("2026-08-05T00:00:00Z"));
 		expect(report).toEqual({ ran: true, candidates: 1, found: 1 });
 		expect(decodeAttendanceRecord(await env.FEED_TAGS.get("attendance:401853961")))
 			.toMatchObject({ n: 19897, source: "nwsl" });

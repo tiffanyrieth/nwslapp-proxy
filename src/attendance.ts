@@ -183,8 +183,8 @@ export async function attendanceSweep(
 	env: AttendanceEnv,
 	emit: Emit,
 	force = false,
+	now = Date.now(), // injectable for deterministic tests (the last-N-days filter below keys off it)
 ): Promise<{ ran: boolean; candidates: number; found: number }> {
-	const now = Date.now();
 	if (!force) {
 		const last = Number(await env.FEED_TAGS.get(SWEEP_GATE_KEY));
 		if (Number.isFinite(last) && now - last < SWEEP_INTERVAL_MS) {
@@ -195,19 +195,24 @@ export async function attendanceSweep(
 	// ESPN every 5 minutes — it retries on the next 6h tick.
 	await env.FEED_TAGS.put(SWEEP_GATE_KEY, String(now));
 
-	// 1. The last-30-days WINDOWED scoreboard — small (~15-20 events) and fresh ESPN-side
-	// (the full-season `dates=` query is the one ESPN serves stale and the one whose 2MB
-	// parse blew the CPU cap — never fetch that here). `_cb` forces a recompute.
-	const from = dayStamp(new Date(now - SWEEP_WINDOW_DAYS * 24 * 3600 * 1000));
-	const to = dayStamp(new Date(now));
+	// 1. The last-30-days finished matches. ESPN broke the hyphenated `dates=A-B` RANGE shape on
+	// 2026-09-16 (every range 400s) — so fetch the year-only form it still accepts, then filter to the
+	// window LOCALLY. The local filter is essential: without it the candidate loop below would re-probe
+	// every unbanked finished match of the whole season. Year-only is an accepted shape at trivial
+	// volume (this cron runs every 6h), so no WAF-footprint concern.
+	const windowStartMs = now - SWEEP_WINDOW_DAYS * 24 * 3600 * 1000;
 	let events: SweepEvent[] = [];
 	try {
 		const res = await fetch(
-			`${ESPN_SCOREBOARD}?dates=${from}-${to}&limit=100&_cb=${now}`,
+			`${ESPN_SCOREBOARD}?dates=${new Date(now).getUTCFullYear()}&limit=1000`,
 			{ headers: ESPN_HEADERS },
 		);
 		if (!res.ok) throw new Error(`scoreboard ${res.status}`);
-		events = ((await res.json()) as { events?: SweepEvent[] }).events ?? [];
+		const all = ((await res.json()) as { events?: SweepEvent[] }).events ?? [];
+		events = all.filter((e) => {
+			const t = e.date ? Date.parse(e.date) : NaN;
+			return !isNaN(t) && t >= windowStartMs && t <= now;
+		});
 	} catch (e) {
 		emit("apiFailure", `attendance sweep scoreboard: ${(e as Error).message.slice(0, 60)}`);
 		return { ran: true, candidates: 0, found: 0 };

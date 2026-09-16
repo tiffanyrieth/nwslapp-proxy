@@ -196,6 +196,21 @@ const SUMMARY_PENDING_COLD_TTL = 604800; // 7d — settled, old, still incomplet
 // to cover a full game day's ESPN outage, short enough that a rolled-over scoreboard window or a
 // long-dead entry can't be served a week later.
 const SNAPSHOT_TTL = 86400; // 24h
+// DURABLE full-season last-good (2026-09-16). The Cache-API snapshot above is per-colo + 24h, so a
+// multi-day ESPN outage let it expire and the schedule went fully blank (the 2026-09-16 incident). This
+// is its cross-colo, non-expiring twin in KV: written (throttled) whenever a full-season `dates=YYYY`
+// scoreboard fetch succeeds, read at recovery-ladder step 3.6 when the Cache-API snapshot has missed.
+// Keyed per league so it covers NWSL AND every NT/cup slug. NO expirationTtl — it persists until a fresh
+// good copy REPLACES it (owner's backup rule: a timer must never silently drop the last-good; the
+// staleness ALERT in runSyntheticChecks, not a TTL, is what surfaces a copy that has gone stale). The
+// schedule is static (changes ~3×/yr), so a days-old copy is a truthful degraded-but-present schedule.
+const SCHED_KV_MIN_AGE_MS = 6 * 60 * 60 * 1000; // re-archive at most every 6h/key (~4 writes/day, far under the 1k/day account KV cap even across ~18 feeds)
+const SCHED_STALE_ALERT_MS = 24 * 60 * 60 * 1000; // page if the NWSL full-season last-good hasn't refreshed in 24h (owner: schedule is low-urgency; per-surface thresholds tighten for fresher feeds like club news)
+const schedSnapKey = (league: string, year: number): string => `sched-snap:${league}:${year}`;
+interface SchedSnapRecord {
+	fetchedAt: string; // ISO — surfaced to the app as proxyCachedAsOf; drives the staleness alert
+	body: unknown; // the verbatim full-season scoreboard JSON
+}
 // What we tell the CLIENT to cache, regardless of the (much longer) edge TTL. A device that pins a
 // summary for a year is unreachable: no server-side fix can reach it, because the device never even
 // asks. The edge still absorbs the load — a client revalidation is an edge HIT, not an ESPN fetch.
@@ -1661,15 +1676,33 @@ async function proxyAndCache(
 				out.headers.set("Cache-Control", "public, max-age=30");
 				return withCacheStatus(out, "STALE");
 			}
-			// Step 3.6 — no snapshot anywhere for this feed (an aux competition never full-season-loaded, or
-			// a snapshot that expired). Serve a VALID EMPTY scoreboard at 200 rather than 502: the watcher
-			// reads `events ?? []` so its sweep COMPLETES and its fixture index rebuilds (ending the retry
-			// storm), and a feed with no fixtures this window is honestly empty anyway. Never for NWSL in
-			// practice — its full-season snapshot is always warm and answers at Step 3.5 above.
+			// Step 3.6 — DURABLE KV full-season last-good (cross-colo, non-expiring). The per-colo Cache-API
+			// snapshot above is 24h + per-colo, so a multi-day ESPN outage expired it and blanked the app
+			// (the 2026-09-16 incident). This KV copy survives that. Serve the whole schedule
+			// (degraded-but-present) with an honest `proxyCachedAsOf` marker and a 30s client TTL so devices
+			// re-ask once ESPN recovers. This is why the NWSL floor is NEVER empty.
+			{
+				const league = url.searchParams.get("league") ?? "usa.nwsl";
+				const kvRec = (await env.FEED_TAGS.get(schedSnapKey(league, yr), "json").catch(() => null)) as SchedSnapRecord | null;
+				if (kvRec?.body && typeof kvRec.body === "object") {
+					emitDiagCoalesced(env, ctx, "staleServe", `${failDetail} — served durable KV last-good (as of ${kvRec.fetchedAt})`, url.pathname);
+					const withMarker = { ...(kvRec.body as Record<string, unknown>), proxyCachedAsOf: kvRec.fetchedAt };
+					return withCacheStatus(new Response(JSON.stringify(withMarker), {
+						status: 200,
+						headers: { "Content-Type": "application/json", "Cache-Control": "public, max-age=30" },
+					}), "STALE");
+				}
+			}
+			// Step 3.7 — no snapshot ANYWHERE (an aux competition never full-season-loaded, or every copy
+			// expired). Serve a VALID EMPTY scoreboard at 200 rather than 502: the watcher reads
+			// `events ?? []` so its sweep COMPLETES and its fixture index rebuilds (ending the retry storm),
+			// and a feed with no fixtures this window is honestly empty anyway. For NWSL this should be
+			// unreachable now (the durable KV last-good at 3.6 always answers). Tag it `X-Proxy-Degraded:
+			// outage` so the app can tell a true outage from a genuine "no games" and show an honest retry.
 			emitDiagCoalesced(env, ctx, "staleServe", `${failDetail} — served empty (no snapshot)`, url.pathname);
 			const empty = new Response(JSON.stringify({ events: [] }), {
 				status: 200,
-				headers: { "Content-Type": "application/json", "Cache-Control": "public, max-age=30" },
+				headers: { "Content-Type": "application/json", "Cache-Control": "public, max-age=30", "X-Proxy-Degraded": "outage" },
 			});
 			return withCacheStatus(empty, "STALE");
 		}
@@ -1710,6 +1743,29 @@ async function proxyAndCache(
 				new Response(body, { status: 200, headers: snapHeaders }),
 			),
 		);
+	}
+
+	// DURABLE full-season last-good → KV (cross-colo, non-expiring; the twin of the per-colo Cache-API
+	// snapshot above). ONLY the full-season year-only scoreboard query writes it — after Fix 1 the app's
+	// season load arrives as `dates=YYYY`; windowed/live per-day queries never do. Throttled by reading
+	// the existing record's `fetchedAt` first (KV reads are free; writes are the scarce 1k/day budget),
+	// and it NEVER overwrites a good copy with an empty one. No `expirationTtl` — persists until replaced.
+	if (bustUpstream && url.pathname === "/scoreboard" && /^\d{4}$/.test(url.searchParams.get("dates") ?? "")) {
+		const league = url.searchParams.get("league") ?? "usa.nwsl";
+		const year = Number(url.searchParams.get("dates"));
+		const bytes = body; // ArrayBuffer of the (possibly enriched) response
+		ctx.waitUntil((async () => {
+			try {
+				const key = schedSnapKey(league, year);
+				const existing = (await env.FEED_TAGS.get(key, "json")) as SchedSnapRecord | null;
+				const ageMs = existing?.fetchedAt ? Date.now() - Date.parse(existing.fetchedAt) : Infinity;
+				if (ageMs < SCHED_KV_MIN_AGE_MS) return; // write-throttle
+				const parsed = JSON.parse(new TextDecoder().decode(bytes)) as { events?: unknown[] };
+				if (!parsed.events?.length) return; // never archive an empty season over a good one
+				const record: SchedSnapRecord = { fetchedAt: new Date().toISOString(), body: parsed };
+				await env.FEED_TAGS.put(key, JSON.stringify(record));
+			} catch { /* best-effort — never fail the response on a KV hiccup */ }
+		})());
 	}
 
 	return withCacheStatus(withClientTTL(toCache), "MISS");
@@ -6417,6 +6473,26 @@ async function runSyntheticChecks(env: Env, ctx: ExecutionContext): Promise<void
 			? `breaker OPEN — ESPN is failing our dated scoreboard queries (backed off until ${new Date(breakerOpenUntil).toISOString()})`
 			: "closed",
 	});
+
+	// Schedule freshness (2026-09-16) — the durable KV full-season last-good must keep getting refreshed.
+	// If it hasn't been rewritten in >24h, ESPN has quietly stopped serving our full-season query and the
+	// app is living on a stale copy. Users are UNAFFECTED (that's the redundancy contract working) — so
+	// this alert is the ONLY way we'd find out. Missing = not yet warmed (a full-season fetch writes it
+	// within the hour) → not a fail; a hard ESPN outage is already covered by the two checks above.
+	{
+		const yr = new Date().getUTCFullYear();
+		const schedRec = (await env.FEED_TAGS.get(schedSnapKey("usa.nwsl", yr), "json").catch(() => null)) as SchedSnapRecord | null;
+		const ageMs = schedRec?.fetchedAt ? Date.now() - Date.parse(schedRec.fetchedAt) : null;
+		checks.push({
+			label: "Schedule freshness (durable last-good)",
+			status: ageMs != null && ageMs > SCHED_STALE_ALERT_MS ? "fail" : "ok",
+			detail: ageMs == null
+				? "not yet warmed (no KV copy yet)"
+				: ageMs > SCHED_STALE_ALERT_MS
+					? `last refreshed ${Math.floor(ageMs / 3_600_000)}h ago — ESPN full-season refresh has STOPPED; serving stale (users unaffected — investigate the source shape)`
+					: `refreshed ${Math.floor(ageMs / 3_600_000)}h ago`,
+		});
+	}
 
 	const fails = checks.filter((c) => c.status === "fail");
 	await env.FEED_TAGS.put(SYNTHETIC_LAST_KEY,
