@@ -117,6 +117,15 @@ const MIN_APP_BUILD = 31;
 // with HomeView's FanGame mapping — never rename them.
 const FANZONE_ORDER_KEY = "config:fanzone_order";
 
+// Fan Zone KILL-SWITCH — the owner's "pull a game" lever (2026-09-17). Games listed here are
+// removed ENTIRELY from the app's Home Fan Zone shelf (app FanZoneVisibilityConfig drops the
+// card + its only entry point) until un-hidden. This is a DELIBERATE operator override for a
+// crowd-dependent game (e.g. The Bracket, which only works with enough active users) — NOT the
+// reversed auto-hide-when-empty (a dormant game keeps its card, always-visible ruling). Managed
+// on the same Access-gated /admin/fanzone-order page (?hide=csv | ?show=1). Absent/invalid →
+// /config omits `hiddenGames` and the app hides nothing (fail open). Same cross-repo id contract.
+const FANZONE_HIDDEN_KEY = "config:fanzone_hidden";
+
 // The schedule-derived Know Her Game calendar (2026-09-14, src/khg-calendar.ts): which biweekly KHG
 // drop Mondays are PAUSED (no NWSL fixture in the round's 14-day window — offseason, World Cup, Olympics,
 // international windows, the June block) and when the season ends. Served on /config (`khgCalendar`) so
@@ -871,31 +880,52 @@ export default {
 			const escapeHtml = (s: string) =>
 				s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
 			// Tiny self-contained page (renders inside the portal's iframe tab): shows the live
-			// value, one-click presets, and the custom-set recipe. Every action is a GET link
-			// back to this same URL, so the whole lever works without a terminal.
-			const page = (status: string, current: string) => new Response(`<!doctype html>
+			// ORDER + HIDDEN values, one-click presets, and the custom recipes. Every action is a
+			// GET link back to this same URL, so the whole lever works without a terminal.
+			const page = (status: string, current: string, hidden: string) => new Response(`<!doctype html>
 <html><head><meta charset="utf-8"><style>
 body{background:#111;color:#ddd;font:14px -apple-system,sans-serif;padding:18px;max-width:640px}
 a{color:#9ad} code{background:#1c1c1e;padding:1px 5px;border-radius:4px;font-size:12px}
-.cur{color:#fff;font-weight:600} .ok{color:#8c8} p{line-height:1.5}
+.cur{color:#fff;font-weight:600} .ok{color:#8c8} .warn{color:#e9a} p{line-height:1.5}
+hr{border:none;border-top:1px solid #333;margin:18px 0}
 </style></head><body>
 <p class="ok">${escapeHtml(status)}</p>
+<h3>Card order</h3>
 <p>Home-carousel order served to the app: <span class="cur">${escapeHtml(current)}</span></p>
 <p>Presets:
 <a href="/admin/fanzone-order?clear=1">Season default (Predict · Know Her · Trivia · Bracket)</a> ·
 <a href="/admin/fanzone-order?set=bracket,trivia,predict,knowHer">Offseason (Bracket · Trivia first)</a></p>
 <p>Custom: <code>?set=</code> a comma list of unique ids from <code>${FANZONE_GAME_IDS.join(", ")}</code>.
-A partial list promotes those games; the rest follow in the default order.
-Apps apply it on their next launch (config cache under 5 min).</p>
+A partial list promotes those games; the rest follow in the default order.</p>
+<hr>
+<h3>Hidden games (kill-switch)</h3>
+<p>Games pulled from the shelf ENTIRELY (card + screen gone until un-hidden): <span class="cur">${escapeHtml(hidden)}</span></p>
+<p class="warn">This removes a game outright — it is NOT the same as an offseason/dormant game, which
+stays visible with an honest quiet card. Use it only to deliberately shelve a game (e.g. a crowd game
+that needs more users) until you bring it back.</p>
+<p>One-click:
+<a href="/admin/fanzone-order?hide=bracket">Hide The Bracket</a> ·
+<a href="/admin/fanzone-order?show=1">Show all games (un-hide)</a></p>
+<p>Custom: <code>?hide=</code> a comma list of unique ids to hide; <code>?show=1</code> restores all.</p>
+<p>Apps apply either change on their next launch (config cache under 5 min).</p>
 </body></html>`, { headers: { "Content-Type": "text/html; charset=utf-8" } });
 			const currentLabel = async () => {
 				const raw = await env.FEED_TAGS.get(FANZONE_ORDER_KEY);
 				return raw ?? "(not set — app default)";
 			};
+			const hiddenLabel = async () => {
+				const raw = await env.FEED_TAGS.get(FANZONE_HIDDEN_KEY);
+				return raw ?? "(none — all games visible)";
+			};
 			if (url.searchParams.get("clear") === "1") {
 				await env.FEED_TAGS.delete(FANZONE_ORDER_KEY);
 				emitDiag(env, ctx, "fanZoneOrderSet", "cleared (app default order)");
-				return page("Cleared — the app uses its built-in default order.", "(not set — app default)");
+				return page("Cleared — the app uses its built-in default order.", "(not set — app default)", await hiddenLabel());
+			}
+			if (url.searchParams.get("show") === "1") {
+				await env.FEED_TAGS.delete(FANZONE_HIDDEN_KEY);
+				emitDiag(env, ctx, "fanZoneHiddenSet", "cleared (all games visible)");
+				return page("All games visible — kill-switch cleared.", await currentLabel(), "(none — all games visible)");
 			}
 			const set = url.searchParams.get("set");
 			if (set !== null) {
@@ -905,13 +935,29 @@ Apps apply it on their next launch (config cache under 5 min).</p>
 					new Set(order).size === order.length;
 				if (!valid) {
 					return page(`Invalid order "${set}" — nothing changed. Use unique ids from the list below.`,
-						await currentLabel());
+						await currentLabel(), await hiddenLabel());
 				}
 				await env.FEED_TAGS.put(FANZONE_ORDER_KEY, JSON.stringify(order));
 				emitDiag(env, ctx, "fanZoneOrderSet", order.join(","));
-				return page(`Order set: ${order.join(" → ")}`, JSON.stringify(order));
+				return page(`Order set: ${order.join(" → ")}`, JSON.stringify(order), await hiddenLabel());
 			}
-			return page("Fan Zone card order", await currentLabel());
+			const hide = url.searchParams.get("hide");
+			if (hide !== null) {
+				const games = hide.split(",").map((s) => s.trim()).filter(Boolean);
+				// Strict, like the order lever: unique known ids only, so a typo can never ship a
+				// broken hidden set. To hide NOTHING, use ?show=1 (an empty ?hide= is a mistake).
+				const valid = games.length > 0 && games.length <= FANZONE_GAME_IDS.length &&
+					games.every((g) => (FANZONE_GAME_IDS as readonly string[]).includes(g)) &&
+					new Set(games).size === games.length;
+				if (!valid) {
+					return page(`Invalid hide list "${hide}" — nothing changed. Use unique ids from the list above, or ?show=1 to un-hide all.`,
+						await currentLabel(), await hiddenLabel());
+				}
+				await env.FEED_TAGS.put(FANZONE_HIDDEN_KEY, JSON.stringify(games));
+				emitDiag(env, ctx, "fanZoneHiddenSet", games.join(","));
+				return page(`Hidden: ${games.join(", ")} — pulled from the shelf.`, await currentLabel(), JSON.stringify(games));
+			}
+			return page("Fan Zone shelf — card order + kill-switch", await currentLabel(), await hiddenLabel());
 		}
 
 		// Admin/routine-keyed social self-tuning audit surface: GET ?nt= (ledger populate),
@@ -1085,6 +1131,26 @@ Apps apply it on their next launch (config cache under 5 min).</p>
 				}
 			} catch (e) {
 				emitDiag(env, ctx, "fanZoneOrderInvalid",
+					`read/parse failed: ${e instanceof Error ? e.message : String(e)}`);
+			}
+			// The Fan Zone kill-switch. Same fail-open contract as the order lever: an absent/invalid
+			// value omits `hiddenGames` and the app hides nothing (a game stays on the shelf), and any
+			// problem diags LOUD — a silently-ignored kill-switch reads as "the lever is broken".
+			try {
+				const raw = await env.FEED_TAGS.get(FANZONE_HIDDEN_KEY);
+				if (raw) {
+					const hidden: unknown = JSON.parse(raw);
+					if (
+						Array.isArray(hidden) && hidden.length > 0 &&
+						hidden.every((g) => (FANZONE_GAME_IDS as readonly string[]).includes(g as string))
+					) {
+						body.hiddenGames = hidden;
+					} else {
+						emitDiag(env, ctx, "fanZoneHiddenInvalid", `stored value rejected: ${raw.slice(0, 120)}`);
+					}
+				}
+			} catch (e) {
+				emitDiag(env, ctx, "fanZoneHiddenInvalid",
 					`read/parse failed: ${e instanceof Error ? e.message : String(e)}`);
 			}
 			// The schedule-derived KHG calendar. Fails open: any derivation problem omits the field (the app

@@ -74,7 +74,7 @@ export const ADMIN_PORTAL_HTML = `<!doctype html>
 <div class="panel" id="bracket"><iframe data-src="/bracket/admin" title="The Bracket admin"></iframe></div>
 <div class="panel" id="knowher"><iframe data-src="/knowher/admin" title="Know Her Game admin"></iframe></div>
 <div class="panel" id="analytics"><iframe data-src="/analytics/admin" title="Analytics"></iframe></div>
-<div class="panel" id="fanzone"><iframe data-src="/admin/fanzone-order" title="Fan Zone card order"></iframe></div>
+<div class="panel" id="fanzone"><iframe data-src="/admin/fanzone-order" title="Fan Zone shelf (card order + kill-switch)"></iframe></div>
 
 <script>
 const $ = (s) => document.querySelector(s);
