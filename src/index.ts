@@ -141,6 +141,23 @@ const ESPN_SCOREBOARD =
 const ESPN_SUMMARY =
 	"https://site.api.espn.com/apis/site/v2/sports/soccer/usa.nwsl/summary";
 
+// The KHG calendar's ESPN fetcher, passed to loadKnowHerCalendar(env, fetchKHGCalendarEvents, …).
+// ⚠️ RESTORED 2026-09-17: this definition was accidentally dropped by the /spotlight-cleanup commit
+// (2d1a5a6) while both its usages (/config + /admin/khg-calendar) remained, so `GET /config` threw
+// `ReferenceError: fetchKHGCalendarEvents is not defined` and 500'd from the 2026-09-16 deploy onward
+// — invisible because the app fails OPEN on /config (no forced-update/lever sync, no user error).
+// ⚠️ Uses the YEAR-ONLY `dates=YYYY` shape: the hyphenated `dates=A-B` RANGE form (what the original
+// used) is DEAD — ESPN 400s it since 2026-09-16 (docs/backend.md). Called at most once per 6h
+// calendar-cache miss (loadKnowHerCalendar TTL); loadKnowHerCalendar catches any throw and fails open.
+async function fetchKHGCalendarEvents(year: number): Promise<KHGCalendarEvent[]> {
+	const r = await fetch(`${ESPN_SCOREBOARD}?dates=${year}&limit=1000`, {
+		headers: { "User-Agent": ESPN_UA, Accept: "application/json" },
+	});
+	if (!r.ok) throw new Error(`scoreboard ${year} ${r.status}`);
+	const json = (await r.json()) as { events?: Array<{ date?: string; season?: { slug?: string } }> };
+	return (json.events ?? []).map((ev) => ({ date: ev.date, seasonSlug: ev.season?.slug ?? null }));
+}
+
 // `/scoreboard?league=<slug>` serves any of these ESPN soccer competitions (women's)
 // through the same cached pass-through. NWSL is the default when `league` is absent
 // (so the existing app build keeps working). The slug is ALLOWLISTED server-side —
