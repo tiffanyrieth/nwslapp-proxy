@@ -1202,16 +1202,17 @@ that needs more users) until you bring it back.</p>
 			}
 			const upstream = scoreboardUpstream(league);
 			// ESPN broke hyphenated `dates=A-B` ranges (2026-09-16) — rewrite to a form it accepts BEFORE
-			// hitting it. See classifyScoreboardDates. Non-range shapes pass through unchanged.
+			// hitting it. See classifyScoreboardDates. Non-range shapes pass through unchanged. This rewrite is
+			// EXPECTED, not a failure (every current app build still sends the range), so it does NOT emit a
+			// diagnostic — it fired on every scoreboard request as constant `scoreboardDateRewrite` telemetry
+			// noise (removed 2026-09-18). A genuinely FAILED rewrite still surfaces via apiFailure/staleServe.
 			const shape = classifyScoreboardDates(url.searchParams.get("dates"));
 			if (shape.mode === "year") {
-				emitDiagCoalesced(env, ctx, "scoreboardDateRewrite", `${league} full-season range → dates=${shape.year}`, `sb-year-${league}`);
 				const yearURL = new URL(url);
 				yearURL.searchParams.set("dates", shape.year);
 				return proxyAndCache(yearURL, upstream, chooseScoreboardTTL, ctx, env, true);
 			}
 			if (shape.mode === "window") {
-				emitDiagCoalesced(env, ctx, "scoreboardDateRewrite", `${league} window range → ${shape.days.length}-day merge`, `sb-window-${league}`);
 				return proxyScoreboardWindow(url, upstream, chooseScoreboardTTL, ctx, env, shape.days);
 			}
 			// bustUpstream: ESPN serves the full-season scoreboard STALE for tens of minutes during
@@ -2930,6 +2931,25 @@ const serverDiagAccum = new Map<string, DiagAccum>();
 let lastDiagFlushAt = 0;
 const DIAG_FLUSH_INTERVAL_MS = 60 * 1000;
 
+// Per-isolate, per-KIND log throttle — SEPARATE from the Supabase accumulator above (which bounds the durable
+// rollup) and from the flush timer. This bounds the raw `console.log("telemetry", …)` lines that show in the
+// Cloudflare observability tail: a kind's full line is logged at most once per DIAG_LOG_WINDOW_MS, so a
+// broadcast error at scale (an ESPN outage hammering apiFailure/staleServe across the fleet) shows ~1 line per
+// kind per minute per isolate with a count on flush, NOT thousands of identical lines (owner: "one line in the
+// logs, not thousands of the same error"). The Supabase count is unaffected — every occurrence still folds in.
+const lastDiagLogAt = new Map<string, number>();
+const DIAG_LOG_WINDOW_MS = 60 * 1000;
+
+/** True (and stamps) at most once per window per kind — leading-edge, so the FIRST occurrence logs in full
+ *  (immediate visibility + detail) and repeats within the window are suppressed to just their flush count. */
+function shouldLogDiag(kind: string): boolean {
+	const now = Date.now();
+	const last = lastDiagLogAt.get(kind);
+	if (last && now - last < DIAG_LOG_WINDOW_MS) return false;
+	lastDiagLogAt.set(kind, now);
+	return true;
+}
+
 function accumulateDiag(kind: string, detail: string): void {
 	const k = kind.slice(0, 40);
 	const e = serverDiagAccum.get(k);
@@ -2951,6 +2971,10 @@ function flushDiags(env: Env, ctx: ExecutionContext, force = false): void {
 	lastDiagFlushAt = now;
 	const events = [...serverDiagAccum.entries()].map(([kind, e]) => ({ kind, n: e.count, detail: e.lastDetail }));
 	serverDiagAccum.clear();
+	// One compact rollup line for any kind that occurred more than once in this window — so the volume the
+	// per-kind log throttle (shouldLogDiag) suppressed is still visible at a glance in the observability tail.
+	const rolled = events.filter((e) => e.n > 1).map((e) => `${e.kind}×${e.n}`).join(" ");
+	if (rolled) console.log("telemetry-rollup", rolled);
 	const sb = env as unknown as SupabaseAdminEnv;
 	if (!sb.SUPABASE_URL || !sb.SUPABASE_SERVICE_ROLE_KEY) return; // local dev / unconfigured → dropped (no KV, no Supabase)
 	const base = sb.SUPABASE_URL.replace(/\/$/, ""), svcKey = sb.SUPABASE_SERVICE_ROLE_KEY;
@@ -2972,16 +2996,19 @@ function flushDiags(env: Env, ctx: ExecutionContext, force = false): void {
 
 /** NO SILENT FAILURES (proxy edition): surface one operational event so a proxy-side miss shows up in the
  *  owner's `GET /telemetry/recent` Diagnostics alongside app telemetry. Best-effort, non-PII. The console
- *  line stays whole (`wrangler tail` is the real-time incident view); the durable record folds into the
- *  Supabase `server_diagnostics` rollup via the accumulator (no KV write). */
+ *  line is THROTTLED per kind (shouldLogDiag) so the observability tail shows each error ~once/min/isolate,
+ *  not per-occurrence; the durable record still folds EVERY occurrence into the Supabase `server_diagnostics`
+ *  rollup via the accumulator (no KV write). */
 export function emitDiag(env: Env, ctx: ExecutionContext, kind: string, detail: string): void {
-	console.log("telemetry", JSON.stringify({
-		at: new Date().toISOString(),
-		app: "proxy",
-		os: "worker",
-		origin: "server",
-		events: [{ kind: kind.slice(0, 40), detail: detail.slice(0, 80), ts: Date.now() }],
-	}));
+	if (shouldLogDiag(kind)) {
+		console.log("telemetry", JSON.stringify({
+			at: new Date().toISOString(),
+			app: "proxy",
+			os: "worker",
+			origin: "server",
+			events: [{ kind: kind.slice(0, 40), detail: detail.slice(0, 80), ts: Date.now() }],
+		}));
+	}
 	accumulateDiag(kind, detail);
 	flushDiags(env, ctx);
 }
@@ -3001,14 +3028,19 @@ function emitDiagCoalesced(env: Env, ctx: ExecutionContext, kind: string, detail
 export function emitDiagBatch(env: Env, ctx: ExecutionContext, events: { kind: string; detail: string }[]): void {
 	if (events.length === 0) return;
 	const ts = Date.now();
-	console.log("telemetry", JSON.stringify({
-		at: new Date().toISOString(),
-		app: "proxy",
-		os: "worker",
-		origin: "server",
-		events: events.slice(0, 20).map((e) => ({ kind: e.kind.slice(0, 40), detail: e.detail.slice(0, 80), ts })),
-	}));
-	for (const e of events.slice(0, 20)) accumulateDiag(e.kind, e.detail);
+	const capped = events.slice(0, 20);
+	// Log only the kinds not already logged this window (same throttle as emitDiag); the rest still count.
+	const toLog = capped.filter((e) => shouldLogDiag(e.kind));
+	if (toLog.length > 0) {
+		console.log("telemetry", JSON.stringify({
+			at: new Date().toISOString(),
+			app: "proxy",
+			os: "worker",
+			origin: "server",
+			events: toLog.map((e) => ({ kind: e.kind.slice(0, 40), detail: e.detail.slice(0, 80), ts })),
+		}));
+	}
+	for (const e of capped) accumulateDiag(e.kind, e.detail);
 	flushDiags(env, ctx);
 }
 
