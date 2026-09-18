@@ -62,6 +62,12 @@ write any `herGame` / stat questions (the system adds those in code).**
   Network) — their player Q&As and "get to know her" features carry the warm/relatable detail (the
   PS5-in-the-suitcase kind). **VARY them throughout** — don't cluster all the True/False together, and don't save
   the single best fact for last.
+  ⚠️ **When a search returns a mix, OPEN the interview / feature / Q&A / "fun facts" / "things you didn't know"
+  result — and do NOT open the encyclopedia / stat / roster / nav result (Wikipedia · ESPN · FBref · Sofascore ·
+  fotmob · league roster/nav pages) hoping for fun facts. Those never carry off-pitch color and the bio routine
+  already mined them, so opening them is the token sink.** If the personality wells are genuinely dry after a
+  real hunt, she is thin: keep what you found (2 is a success) and move on — never grind a stat page to
+  manufacture a fact.
 - **You already fetched her bio partial — but you do NOT need to read her bio questions to avoid overlap.**
   Off-pitch fun facts are categorically different from career facts (the bio routine's job), so they won't
   collide. Spend your budget HUNTING fun facts, not cross-checking the bio. (The partial is just your roster +
@@ -94,6 +100,13 @@ she's dating or which relative is famous.
 
 ## Sourcing — the A-TIER allow-list (single source) + a fun-facts escape hatch (≥2)
 
+⚠️ **This list is a TRUST gate, NOT a search map — and NOT a priority order.** It only tells you, once you have
+already FOUND a fun fact, whether ONE source is enough (A-tier: proven women's-soccer outlets that run real
+player interviews) or whether you need TWO independent agreeing sources (everything else — the wall against a
+satirical or fabricated "interview" you cannot tell from a real one). It does NOT tell you where to look. Do
+NOT open a source *because* it is on this list. Go where the fun facts actually live (the wells above), then
+check what you found against this gate.
+
 - **A-TIER — one of these ALONE is enough** (trusted, no independent corroboration needed). Use for a fun-fact
   quote the player gives DIRECTLY in an A-tier interview:
   - **Authoritative:** Wikipedia · official club sites · nwslsoccer.com (the NWSL league site, NOT nwsl.com) · ESPN · U.S. Soccer · Olympics.com ·
@@ -102,7 +115,7 @@ she's dating or which relative is famous.
     NBC (NBC Olympics / Sports) · CBS Sports · Yahoo Sports · BBC.
   - **Pro-women interview wells:** Girls Soccer Network · Just Women's Sports · Beats & Rhymes FC · Fangirl Sports Network.
   - **Approved editorial extras:** Nike (about.nike.com magazine) · CLIF (athlete features) · Grant Wahl ("Fútbol with Grant Wahl").
-  ⭐ For FUN FACTS, the club "get to know" / Q&A features and the interview wells are your best well.
+  ⭐ For FUN FACTS, the club "get to know" / Q&A features and the interview wells are your best well — the warm/relatable detail a Wikipedia career summary never carries.
 - **ESCAPE HATCH — FUN FACTS ONLY, and only with ≥2 independent agreeing sources.** For a genuine off-pitch fun
   fact on a REPUTABLE source NOT on the A-tier list (e.g. a reputable foreign-language outlet for an international
   player), use it ONLY if **two independent reputable sources agree** on it. One source alone — even a quote —
