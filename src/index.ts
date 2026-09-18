@@ -1348,15 +1348,13 @@ that needs more users) until you bring it back.</p>
 			} catch {
 				/* swallow — the next 5-min tick retries; the engine is idempotent */
 			}
-			// Error-spike alerting rides the same 5-min tick (owner decision 2026-07-16: every
-			// existing channel is PULL — dashboards nobody watches mid-incident; the 7/15 CPU-error
-			// burst was found a day late. This is the PUSH channel.) Isolated: an alerting bug can
-			// never affect the bracket engine.
-			try {
-				await checkErrorSpike(env, ctx);
-			} catch {
-				/* swallow — best-effort; next tick retries */
-			}
+			// The 15-min error-spike email pager was RETIRED here 2026-09-18: proxy diagnostics moved off KV
+			// into the Supabase `server_diagnostics` rollup and now surface in the ONCE-A-DAY digest instead of
+			// a sub-hourly page (owner: "a single alert per day"). Genuine core outages still page IMMEDIATELY
+			// via runSyntheticChecks below (ESPN down / empty game pool / breaker open), and a dead */5 cron
+			// still pages via healthchecks.io — so "the app is actually down" is never quiet, only the routine
+			// error-breadcrumb chatter is. A force-flush of this cron isolate's accumulator runs at the end of
+			// the tick (after the passes below emit), so a cron-isolate diag isn't lost to eviction.
 			// Proxy self-heartbeat (A3, 2026-08-23): the ONE external backstop, extended to the proxy. A
 			// dead */5 cron stops these pings → healthchecks.io emails the owner — the failure class no
 			// self-hosted alert can cover (a dead worker can't email itself). The watcher pings its own
@@ -1385,11 +1383,12 @@ that needs more users) until you bring it back.</p>
 			} catch {
 				/* best-effort; the next gated tick retries */
 			}
-			// Weekly digest (A6) — self-gated to the Monday 09:xx UTC window, once/week.
+			// Daily digest (A6) — self-gated to the 09:xx UTC window, once/day (owner: "a single alert per
+			// day"). The health rollup + analytics pulse + today's proxy-diagnostics error-class total.
 			try {
-				await maybeSendWeeklyDigest(env, ctx);
+				await maybeSendDailyDigest(env, ctx);
 			} catch {
-				/* best-effort; retries next Monday tick */
+				/* best-effort; retries next day's tick */
 			}
 			// Attendance backstop: internally gated to ~every 6h (attendance-sweep:last), so this
 			// is a no-op on almost every tick. Isolated like the pager — a sweep bug can never
@@ -1398,6 +1397,13 @@ that needs more users) until you bring it back.</p>
 				await attendanceSweep(env, (kind, detail) => emitDiag(env, ctx, kind, detail));
 			} catch {
 				/* swallow — best-effort; the next gated tick retries */
+			}
+			// End-of-tick: flush any diagnostics this cron isolate accumulated above (synthetic checks, the
+			// aggregate scan, attendance sweep) to Supabase, so a cron-isolate diag isn't lost to eviction.
+			try {
+				flushDiags(env, ctx, true);
+			} catch {
+				/* best-effort; the accumulator flushes again next tick */
 			}
 			return;
 		}
@@ -2902,73 +2908,134 @@ async function handleAppleTokenExchange(request: Request, env: Env, ctx: Executi
 	return jsonResponse({ ok: true }, 200);
 }
 
-/** NO SILENT FAILURES (proxy edition): write one operational event to the SAME KV +
- *  record shape the app's `POST /telemetry` sink uses (see handleTelemetryIngest), so a
- *  proxy-side miss surfaces in the owner's `GET /telemetry/recent` Diagnostics alongside
- *  app telemetry. Best-effort, non-PII. */
-export function emitDiag(env: Env, ctx: ExecutionContext, kind: string, detail: string): void {
-	const record = {
-		at: new Date().toISOString(),
-		app: "proxy",
-		os: "worker",
-		// UN-FORGEABLE server-origin marker: only emitDiag sets it. The error-spike pager counts ONLY
-		// origin:"server" records, so a spoofed client /telemetry POST (which never carries origin —
-		// handleTelemetryIngest copies only app/os/events from the body) can't trip the owner's alert.
-		origin: "server",
-		events: [{ kind: kind.slice(0, 40), detail: detail.slice(0, 80), ts: Date.now() }],
-	};
-	console.log("telemetry", JSON.stringify(record));
-	// SERVER diagnostics use a SEPARATE `sdiag:` prefix from client `/telemetry` (`diag:`) so the
-	// error-spike pager (checkErrorSpike) scans server errors ALONE — a fleet-scale client-telemetry
-	// flood can never bury them in the newest-N list window. The owner view (/telemetry/recent) merges both.
-	const key = `sdiag:${1e15 - Date.now()}:${crypto.randomUUID().slice(0, 8)}`;
-	ctx.waitUntil(env.FEED_TAGS.put(key, JSON.stringify(record), { expirationTtl: 60 * 60 * 24 * 30 }));
-}
+// ── Server diagnostics: NO SILENT FAILURES, folded into a bounded Supabase rollup (2026-09-18) ────
+// emitDiag/emitDiagBatch were the ONLY user-scaling KV WRITE left in the proxy — one `sdiag:` .put per
+// proxy-side error, PER REQUEST — and that write shared the 1,000/day ACCOUNT-WIDE KV cap with the live-match
+// watcher (MATCH_STATE). A diagnostics storm (an ESPN blip hammering staleServe/apiFailure on a user path at
+// 1k DAU) could exhaust the budget and STARVE live-game push writes → the V2 Live Activity breaks mid-game.
+// Observability must degrade, never crash the product. So server diagnostics now fold into the Supabase
+// rollup `server_diagnostics` (record_server_diagnostics — the server twin of client_diagnostics, which did
+// the same for the app's `/telemetry`) → ZERO KV writes for diagnostics at ANY user count. Supabase has no
+// read/write op cap (only DB size, which the day-grained table + 30-day prune bound). See
+// supabase/migration_server_diagnostics.sql + docs/stress-testing.md §7.
+//
+// Per-isolate accumulator keyed by KIND (the table's PK dimension alongside `day`), flushed LEADING-EDGE +
+// time-gated on emit: the FIRST error in an isolate flushes immediately (so a rare quiet-day event is never
+// lost to isolate eviction), then further events coalesce and flush at most once per DIAG_FLUSH_INTERVAL_MS —
+// a spike costs ~1 Supabase RPC/min/isolate, not one write per event. Module-global state is per-isolate +
+// ephemeral, so a handful of un-flushed tail events can be lost on eviction: an accepted trade for a
+// non-user-facing spine (the whole point of the move). The cron force-flushes its own isolate each tick.
+type DiagAccum = { count: number; lastDetail: string };
+const serverDiagAccum = new Map<string, DiagAccum>();
+let lastDiagFlushAt = 0;
+const DIAG_FLUSH_INTERVAL_MS = 60 * 1000;
 
-// In-memory (per-isolate) coalescer for the HOT ESPN failure-ladder diags. During an outage every
-// polling request hits staleServe/apiFailure → one `sdiag:` KV write EACH (100-300 in a 2-min blip at
-// 1k users). This writes at most one `sdiag:` per (kind, route) per window, carrying the suppressed
-// count so the incident's SCALE still surfaces and the error-spike pager still trips on a sustained
-// outage (≥8/15min accrues across windows + multiple routes; brief single-route blips no longer
-// storm it, and synthetic checks catch a real down independently). Per-isolate + route-bounded, so
-// the Map stays tiny. (2026-08-30 KV write-budget pass, docs/stress-testing.md §7.)
-const diagCoalesce = new Map<string, { windowStart: number; count: number }>();
-const DIAG_COALESCE_WINDOW_MS = 60 * 1000;
-
-function emitDiagCoalesced(env: Env, ctx: ExecutionContext, kind: string, detail: string, route: string): void {
-	const now = Date.now();
-	const mapKey = `${kind}|${route}`;
-	const e = diagCoalesce.get(mapKey);
-	if (!e || now - e.windowStart >= DIAG_COALESCE_WINDOW_MS) {
-		const suppressed = e ? e.count - 1 : 0; // the prior window's count minus the one already written at its start
-		const note = suppressed > 0 ? ` [+${suppressed} suppressed in prior ${DIAG_COALESCE_WINDOW_MS / 1000}s]` : "";
-		emitDiag(env, ctx, kind, `${detail}${note}`);
-		diagCoalesce.set(mapKey, { windowStart: now, count: 1 });
+function accumulateDiag(kind: string, detail: string): void {
+	const k = kind.slice(0, 40);
+	const e = serverDiagAccum.get(k);
+	if (e) {
+		e.count += 1;
+		e.lastDetail = detail.slice(0, 80);
 	} else {
-		e.count += 1; // within the window → count only, no KV write
+		serverDiagAccum.set(k, { count: 1, lastDetail: detail.slice(0, 80) });
 	}
 }
 
-/** Many events, ONE KV write. For a job that produces a burst of findings at once (the nightly
- *  roster verification emits one event per failing gate across 16 clubs) — a put per finding would
- *  blow the invocation's subrequest budget and burn the free-tier daily write allowance.
- *
- *  `checkErrorSpike` already iterates `record.events`, so a batch of N countable kinds contributes N
- *  toward the alert threshold. That is deliberate: one club failing a gate is 1–2 events and stays
- *  quiet, while a contamination or a deleted club fails many at once and pages. */
+/** Flush the per-isolate accumulator to Supabase (leading-edge + time-gated; `force` bypasses the gate,
+ *  used by the cron). Best-effort via waitUntil; unconfigured (local dev) → clears silently. NEVER calls
+ *  emitDiag on failure (that would re-enter the accumulator/flush) — it logs to console only. */
+function flushDiags(env: Env, ctx: ExecutionContext, force = false): void {
+	if (serverDiagAccum.size === 0) return;
+	const now = Date.now();
+	if (!force && now - lastDiagFlushAt < DIAG_FLUSH_INTERVAL_MS) return;
+	lastDiagFlushAt = now;
+	const events = [...serverDiagAccum.entries()].map(([kind, e]) => ({ kind, n: e.count, detail: e.lastDetail }));
+	serverDiagAccum.clear();
+	const sb = env as unknown as SupabaseAdminEnv;
+	if (!sb.SUPABASE_URL || !sb.SUPABASE_SERVICE_ROLE_KEY) return; // local dev / unconfigured → dropped (no KV, no Supabase)
+	const base = sb.SUPABASE_URL.replace(/\/$/, ""), svcKey = sb.SUPABASE_SERVICE_ROLE_KEY;
+	ctx.waitUntil(
+		(async () => {
+			try {
+				const r = await fetch(`${base}/rest/v1/rpc/record_server_diagnostics`, {
+					method: "POST",
+					headers: { apikey: svcKey, Authorization: `Bearer ${svcKey}`, "Content-Type": "application/json" },
+					body: JSON.stringify({ p_events: events }),
+				});
+				if (!r.ok) console.log(`[sdiag] record_server_diagnostics failed: ${r.status}`);
+			} catch (err) {
+				console.log(`[sdiag] record_server_diagnostics threw: ${String(err).slice(0, 120)}`);
+			}
+		})(),
+	);
+}
+
+/** NO SILENT FAILURES (proxy edition): surface one operational event so a proxy-side miss shows up in the
+ *  owner's `GET /telemetry/recent` Diagnostics alongside app telemetry. Best-effort, non-PII. The console
+ *  line stays whole (`wrangler tail` is the real-time incident view); the durable record folds into the
+ *  Supabase `server_diagnostics` rollup via the accumulator (no KV write). */
+export function emitDiag(env: Env, ctx: ExecutionContext, kind: string, detail: string): void {
+	console.log("telemetry", JSON.stringify({
+		at: new Date().toISOString(),
+		app: "proxy",
+		os: "worker",
+		origin: "server",
+		events: [{ kind: kind.slice(0, 40), detail: detail.slice(0, 80), ts: Date.now() }],
+	}));
+	accumulateDiag(kind, detail);
+	flushDiags(env, ctx);
+}
+
+// The per-isolate accumulator now coalesces ALL diagnostics by kind before a bounded Supabase flush, so the
+// old per-(kind|route) 60s KV-write throttle is redundant — every emit is already write-cheap. Kept as a
+// thin alias so the many hot-path call sites (the ESPN failure ladder) don't change; `route` is dropped
+// (kind is the table's dimension, and the leading-edge flush already bounds writes to ~1/min/isolate).
+function emitDiagCoalesced(env: Env, ctx: ExecutionContext, kind: string, detail: string, _route: string): void {
+	emitDiag(env, ctx, kind, detail);
+}
+
+/** Many events at once (the nightly roster verification emits one event per failing gate across 16 clubs).
+ *  Each folds into the accumulator by kind; a single flush covers the whole batch — so a contamination or a
+ *  deleted club (many kinds/gates at once) shows up loud in the daily digest's error-class total, while one
+ *  club failing a gate stays 1–2 events and quiet. */
 export function emitDiagBatch(env: Env, ctx: ExecutionContext, events: { kind: string; detail: string }[]): void {
 	if (events.length === 0) return;
 	const ts = Date.now();
-	const record = {
+	console.log("telemetry", JSON.stringify({
 		at: new Date().toISOString(),
 		app: "proxy",
 		os: "worker",
 		origin: "server",
 		events: events.slice(0, 20).map((e) => ({ kind: e.kind.slice(0, 40), detail: e.detail.slice(0, 80), ts })),
-	};
-	console.log("telemetry", JSON.stringify(record));
-	const key = `sdiag:${1e15 - ts}:${crypto.randomUUID().slice(0, 8)}`;
-	ctx.waitUntil(env.FEED_TAGS.put(key, JSON.stringify(record), { expirationTtl: 60 * 60 * 24 * 30 }));
+	}));
+	for (const e of events.slice(0, 20)) accumulateDiag(e.kind, e.detail);
+	flushDiags(env, ctx);
+}
+
+/** A UTC `YYYY-MM-DD` day string, `offsetDays` from today — the key for server_diagnostics reads. */
+function utcDayStr(offsetDays = 0): string {
+	return new Date(Date.now() + offsetDays * 86_400_000).toISOString().slice(0, 10);
+}
+
+type ServerDiagRow = { day: string; kind: string; count: number; last_detail: string | null; last_seen: string };
+
+/** Read server_diagnostics rows with `day >= sinceDay` (newest-seen first). The read half of the KV→Supabase
+ *  move — used by the Status tab, the daily digest, and /telemetry/recent. Degrades to [] (never throws) when
+ *  Supabase is unreachable or unconfigured, so a reader never 5xxes on a diagnostics-store hiccup. */
+async function fetchServerDiagnostics(env: Env, sinceDay: string): Promise<ServerDiagRow[]> {
+	const sb = env as unknown as SupabaseAdminEnv;
+	if (!sb.SUPABASE_URL || !sb.SUPABASE_SERVICE_ROLE_KEY) return [];
+	try {
+		const base = sb.SUPABASE_URL.replace(/\/$/, ""), svcKey = sb.SUPABASE_SERVICE_ROLE_KEY;
+		const r = await fetch(
+			`${base}/rest/v1/server_diagnostics?day=gte.${sinceDay}&select=day,kind,count,last_detail,last_seen&order=last_seen.desc&limit=500`,
+			{ headers: { apikey: svcKey, Authorization: `Bearer ${svcKey}` } },
+		);
+		if (!r.ok) return [];
+		return (await r.json()) as ServerDiagRow[];
+	} catch {
+		return [];
+	}
 }
 
 // ── Weekly adjudication (GET /roster-truth/todo + POST /roster-truth/rulings) ────
@@ -3255,29 +3322,30 @@ async function statusCheckIG(env: Env): Promise<StatusSection> {
 }
 
 async function statusCheckErrors(env: Env): Promise<StatusSection> {
-	const list = await env.FEED_TAGS.list({ prefix: "sdiag:", limit: 120 });
-	const now = Date.now();
-	const DAY = 86_400_000, HOUR = 3_600_000;
-	let last24 = 0, lastHour = 0;
-	const recent: { kind: string; detail: string; ts: number }[] = [];
-	const records = await Promise.all(list.keys.slice(0, 30).map((k) => env.FEED_TAGS.get(k.name, "json").catch(() => null)));
-	for (const rec of records) {
-		const events = (rec as { events?: { kind: string; detail: string; ts: number }[] } | null)?.events;
-		if (!Array.isArray(events)) continue;
-		for (const e of events) {
-			const age = now - (e.ts ?? 0);
-			if (age <= DAY) { last24++; if (recent.length < 12) recent.push(e); }
-			if (age <= HOUR) lastHour++;
-		}
+	// Server diagnostics live in the Supabase rollup (server_diagnostics) — one row per (day, kind) with a
+	// count + latest sample. Read today + yesterday and total by kind. (Moved off `sdiag:` KV 2026-09-18.)
+	const rows = await fetchServerDiagnostics(env, utcDayStr(-1));
+	let total = 0, errorTotal = 0;
+	const byKind = new Map<string, { count: number; lastDetail: string; lastSeen: number }>();
+	for (const r of rows) {
+		total += r.count;
+		if (ALERT_ERROR_KINDS.has(r.kind)) errorTotal += r.count;
+		const ls = Date.parse(r.last_seen) || 0;
+		const cur = byKind.get(r.kind);
+		if (cur) { cur.count += r.count; if (ls > cur.lastSeen) { cur.lastSeen = ls; cur.lastDetail = r.last_detail ?? ""; } }
+		else byKind.set(r.kind, { count: r.count, lastDetail: r.last_detail ?? "", lastSeen: ls });
 	}
-	const status: StatusCheck["status"] = lastHour >= 8 ? "fail" : last24 > 20 ? "warn" : last24 > 0 ? "info" : "ok";
+	// Day-grained data has no sub-day resolution, so severity keys off the 48h error-class total, not "last hour".
+	const status: StatusCheck["status"] = errorTotal >= 50 ? "fail" : errorTotal >= 10 ? "warn" : total > 0 ? "info" : "ok";
 	const checks: StatusCheck[] = [{
-		label: "Proxy diagnostics (sdiag)",
+		label: "Proxy diagnostics (server_diagnostics)",
 		status,
-		detail: `${last24} events / 24h · ${lastHour} / last hour${lastHour >= 8 ? " ⚠️ SPIKE (pager threshold)" : ""}`,
+		detail: `${total} events / 48h · ${errorTotal} error-class${errorTotal >= 50 ? " ⚠️ ELEVATED" : ""}`,
 	}];
-	for (const e of recent) checks.push({ label: `  ${e.kind}`, status: "info", detail: e.detail });
-	return { title: "Recent proxy diagnostics (last 24h)", note: "The catch-all: every unexpected condition (fallback / API fail / parse / empty) logs here first.", checks };
+	for (const [kind, v] of [...byKind.entries()].sort((a, b) => b[1].count - a[1].count).slice(0, 12)) {
+		checks.push({ label: `  ${kind}`, status: "info", detail: `x${v.count} · ${v.lastDetail}${v.lastSeen ? ` · ${ageLabel(Date.now() - v.lastSeen)}` : ""}` });
+	}
+	return { title: "Recent proxy diagnostics (last 48h, Supabase)", note: "The catch-all: every unexpected condition (fallback / API fail / parse / empty) folds here first — one row per kind per day (moved off KV 2026-09-18). The daily digest emails the error-class total.", checks };
 }
 
 /** The ACTIVE half of monitoring (A7, 2026-08-23): the pull view of what the scheduled PUSH checks last
@@ -6074,7 +6142,7 @@ async function handleKnowHerTodo(url: URL, env: Env, ctx: ExecutionContext): Pro
 	} catch (e) {
 		// NO SILENT FAILURES: a bare upstreamError() here mislabeled a UA/403 bug in fetchTeamAbbrs as
 		// "ESPN down" for two days and sent the KHG cloud routine chasing a non-existent ESPN outage.
-		// Record the REAL error so the next incident is diagnosable from the sdiag: KV, not guessed.
+		// Record the REAL error so the next incident is diagnosable from server_diagnostics, not guessed.
 		emitDiag(env, ctx, "knowherTodoError", `team=${team}: ${e instanceof Error ? e.message : String(e)}`);
 		return upstreamError();
 	}
@@ -6336,26 +6404,24 @@ async function handleAnalyticsIngest(request: Request, env: Env, ctx: ExecutionC
 	return new Response(null, { status: 204 });
 }
 
-// ── Error-spike email alerting (2026-07-16) ──────────────────────────────────────────────────
-// Every telemetry channel is PULL (in-app Diagnostics, /telemetry/recent, dashboards) — nobody
-// watches a dashboard mid-incident; the 2026-07-15 exceededCpu burst surfaced a day late. This is
-// the PUSH half: the 5-min cron scans the recent `diag:` records and emails the owner (Resend)
-// when error-class events spike. Alert volume scales with INCIDENTS, not users → flat $0.
-// Unconfigured (no RESEND_API_KEY / ALERT_EMAIL secret) → silent no-op.
-
-/** Error-CLASS kinds only — traces and success breadcrumbs must never page the owner. */
+// ── Error-CLASS diagnostic kinds (2026-07-16; role changed 2026-09-18) ────────────────────────
+// The set of diagnostic kinds that are ERRORS (vs traces / success breadcrumbs). Originally the filter for
+// the 15-min error-spike EMAIL pager (checkErrorSpike). That pager was RETIRED 2026-09-18 when proxy
+// diagnostics moved off KV into the Supabase `server_diagnostics` rollup — this set now drives the ONCE-A-DAY
+// digest's "error-class total" line + the Status tab's severity, instead of a sub-hourly page (owner: "a
+// single alert per day"). Genuine core OUTAGES still page immediately via runSyntheticChecks, so demoting
+// this to a daily total loses no down-detection — only the routine error-breadcrumb chatter is deferred.
 const ALERT_ERROR_KINDS = new Set([
 	"apiFailure", "parseError", "unexpectedEmpty", "staleServe",
 	"analyticsRpcFail", "metricKitDiagnostic", "tier2SignedOutDesync",
 	// Roster integrity. `rosterContinuityRefused` = a plausibly-sized ESPN payload that shares
 	// almost no players with the trusted copy (contamination-class). `knowherTodoEmpty` fired for
 	// real at 2026-W31 when ESPN briefly returned an empty Orlando roster and the edition shipped
-	// 15 teams — it was diagnosable only after the fact because nothing paged on it.
+	// 15 teams — it was diagnosable only after the fact because nothing surfaced it.
 	"rosterContinuityRefused", "knowherTodoEmpty",
-	// Nightly verification. A gate failure is one event per failing club-gate, all in ONE batched
-	// record — so a single club blip stays under ALERT_THRESHOLD and is report-only, while a
-	// contamination or a deleted club fails many gates at once and pages. Severity scales with
-	// blast radius for free. Per-player diffs (positions, erasures) deliberately do NOT page.
+	// Nightly verification. A gate failure is one event per failing club-gate — a single club blip is 1–2
+	// events and small in the daily total, while a contamination or a deleted club fails many gates at once
+	// and shows up loud. Severity scales with blast radius for free. Per-player diffs are informational.
 	"rosterTruthGateFail", "rosterTruthRunFail",
 	// Trivia content pipeline (roadmap #2). `triviaGroupInfeasible` = an ingest whose pool couldn't satisfy
 	// the round constraints (a bad generation) → the prior season stays live. `triviaStaleServe` = the app
@@ -6363,20 +6429,9 @@ const ALERT_ERROR_KINDS = new Set([
 	// report-only visibility — health_check_trivia.mjs is the true "wrong-season pool" gate.
 	"triviaGroupInfeasible", "triviaStaleServe",
 ]);
-const ALERT_WINDOW_MS = 15 * 60 * 1000;
-const ALERT_THRESHOLD = 8; // error events in the window ⇒ email (2-user baseline is ~0-2/day; a real incident bursts)
-const ALERT_THROTTLE_MS = 60 * 60 * 1000; // at most 1 email/hour — an incident can't flood the inbox
-const ALERT_SENT_KEY = "alert:last-email";
 
-/** The write-time of a reverse-time `diag:` key (see handleTelemetryIngest) — lets the spike scan
- *  filter by age from the KEY alone, so a quiet tick costs one KV list and ZERO record reads. */
-function diagKeyTime(name: string): number {
-	const inv = Number(name.split(":")[1]);
-	return Number.isFinite(inv) ? 1e15 - inv : 0;
-}
-
-/** The ONE owner-email primitive (Resend). Every alerting path — the error-spike pager, the scheduled
- *  synthetic checks, the client crash/feature aggregate, and the weekly digest — sends through here, so
+/** The ONE owner-email primitive (Resend). Every alerting path — the scheduled synthetic checks, the
+ *  client crash/feature aggregate, and the daily digest — sends through here, so
  *  there is a single sender, a single `NWSLApp:` subject prefix, and ONE config guard. Returns true iff
  *  Resend accepted the message. Unconfigured (no RESEND_API_KEY / ALERT_EMAIL) → false, silent no-op. A
  *  non-email ALERT_EMAIL (a common setup slip: pasting the API key into it) emits `alertEmailMisconfig`
@@ -6429,67 +6484,15 @@ async function dueBySnapshot(env: Env, lastKey: string, intervalMs: number): Pro
 	return !snap?.at || Date.now() - snap.at >= intervalMs;
 }
 
-async function checkErrorSpike(env: Env, ctx: ExecutionContext): Promise<void> {
-	const cfg = env as unknown as { RESEND_API_KEY?: string; ALERT_EMAIL?: string };
-	if (!cfg.RESEND_API_KEY || !cfg.ALERT_EMAIL) return; // not set up yet → skip the scan entirely
-	const last = await env.FEED_TAGS.get(ALERT_SENT_KEY);
-	if (last && Date.now() - Number(last) < ALERT_THROTTLE_MS) return;
-
-	const cutoff = Date.now() - ALERT_WINDOW_MS;
-	// Scan ONLY server-origin diagnostics (`sdiag:`), never the shared client `diag:` stream — otherwise a
-	// fleet-scale /telemetry flood fills the newest-60 window and buries the very server errors this pager
-	// exists to catch (per-IP rate-limiting can't cap a real multi-IP fleet). 60 is ample for server-only.
-	const list = await env.FEED_TAGS.list({ prefix: "sdiag:", limit: 60 }); // reverse-time → newest first
-	const recent = list.keys.filter((k) => diagKeyTime(k.name) >= cutoff);
-	if (recent.length === 0) return;
-
-	let count = 0;
-	const samples: string[] = [];
-	for (const k of recent) {
-		const raw = await env.FEED_TAGS.get(k.name);
-		if (!raw) continue;
-		let rec: { app?: string; origin?: string; events?: { kind?: string; detail?: string }[] };
-		try {
-			rec = JSON.parse(raw) as typeof rec;
-		} catch {
-			continue;
-		}
-		// Only PROXY-emitted diagnostics page the owner. Client POST /telemetry is unauthenticated and
-		// spoofable, and never carries the server-set `origin`, so counting it would let anyone trip the
-		// alert email. Client telemetry still lands in KV + the /telemetry/recent pull view — just no page.
-		if (rec.origin !== "server") continue;
-		for (const e of rec.events ?? []) {
-			if (!e.kind || !ALERT_ERROR_KINDS.has(e.kind)) continue;
-			// Expected third-party image flakiness (Instagram CDN URLs expire/rotate, YouTube & club
-			// thumbnails 404/hotlink-block) is an honest placeholder fallback, NOT an incident — but it
-			// rides `apiFailure`, so a batch of it could trip the spike alone and cry wolf. Exclude it
-			// from the PAGING count only; it stays in telemetry + the in-app Diagnostics screen.
-			if (e.kind === "apiFailure" && (e.detail ?? "").startsWith("image fetch ")) continue;
-			count++;
-			if (samples.length < 6) samples.push(`${rec.app ?? "?"}: ${e.kind} — ${e.detail ?? ""}`);
-		}
-	}
-	if (count < ALERT_THRESHOLD) return;
-
-	// Mark BEFORE sending (a Resend hiccup shouldn't re-fire every 5 min for the same incident).
-	await env.FEED_TAGS.put(ALERT_SENT_KEY, String(Date.now()), { expirationTtl: 24 * 3600 });
-	await sendOwnerEmail(env, ctx, `${count} error events in the last 15 min`,
-		`Telemetry error spike (threshold ${ALERT_THRESHOLD} in ${ALERT_WINDOW_MS / 60000} min).\n\n` +
-		`Recent samples:\n${samples.map((s) => `  • ${s}`).join("\n")}\n\n` +
-		`Where to look: GET /telemetry/recent (x-admin-key) · the in-app Diagnostics screen · ` +
-		`the Cloudflare dashboards (proxy + watcher).\n` +
-		`Throttled to at most one email per hour.`);
-}
-
 // ── Scheduled synthetic health checks (A4, 2026-08-23) ────────────────────────────────────────
 // The deploy-time health_check_*.mjs scripts assert real data, but ONLY at deploy. A source that breaks
-// mid-week (an ESPN outage, an emptied KV pool, a dead IG snapshot) was invisible to PUSH alerting until
-// it happened to spike the error pager. This runs the CRITICAL-availability assertions on the */5 cron
-// (gated to ~30 min) and pages IMMEDIATELY on any hard failure — the definitive "the app's core data is
-// actually down" signal, with no ≥8-spike wait. Kept LIGHT (2 ESPN fetches + a few KV reads) so it never
-// approaches the per-invocation subrequest budget. Editorial drift (a dormant reporter, a club on press
-// fallback) is deliberately NOT checked here — that stays in the pull Status tab + the weekly digest;
-// only genuine outages page.
+// mid-week (an ESPN outage, an emptied KV pool, a dead IG snapshot) would otherwise be invisible until the
+// daily digest. This runs the CRITICAL-availability assertions on the */5 cron (gated to ~30 min) and pages
+// IMMEDIATELY on any hard failure — the definitive "the app's core data is actually down" signal, and (since
+// the 15-min error-spike pager was retired 2026-09-18) the ONLY self-hosted immediate page. Kept LIGHT (2
+// ESPN fetches + a few KV reads) so it never approaches the per-invocation subrequest budget. Editorial
+// drift (a dormant reporter, a club on press fallback) is deliberately NOT checked here — that stays in the
+// pull Status tab + the daily digest; only genuine outages page.
 const SYNTHETIC_LAST_KEY = "synthetic:last";
 const SYNTHETIC_PAGE_KEY = "synthetic:last-page";
 const SYNTHETIC_PAGE_THROTTLE_MS = 60 * 60 * 1000; // at most one synthetic-fail email/hour
@@ -6664,35 +6667,38 @@ async function scanClientAggregate(env: Env, ctx: ExecutionContext): Promise<voi
 	}
 }
 
-// ── Weekly digest (A6, 2026-08-23) ─────────────────────────────────────────────────────────────
-// The chronic-failure catch + the week's product pulse, in one Monday email. Self-gated to fire once a
-// week (Monday, ~09:xx UTC) via a KV marker on the */5 cron — no new cron trigger (free-plan cap). The
-// definitive real-time signals are the synthetic checks + the aggregate scan (which page as they happen);
-// this digest is the PULSE — a BOUNDED health rollup (the last synthetic + aggregate results, plus a
-// newest-N diagnostics sample) alongside the analytics numbers the owner values. Never an unbounded 7-day
-// scan (that would blow the subrequest budget at scale).
-const DIGEST_MARKER_KEY = "digest:last-week";
+// ── Daily digest (A6, 2026-08-23; weekly → DAILY 2026-09-18) ────────────────────────────────────
+// The chronic-failure catch + the product pulse + today's proxy-diagnostics total, in ONE email a day
+// (owner: "a single alert per day"). Self-gated to fire once/day (~09:xx UTC) via a KV marker on the */5
+// cron — no new cron trigger (free-plan cap). The definitive real-time signals are the synthetic checks +
+// the aggregate scan (which page as they happen); this digest is the PULSE — a BOUNDED health rollup (the
+// last synthetic + aggregate results, plus today's server_diagnostics rows) alongside the analytics numbers
+// the owner values. It absorbed the retired 15-min error-spike pager: the error-class total lives here now.
+const DIGEST_MARKER_KEY = "digest:last-day";
 
-async function maybeSendWeeklyDigest(env: Env, ctx: ExecutionContext): Promise<void> {
+async function maybeSendDailyDigest(env: Env, ctx: ExecutionContext): Promise<void> {
 	const cfg = env as unknown as { RESEND_API_KEY?: string; ALERT_EMAIL?: string };
 	if (!cfg.RESEND_API_KEY || !cfg.ALERT_EMAIL) return;
-	const d = new Date();
-	if (d.getUTCDay() !== 1 || d.getUTCHours() !== 9) return; // Monday 09:xx UTC window only
-	if (!(await dueByMarker(env, DIGEST_MARKER_KEY, 6 * 24 * 60 * 60 * 1000))) return; // once/week
+	if (new Date().getUTCHours() !== 9) return; // the 09:xx UTC window only
+	if (!(await dueByMarker(env, DIGEST_MARKER_KEY, 20 * 60 * 60 * 1000))) return; // once/day (20h guard)
 	await sendDigest(env, ctx);
 }
 
-/** Build + send the weekly digest UNCONDITIONALLY (the once/week gating lives in maybeSendWeeklyDigest;
+/** Build + send the daily digest UNCONDITIONALLY (the once/day gating lives in maybeSendDailyDigest;
  *  the /admin/selftest hook calls this directly to preview the digest on demand). */
 async function sendDigest(env: Env, ctx: ExecutionContext): Promise<void> {
 	const synth = (await env.FEED_TAGS.get(SYNTHETIC_LAST_KEY, "json").catch(() => null)) as { at?: number; fails?: number } | null;
 	const agg = (await env.FEED_TAGS.get(CLIENTAGG_LAST_KEY, "json").catch(() => null)) as { crashes24h?: number } | null;
-	// Recent diagnostics sample (bounded newest-30, same as the Status tab) → kind histogram.
-	const list = await env.FEED_TAGS.list({ prefix: "sdiag:", limit: 60 });
+	// Today's proxy diagnostics from the Supabase rollup (server_diagnostics) → kind histogram + error-class
+	// total (the signal the retired 15-min pager used to email). One row per kind per day, so no KV scan.
+	const diagRows = await fetchServerDiagnostics(env, utcDayStr(0));
+	let errClassToday = 0;
 	const kinds: Record<string, number> = {};
-	const recs = await Promise.all(list.keys.slice(0, 30).map((k) => env.FEED_TAGS.get(k.name, "json").catch(() => null)));
-	for (const rec of recs) for (const e of (rec as { events?: { kind?: string }[] } | null)?.events ?? []) if (e.kind) kinds[e.kind] = (kinds[e.kind] ?? 0) + 1;
-	const kindLines = Object.entries(kinds).sort((a, b) => b[1] - a[1]).map(([k, n]) => `  ${k}: ${n}`).join("\n") || "  (none)";
+	for (const r of diagRows) {
+		kinds[r.kind] = (kinds[r.kind] ?? 0) + r.count;
+		if (ALERT_ERROR_KINDS.has(r.kind)) errClassToday += r.count;
+	}
+	const kindLines = Object.entries(kinds).sort((a, b) => b[1] - a[1]).map(([k, n]) => `  ${k}: ${n}`).join("\n") || "  (none today)";
 
 	// Analytics pulse (reuse the dashboard's computeMetrics).
 	let pulse = "  (analytics unavailable)";
@@ -6711,7 +6717,7 @@ async function sendDigest(env: Env, ctx: ExecutionContext): Promise<void> {
 	// Roster cross-check chronic staleness (v2, 2026-09-15) — clubs whose feeds have DISAGREED (Gate C
 	// failing) long enough that the last-known-good is >14d old (fetchedAt = the last time the feeds
 	// agreed, since v2 only archives verified copies). A chronic condition an override can't clear (the
-	// feeds still disagree), so it belongs in the once/week digest, not the 30-min pager. The KC case.
+	// feeds still disagree), so it belongs in the daily digest, not an immediate page. The KC case.
 	let rosterLine = "Roster cross-check: all clubs verified recently";
 	try {
 		const verdicts = await readVerdicts(env);
@@ -6727,13 +6733,14 @@ async function sendDigest(env: Env, ctx: ExecutionContext): Promise<void> {
 	} catch { /* keep the clear line */ }
 
 	const synthLine = synth ? `${synth.fails ? `⚠️ ${synth.fails} FAILING` : "all clear"} (checked ${ageLabel(Date.now() - (synth.at ?? 0))})` : "no run yet";
-	await sendOwnerEmail(env, ctx, "weekly digest",
-		`NWSLApp weekly digest.\n\n` +
+	await sendOwnerEmail(env, ctx, "daily digest",
+		`NWSLApp daily digest.\n\n` +
 		`— HEALTH —\n` +
 		`Synthetic checks: ${synthLine}\n` +
 		`Client crashes (24h): ${agg?.crashes24h ?? 0} reports\n` +
 		`${rosterLine}\n` +
-		`Recent proxy diagnostics (sample, by kind):\n${kindLines}\n\n` +
+		`Proxy diagnostics today — error-class total: ${errClassToday}${errClassToday >= 50 ? " ⚠️ ELEVATED" : ""}\n` +
+		`Proxy diagnostics today (by kind):\n${kindLines}\n\n` +
 		`— ANALYTICS —\n${pulse}\n\n` +
 		`Full detail: the /admin Status + Analytics tabs.`);
 }
@@ -6741,7 +6748,7 @@ async function sendDigest(env: Env, ctx: ExecutionContext): Promise<void> {
 /** GET /admin/selftest?do=… — force each PUSH alerting path on demand (admin-gated) so email delivery
  *  and each detector can be proven end-to-end without waiting for the gates. Returns a small JSON report.
  *  `email` sends a test email; `synthetic`/`aggregate` run the scans NOW (bypassing the ~30-min gate) and
- *  return what they stored; `digest` builds + sends the weekly digest immediately; `heartbeat` pings the
+ *  return what they stored; `digest` builds + sends the daily digest immediately; `heartbeat` pings the
  *  proxy healthchecks.io URL. */
 async function handleAlertSelfTest(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
 	// Portal surface (under /admin*) → the full gate. Once Access is armed, run selftests from the
@@ -6766,7 +6773,7 @@ async function handleAlertSelfTest(request: Request, env: Env, ctx: ExecutionCon
 		}
 		case "digest": {
 			await sendDigest(env, ctx);
-			return json({ do: "digest", sent: true, note: "the weekly digest was built + sent now (bypassing the Monday gate) — check your inbox" });
+			return json({ do: "digest", sent: true, note: "the daily digest was built + sent now (bypassing the once/day gate) — check your inbox" });
 		}
 		case "heartbeat": {
 			const hc = (env as unknown as { HEALTHCHECK_URL_PROXY?: string }).HEALTHCHECK_URL_PROXY;
@@ -6785,18 +6792,15 @@ async function handleTelemetryRecent(request: Request, env: Env): Promise<Respon
 	// Curl-style key endpoint (never behind Access) → constant-time key + failure throttle only.
 	const gate = await adminGate(request, env as unknown as AdminAuthEnv, { jwt: false });
 	if (gate) return gate;
-	// Server diagnostics stay in KV (`sdiag:`); client telemetry now lives in the DEDUPED Supabase
-	// rollup (client_diagnostics). Merge both for the owner view — server records carry `at`, client
-	// rows carry `last_seen` + a `count`. The client half degrades to empty (never 5xx) if Supabase
-	// is unreachable.
-	const server = await env.FEED_TAGS.list({ prefix: "sdiag:", limit: 100 });
-	const serverNames = server.keys
-		.sort((a, b) => diagKeyTime(b.name) - diagKeyTime(a.name)) // newest first
-		.slice(0, 100)
-		.map((k) => k.name);
-	const serverRecords = (await Promise.all(serverNames.map((n) => env.FEED_TAGS.get(n))))
-		.filter((s): s is string => s !== null)
-		.map((s) => JSON.parse(s));
+	// Both halves now live in Supabase rollups: server diagnostics in `server_diagnostics` (moved off the
+	// `sdiag:` KV stream 2026-09-18), client telemetry in the DEDUPED `client_diagnostics`. Merge both for
+	// the owner view — server rows carry a per-(day,kind) `count` + latest sample, client rows carry
+	// `last_seen` + a `count`. Each half degrades to empty (never 5xx) if Supabase is unreachable.
+	const serverRows = await fetchServerDiagnostics(env, utcDayStr(-3)); // last few days, newest-seen first
+	const serverRecords = serverRows.map((r) => ({
+		at: r.last_seen, day: r.day, app: "proxy", os: "worker", origin: "server",
+		kind: r.kind, detail: r.last_detail, count: r.count,
+	}));
 
 	let clientRecords: unknown[] = [];
 	const sb = env as unknown as { SUPABASE_URL?: string; SUPABASE_SERVICE_ROLE_KEY?: string };
