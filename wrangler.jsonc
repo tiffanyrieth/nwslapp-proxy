@@ -14,12 +14,13 @@
 			"id": "3c1372c0f8174cdcb3e2e52ca5de14ad",
 		},
 	],
-	// Workers AI — backs the Social feed's IMAGE-MODERATION backstop (moderateFeedImages):
-	// one vision safety check per player-IG thumbnail, run at SCRAPE time (in refreshSocialCache,
-	// before the snapshot is written to KV), NEVER per user-open. Verdicts cache in FEED_TAGS
-	// (imgmod:{url}, ~30d) so each image is scanned once. Cost is Neurons, flat with scrape volume
-	// (not users) — ~410 images/run every 2 days sits inside the 10k/day free allotment (~$0/mo).
-	// Uses @cf/meta/llama-3.2-11b-vision-instruct (one-time Meta license accept required).
+	// Workers AI — backs the Social feed's IMAGE-MODERATION backstop. DECOUPLED from the scrape
+	// (FREE tier = 50 subrequests / 10ms CPU per run can't classify a ~300-image scrape at once):
+	// a small batch runs on the 5-min cron (gated ~30 min, moderateSnapshotTick), reading the CACHED
+	// snapshot — no extra Apify. Verdicts live IN the snapshot (card.mod), so a whole batch saves in
+	// ONE KV write; unsafe cards are dropped so they never reach the app. Cost is Neurons, flat with
+	// scrape volume not users (~$0/mo, inside the 10k/day free allotment). Approve allowlist =
+	// imgmod:approved. Uses @cf/meta/llama-3.2-11b-vision-instruct (one-time Meta license accept).
 	"ai": {
 		"binding": "AI",
 	},
