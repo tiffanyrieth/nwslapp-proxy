@@ -20,8 +20,16 @@ interface Env {
 	// KV namespace caching one Haiku verdict per post id (bsky:{uri}), ~7d TTL —
 	// a post is tagged ONCE, ever; only never-seen posts hit Haiku on a cache miss.
 	// Also holds the B3b social-cards snapshots (SOCIAL_CLUB_KEY via the Apify cron,
-	// SOCIAL_PLAYER_KEY via the Bright Data webhook; legacy SOCIAL_CACHE_KEY read-only).
+	// SOCIAL_PLAYER_KEY via the Bright Data webhook; legacy SOCIAL_CACHE_KEY read-only)
+	// and the image-moderation verdict cache (imgmod:{url}, ~30d).
 	FEED_TAGS: KVNamespace;
+
+	// Workers AI binding (wrangler.jsonc `ai`). Backs the Social feed image-moderation
+	// backstop (moderateFeedImages): a vision safety check on each player-IG thumbnail at
+	// scrape time. Typed structurally (a `run` method) so this hand-maintained file needn't
+	// depend on the generated global `Ai` type. Optional so a not-yet-deployed binding fails
+	// OPEN in code (a missing AI binding keeps the card, like every other moderation error).
+	AI?: { run(model: string, inputs: Record<string, unknown>, options?: Record<string, unknown>): Promise<unknown> };
 
 	// Native per-IP rate limiter (wrangler.jsonc `ratelimits`) guarding the two ANONYMOUS ingest
 	// endpoints (POST /telemetry, /analytics). Optional so a not-yet-deployed binding fails OPEN in

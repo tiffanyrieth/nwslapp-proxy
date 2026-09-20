@@ -31,6 +31,7 @@ import {
 	type BracketEnv,
 } from "./bracket-engine.ts";
 import { buildHeadshotMap, handleHeadshots, normalizeName } from "./headshots.ts";
+import { moderateFeedImages, IMGMOD_MODEL } from "./social-moderation.ts";
 import { adminAuthed, adminGate, safeEqual, type AdminAuthEnv } from "./admin-auth.ts";
 import { handleAnalyticsAdmin, computeMetrics } from "./analytics-admin.ts";
 import { ADMIN_PORTAL_HTML } from "./admin-portal.ts";
@@ -4611,6 +4612,27 @@ async function buildSocialCards(env: Env, handles: SocialHandle[], ctx?: Executi
 	return { instagram, tiktok: [] };
 }
 
+// ── Social feed IMAGE MODERATION wiring ────────────────────────────────────────────────
+// The low-grade image-safety backstop lives in ./social-moderation.ts (isolated + unit-tested);
+// here we only supply the platform deps it needs. Full rationale is in that module's header
+// (runs once per image at SCRAPE time, caches verdicts, FAILS OPEN so a hiccup never blanks the
+// Feed; scope = the in-app thumbnail only). This fetcher reuses fetchBounded so a hung IG CDN
+// host is TRULY aborted (not just raced), with a generic browser UA (NOT ESPN_HEADERS — JSON).
+const IMAGE_FETCH_MAX_BYTES = 6_000_000; // skip absurdly large images rather than buffer them (fail-open)
+async function fetchImageBytes(url: string): Promise<Uint8Array | null> {
+	try {
+		const r = await fetchBounded(url, { headers: { Accept: "image/*", "User-Agent": "Mozilla/5.0 (compatible; NWSLApp/1.0)" } });
+		if (!r.ok) return null;
+		const len = Number(r.headers.get("content-length") ?? 0);
+		if (len && len > IMAGE_FETCH_MAX_BYTES) return null;
+		const buf = await r.arrayBuffer();
+		if (buf.byteLength > IMAGE_FETCH_MAX_BYTES) return null;
+		return new Uint8Array(buf);
+	} catch {
+		return null; // any fetch failure → null → caller fails open (keeps the card)
+	}
+}
+
 /** Cron/manual-refresh entry: rebuild the social snapshot → the SPLIT KV keys.
  *  PLAYER side: scraped via Apify inline (sync run) and written here. CLUB side: when
  *  Bright Data is configured, an ASYNC scrape is triggered and /brightdata-webhook writes
@@ -4645,7 +4667,16 @@ async function refreshSocialCache(env: Env, ctx?: ExecutionContext): Promise<{ p
 	const apifyHandles = bdConfigured ? igHandles.filter((h) => h.kind === "player") : igHandles;
 	const { instagram } = await buildSocialCards(env, apifyHandles, ctx);
 	const players = instagram.filter((c) => (c as { placement?: string }).placement === "feed");
-	const playerCards = await writeSideOrKeepLastGood(env, ctx, poolKey(thisPool), players, "player", POOL_SNAPSHOT_TTL);
+	// Low-grade image-safety backstop: the player thumbnails render in-app UNDER each player's
+	// name, so scan them ONCE here (cached, budgeted) before they're persisted. Fails open.
+	const safePlayers = await moderateFeedImages(players, {
+		ai: env.AI,
+		kvGet: (k) => env.FEED_TAGS.get(k),
+		kvPut: (k, v, o) => env.FEED_TAGS.put(k, v, o),
+		fetchImageBytes,
+		diag: ctx ? (kind, detail) => emitDiag(env, ctx, kind, detail) : undefined,
+	});
+	const playerCards = await writeSideOrKeepLastGood(env, ctx, poolKey(thisPool), safePlayers, "player", POOL_SNAPSHOT_TTL);
 
 	let clubs: string;
 	if (bdConfigured) {
@@ -6813,8 +6844,32 @@ async function handleAlertSelfTest(request: Request, env: Env, ctx: ExecutionCon
 			let ok = false; try { ok = (await fetch(hc)).ok; } catch { /* ok stays false */ }
 			return json({ do: "heartbeat", pinged: true, ok, note: "pinged the proxy healthchecks.io check" });
 		}
+		case "imgmod": {
+			// Accept Meta's one-time license for the vision model AND (optionally) live-test the safety
+			// pass on a specific image. `?do=imgmod` alone accepts the license (account-wide, idempotent);
+			// add `&url=<image>` to classify that image through the real moderateFeedImages path.
+			if (!env.AI) return json({ do: "imgmod", ok: false, note: "AI binding unset — deploy with the `ai` binding first" });
+			let license: string;
+			try {
+				const out = await env.AI.run(IMGMOD_MODEL, { prompt: "agree" });
+				license = `accepted (model replied: ${String((out as { response?: unknown })?.response ?? "").slice(0, 80)})`;
+			} catch (e) {
+				return json({ do: "imgmod", ok: false, step: "license", error: String((e as Error)?.message ?? e).slice(0, 200) });
+			}
+			const testUrl = new URL(request.url).searchParams.get("url");
+			if (!testUrl) return json({ do: "imgmod", ok: true, license, note: "license accepted (one-time, account-wide). Add &url=<image> to live-test the safety check." });
+			const testCard = { id: "selftest", url: testUrl, thumbnailURL: testUrl, handle: "@selftest" };
+			const kept = await moderateFeedImages([testCard], {
+				ai: env.AI,
+				kvGet: async () => null, // bypass the verdict cache for the test
+				kvPut: async () => { /* don't pollute the cache from a selftest */ },
+				fetchImageBytes,
+				diag: (kind, detail) => emitDiag(env, ctx, kind, detail),
+			});
+			return json({ do: "imgmod", ok: true, license, testUrl, verdict: kept.length ? "SAFE (kept)" : "UNSAFE (dropped)" });
+		}
 		default:
-			return json({ error: "unknown ?do=", allowed: ["email", "synthetic", "aggregate", "digest", "heartbeat"] });
+			return json({ error: "unknown ?do=", allowed: ["email", "synthetic", "aggregate", "digest", "heartbeat", "imgmod"] });
 	}
 }
 

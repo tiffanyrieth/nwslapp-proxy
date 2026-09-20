@@ -14,6 +14,15 @@
 			"id": "3c1372c0f8174cdcb3e2e52ca5de14ad",
 		},
 	],
+	// Workers AI — backs the Social feed's IMAGE-MODERATION backstop (moderateFeedImages):
+	// one vision safety check per player-IG thumbnail, run at SCRAPE time (in refreshSocialCache,
+	// before the snapshot is written to KV), NEVER per user-open. Verdicts cache in FEED_TAGS
+	// (imgmod:{url}, ~30d) so each image is scanned once. Cost is Neurons, flat with scrape volume
+	// (not users) — ~410 images/run every 2 days sits inside the 10k/day free allotment (~$0/mo).
+	// Uses @cf/meta/llama-3.2-11b-vision-instruct (one-time Meta license accept required).
+	"ai": {
+		"binding": "AI",
+	},
 	// Per-IP throttle for the two UNAUTHENTICATED ingest endpoints (POST /telemetry, /analytics) — the
 	// only anonymous writers. Without a cap, a flood of /telemetry POSTs (one KV write each) could
 	// exhaust the account-wide KV daily write budget and starve the watcher's live-match state on a
