@@ -59,6 +59,7 @@ export const ADMIN_PORTAL_HTML = `<!doctype html>
   <button data-tab="knowher">Know Her Game</button>
   <button data-tab="analytics">Analytics</button>
   <button data-tab="fanzone">Fan Zone</button>
+  <button data-tab="modDrops">Moderation</button>
 </nav>
 
 <div class="panel on" id="roster">
@@ -76,6 +77,12 @@ export const ADMIN_PORTAL_HTML = `<!doctype html>
 <div class="panel" id="analytics"><iframe data-src="/analytics/admin" title="Analytics"></iframe></div>
 <div class="panel" id="fanzone"><iframe data-src="/admin/fanzone-order" title="Fan Zone shelf (card order + kill-switch)"></iframe></div>
 
+<div class="panel" id="modDrops">
+  <div class="row"><button class="act" id="modReload">Reload</button><span id="modCounts" class="muted small"></span></div>
+  <div class="note">Player-feed images the safety backstop removed (they never reach the app). Review for over-reaction; <b>Approve</b> keeps an image going forward (returns on the next scrape). Thumbnails load from Instagram and can expire after a few days &mdash; use the Instagram link to see the post.</div>
+  <div id="modBody"></div>
+</div>
+
 <script>
 const $ = (s) => document.querySelector(s);
 const esc = (s) => String(s ?? "").replace(/[&<>"]/g, (c) => ({ "&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;" }[c]));
@@ -92,6 +99,7 @@ for (const b of document.querySelectorAll("nav button")) {
       if (b.dataset.tab === "status") f.src = f.dataset.src + "?t=" + Date.now(); // always re-run the check
       else if (!f.src) f.src = f.dataset.src;                                     // others lazy-load once
     }
+    if (b.dataset.tab === "modDrops") loadModDrops();
   };
 }
 
@@ -111,6 +119,60 @@ async function api(op, extra = {}) {
   }
   return r.json();
 }
+
+// ── Moderation drops (Social image-safety backstop review) ─────────────────────────────
+async function modApi(op, extra = {}) {
+  const r = await fetch("/admin/moderation-drops", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ op, ...extra }),
+  });
+  const ct = r.headers.get("content-type") || "";
+  if (!r.ok || !ct.includes("application/json")) {
+    if (r.redirected) throw new Error("Cloudflare Access session expired — re-authenticate");
+    throw new Error("moderation API returned " + r.status);
+  }
+  return r.json();
+}
+
+async function loadModDrops() {
+  $("#modBody").innerHTML = '<p class="muted small">Loading…</p>';
+  try {
+    const d = await modApi("list");
+    const c = d.counts || { total: 0, dropped: 0, approved: 0, byReason: {} };
+    const byReason = Object.entries(c.byReason || {}).map(([k, v]) => esc(k) + ": " + v).join(" · ");
+    $("#modCounts").textContent = c.total + " total · " + c.dropped + " active · " + c.approved + " approved" + (byReason ? " · " + byReason : "");
+    const drops = d.drops || [];
+    if (!drops.length) { $("#modBody").innerHTML = '<p class="muted small">No drops logged yet.</p>'; return; }
+    let h = "";
+    for (const x of drops) {
+      const approved = x.status === "approved";
+      h += '<div class="row" style="border:1px solid #2a2a2e;border-radius:8px;padding:8px;align-items:flex-start">' +
+        '<img src="' + esc(x.image_url) + '" alt="" style="width:96px;height:96px;object-fit:cover;border-radius:6px;background:#222" onerror="this.style.opacity=0.25">' +
+        '<div style="flex:1;min-width:180px">' +
+          '<div><b>' + esc(x.player_name || x.handle || "?") + '</b> <span class="muted small">' + esc(x.handle || "") + '</span></div>' +
+          '<div class="small"><span class="pill bad">' + esc(x.reason || "unspecified") + '</span> <span class="muted">pool ' + esc(x.pool || "?") + ' · ' + esc((x.dropped_at || "").slice(0, 16).replace("T", " ")) + '</span></div>' +
+          '<div class="small"><a href="' + esc(x.post_url) + '" target="_blank" rel="noopener">View on Instagram ↗</a></div>' +
+        '</div>' +
+        '<div>' + (approved
+          ? '<span class="pill ok">approved</span>'
+          : '<button class="act go" data-approve="' + esc(x.post_id) + '" data-url="' + esc(x.post_url) + '">Approve</button>') +
+        '</div>' +
+      '</div>';
+    }
+    $("#modBody").innerHTML = h;
+    for (const btn of document.querySelectorAll("#modBody [data-approve]")) {
+      btn.onclick = async () => {
+        btn.disabled = true; btn.textContent = "…";
+        try { await modApi("approve", { postId: btn.dataset.approve, postUrl: btn.dataset.url }); loadModDrops(); }
+        catch (e) { btn.disabled = false; btn.textContent = "Retry"; $("#modCounts").textContent = "approve failed: " + e.message; }
+      };
+    }
+  } catch (e) {
+    $("#modBody").innerHTML = '<div class="note bad">' + esc(e.message) + '</div>';
+  }
+}
+if ($("#modReload")) $("#modReload").onclick = loadModDrops;
 
 function gateRow(label, ok, detail) {
   return '<tr><td>' + esc(label) + '</td><td>' +

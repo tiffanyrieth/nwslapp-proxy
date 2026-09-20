@@ -139,3 +139,21 @@ test("diag is emitted with a run summary (drop + run kinds)", async () => {
 	assert.ok(kinds.includes("imageModerationDrop"), "a drop emits imageModerationDrop");
 	assert.ok(kinds.includes("imageModerationRun"), "every run emits a summary");
 });
+
+test("onDrop fires once per dropped card with the parsed reason category", async () => {
+	const kv = makeKV();
+	const { ai } = makeAI(() => "UNSAFE nudity");
+	const rows: Array<{ handle: string; reason: string; postUrl: string }> = [];
+	await moderateFeedImages([card("a"), card("b")], deps({ ai, kvGet: kv.kvGet, kvPut: kv.kvPut, onDrop: (r) => rows.push(r) }));
+	assert.equal(rows.length, 2, "onDrop fires for each drop");
+	assert.equal(rows[0].reason, "nudity", "reason parsed from the model reply");
+	assert.equal(rows[0].postUrl, "https://www.instagram.com/p/a/", "carries the post url for approve/keying");
+});
+
+test("onDrop does NOT fire for a SAFE image", async () => {
+	const kv = makeKV();
+	const { ai } = makeAI(() => "SAFE");
+	let fired = 0;
+	await moderateFeedImages([card("a")], deps({ ai, kvGet: kv.kvGet, kvPut: kv.kvPut, onDrop: () => fired++ }));
+	assert.equal(fired, 0, "safe images never call onDrop");
+});

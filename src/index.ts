@@ -880,9 +880,15 @@ export default {
 		}
 		// Alerting self-test (A-verification): force each PUSH path on demand so email delivery can be
 		// proven without waiting for the ~30-min gates or the Monday digest window. Admin-gated. `?do=`
-		// email | synthetic | aggregate | digest | heartbeat.
+		// email | synthetic | aggregate | digest | heartbeat | imgmod.
 		if (url.pathname === "/admin/selftest") {
 			return handleAlertSelfTest(request, env, ctx);
+		}
+
+		// Moderation review: the drop log for the Social image-safety backstop. `{op:"list"}` returns
+		// recent drops + counts; `{op:"approve", postId, postUrl}` marks an image safe (kept next scrape).
+		if (url.pathname === "/admin/moderation-drops") {
+			return handleModerationDrops(request, env, ctx);
 		}
 
 		// Owner lever: inspect/set the Fan Zone card order served by /config. Browser-friendly
@@ -1025,7 +1031,17 @@ that needs more users) until you bring it back.</p>
 						headers: { "Content-Type": "application/json" },
 					});
 				}
-				const summary = await refreshSocialCache(env, ctx);
+				if (side === "players") {
+						// PLAYERS ONLY (Apify) — never touches Club News (Bright Data). `pool=A|B` forces a
+						// specific pool so both pools can be refreshed deterministically (call once per pool).
+						const pParam = url.searchParams.get("pool");
+						const poolArg = pParam === "A" || pParam === "B" ? pParam : undefined;
+						const playersSummary = await refreshSocialCache(env, ctx, { playersOnly: true, pool: poolArg });
+						return new Response(`${JSON.stringify(playersSummary)}\n`, {
+							headers: { "Content-Type": "application/json" },
+						});
+					}
+					const summary = await refreshSocialCache(env, ctx);
 				return new Response(`${JSON.stringify(summary)}\n`, {
 					headers: { "Content-Type": "application/json" },
 				});
@@ -4633,12 +4649,33 @@ async function fetchImageBytes(url: string): Promise<Uint8Array | null> {
 	}
 }
 
+/** Write one reviewable moderation-drop row to Supabase (fire-and-forget, via ctx.waitUntil). Uses the
+ *  SECURITY DEFINER RPC `record_moderation_drop` (house convention). No-ops when Supabase is unset; a
+ *  non-2xx only emits a diag — a log failure must never block the scrape. Backs the admin Moderation tab. */
+function recordModerationDrop(env: Env, ctx: ExecutionContext, rec: { postId: string; postUrl: string; imageUrl: string; name: string; handle: string; reason: string; pool: string }): void {
+	const sb = env as unknown as { SUPABASE_URL?: string; SUPABASE_SERVICE_ROLE_KEY?: string };
+	if (!sb.SUPABASE_URL || !sb.SUPABASE_SERVICE_ROLE_KEY) return;
+	const base = sb.SUPABASE_URL.replace(/\/$/, ""), svcKey = sb.SUPABASE_SERVICE_ROLE_KEY;
+	ctx.waitUntil((async () => {
+		try {
+			const r = await fetch(`${base}/rest/v1/rpc/record_moderation_drop`, {
+				method: "POST",
+				headers: { apikey: svcKey, Authorization: `Bearer ${svcKey}`, "Content-Type": "application/json" },
+				body: JSON.stringify({ p_post_id: rec.postId, p_post_url: rec.postUrl, p_image_url: rec.imageUrl, p_player_name: rec.name, p_handle: rec.handle, p_reason: rec.reason, p_pool: rec.pool }),
+			});
+			if (!r.ok) emitDiag(env, ctx, "moderationDropLogFail", `record_moderation_drop ${r.status}`);
+		} catch (e) {
+			emitDiag(env, ctx, "moderationDropLogFail", String((e as Error)?.message ?? e).slice(0, 60));
+		}
+	})());
+}
+
 /** Cron/manual-refresh entry: rebuild the social snapshot → the SPLIT KV keys.
  *  PLAYER side: scraped via Apify inline (sync run) and written here. CLUB side: when
  *  Bright Data is configured, an ASYNC scrape is triggered and /brightdata-webhook writes
  *  the club key minutes later; until then clubs ride the same Apify run (pre-split
  *  fallback — the split deploys without a flag day). Returns a summary for /refresh-social. */
-async function refreshSocialCache(env: Env, ctx?: ExecutionContext): Promise<{ playerCards: number; pool: string; clubs: string }> {
+async function refreshSocialCache(env: Env, ctx?: ExecutionContext, opts?: { playersOnly?: boolean; pool?: "A" | "B" }): Promise<{ playerCards: number; pool: string; clubs: string }> {
 	const playerList = await loadPlayerSocial(env);
 	// Pool hygiene: any entry without a pool (pre-rotation data, or a write that skipped
 	// assignment) gets the lighter pool NOW and the list is persisted — never scrape-skipped.
@@ -4651,9 +4688,10 @@ async function refreshSocialCache(env: Env, ctx?: ExecutionContext): Promise<{ p
 	}
 	if (assigned) await env.FEED_TAGS.put(PLAYER_LIST_KEY, JSON.stringify(playerList));
 
-	// Alternate pools: scrape the one NOT scraped last run.
+	// Alternate pools: scrape the one NOT scraped last run — or a caller-forced pool, for a
+	// deterministic manual refresh of a specific pool.
 	const last = await env.FEED_TAGS.get(POOL_MARKER_KEY);
-	const thisPool: "A" | "B" = last === "A" ? "B" : "A";
+	const thisPool: "A" | "B" = opts?.pool ?? (last === "A" ? "B" : "A");
 	await env.FEED_TAGS.put(POOL_MARKER_KEY, thisPool);
 	const poolPlayers = playerList.filter((p) => p.pool === thisPool);
 
@@ -4664,7 +4702,7 @@ async function refreshSocialCache(env: Env, ctx?: ExecutionContext): Promise<{ p
 		emitDiag(env, ctx, "playerCapExceeded", `pool ${thisPool}: ${poolPlayers.length}/${MAX_POOL_HANDLES}`);
 	}
 
-	const apifyHandles = bdConfigured ? igHandles.filter((h) => h.kind === "player") : igHandles;
+	const apifyHandles = (bdConfigured || opts?.playersOnly) ? igHandles.filter((h) => h.kind === "player") : igHandles;
 	const { instagram } = await buildSocialCards(env, apifyHandles, ctx);
 	const players = instagram.filter((c) => (c as { placement?: string }).placement === "feed");
 	// Low-grade image-safety backstop: the player thumbnails render in-app UNDER each player's
@@ -4675,11 +4713,15 @@ async function refreshSocialCache(env: Env, ctx?: ExecutionContext): Promise<{ p
 		kvPut: (k, v, o) => env.FEED_TAGS.put(k, v, o),
 		fetchImageBytes,
 		diag: ctx ? (kind, detail) => emitDiag(env, ctx, kind, detail) : undefined,
+		// Per-drop reviewable log → Supabase row (fire-and-forget; a log failure never blocks the scrape).
+		onDrop: ctx ? (rec) => recordModerationDrop(env, ctx, { ...rec, pool: thisPool }) : undefined,
 	});
 	const playerCards = await writeSideOrKeepLastGood(env, ctx, poolKey(thisPool), safePlayers, "player", POOL_SNAPSHOT_TTL);
 
 	let clubs: string;
-	if (bdConfigured) {
+	if (opts?.playersOnly) {
+		clubs = "skipped (players-only)"; // a manual player refresh must NEVER touch Club News (Bright Data)
+	} else if (bdConfigured) {
 		clubs = await triggerBrightDataClubs(env, ctx);
 	} else {
 		const fresh = instagram.filter((c) => (c as { placement?: string }).placement === "home");
@@ -6871,6 +6913,45 @@ async function handleAlertSelfTest(request: Request, env: Env, ctx: ExecutionCon
 		default:
 			return json({ error: "unknown ?do=", allowed: ["email", "synthetic", "aggregate", "digest", "heartbeat", "imgmod"] });
 	}
+}
+
+/** GET/POST /admin/moderation-drops — review surface for the Social image-safety backstop's drops.
+ *  `{op:"list"}` (default) → recent drops + counts (total / dropped / approved / by-reason). `{op:"approve",
+ *  postId, postUrl}` → seed the verdict cache 'safe' (so the next scrape keeps it) + flip the row to
+ *  'approved'. Portal surface → `adminGate {jwt:true}`. No-ops (503) when Supabase is unset. */
+async function handleModerationDrops(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
+	const gate = await adminGate(request, env as unknown as AdminAuthEnv, { jwt: true },
+		(kind, detail) => emitDiag(env, ctx, kind, detail));
+	if (gate) return gate;
+	const json = (b: unknown, status = 200) => new Response(JSON.stringify(b), { status, headers: { "Content-Type": "application/json" } });
+	const sb = env as unknown as { SUPABASE_URL?: string; SUPABASE_SERVICE_ROLE_KEY?: string };
+	if (!sb.SUPABASE_URL || !sb.SUPABASE_SERVICE_ROLE_KEY) return json({ error: "supabase unset" }, 503);
+	const base = sb.SUPABASE_URL.replace(/\/$/, ""), svcKey = sb.SUPABASE_SERVICE_ROLE_KEY;
+	const headers = { apikey: svcKey, Authorization: `Bearer ${svcKey}`, "Content-Type": "application/json" };
+
+	let body: { op?: string; postId?: string; postUrl?: string } = {};
+	if (request.method === "POST") { try { body = await request.json(); } catch { /* empty/invalid → default list */ } }
+	const op = body.op ?? "list";
+
+	if (op === "approve") {
+		if (!body.postId || !body.postUrl) return json({ error: "postId + postUrl required" }, 400);
+		// Keep it going forward: seed the verdict cache 'safe' so the next scrape won't re-drop it.
+		try { await env.FEED_TAGS.put(`imgmod:${body.postUrl}`, "safe", { expirationTtl: 30 * 24 * 3600 }); } catch { /* KV budget — the row flip below is the durable record */ }
+		const r = await fetch(`${base}/rest/v1/rpc/approve_moderation_drop`, { method: "POST", headers, body: JSON.stringify({ p_post_id: body.postId }) });
+		if (!r.ok) { emitDiag(env, ctx, "moderationApproveFail", `${r.status}`); return json({ error: `approve failed ${r.status}` }, 502); }
+		return json({ ok: true, approved: body.postId });
+	}
+
+	// list (default): recent drops, newest first, + summary counts.
+	const r = await fetch(`${base}/rest/v1/moderation_drops?select=*&order=dropped_at.desc&limit=200`, { headers });
+	if (!r.ok) return json({ error: `list failed ${r.status}` }, 502);
+	const drops = (await r.json()) as Array<{ status?: string; reason?: string }>;
+	const counts = { total: drops.length, dropped: 0, approved: 0, byReason: {} as Record<string, number> };
+	for (const d of drops) {
+		if (d.status === "approved") counts.approved++; else counts.dropped++;
+		const key = d.reason || "unspecified"; counts.byReason[key] = (counts.byReason[key] ?? 0) + 1;
+	}
+	return json({ drops, counts });
 }
 
 /** Owner view of recent telemetry: `GET /telemetry/recent` (newest first), gated by the same

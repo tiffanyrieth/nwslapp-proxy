@@ -23,9 +23,9 @@ const IMGMOD_MAX_SCANS_PER_RUN = 80; // NEW-image scan budget/run: bounds cron l
 const IMGMOD_TIME_BUDGET_MS = 20_000; // stop scanning NEW images past this; remainder KEPT (fail-open), scanned a later run
 const IMGMOD_PROMPT =
 	"You are a narrow content-safety check for a women's soccer fan app that reposts players' public " +
-	"Instagram photos. Reply with ONLY one word: UNSAFE if the image shows explicit sexual content or " +
-	"nudity, or graphic violence or gore. Otherwise reply SAFE. Normal athlete, sport, training, " +
-	"celebration, fashion, family, and lifestyle photos are SAFE.";
+	"Instagram photos. If the image shows explicit sexual content or nudity, or graphic violence or gore, " +
+	"reply UNSAFE followed by ONE word for the category (nudity, sexual, violence, or gore). Otherwise reply " +
+	"SAFE. Normal athlete, sport, training, celebration, fashion, family, and lifestyle photos are SAFE.";
 
 /** Platform dependencies injected by index.ts (mocked in tests). */
 export interface ImageModDeps {
@@ -39,16 +39,23 @@ export interface ImageModDeps {
 	fetchImageBytes(url: string): Promise<Uint8Array | null>;
 	/** Optional diagnostics sink (index wires emitDiag; undefined in tests / when there's no ctx). */
 	diag?(kind: string, detail: string): void;
+	/** Optional per-drop hook — fires once for each card dropped as unsafe, so the caller can log a
+	 *  reviewable record (index wires it to a Supabase row). Best-effort; never blocks the pass. */
+	onDrop?(rec: { postId: string; postUrl: string; imageUrl: string; name: string; handle: string; reason: string }): void;
 }
 
-/** Vision safety check on one image's bytes. true=safe, false=unsafe, or null when it can't decide
- *  (AI error / ambiguous reply) — the caller fails open on null. */
-async function classifyImageSafe(ai: NonNullable<ImageModDeps["ai"]>, bytes: Uint8Array): Promise<boolean | null> {
+/** Vision safety check on one image's bytes. Returns `{ safe, reason }` (reason = the model's short
+ *  category on an unsafe verdict, else "safe"), or null when it can't decide (AI error / ambiguous
+ *  reply) — the caller fails open on null. */
+async function classifyImage(ai: NonNullable<ImageModDeps["ai"]>, bytes: Uint8Array): Promise<{ safe: boolean; reason: string } | null> {
 	try {
-		const out = await ai.run(IMGMOD_MODEL, { prompt: IMGMOD_PROMPT, image: Array.from(bytes), max_tokens: 12 });
-		const text = String((out as { response?: unknown })?.response ?? "").toUpperCase();
-		if (text.includes("UNSAFE")) return false; // check UNSAFE first — it CONTAINS "SAFE" as a substring
-		if (text.includes("SAFE")) return true;
+		const out = await ai.run(IMGMOD_MODEL, { prompt: IMGMOD_PROMPT, image: Array.from(bytes), max_tokens: 16 });
+		const up = String((out as { response?: unknown })?.response ?? "").trim().toUpperCase();
+		if (up.includes("UNSAFE")) { // check UNSAFE first — it CONTAINS "SAFE" as a substring
+			const m = up.match(/UNSAFE[:\s]+([A-Z]+)/); // capture the trailing category word, if any
+			return { safe: false, reason: (m?.[1] ?? "unspecified").toLowerCase() };
+		}
+		if (up.includes("SAFE")) return { safe: true, reason: "safe" };
 		return null; // ambiguous → fail open
 	} catch {
 		return null; // AI error → fail open
@@ -77,7 +84,7 @@ export async function moderateFeedImages(cards: unknown[], deps: ImageModDeps): 
 	async function worker(): Promise<void> {
 		while (idx < cards.length) {
 			const i = idx++;
-			const c = cards[i] as { url?: string; thumbnailURL?: string; handle?: string };
+			const c = cards[i] as { id?: string; url?: string; thumbnailURL?: string; handle?: string; authorName?: string };
 			const img = c.thumbnailURL;
 			if (!img) continue; // nothing to check → keep
 			const cacheKey = `imgmod:${c.url ?? img}`;
@@ -90,10 +97,13 @@ export async function moderateFeedImages(cards: unknown[], deps: ImageModDeps): 
 			newScans++; scanned++;
 			const bytes = await deps.fetchImageBytes(img);
 			if (!bytes) { errored++; continue; } // fetch fail → keep, don't cache (retry next run)
-			const safe = await classifyImageSafe(ai, bytes);
-			if (safe === null) { errored++; continue; } // AI error/ambiguous → keep, don't cache
-			try { await deps.kvPut(cacheKey, safe ? "safe" : "unsafe", { expirationTtl: IMGMOD_TTL }); } catch { /* KV write budget — verdict still applied below */ }
-			if (!safe) { decisions[i] = false; dropped++; if (c.handle) dropDetails.push(c.handle); }
+			const verdict = await classifyImage(ai, bytes);
+			if (verdict === null) { errored++; continue; } // AI error/ambiguous → keep, don't cache
+			try { await deps.kvPut(cacheKey, verdict.safe ? "safe" : "unsafe", { expirationTtl: IMGMOD_TTL }); } catch { /* KV write budget — verdict still applied below */ }
+			if (!verdict.safe) {
+				decisions[i] = false; dropped++; if (c.handle) dropDetails.push(c.handle);
+				deps.onDrop?.({ postId: c.id ?? c.url ?? img, postUrl: c.url ?? "", imageUrl: img, name: c.authorName ?? "", handle: c.handle ?? "", reason: verdict.reason });
+			}
 		}
 	}
 	await Promise.all(Array.from({ length: Math.min(IMGMOD_CONCURRENCY, cards.length) }, () => worker()));
