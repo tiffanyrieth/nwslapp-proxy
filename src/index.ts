@@ -1417,13 +1417,15 @@ that needs more users) until you bring it back.</p>
 				/* swallow — best-effort; the next gated tick retries */
 			}
 			// Image-safety backstop (decoupled from the scrape): classify a small batch of unjudged player
-			// thumbnails from the CACHED snapshot — no Apify. Gated to :00/:30 so it rides this tick with no
-			// new cron. Runs LAST so a FREE-tier CPU/subrequest kill can never affect the bracket engine or
-			// alerting above (all their KV writes are already done). Drops → the Supabase moderation log.
+			// thumbnails from the CACHED snapshot — no Apify. Runs EVERY tick (idle-skips when a pool is
+			// fully judged, so it's ~1 read when there's no work) to clear a backlog within a few hours and
+			// keep steady-state catch well under an hour. Runs LAST so a FREE-tier CPU/subrequest kill can
+			// never affect the bracket engine or alerting above (their KV writes are already done). Drops →
+			// the Supabase moderation log. Starts on the FIRST tick after deploy (≤5 min = effectively now).
 			try {
-				if (new Date().getUTCMinutes() % 30 === 0) await moderateSnapshotTick(env, ctx);
+				await moderateSnapshotTick(env, ctx);
 			} catch {
-				/* swallow — best-effort; the next gated tick retries the remaining unjudged images */
+				/* swallow — best-effort; the next tick retries the remaining unjudged images */
 			}
 			// End-of-tick: flush any diagnostics this cron isolate accumulated above (synthetic checks, the
 			// aggregate scan, attendance sweep) to Supabase, so a cron-isolate diag isn't lost to eviction.
@@ -4670,27 +4672,41 @@ async function loadModApproved(env: Env): Promise<Set<string>> {
 	}
 }
 
-/** Decoupled moderation pass — runs on the 5-min cron (gated to ~30 min by the caller). Reads ONE pool's
- *  CACHED snapshot (no scrape → no Apify), classifies a small batch of not-yet-judged images, and writes
- *  the snapshot back only if it changed. Alternates pools by the half-hour so each is checked ~hourly with
- *  a single KV read/pass. Idle (fully-judged) pools cost just that one read. Drops → Supabase log. */
+// Keep only the freshest few posts per player in the SNAPSHOT (the Feed serves at most MAX_PER_HANDLE=3).
+// Storing/moderating more than this is pure waste — trimming shrinks the moderation universe ~3x so a
+// cold backlog clears in a few hours, not a day, and keeps the snapshot small.
+const MODERATE_KEEP_PER_HANDLE = 4;
+
+/** Decoupled moderation pass — runs EVERY 5-min tick. Handles ONE pool per tick (whichever still has
+ *  unjudged images, A first) to bound CPU/subrequests on the FREE tier: it (1) trims the pool to the
+ *  freshest MODERATE_KEEP_PER_HANDLE/player, (2) classifies up to IMGMOD_BATCH not-yet-judged images, and
+ *  (3) writes the snapshot back once if anything changed. Fully-judged pools cost just a read (idle-skip).
+ *  No scrape → no Apify. Drops → Supabase log. */
 async function moderateSnapshotTick(env: Env, ctx: ExecutionContext): Promise<void> {
 	if (!env.AI) return; // no binding → nothing to classify
-	const pool: "A" | "B" = new Date().getUTCMinutes() % 60 < 30 ? "A" : "B";
-	const key = poolKey(pool);
-	const cards = (await env.FEED_TAGS.get(key, "json")) as unknown[] | null;
-	if (!cards || cards.length === 0) return;
-	// Cheap in-memory check first: skip the allowlist read + all work when the pool is fully judged.
-	const anyUnjudged = cards.some((c) => { const x = c as { thumbnailURL?: string; mod?: string }; return !!x.thumbnailURL && x.mod !== "ok"; });
-	if (!anyUnjudged) return;
-	const approved = await loadModApproved(env);
-	const res = await moderateSnapshotBatch(cards, approved, IMGMOD_BATCH, {
-		ai: env.AI,
-		fetchImageBytes,
-		diag: (kind, detail) => emitDiag(env, ctx, kind, detail),
-		onDrop: (rec) => recordModerationDrop(env, ctx, { ...rec, pool }),
-	});
-	if (res.changed) await env.FEED_TAGS.put(key, JSON.stringify(res.cards), { expirationTtl: POOL_SNAPSHOT_TTL });
+	let approved: Set<string> | null = null;
+	for (const pool of ["A", "B"] as const) {
+		const key = poolKey(pool);
+		const raw = (await env.FEED_TAGS.get(key, "json")) as unknown[] | null;
+		if (!raw || raw.length === 0) continue;
+		// Trim to the serve-relevant freshest few per handle (sort newest-first, then cap).
+		const trimmed = capPerHandle([...raw].sort(byTimestampDesc), MODERATE_KEEP_PER_HANDLE);
+		let changed = trimmed.length !== raw.length;
+		const anyUnjudged = trimmed.some((c) => { const x = c as { thumbnailURL?: string; mod?: string }; return !!x.thumbnailURL && x.mod !== "ok"; });
+		if (!anyUnjudged) { // pool fully judged — persist a trim if we made one, then try the other pool
+			if (changed) await env.FEED_TAGS.put(key, JSON.stringify(trimmed), { expirationTtl: POOL_SNAPSHOT_TTL });
+			continue;
+		}
+		if (!approved) approved = await loadModApproved(env);
+		const res = await moderateSnapshotBatch(trimmed, approved, IMGMOD_BATCH, {
+			ai: env.AI,
+			fetchImageBytes,
+			diag: (kind, detail) => emitDiag(env, ctx, kind, detail),
+			onDrop: (rec) => recordModerationDrop(env, ctx, { ...rec, pool }),
+		});
+		if (res.changed || changed) await env.FEED_TAGS.put(key, JSON.stringify(res.cards), { expirationTtl: POOL_SNAPSHOT_TTL });
+		return; // one pool per tick — the next tick (≤5 min) picks up the other / the remainder
+	}
 }
 
 /** Write one reviewable moderation-drop row to Supabase (fire-and-forget, via ctx.waitUntil). Uses the
@@ -4758,8 +4774,11 @@ async function refreshSocialCache(env: Env, ctx?: ExecutionContext, opts?: { pla
 		env.FEED_TAGS.get(poolKey(thisPool), "json") as Promise<unknown[] | null>,
 		loadModApproved(env),
 	]);
-	carryForwardVerdicts(players, priorPool ?? [], approvedSet);
-	const playerCards = await writeSideOrKeepLastGood(env, ctx, poolKey(thisPool), players, "player", POOL_SNAPSHOT_TTL);
+	// Trim to the freshest few per player before storing (the Feed serves ≤3/handle; storing/moderating
+	// the actor's ~12/handle is pure waste — this keeps the snapshot + the moderation universe small).
+	const trimmedPlayers = capPerHandle([...players].sort(byTimestampDesc), MODERATE_KEEP_PER_HANDLE);
+	carryForwardVerdicts(trimmedPlayers, priorPool ?? [], approvedSet);
+	const playerCards = await writeSideOrKeepLastGood(env, ctx, poolKey(thisPool), trimmedPlayers, "player", POOL_SNAPSHOT_TTL);
 
 	let clubs: string;
 	if (opts?.playersOnly) {
@@ -6954,8 +6973,16 @@ async function handleAlertSelfTest(request: Request, env: Env, ctx: ExecutionCon
 				: "UNJUDGED — the fetch or AI call failed, so it fail-open KEEPS it (check the image URL is fresh)";
 			return json({ do: "imgmod", ok: true, license, testUrl, verdict });
 		}
+		case "moderate": {
+			// Kick a moderation pass RIGHT NOW (same work the 5-min tick does) — for clearing the backlog
+			// immediately after a deploy without waiting for the next tick. Hit it repeatedly to blast
+			// through faster; each pass does one pool's batch. Reports counts via the diag it emits.
+			if (!env.AI) return json({ do: "moderate", ok: false, note: "AI binding unset" });
+			await moderateSnapshotTick(env, ctx);
+			return json({ do: "moderate", ok: true, note: "ran one moderation pass now — see imageModerationRun in /telemetry/recent; hit again to process the next batch, or just let the 5-min tick finish it" });
+		}
 		default:
-			return json({ error: "unknown ?do=", allowed: ["email", "synthetic", "aggregate", "digest", "heartbeat", "imgmod"] });
+			return json({ error: "unknown ?do=", allowed: ["email", "synthetic", "aggregate", "digest", "heartbeat", "imgmod", "moderate"] });
 	}
 }
 
