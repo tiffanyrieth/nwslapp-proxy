@@ -24,7 +24,7 @@ export const IMGMOD_MODEL = "@cf/meta/llama-3.2-11b-vision-instruct";
 // costs a byte→array conversion) AND 50-subrequest cap (2 subrequests/image). Conservative on purpose;
 // lower it if `exceededCpu`/subrequest kills ever show in diagnostics. Steady state has few new images
 // per scrape, so this only paces the one-time backlog. It rides a ~30-min gate on the 5-min cron.
-export const IMGMOD_BATCH = 5;
+export const IMGMOD_BATCH = 1;
 
 const IMGMOD_PROMPT =
 	"You are a narrow content-safety check for a women's soccer fan app that reposts players' public " +
