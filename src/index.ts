@@ -4682,6 +4682,13 @@ async function loadModApproved(env: Env): Promise<Set<string>> {
 // cold backlog clears in a few hours, not a day, and keeps the snapshot small.
 const MODERATE_KEEP_PER_HANDLE = 4;
 
+// Moderation only runs in a ~2h window right after the every-other-day scrape (`0 12 */2 * *` UTC), then
+// idles the rest of the day so it isn't burning KV reads 24/7. Steady-state = only a few dozen NEW posts
+// per scrape, which clear well inside 2h; the one-time backlog is already done. Outside the window the tick
+// returns BEFORE any KV read. (If we ever move the scrape time, update MOD_WINDOW_START_UTC_HOUR to match.)
+const MOD_WINDOW_START_UTC_HOUR = 12; // = the scrape cron hour
+const MOD_WINDOW_HOURS = 2;
+
 /** Decoupled moderation pass — runs EVERY 5-min tick. Handles ONE pool per tick (whichever still has
  *  unjudged images, A first) to bound CPU/subrequests on the FREE tier: it (1) trims the pool to the
  *  freshest MODERATE_KEEP_PER_HANDLE/player, (2) classifies up to IMGMOD_BATCH not-yet-judged images, and
@@ -4689,6 +4696,9 @@ const MODERATE_KEEP_PER_HANDLE = 4;
  *  No scrape → no Apify. Drops → Supabase log. */
 async function moderateSnapshotTick(env: Env, ctx: ExecutionContext): Promise<void> {
 	if (!env.AI) return; // no binding → nothing to classify
+	// Only run in the ~2h window after the scrape; outside it, return BEFORE any KV read (idle = ~free).
+	const hourUTC = new Date().getUTCHours();
+	if (hourUTC < MOD_WINDOW_START_UTC_HOUR || hourUTC >= MOD_WINDOW_START_UTC_HOUR + MOD_WINDOW_HOURS) return;
 	let approved: Set<string> | null = null;
 	for (const pool of ["A", "B"] as const) {
 		const key = poolKey(pool);
