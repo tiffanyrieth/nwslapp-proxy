@@ -20,11 +20,12 @@
 // emitDiag + the Supabase drop-log.
 
 export const IMGMOD_MODEL = "@cf/meta/llama-3.2-11b-vision-instruct";
-// Per-pass batch of NEW images to classify. TUNED for the FREE tier's 10ms CPU limit (each image
-// costs a byte→array conversion) AND 50-subrequest cap (2 subrequests/image). Conservative on purpose;
-// lower it if `exceededCpu`/subrequest kills ever show in diagnostics. Steady state has few new images
-// per scrape, so this only paces the one-time backlog. It rides a ~30-min gate on the 5-min cron.
-export const IMGMOD_BATCH = 1;
+// Per-pass batch of NEW images to classify per 5-min tick. Since the image fetch is a weserv-RESIZED
+// ~13KB thumbnail (see index.ts fetchImageBytes), the byte→array conversion is now trivial, so the FREE
+// tier's 10ms CPU is no longer the binding limit — the 50-subrequest cap is (2 subrequests/image → ~25
+// max). 10 leaves headroom + clears the trimmed backlog in ~a couple hours. Raise toward ~20 if diagnostics
+// stay clean; lower if `exceededCpu`/subrequest kills reappear.
+export const IMGMOD_BATCH = 10;
 
 const IMGMOD_PROMPT =
 	"You are a narrow content-safety check for a women's soccer fan app that reposts players' public " +

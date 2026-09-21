@@ -4640,23 +4640,28 @@ async function buildSocialCards(env: Env, handles: SocialHandle[], ctx?: Executi
 }
 
 // ── Social feed IMAGE MODERATION wiring ────────────────────────────────────────────────
-// The low-grade image-safety backstop lives in ./social-moderation.ts (isolated + unit-tested);
-// here we only supply the platform deps it needs. Full rationale is in that module's header
-// (runs once per image at SCRAPE time, caches verdicts, FAILS OPEN so a hiccup never blanks the
-// Feed; scope = the in-app thumbnail only). This fetcher reuses fetchBounded so a hung IG CDN
-// host is TRULY aborted (not just raced), with a generic browser UA (NOT ESPN_HEADERS — JSON).
-const IMAGE_FETCH_MAX_BYTES = 6_000_000; // skip absurdly large images rather than buffer them (fail-open)
+// The image-safety backstop lives in ./social-moderation.ts (isolated + unit-tested); here we supply
+// the platform deps. ⚠️ BACKEND-ONLY image fetch: for the CPU-cheap safety check we fetch a SMALL,
+// RESIZED copy via images.weserv.nl (a free image-resize CDN) — NOT the full image. Why: the model
+// requires converting the image to a JS number-array, and doing that on a full ~800KB IG image blows the
+// Workers FREE-tier 10ms CPU budget (live-proven: exceededCpu). weserv resizes on THEIR infra (~800KB →
+// ~13KB), so our conversion is trivial and the batch can be large. The APP still displays the full-size
+// URL from the snapshot — weserv is never shown to users, only used to classify. It's a new external
+// dependency, but confined to moderation, touches only a PUBLIC image, and FAILS OPEN (weserv down →
+// null → card left unjudged, retried next tick). Cloudflare's own Image Resizing would avoid it but is a
+// PAID feature — off the table on Free.
+const IMAGE_FETCH_MAX_BYTES = 2_000_000; // resized thumbs are ~10-30KB; cap well below the raw as a guard
+const MOD_RESIZE_PX = 256; // moderation-only downscale — plenty of detail to detect nudity/gore, tiny to convert
 async function fetchImageBytes(url: string): Promise<Uint8Array | null> {
 	try {
-		const r = await fetchBounded(url, { headers: { Accept: "image/*", "User-Agent": "Mozilla/5.0 (compatible; NWSLApp/1.0)" } });
+		const small = `https://images.weserv.nl/?url=${encodeURIComponent(url)}&w=${MOD_RESIZE_PX}&output=jpg`;
+		const r = await fetchBounded(small, { headers: { Accept: "image/*" } });
 		if (!r.ok) return null;
-		const len = Number(r.headers.get("content-length") ?? 0);
-		if (len && len > IMAGE_FETCH_MAX_BYTES) return null;
 		const buf = await r.arrayBuffer();
 		if (buf.byteLength > IMAGE_FETCH_MAX_BYTES) return null;
 		return new Uint8Array(buf);
 	} catch {
-		return null; // any fetch failure → null → caller fails open (keeps the card)
+		return null; // any fetch/resize failure → null → caller fails open (leaves the card unjudged)
 	}
 }
 
