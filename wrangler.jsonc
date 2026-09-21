@@ -14,6 +14,16 @@
 			"id": "3c1372c0f8174cdcb3e2e52ca5de14ad",
 		},
 	],
+	// Workers AI — backs the Social feed's IMAGE-MODERATION backstop. DECOUPLED from the scrape
+	// (FREE tier = 50 subrequests / 10ms CPU per run can't classify a ~300-image scrape at once):
+	// a small batch runs on the 5-min cron (gated ~30 min, moderateSnapshotTick), reading the CACHED
+	// snapshot — no extra Apify. Verdicts live IN the snapshot (card.mod), so a whole batch saves in
+	// ONE KV write; unsafe cards are dropped so they never reach the app. Cost is Neurons, flat with
+	// scrape volume not users (~$0/mo, inside the 10k/day free allotment). Approve allowlist =
+	// imgmod:approved. Uses @cf/meta/llama-3.2-11b-vision-instruct (one-time Meta license accept).
+	"ai": {
+		"binding": "AI",
+	},
 	// Per-IP throttle for the two UNAUTHENTICATED ingest endpoints (POST /telemetry, /analytics) — the
 	// only anonymous writers. Without a cap, a flood of /telemetry POSTs (one KV write each) could
 	// exhaust the account-wide KV daily write budget and starve the watcher's live-match state on a

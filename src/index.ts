@@ -31,6 +31,7 @@ import {
 	type BracketEnv,
 } from "./bracket-engine.ts";
 import { buildHeadshotMap, handleHeadshots, normalizeName } from "./headshots.ts";
+import { moderateSnapshotBatch, carryForwardVerdicts, IMGMOD_MODEL, IMGMOD_BATCH } from "./social-moderation.ts";
 import { adminAuthed, adminGate, safeEqual, type AdminAuthEnv } from "./admin-auth.ts";
 import { handleAnalyticsAdmin, computeMetrics } from "./analytics-admin.ts";
 import { ADMIN_PORTAL_HTML } from "./admin-portal.ts";
@@ -879,9 +880,15 @@ export default {
 		}
 		// Alerting self-test (A-verification): force each PUSH path on demand so email delivery can be
 		// proven without waiting for the ~30-min gates or the Monday digest window. Admin-gated. `?do=`
-		// email | synthetic | aggregate | digest | heartbeat.
+		// email | synthetic | aggregate | digest | heartbeat | imgmod.
 		if (url.pathname === "/admin/selftest") {
 			return handleAlertSelfTest(request, env, ctx);
+		}
+
+		// Moderation review: the drop log for the Social image-safety backstop. `{op:"list"}` returns
+		// recent drops + counts; `{op:"approve", postId, postUrl}` marks an image safe (kept next scrape).
+		if (url.pathname === "/admin/moderation-drops") {
+			return handleModerationDrops(request, env, ctx);
 		}
 
 		// Owner lever: inspect/set the Fan Zone card order served by /config. Browser-friendly
@@ -1024,7 +1031,17 @@ that needs more users) until you bring it back.</p>
 						headers: { "Content-Type": "application/json" },
 					});
 				}
-				const summary = await refreshSocialCache(env, ctx);
+				if (side === "players") {
+						// PLAYERS ONLY (Apify) — never touches Club News (Bright Data). `pool=A|B` forces a
+						// specific pool so both pools can be refreshed deterministically (call once per pool).
+						const pParam = url.searchParams.get("pool");
+						const poolArg = pParam === "A" || pParam === "B" ? pParam : undefined;
+						const playersSummary = await refreshSocialCache(env, ctx, { playersOnly: true, pool: poolArg });
+						return new Response(`${JSON.stringify(playersSummary)}\n`, {
+							headers: { "Content-Type": "application/json" },
+						});
+					}
+					const summary = await refreshSocialCache(env, ctx);
 				return new Response(`${JSON.stringify(summary)}\n`, {
 					headers: { "Content-Type": "application/json" },
 				});
@@ -1398,6 +1415,17 @@ that needs more users) until you bring it back.</p>
 				await attendanceSweep(env, (kind, detail) => emitDiag(env, ctx, kind, detail));
 			} catch {
 				/* swallow — best-effort; the next gated tick retries */
+			}
+			// Image-safety backstop (decoupled from the scrape): classify a small batch of unjudged player
+			// thumbnails from the CACHED snapshot — no Apify. Runs EVERY tick (idle-skips when a pool is
+			// fully judged, so it's ~1 read when there's no work) to clear a backlog within a few hours and
+			// keep steady-state catch well under an hour. Runs LAST so a FREE-tier CPU/subrequest kill can
+			// never affect the bracket engine or alerting above (their KV writes are already done). Drops →
+			// the Supabase moderation log. Starts on the FIRST tick after deploy (≤5 min = effectively now).
+			try {
+				await moderateSnapshotTick(env, ctx);
+			} catch {
+				/* swallow — best-effort; the next tick retries the remaining unjudged images */
 			}
 			// End-of-tick: flush any diagnostics this cron isolate accumulated above (synthetic checks, the
 			// aggregate scan, attendance sweep) to Supabase, so a cron-isolate diag isn't lost to eviction.
@@ -4611,12 +4639,118 @@ async function buildSocialCards(env: Env, handles: SocialHandle[], ctx?: Executi
 	return { instagram, tiktok: [] };
 }
 
+// ── Social feed IMAGE MODERATION wiring ────────────────────────────────────────────────
+// The image-safety backstop lives in ./social-moderation.ts (isolated + unit-tested); here we supply
+// the platform deps. ⚠️ BACKEND-ONLY image fetch: for the CPU-cheap safety check we fetch a SMALL,
+// RESIZED copy via images.weserv.nl (a free image-resize CDN) — NOT the full image. Why: the model
+// requires converting the image to a JS number-array, and doing that on a full ~800KB IG image blows the
+// Workers FREE-tier 10ms CPU budget (live-proven: exceededCpu). weserv resizes on THEIR infra (~800KB →
+// ~13KB), so our conversion is trivial and the batch can be large. The APP still displays the full-size
+// URL from the snapshot — weserv is never shown to users, only used to classify. It's a new external
+// dependency, but confined to moderation, touches only a PUBLIC image, and FAILS OPEN (weserv down →
+// null → card left unjudged, retried next tick). Cloudflare's own Image Resizing would avoid it but is a
+// PAID feature — off the table on Free.
+const IMAGE_FETCH_MAX_BYTES = 2_000_000; // resized thumbs are ~10-30KB; cap well below the raw as a guard
+const MOD_RESIZE_PX = 256; // moderation-only downscale — plenty of detail to detect nudity/gore, tiny to convert
+async function fetchImageBytes(url: string): Promise<Uint8Array | null> {
+	try {
+		const small = `https://images.weserv.nl/?url=${encodeURIComponent(url)}&w=${MOD_RESIZE_PX}&output=jpg`;
+		const r = await fetchBounded(small, { headers: { Accept: "image/*" } });
+		if (!r.ok) return null;
+		const buf = await r.arrayBuffer();
+		if (buf.byteLength > IMAGE_FETCH_MAX_BYTES) return null;
+		return new Uint8Array(buf);
+	} catch {
+		return null; // any fetch/resize failure → null → caller fails open (leaves the card unjudged)
+	}
+}
+
+// The approve allowlist: post URLs the owner judged safe after a false-positive drop. Stored as ONE KV
+// key (a JSON array — approvals are rare), so a moderation pass reads it once, not per card.
+const MOD_APPROVED_KEY = "imgmod:approved";
+async function loadModApproved(env: Env): Promise<Set<string>> {
+	try {
+		const arr = (await env.FEED_TAGS.get(MOD_APPROVED_KEY, "json")) as string[] | null;
+		return new Set(Array.isArray(arr) ? arr : []);
+	} catch {
+		return new Set(); // fail open: no allowlist → just means approved posts might re-drop until re-approved
+	}
+}
+
+// Keep only the freshest few posts per player in the SNAPSHOT (the Feed serves at most MAX_PER_HANDLE=3).
+// Storing/moderating more than this is pure waste — trimming shrinks the moderation universe ~3x so a
+// cold backlog clears in a few hours, not a day, and keeps the snapshot small.
+const MODERATE_KEEP_PER_HANDLE = 4;
+
+// Moderation only runs in a ~2h window right after the every-other-day scrape (`0 12 */2 * *` UTC), then
+// idles the rest of the day so it isn't burning KV reads 24/7. Steady-state = only a few dozen NEW posts
+// per scrape, which clear well inside 2h; the one-time backlog is already done. Outside the window the tick
+// returns BEFORE any KV read. (If we ever move the scrape time, update MOD_WINDOW_START_UTC_HOUR to match.)
+const MOD_WINDOW_START_UTC_HOUR = 12; // = the scrape cron hour
+const MOD_WINDOW_HOURS = 2;
+
+/** Decoupled moderation pass — runs EVERY 5-min tick. Handles ONE pool per tick (whichever still has
+ *  unjudged images, A first) to bound CPU/subrequests on the FREE tier: it (1) trims the pool to the
+ *  freshest MODERATE_KEEP_PER_HANDLE/player, (2) classifies up to IMGMOD_BATCH not-yet-judged images, and
+ *  (3) writes the snapshot back once if anything changed. Fully-judged pools cost just a read (idle-skip).
+ *  No scrape → no Apify. Drops → Supabase log. */
+async function moderateSnapshotTick(env: Env, ctx: ExecutionContext): Promise<void> {
+	if (!env.AI) return; // no binding → nothing to classify
+	// Only run in the ~2h window after the scrape; outside it, return BEFORE any KV read (idle = ~free).
+	const hourUTC = new Date().getUTCHours();
+	if (hourUTC < MOD_WINDOW_START_UTC_HOUR || hourUTC >= MOD_WINDOW_START_UTC_HOUR + MOD_WINDOW_HOURS) return;
+	let approved: Set<string> | null = null;
+	for (const pool of ["A", "B"] as const) {
+		const key = poolKey(pool);
+		const raw = (await env.FEED_TAGS.get(key, "json")) as unknown[] | null;
+		if (!raw || raw.length === 0) continue;
+		// Trim to the serve-relevant freshest few per handle (sort newest-first, then cap).
+		const trimmed = capPerHandle([...raw].sort(byTimestampDesc), MODERATE_KEEP_PER_HANDLE);
+		let changed = trimmed.length !== raw.length;
+		const anyUnjudged = trimmed.some((c) => { const x = c as { thumbnailURL?: string; mod?: string }; return !!x.thumbnailURL && x.mod !== "ok"; });
+		if (!anyUnjudged) { // pool fully judged — persist a trim if we made one, then try the other pool
+			if (changed) await env.FEED_TAGS.put(key, JSON.stringify(trimmed), { expirationTtl: POOL_SNAPSHOT_TTL });
+			continue;
+		}
+		if (!approved) approved = await loadModApproved(env);
+		const res = await moderateSnapshotBatch(trimmed, approved, IMGMOD_BATCH, {
+			ai: env.AI,
+			fetchImageBytes,
+			diag: (kind, detail) => emitDiag(env, ctx, kind, detail),
+			onDrop: (rec) => recordModerationDrop(env, ctx, { ...rec, pool }),
+		});
+		if (res.changed || changed) await env.FEED_TAGS.put(key, JSON.stringify(res.cards), { expirationTtl: POOL_SNAPSHOT_TTL });
+		return; // one pool per tick — the next tick (≤5 min) picks up the other / the remainder
+	}
+}
+
+/** Write one reviewable moderation-drop row to Supabase (fire-and-forget, via ctx.waitUntil). Uses the
+ *  SECURITY DEFINER RPC `record_moderation_drop` (house convention). No-ops when Supabase is unset; a
+ *  non-2xx only emits a diag — a log failure must never block the scrape. Backs the admin Moderation tab. */
+function recordModerationDrop(env: Env, ctx: ExecutionContext, rec: { postId: string; postUrl: string; imageUrl: string; name: string; handle: string; reason: string; pool: string }): void {
+	const sb = env as unknown as { SUPABASE_URL?: string; SUPABASE_SERVICE_ROLE_KEY?: string };
+	if (!sb.SUPABASE_URL || !sb.SUPABASE_SERVICE_ROLE_KEY) return;
+	const base = sb.SUPABASE_URL.replace(/\/$/, ""), svcKey = sb.SUPABASE_SERVICE_ROLE_KEY;
+	ctx.waitUntil((async () => {
+		try {
+			const r = await fetch(`${base}/rest/v1/rpc/record_moderation_drop`, {
+				method: "POST",
+				headers: { apikey: svcKey, Authorization: `Bearer ${svcKey}`, "Content-Type": "application/json" },
+				body: JSON.stringify({ p_post_id: rec.postId, p_post_url: rec.postUrl, p_image_url: rec.imageUrl, p_player_name: rec.name, p_handle: rec.handle, p_reason: rec.reason, p_pool: rec.pool }),
+			});
+			if (!r.ok) emitDiag(env, ctx, "moderationDropLogFail", `record_moderation_drop ${r.status}`);
+		} catch (e) {
+			emitDiag(env, ctx, "moderationDropLogFail", String((e as Error)?.message ?? e).slice(0, 60));
+		}
+	})());
+}
+
 /** Cron/manual-refresh entry: rebuild the social snapshot → the SPLIT KV keys.
  *  PLAYER side: scraped via Apify inline (sync run) and written here. CLUB side: when
  *  Bright Data is configured, an ASYNC scrape is triggered and /brightdata-webhook writes
  *  the club key minutes later; until then clubs ride the same Apify run (pre-split
  *  fallback — the split deploys without a flag day). Returns a summary for /refresh-social. */
-async function refreshSocialCache(env: Env, ctx?: ExecutionContext): Promise<{ playerCards: number; pool: string; clubs: string }> {
+async function refreshSocialCache(env: Env, ctx?: ExecutionContext, opts?: { playersOnly?: boolean; pool?: "A" | "B" }): Promise<{ playerCards: number; pool: string; clubs: string }> {
 	const playerList = await loadPlayerSocial(env);
 	// Pool hygiene: any entry without a pool (pre-rotation data, or a write that skipped
 	// assignment) gets the lighter pool NOW and the list is persisted — never scrape-skipped.
@@ -4629,9 +4763,10 @@ async function refreshSocialCache(env: Env, ctx?: ExecutionContext): Promise<{ p
 	}
 	if (assigned) await env.FEED_TAGS.put(PLAYER_LIST_KEY, JSON.stringify(playerList));
 
-	// Alternate pools: scrape the one NOT scraped last run.
+	// Alternate pools: scrape the one NOT scraped last run — or a caller-forced pool, for a
+	// deterministic manual refresh of a specific pool.
 	const last = await env.FEED_TAGS.get(POOL_MARKER_KEY);
-	const thisPool: "A" | "B" = last === "A" ? "B" : "A";
+	const thisPool: "A" | "B" = opts?.pool ?? (last === "A" ? "B" : "A");
 	await env.FEED_TAGS.put(POOL_MARKER_KEY, thisPool);
 	const poolPlayers = playerList.filter((p) => p.pool === thisPool);
 
@@ -4642,13 +4777,28 @@ async function refreshSocialCache(env: Env, ctx?: ExecutionContext): Promise<{ p
 		emitDiag(env, ctx, "playerCapExceeded", `pool ${thisPool}: ${poolPlayers.length}/${MAX_POOL_HANDLES}`);
 	}
 
-	const apifyHandles = bdConfigured ? igHandles.filter((h) => h.kind === "player") : igHandles;
+	const apifyHandles = (bdConfigured || opts?.playersOnly) ? igHandles.filter((h) => h.kind === "player") : igHandles;
 	const { instagram } = await buildSocialCards(env, apifyHandles, ctx);
 	const players = instagram.filter((c) => (c as { placement?: string }).placement === "feed");
-	const playerCards = await writeSideOrKeepLastGood(env, ctx, poolKey(thisPool), players, "player", POOL_SNAPSHOT_TTL);
+	// Image-safety backstop: classification is DECOUPLED to the 5-min tick (moderateSnapshotTick) — the
+	// FREE Workers tier (50 subrequests / 10ms CPU per run) can't fetch+classify a ~300-image scrape in
+	// one invocation, and re-scraping to catch up would waste Apify. Here we only CARRY FORWARD verdicts
+	// from the prior snapshot (+ the approve allowlist) so a re-scrape never re-checks a post already
+	// judged; genuinely-new posts stay unjudged (`no mod`) for the cron to chew through a few at a time.
+	const [priorPool, approvedSet] = await Promise.all([
+		env.FEED_TAGS.get(poolKey(thisPool), "json") as Promise<unknown[] | null>,
+		loadModApproved(env),
+	]);
+	// Trim to the freshest few per player before storing (the Feed serves ≤3/handle; storing/moderating
+	// the actor's ~12/handle is pure waste — this keeps the snapshot + the moderation universe small).
+	const trimmedPlayers = capPerHandle([...players].sort(byTimestampDesc), MODERATE_KEEP_PER_HANDLE);
+	carryForwardVerdicts(trimmedPlayers, priorPool ?? [], approvedSet);
+	const playerCards = await writeSideOrKeepLastGood(env, ctx, poolKey(thisPool), trimmedPlayers, "player", POOL_SNAPSHOT_TTL);
 
 	let clubs: string;
-	if (bdConfigured) {
+	if (opts?.playersOnly) {
+		clubs = "skipped (players-only)"; // a manual player refresh must NEVER touch Club News (Bright Data)
+	} else if (bdConfigured) {
 		clubs = await triggerBrightDataClubs(env, ctx);
 	} else {
 		const fresh = instagram.filter((c) => (c as { placement?: string }).placement === "home");
@@ -6813,9 +6963,86 @@ async function handleAlertSelfTest(request: Request, env: Env, ctx: ExecutionCon
 			let ok = false; try { ok = (await fetch(hc)).ok; } catch { /* ok stays false */ }
 			return json({ do: "heartbeat", pinged: true, ok, note: "pinged the proxy healthchecks.io check" });
 		}
+		case "imgmod": {
+			// Accept Meta's one-time license for the vision model AND (optionally) live-test the safety
+			// pass on a specific image. `?do=imgmod` alone accepts the license (account-wide, idempotent);
+			// add `&url=<image>` to classify that image through the real moderateSnapshotBatch path.
+			if (!env.AI) return json({ do: "imgmod", ok: false, note: "AI binding unset — deploy with the `ai` binding first" });
+			let license: string;
+			try {
+				const out = await env.AI.run(IMGMOD_MODEL, { prompt: "agree" });
+				license = `accepted (model replied: ${String((out as { response?: unknown })?.response ?? "").slice(0, 80)})`;
+			} catch (e) {
+				return json({ do: "imgmod", ok: false, step: "license", error: String((e as Error)?.message ?? e).slice(0, 200) });
+			}
+			const testUrl = new URL(request.url).searchParams.get("url");
+			if (!testUrl) return json({ do: "imgmod", ok: true, license, note: "license accepted (one-time, account-wide). Add &url=<image> to live-test the safety check." });
+			const testCard: { id: string; url: string; thumbnailURL: string; handle: string; mod?: string } = { id: "selftest", url: testUrl, thumbnailURL: testUrl, handle: "@selftest" };
+			const res = await moderateSnapshotBatch([testCard], new Set(), 1, {
+				ai: env.AI,
+				fetchImageBytes,
+				diag: (kind, detail) => emitDiag(env, ctx, kind, detail),
+			});
+			const verdict = res.dropped ? "UNSAFE (dropped)"
+				: (res.cards[0] as { mod?: string })?.mod === "ok" ? "SAFE (kept)"
+				: "UNJUDGED — the fetch or AI call failed, so it fail-open KEEPS it (check the image URL is fresh)";
+			return json({ do: "imgmod", ok: true, license, testUrl, verdict });
+		}
+		case "moderate": {
+			// Kick a moderation pass RIGHT NOW (same work the 5-min tick does) — for clearing the backlog
+			// immediately after a deploy without waiting for the next tick. Hit it repeatedly to blast
+			// through faster; each pass does one pool's batch. Reports counts via the diag it emits.
+			if (!env.AI) return json({ do: "moderate", ok: false, note: "AI binding unset" });
+			await moderateSnapshotTick(env, ctx);
+			return json({ do: "moderate", ok: true, note: "ran one moderation pass now — see imageModerationRun in /telemetry/recent; hit again to process the next batch, or just let the 5-min tick finish it" });
+		}
 		default:
-			return json({ error: "unknown ?do=", allowed: ["email", "synthetic", "aggregate", "digest", "heartbeat"] });
+			return json({ error: "unknown ?do=", allowed: ["email", "synthetic", "aggregate", "digest", "heartbeat", "imgmod", "moderate"] });
 	}
+}
+
+/** GET/POST /admin/moderation-drops — review surface for the Social image-safety backstop's drops.
+ *  `{op:"list"}` (default) → recent drops + counts (total / dropped / approved / by-reason). `{op:"approve",
+ *  postId, postUrl}` → seed the verdict cache 'safe' (so the next scrape keeps it) + flip the row to
+ *  'approved'. Portal surface → `adminGate {jwt:true}`. No-ops (503) when Supabase is unset. */
+async function handleModerationDrops(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
+	const gate = await adminGate(request, env as unknown as AdminAuthEnv, { jwt: true },
+		(kind, detail) => emitDiag(env, ctx, kind, detail));
+	if (gate) return gate;
+	const json = (b: unknown, status = 200) => new Response(JSON.stringify(b), { status, headers: { "Content-Type": "application/json" } });
+	const sb = env as unknown as { SUPABASE_URL?: string; SUPABASE_SERVICE_ROLE_KEY?: string };
+	if (!sb.SUPABASE_URL || !sb.SUPABASE_SERVICE_ROLE_KEY) return json({ error: "supabase unset" }, 503);
+	const base = sb.SUPABASE_URL.replace(/\/$/, ""), svcKey = sb.SUPABASE_SERVICE_ROLE_KEY;
+	const headers = { apikey: svcKey, Authorization: `Bearer ${svcKey}`, "Content-Type": "application/json" };
+
+	let body: { op?: string; postId?: string; postUrl?: string } = {};
+	if (request.method === "POST") { try { body = await request.json(); } catch { /* empty/invalid → default list */ } }
+	const op = body.op ?? "list";
+
+	if (op === "approve") {
+		if (!body.postId || !body.postUrl) return json({ error: "postId + postUrl required" }, 400);
+		// Keep it going forward: add the post URL to the approve allowlist so future scrapes + the
+		// moderation cron treat it as safe (never re-dropped). One small KV key, read-modify-write.
+		try {
+			const cur = (await env.FEED_TAGS.get(MOD_APPROVED_KEY, "json")) as string[] | null;
+			const set = new Set(Array.isArray(cur) ? cur : []); set.add(body.postUrl);
+			await env.FEED_TAGS.put(MOD_APPROVED_KEY, JSON.stringify([...set]));
+		} catch { /* KV budget — the Supabase row flip below is the durable record */ }
+		const r = await fetch(`${base}/rest/v1/rpc/approve_moderation_drop`, { method: "POST", headers, body: JSON.stringify({ p_post_id: body.postId }) });
+		if (!r.ok) { emitDiag(env, ctx, "moderationApproveFail", `${r.status}`); return json({ error: `approve failed ${r.status}` }, 502); }
+		return json({ ok: true, approved: body.postId });
+	}
+
+	// list (default): recent drops, newest first, + summary counts.
+	const r = await fetch(`${base}/rest/v1/moderation_drops?select=*&order=dropped_at.desc&limit=200`, { headers });
+	if (!r.ok) return json({ error: `list failed ${r.status}` }, 502);
+	const drops = (await r.json()) as Array<{ status?: string; reason?: string }>;
+	const counts = { total: drops.length, dropped: 0, approved: 0, byReason: {} as Record<string, number> };
+	for (const d of drops) {
+		if (d.status === "approved") counts.approved++; else counts.dropped++;
+		const key = d.reason || "unspecified"; counts.byReason[key] = (counts.byReason[key] ?? 0) + 1;
+	}
+	return json({ drops, counts });
 }
 
 /** Owner view of recent telemetry: `GET /telemetry/recent` (newest first), gated by the same
