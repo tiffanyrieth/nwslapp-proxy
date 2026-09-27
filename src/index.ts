@@ -1608,6 +1608,13 @@ async function proxyScoreboardWindow(
 			const dayUrl = new URL(url);
 			dayUrl.searchParams.set("dates", day);
 			dayUrl.searchParams.delete("_cb"); // we control per-day busting, not the caller
+			// ⚠️ STRIP limit: `dates=YYYYMMDD&limit=500` is the "schedule-extraction" shape ESPN serves
+			// from its 25–47-min-STALE cache, so a live match reads `pre` for its opening ~half hour (the
+			// app's live poll appends limit=500 to the window query). Plain single-day `dates=YYYYMMDD` is
+			// FRESH, and a single day is ≤6 games — far under ESPN's 100 default — so limit is never needed
+			// here. Live-proven 2026-09-26 (POR–HOU: with limit → pre/0'; without → in). Fixes every shipped
+			// app build with no update. See docs/backend.md SCOREBOARD CACHING & FALLBACK.
+			dayUrl.searchParams.delete("limit");
 			const res = await proxyAndCache(dayUrl, upstreamBase, chooseTTL, ctx, env, day === today);
 			try {
 				return (await res.json()) as { events?: Record<string, unknown>[]; leagues?: unknown };
