@@ -4661,7 +4661,7 @@ const REPORTER_NAMES: Record<string, string> = {
 	"lesleyryder.bsky.social": "Lesley Ryder",
 	"phuocerman.bsky.social": "Phuoc Nguyen",
 	"tayvincent6.bsky.social": "Taylor Vincent",
-	"theolloydhughes.bsky.social": "Alison Gale",
+	"theolloydhughes.bsky.social": "Theo Lloyd-Hughes",
 };
 function prettyHandleName(handle: string): string {
 	const h = handle.replace(/^@/, "");
@@ -5044,7 +5044,14 @@ async function handleValidateReporter(url: URL, env: Env, ctx: ExecutionContext)
 	} catch {
 		return jsonResponse({ found: false }, 200); // account doesn't resolve
 	}
-	const displayName = feed.find((it) => it.post?.author)?.post?.author?.displayName || raw;
+	// The handle OWNER's name — never a reposted author's. A repost item (`reason` set) carries the
+	// ORIGINAL poster under post.author, so the old first-item lookup returned whoever they last
+	// reposted (2026-10-01: Theo Lloyd-Hughes read as "Alison Gale"). Prefer an own post, then any
+	// non-repost, then the bare handle.
+	const own =
+		feed.find((it) => !it.reason && it.post?.author?.handle?.toLowerCase() === raw) ??
+		feed.find((it) => !it.reason && it.post?.author);
+	const displayName = own?.post?.author?.displayName || raw;
 	const cards = feed
 		.filter((it) => !it.reason && it.post?.record?.text)
 		.map((it) => mapBskyPost(it.post as BskyPost, { handle: raw, kind: "reporter" }))
