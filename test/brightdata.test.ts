@@ -101,36 +101,45 @@ test("webhook: wrong/missing auth or unset secret → 403, nothing written", asy
 	assert.equal([...store.keys()].some((k) => k.startsWith("social-cards")), false);
 });
 
-test("webhook: valid delivery → maps known handles, writes the player key", async () => {
+// ⚠️ Since the 2026-08-14 swap (#99) the Bright Data webhook serves the CLUB side: it maps the 16 club
+// handles (CLUB_HANDLES) and writes `social-cards-club-v1`; players moved to the Apify cron. These three
+// tests were written for the pre-swap player shape and sat unrun (an extensionless import broke the file
+// under node --test) until 2026-09-30 — rewritten for the club contract.
+const clubItem = (over: Record<string, unknown> = {}): Record<string, unknown> =>
+	bdItem({ user_posted: "gothamfc", shortcode: "CLUB1", url: "https://www.instagram.com/p/CLUB1/", ...over });
+
+test("webhook: valid delivery → maps known CLUB handles, writes the club key", async () => {
 	const { env, store } = stubEnv("s3cret");
-	const items = [bdItem(), bdItem({ user_posted: "not_a_tracked_account", shortcode: "XYZ" })];
+	const items = [clubItem(), clubItem({ user_posted: "not_a_tracked_account", shortcode: "XYZ" })];
 	const resp = await handleBrightDataWebhook(webhook(items, "s3cret"), env, ctx);
 	assert.equal(resp.status, 200);
 	const summary = (await resp.json()) as { received: number; cards: number; kept: number };
 	assert.equal(summary.received, 2);
 	assert.equal(summary.cards, 1); // the untracked account is dropped
-	const written = JSON.parse(store.get("social-cards-player-v1")!) as Card[];
+	const written = JSON.parse(store.get("social-cards-club-v1")!) as Card[];
 	assert.equal(written.length, 1);
-	assert.equal(written[0].handle, "@trinity_rodman");
+	assert.equal(written[0].handle, "@gothamfc");
+	assert.equal(written[0].placement, "home"); // club IG = Home Club News, never Social
+	assert.equal(store.has("social-cards-player-v1"), false); // the player side is Apify's, untouched
 });
 
-test("webhook: empty delivery keeps the last-good player snapshot (re-put, not blanked)", async () => {
-	const lastGood = [{ id: "ig-OLD", placement: "feed", handle: "@trinity_rodman" }];
-	const { env, store } = stubEnv("s3cret", { "social-cards-player-v1": JSON.stringify(lastGood) });
+test("webhook: empty delivery keeps the last-good club snapshot (re-put, not blanked)", async () => {
+	const lastGood = [{ id: "ig-OLD", placement: "home", handle: "@gothamfc" }];
+	const { env, store } = stubEnv("s3cret", { "social-cards-club-v1": JSON.stringify(lastGood) });
 	const resp = await handleBrightDataWebhook(webhook([], "s3cret"), env, ctx);
 	assert.equal(resp.status, 200);
 	const summary = (await resp.json()) as { kept: number };
 	assert.equal(summary.kept, 1);
-	assert.deepEqual(JSON.parse(store.get("social-cards-player-v1")!), lastGood);
+	assert.deepEqual(JSON.parse(store.get("social-cards-club-v1")!), lastGood);
 });
 
-test("webhook: empty delivery with no prior player key falls back to the LEGACY combined key", async () => {
+test("webhook: empty delivery with no prior club key falls back to the LEGACY combined key", async () => {
 	const legacy = [
 		{ id: "ig-CLUB", placement: "home" },
 		{ id: "ig-PLAYER", placement: "feed" },
 	];
 	const { env, store } = stubEnv("s3cret", { "social-cards-v1": JSON.stringify(legacy) });
 	await handleBrightDataWebhook(webhook([], "s3cret"), env, ctx);
-	const written = JSON.parse(store.get("social-cards-player-v1")!) as Array<{ id: string }>;
-	assert.deepEqual(written.map((c) => c.id), ["ig-PLAYER"]); // only the feed side seeds the player key
+	const written = JSON.parse(store.get("social-cards-club-v1")!) as Array<{ id: string }>;
+	assert.deepEqual(written.map((c) => c.id), ["ig-CLUB"]); // only the home side seeds the club key
 });
