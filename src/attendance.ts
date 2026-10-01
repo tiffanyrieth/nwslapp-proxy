@@ -23,7 +23,7 @@
 // Wikipedia is aggregates-only, FBref/FotMob/Sofascore/FootyStats are bot-walled and
 // Opta-fed) is recorded in docs/backend.md — do not re-litigate it from scratch.
 
-import { ESPN_HEADERS } from "./espn-ua";
+import { ESPN_HEADERS } from "./espn-ua.ts";
 
 // Self-declared ESPN bases (index.ts's consts aren't importable without a cycle; these are the
 // same stable strings). NWSL default only — the backstop deliberately covers NWSL matches, not

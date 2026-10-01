@@ -163,8 +163,12 @@ test("buildForecastUrl spans the window's UTC dates and requests the full field 
 	const kickoff = Date.parse("2026-08-14T23:00:00Z"); // window +2h crosses into the 15th UTC
 	const url = buildForecastUrl(coords, kickoff);
 	assert.ok(url.startsWith("https://api.open-meteo.com/v1/forecast?"));
-	assert.match(url, /start_date=2026-08-14/);
-	assert.match(url, /end_date=2026-08-15/); // kickoff+2h = 01:00Z next day
+	// ±1 UTC day around kickoff (2026-08-12, #94): `timezone=auto` returns venue-LOCAL days, so the range is
+	// widened one day each side to guarantee the local match day + its sunset are covered. The 4-hour
+	// game WINDOW is unchanged — extractWindow still strips exactly kickoff −1h … +2h out of this payload.
+	assert.match(url, /start_date=2026-08-13/);
+	assert.match(url, /end_date=2026-08-15/);
+	assert.match(url, /timezone=auto/);
 	for (const field of ["temperature_2m", "apparent_temperature", "weather_code", "is_day", "wind_speed_10m", "precipitation_probability"]) {
 		assert.match(url, new RegExp(field), `hourly has ${field}`);
 	}
@@ -189,7 +193,7 @@ test("extractWindow pulls the 4 window hours with kickoff at index 1", () => {
 	};
 	const w = extractWindow(payload, "2026-08-14T19:00"); // kickoff 7 PM
 	assert.equal(w.length, 4);
-	assert.equal(w[1].time, "2026-08-14T19:00Z"); // kickoff at index 1
+	assert.equal(w[1].time, "2026-08-14T19:00:00.000Z"); // kickoff at index 1 — a full UTC instant (with seconds) since #94
 	assert.equal(w[0].tempF, 82); // kickoff −1h = 6 PM
 	assert.equal(w[1].tempF, 84);
 	assert.equal(w[1].feelsLikeF, 90);
@@ -212,8 +216,8 @@ test("extractWindow handles a window crossing UTC midnight", () => {
 	};
 	const w = extractWindow(payload, "2026-08-14T23:00"); // kickoff 11 PM UTC
 	assert.equal(w.length, 4);
-	assert.equal(w[1].time, "2026-08-14T23:00Z");
-	assert.equal(w[3].time, "2026-08-15T01:00Z"); // +2h rolled the date
+	assert.equal(w[1].time, "2026-08-14T23:00:00.000Z");
+	assert.equal(w[3].time, "2026-08-15T01:00:00.000Z"); // +2h rolled the date
 });
 
 test("extractWindow returns null if any window hour is missing (no partial strip)", () => {
