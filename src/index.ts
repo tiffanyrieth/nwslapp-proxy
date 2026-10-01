@@ -50,6 +50,21 @@ import {
 	type RawItem,
 	type SourceTier,
 } from "./club-beat.ts";
+import {
+	PODCAST_SEED,
+	MAX_PODCASTS_PER_CLUB,
+	MAX_EPISODES_PER_SHOW,
+	PODCAST_INACTIVE_DAYS,
+	parsePodcastRSS,
+	normalizeDuration,
+	normalizeForMatch,
+	routeEpisode,
+	applyPodcastChanges,
+	isValidPodcastList,
+	showLinks,
+	type PodcastShow,
+	type PodcastEpisode,
+} from "./podcasts.ts";
 import { adminAuthed, adminGate, safeEqual, type AdminAuthEnv } from "./admin-auth.ts";
 import { handleAnalyticsAdmin, computeMetrics } from "./analytics-admin.ts";
 import { ADMIN_PORTAL_HTML } from "./admin-portal.ts";
@@ -1130,9 +1145,22 @@ that needs more users) until you bring it back.</p>
 			if (!auditAuthed(request, env)) {
 				return new Response("Authentication required.", { status: 401, headers: { "WWW-Authenticate": adminRealm("NWSLApp Admin") } });
 			}
+			if (url.searchParams.get("family") === "podcasts") {
+				const p = await refreshPodcastsSnapshot(env, ctx);
+				emitDiag(env, ctx, "podcastRefresh", `${p.refreshed}/${p.total} ok${p.failed.length ? `, ${p.failed.length} failed` : ""}`);
+				return jsonResponse(p, 200);
+			}
 			const summary = await refreshSocialSources(env, ctx);
 			emitDiag(env, ctx, "socialSourcesRefresh", `${summary.refreshed}/${summary.total} ok${summary.failed.length ? `, ${summary.failed.length} failed` : ""}${summary.carried ? `, ${summary.carried} carried` : ""}`);
 			return jsonResponse(summary, 200);
+		}
+		// Podcast directory (public, 1h edge) — the Settings directory + Listen toggle source.
+		if (url.pathname === "/podcasts/directory") {
+			return handlePodcastDirectory(env);
+		}
+		// Podcast show-list admin/routine surface (guarded).
+		if (url.pathname === "/social/podcasts" || url.pathname.startsWith("/social/podcasts/")) {
+			return handlePodcastsAdmin(request, env, ctx);
 		}
 
 		// POST telemetry ingest must be registered BEFORE the GET-only guard below.
@@ -1562,6 +1590,13 @@ that needs more users) until you bring it back.</p>
 			// via the SELF service binding, so it never competes with this tick's alerting budget.
 			try {
 				await triggerSocialSourcesRefresh(env, ctx);
+			} catch {
+				/* best-effort; the next gated tick retries (staleness shows on the Status board) */
+			}
+			// Podcasts snapshot refresh — its OWN hourly SELF invocation (own 50-subrequest budget),
+			// independent of the 30-min family above so the 23 feed fetches never compete with it.
+			try {
+				await triggerPodcastsRefresh(env, ctx);
 			} catch {
 				/* best-effort; the next gated tick retries (staleness shows on the Status board) */
 			}
@@ -3692,6 +3727,7 @@ const STATUS_SECTIONS: Record<string, { label: string; run: (env: Env) => Promis
 	espn: { label: "ESPN core", run: () => statusCheckESPN() },
 	feeds: { label: "Feed sources", run: (env) => statusCheckFeedSources(env) },
 	beats: { label: "Club Beat", run: (env) => statusCheckBeats(env) },
+	podcasts: { label: "Podcasts", run: (env) => statusCheckPodcasts(env) },
 	ig: { label: "Instagram", run: (env) => statusCheckIG(env) },
 	alerting: { label: "Alerting", run: (env) => statusCheckAlerting(env) },
 	errors: { label: "Diagnostics", run: (env) => statusCheckErrors(env) },
@@ -4266,6 +4302,21 @@ async function triggerSocialSourcesRefresh(env: Env, ctx: ExecutionContext): Pro
 	if (!r.ok) emitDiag(env, ctx, "sourcesRefreshFail", `refresh returned HTTP ${r.status}`);
 }
 
+/** Podcasts refresh trigger — its OWN hourly SELF invocation (own 50-subrequest budget), separate
+ *  from the 30-min Club-Beat/outlet family so the 23 feed fetches never compete with it. */
+async function triggerPodcastsRefresh(env: Env, ctx: ExecutionContext): Promise<void> {
+	if (!(await dueBySnapshot(env, SOCIAL_PODCASTS_KEY, SOCIAL_PODCASTS_REFRESH_MS))) return;
+	const e = env as unknown as { SELF?: Fetcher; BRACKET_ADMIN_KEY?: string };
+	if (!e.SELF || !e.BRACKET_ADMIN_KEY) {
+		emitDiag(env, ctx, "sourcesRefreshFail", `podcasts: not configured (SELF ${e.SELF ? "ok" : "missing"}, key ${e.BRACKET_ADMIN_KEY ? "ok" : "missing"})`);
+		return;
+	}
+	const r = await e.SELF.fetch(
+		new Request(`${PROXY_PUBLIC_ORIGIN}/social/sources/refresh?family=podcasts`, { method: "POST", headers: { "x-admin-key": e.BRACKET_ADMIN_KEY } }),
+	);
+	if (!r.ok) emitDiag(env, ctx, "sourcesRefreshFail", `podcasts refresh returned HTTP ${r.status}`);
+}
+
 /** REFRESH the social sources snapshot (runs in its OWN invocation — see SOCIAL_SOURCES_KEY). Every
  *  source is isolated (a failed one keeps its previous items, flagged `ok:false` + a diag). When the
  *  lists outgrow REFRESH_SOURCE_BUDGET, the stalest sources refresh first and the rest carry
@@ -4319,6 +4370,304 @@ async function refreshSocialSources(
 	await env.FEED_TAGS.put(SOCIAL_SOURCES_KEY, JSON.stringify(snap));
 	if (carried.length) emitDiag(env, ctx, "sourcesRefreshCarried", `${carried.length} source(s) past the per-run budget carried forward`);
 	return { refreshed: due.length - failed.length, failed, carried: carried.length, total: jobs.length };
+}
+
+// ---------------------------------------------------------------------------
+// PODCASTS (2026-10-01) — a curated directory + the Listen chip. Shows are DATA (KV overlay
+// `social:podcast-list`, seed = PODCAST_SEED). The hourly refresh fetches every feed in its OWN
+// invocation (its own 50-subrequest budget, separate from the 30-min Club-Beat/outlet family) and
+// writes ONE snapshot KV key; /feed and /podcasts/directory only READ it. Pure logic (parse, route,
+// validate) lives in ./podcasts.ts. Routing reads the proxy's EXISTING roster copy in KV — ZERO new
+// ESPN calls.
+// ---------------------------------------------------------------------------
+const PODCAST_LIST_KEY = "social:podcast-list";
+const SOCIAL_PODCASTS_KEY = "social:podcasts-snapshot";
+const SOCIAL_PODCASTS_REFRESH_MS = 60 * 60 * 1000; // hourly — weekly shows don't need the 30-min cadence
+
+interface PodcastSlot {
+	meta: PodcastShow;
+	artwork?: string;
+	lastEpisodeAt: number | null;
+	ok: boolean;
+	error?: string;
+	/** Per-club mention counts across this show's recent episodes (directory chip sort). */
+	clubCounts: Record<string, number>;
+	episodes: PodcastEpisode[];
+}
+interface PodcastsSnapshot {
+	v: 1;
+	updatedAt: number;
+	at: number; // = updatedAt (dueBySnapshot gates on this)
+	shows: Record<string, PodcastSlot>;
+}
+
+async function loadPodcastShows(env: Env, ctx?: ExecutionContext): Promise<PodcastShow[]> {
+	try {
+		const raw = await env.FEED_TAGS.get(PODCAST_LIST_KEY);
+		if (!raw) return PODCAST_SEED;
+		const list = JSON.parse(raw) as unknown;
+		if (isValidPodcastList(list)) return list;
+		if (ctx) emitDiag(env, ctx, "beatListInvalid", "social:podcast-list failed validation — serving seed");
+	} catch {
+		if (ctx) emitDiag(env, ctx, "beatListInvalid", "social:podcast-list unreadable — serving seed");
+	}
+	return PODCAST_SEED;
+}
+
+async function readPodcastsSnapshot(env: Env): Promise<PodcastsSnapshot | null> {
+	try {
+		const snap = (await env.FEED_TAGS.get(SOCIAL_PODCASTS_KEY, "json")) as PodcastsSnapshot | null;
+		return snap && snap.v === 1 && snap.shows ? snap : null;
+	} catch {
+		return null;
+	}
+}
+
+/** Full player-name → club-abbr map for routing, from the proxy's EXISTING KV roster copy — NEVER
+ *  `nwslNameMap` (it fetches ESPN on a miss). Keys are re-normalized to the podcast matcher's form.
+ *  `social:nwsl-names` (all 16 rosters, 12h) first; `loadPlayerSocial` (featured players, always
+ *  present) as the fallback so routing still works cold. */
+async function loadRosterNameMap(env: Env): Promise<Map<string, string>> {
+	const map = new Map<string, string>();
+	try {
+		const raw = await env.FEED_TAGS.get(NWSL_NAMES_KEY);
+		if (raw) {
+			for (const [name, abbr] of JSON.parse(raw) as [string, string][]) {
+				const k = normalizeForMatch(name);
+				if (k.includes(" ")) map.set(k, abbr);
+			}
+		}
+	} catch {
+		/* fall through to featured players */
+	}
+	if (map.size === 0) {
+		for (const p of await loadPlayerSocial(env)) {
+			const k = normalizeForMatch(p.name);
+			if (k.includes(" ")) map.set(k, p.abbr);
+		}
+	}
+	return map;
+}
+
+/** Build one show's snapshot slot (uncached refresh path). Fetches the feed, parses episodes,
+ *  routes league shows (club shows inherit their scope), caps to MAX_EPISODES_PER_SHOW. */
+async function buildPodcastSlot(show: PodcastShow, roster: Map<string, string>): Promise<PodcastSlot> {
+	const r = await fetchBounded(show.rss, { headers: { "User-Agent": BROWSER_UA, Accept: "application/rss+xml, application/xml, text/xml" } });
+	if (!r.ok) throw new Error(`HTTP ${r.status}`);
+	const parsed = parsePodcastRSS(await r.text());
+	const episodes: PodcastEpisode[] = [];
+	const clubCounts: Record<string, number> = {};
+	let lastEpisodeAt: number | null = null;
+	for (const ep of parsed.episodes) {
+		if (show.titleMatch && !ep.title.toLowerCase().includes(show.titleMatch.toLowerCase())) continue;
+		const timestamp = isoNoFraction(ep.pubDate);
+		if (!timestamp) continue;
+		const title = decodeEntities(ep.title).trim();
+		const description = ep.description ? stripHtml(ep.description).slice(0, 240) : "";
+		const { clubs, matchedTerms } =
+			show.scope === "league"
+				? routeEpisode(title, description, roster)
+				: { clubs: [show.scope], matchedTerms: [] as string[] };
+		for (const c of clubs) clubCounts[c] = (clubCounts[c] ?? 0) + 1;
+		const ms = Date.parse(timestamp);
+		if (!Number.isNaN(ms)) lastEpisodeAt = Math.max(lastEpisodeAt ?? 0, ms);
+		episodes.push({
+			guid: ep.guid,
+			showId: show.id,
+			title,
+			description,
+			pubDate: timestamp,
+			duration: normalizeDuration(ep.durationRaw),
+			url: ep.link,
+			clubs,
+			matchedTerms,
+		});
+		if (episodes.length >= MAX_EPISODES_PER_SHOW) break;
+	}
+	return { meta: show, artwork: httpsImage(parsed.artwork), lastEpisodeAt, ok: true, clubCounts, episodes };
+}
+
+/** REFRESH the podcasts snapshot (own invocation via SELF — see SOCIAL_PODCASTS_KEY). Per-show
+ *  isolation: a failed feed keeps its previous slot flagged `ok:false`. ONE KV write/run (~24/day). */
+async function refreshPodcastsSnapshot(env: Env, ctx: ExecutionContext): Promise<{ refreshed: number; failed: string[]; total: number }> {
+	const prev = await readPodcastsSnapshot(env);
+	const shows = await loadPodcastShows(env, ctx);
+	const roster = await loadRosterNameMap(env);
+	const now = Date.now();
+	const out: Record<string, PodcastSlot> = {};
+	const failed: string[] = [];
+	await Promise.all(
+		shows.map(async (show) => {
+			try {
+				out[show.id] = await buildPodcastSlot(show, roster);
+			} catch (e) {
+				const msg = String((e as Error)?.message ?? e).slice(0, 80);
+				failed.push(show.id);
+				if (isTimeout(e)) emitDiag(env, ctx, "feedUpstreamTimeout", `pod:${show.id}`);
+				else if (isSubrequestCap(e)) emitDiag(env, ctx, "subrequestCapHit", `pod:${show.id}`);
+				else emitDiag(env, ctx, "podcastFeedFail", `${show.id}: ${msg}`);
+				const old = prev?.shows[show.id];
+				out[show.id] = old
+					? { ...old, ok: false, error: msg, meta: show }
+					: { meta: show, lastEpisodeAt: null, ok: false, error: msg, clubCounts: {}, episodes: [] };
+			}
+		}),
+	);
+	const snap: PodcastsSnapshot = { v: 1, updatedAt: now, at: now, shows: out };
+	await env.FEED_TAGS.put(SOCIAL_PODCASTS_KEY, JSON.stringify(snap));
+	return { refreshed: shows.length - failed.length, failed, total: shows.length };
+}
+
+const PODCAST_ACTIVE_MS = PODCAST_INACTIVE_DAYS * 86_400_000;
+const isPodcastActive = (slot: PodcastSlot, now: number): boolean =>
+	slot.lastEpisodeAt !== null && now - slot.lastEpisodeAt <= PODCAST_ACTIVE_MS;
+
+/** One podcast episode → a ContentCard (only emitted to clients that declare `caps=podcast`).
+ *  `episodeKind`: "club" = tied to a club the user follows (→ the app's "Your clubs" section);
+ *  "league" = a league show's episode not about a followed club (→ "Around the league").
+ *  `teamTag` is the followed club this episode is pinned to (undefined for a league card). */
+function podcastEpisodeCard(ep: PodcastEpisode, slot: PodcastSlot, teamTag: string | undefined, kind: "club" | "league"): unknown {
+	const followedClub = teamTag;
+	return {
+		id: `pod-${hashId(ep.showId + ep.guid)}`,
+		layout: "podcastEpisode",
+		platform: "podcast",
+		sourceType: "podcast",
+		placement: "feed",
+		handle: `pod:${ep.showId}`, // capPerHandle bounds episodes per show
+		showId: ep.showId,
+		authorName: slot.meta.name,
+		sourceName: slot.meta.name,
+		headline: `${slot.meta.name} · ${ep.title}`, // unique key for dedupeByContent
+		title: ep.title,
+		blurb: ep.description,
+		thumbnailURL: slot.artwork,
+		duration: ep.duration,
+		timestamp: ep.pubDate,
+		url: ep.url,
+		teamAbbreviation: followedClub,
+		isLeague: !followedClub,
+		clubs: ep.clubs,
+		matchedTerms: ep.matchedTerms,
+		episodeKind: kind,
+		igFallback: false,
+		ctaLabel: "Listen",
+	};
+}
+
+/** Listen-chip episode cards for a `caps=podcast` client. `hiddenShows` = the user's "Show in
+ *  Listen" opt-outs. Club-show episodes + league episodes routed to a followed club carry that
+ *  club tag (episodeKind "club"); every other league episode rides as episodeKind "league" (the
+ *  app's "Around the league" section). Zero upstream fetches — reads the snapshot. */
+function buildPodcastCards(snap: PodcastsSnapshot | null, teams: string[], hiddenShows: Set<string>, now: number): unknown[] {
+	if (!snap) return [];
+	const followed = new Set(teams);
+	const out: unknown[] = [];
+	for (const slot of Object.values(snap.shows)) {
+		if (hiddenShows.has(slot.meta.id) || !isPodcastActive(slot, now)) continue;
+		const isClubShow = slot.meta.scope !== "league";
+		for (const ep of slot.episodes) {
+			if (isClubShow) {
+				// A club show's episodes reach ONLY that club's followers (like player IG / Club Beat).
+				if (!followed.has(slot.meta.scope)) continue;
+				out.push(podcastEpisodeCard(ep, slot, slot.meta.scope, "club"));
+			} else {
+				// A league show: episodes routed to a followed club pin to "Your clubs"; the rest are
+				// "Around the league" (the app windows those to the last 7 days).
+				const followedClub = ep.clubs.find((c) => followed.has(c));
+				out.push(podcastEpisodeCard(ep, slot, followedClub, followedClub ? "club" : "league"));
+			}
+		}
+	}
+	return out;
+}
+
+/** GET /podcasts/directory — the Settings directory + the Listen toggle source. Public, 1h edge.
+ *  Shows (artwork, scope, last-episode age, per-app Follow links, per-club mention counts); inactive
+ *  shows are dropped. Reads the snapshot (zero upstream fetches). */
+async function handlePodcastDirectory(env: Env): Promise<Response> {
+	const snap = await readPodcastsSnapshot(env);
+	const now = Date.now();
+	const shows = snap
+		? Object.values(snap.shows)
+				.filter((s) => isPodcastActive(s, now))
+				.map((s) => ({
+					id: s.meta.id,
+					name: s.meta.name,
+					scope: s.meta.scope,
+					blurb: s.meta.blurb,
+					artwork: s.artwork,
+					lastEpisodeAt: s.lastEpisodeAt,
+					links: showLinks(s.meta),
+					clubCounts: s.clubCounts,
+				}))
+		: [];
+	const headers = new Headers({ "Content-Type": "application/json", "Cache-Control": "public, max-age=3600" });
+	return new Response(JSON.stringify({ shows }), { status: 200, headers });
+}
+
+/** Admin/routine surface for the podcast show list (pattern of handleBeatAudit). */
+async function handlePodcastsAdmin(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
+	if (!auditAuthed(request, env)) {
+		return new Response("Authentication required.", { status: 401, headers: { "WWW-Authenticate": adminRealm("NWSLApp Admin") } });
+	}
+	const path = new URL(request.url).pathname;
+	if (request.method === "POST" && path === "/social/podcasts/apply") {
+		let body: { add?: Partial<PodcastShow>[]; drop?: string[] };
+		try {
+			body = (await request.json()) as typeof body;
+		} catch {
+			return jsonResponse({ error: "unparseable JSON" }, 400);
+		}
+		const res = applyPodcastChanges(await loadPodcastShows(env, ctx), body);
+		if (res.added.length || res.dropped.length) await env.FEED_TAGS.put(PODCAST_LIST_KEY, JSON.stringify(res.list));
+		emitDiag(env, ctx, "podcastApply", `+${res.added.length} -${res.dropped.length} → ${res.list.length}${res.rejected.length ? ` (${res.rejected.length} rejected)` : ""}`);
+		return jsonResponse({ added: res.added, dropped: res.dropped, rejected: res.rejected, total: res.list.length, perClubRail: MAX_PODCASTS_PER_CLUB }, 200);
+	}
+	if (request.method !== "GET") return jsonResponse({ error: "method not allowed" }, 405);
+	const list = await loadPodcastShows(env, ctx);
+	const snap = await readPodcastsSnapshot(env);
+	const now = Date.now();
+	const health = list.map((s) => {
+		const slot = snap?.shows[s.id];
+		return {
+			id: s.id,
+			name: s.name,
+			scope: s.scope,
+			ok: slot?.ok ?? false,
+			episodes: slot?.episodes.length ?? 0,
+			lastEpisodeDays: slot?.lastEpisodeAt ? Math.floor((now - slot.lastEpisodeAt) / 86_400_000) : null,
+			active: slot ? isPodcastActive(slot, now) : false,
+			error: slot?.error,
+		};
+	});
+	return jsonResponse({ total: list.length, snapshotAgeMin: snap ? Math.round((now - snap.updatedAt) / 60_000) : null, shows: list, health }, 200);
+}
+
+async function statusCheckPodcasts(env: Env): Promise<StatusSection> {
+	const snap = await readPodcastsSnapshot(env);
+	const list = await loadPodcastShows(env);
+	const now = Date.now();
+	const checks: StatusCheck[] = [];
+	if (!snap) {
+		checks.push({ label: "Podcasts snapshot", status: "fail", detail: "MISSING — the hourly refresh hasn't run (check SELF binding / podcastRefresh diag)" });
+	} else {
+		const ageMin = Math.round((now - snap.updatedAt) / 60_000);
+		checks.push({ label: "Podcasts snapshot", status: ageMin > 150 ? "fail" : ageMin > 75 ? "warn" : "ok", detail: `refreshed ${ageMin} min ago (hourly)` });
+	}
+	for (const s of list.sort((a, b) => a.scope.localeCompare(b.scope))) {
+		const slot = snap?.shows[s.id];
+		const label = `${s.scope} · ${s.name}`;
+		if (!slot) checks.push({ label, status: "warn", detail: "not fetched yet (next refresh)" });
+		else if (!slot.ok) checks.push({ label, status: "fail", detail: `last refresh failed: ${slot.error ?? "error"}` });
+		else if (!isPodcastActive(slot, now)) checks.push({ label, status: "fail", detail: `no episode in ${PODCAST_INACTIVE_DAYS}d — hidden (drop candidate)` });
+		else checks.push({ label, status: "ok", detail: `${slot.episodes.length} eps · newest ${slot.lastEpisodeAt ? Math.floor((now - slot.lastEpisodeAt) / 86_400_000) : "?"}d ago` });
+	}
+	return {
+		title: `Podcasts (${list.length}) — directory + Listen chip`,
+		note: "Hourly snapshot (own SELF invocation). Shows tier on their newest episode; a show with no episode in 42d is hidden from the directory + Listen. GET /social/podcasts re-reads the list live.",
+		checks,
+	};
 }
 
 /** videos.list for the given ids + part, chunked at the API's 50-id limit. */
@@ -4451,6 +4800,11 @@ async function handleFeed(url: URL, env: Env, ctx: ExecutionContext): Promise<Re
 	// 2c: Bluesky handles the user added AS PLAYERS (the add-flow's reporter|player pick).
 	// Player voices NEVER go through Haiku (owner law) — served unfiltered like player IG.
 	const userPlayerBsky = parseHandleList(url.searchParams.get("playerBsky")).slice(0, MAX_USER_HANDLES);
+	// Capability flags the CLIENT declares (build 43 sends none): only a `podcast`-capable build gets
+	// podcast episode cards, since older builds drop unknown card layouts on decode.
+	const caps = new Set(parseHandleList(url.searchParams.get("caps")));
+	// Podcast shows the user turned OFF in "Show in Listen" (opt-out; new shows stay on).
+	const hiddenShows = new Set(parseHandleList(url.searchParams.get("shows")));
 
 	const cache = caches.default;
 	const cacheUrl = new URL(url);
@@ -4465,6 +4819,10 @@ async function handleFeed(url: URL, env: Env, ctx: ExecutionContext): Promise<Re
 	else cacheUrl.searchParams.delete("muted");
 	if (userPlayerBsky.length) cacheUrl.searchParams.set("playerBsky", [...userPlayerBsky].sort().join(","));
 	else cacheUrl.searchParams.delete("playerBsky");
+	if (caps.size) cacheUrl.searchParams.set("caps", [...caps].sort().join(","));
+	else cacheUrl.searchParams.delete("caps");
+	if (hiddenShows.size) cacheUrl.searchParams.set("shows", [...hiddenShows].sort().join(","));
+	else cacheUrl.searchParams.delete("shows");
 	const cacheKey = new Request(cacheUrl.toString(), { method: "GET" });
 
 	const hit = await cache.match(cacheKey);
@@ -4495,7 +4853,9 @@ async function handleFeed(url: URL, env: Env, ctx: ExecutionContext): Promise<Re
 		// Bluesky wave follows with its hang bound, so a Bluesky incident degrades ONLY the
 		// Bluesky sources and the rest of the feed always arrives.
 		// Social sources snapshot (Club Beat + News outlets): ONE KV read, refreshed off-path ~30 min.
+		// Podcasts snapshot only when the client is podcast-capable (build 43 sends no caps).
 		const sourcesSnap = await readSourcesSnapshot(env);
+		const podcastsSnap = caps.has("podcast") ? await readPodcastsSnapshot(env) : null;
 		const [newsCards, social, beatCards] = await Promise.all([
 			// News (B1): outlet items (snapshot) -> Haiku NWSL-gate + team-tag + followed-team
 			// filter -> capped OG-enrich -> newsArticle cards. Self-isolating; failures yield [].
@@ -4541,7 +4901,9 @@ async function handleFeed(url: URL, env: Env, ctx: ExecutionContext): Promise<Re
 		const userReporterCards = rawUserReporters.map((c) => ({ ...(c as Record<string, unknown>), userAdded: true }));
 		const userPlayerBskyCards = rawUserPlayerBsky.map((c) => ({ ...(c as Record<string, unknown>), userAdded: true }));
 		const playerSocial = socialFor(social, teams, new Set(["feed"]), userPlayers);
-		cards = [...socialBluesky, ...userReporterCards, ...newsCards, ...beatCards, ...playerSocial, ...userPlayerBskyCards].sort(
+		// Podcasts (podcast-capable clients only): episode cards from the hourly snapshot (zero fetches).
+		const podcastCards = buildPodcastCards(podcastsSnap, teams, hiddenShows, Date.now());
+		cards = [...socialBluesky, ...userReporterCards, ...newsCards, ...beatCards, ...playerSocial, ...userPlayerBskyCards, ...podcastCards].sort(
 			byTimestampDesc,
 		);
 		// Collapse identical-text duplicates (bot double-posts) BEFORE the cap, so a
@@ -7032,6 +7394,10 @@ const ANALYTICS_EVENTS = new Set([
 	// endpoint aggregates these into addSignals; threshold judgment lives in the routine.
 	"reporter_added",
 	"reporter_add_session", // denominator: sessions that added ANY reporter
+	// Podcasts (2026-10-01): directory Follow taps, Listen episode taps, Listen chip opens. No identity.
+	"podcast_follow_tapped",
+	"podcast_episode_tapped",
+	"listen_opened",
 	// Engagement counters (2026-08-22): all coarse buckets, self-deduped per window on-device, no identity.
 	"active_week",       // param new/returning — once per ISO week per device → sum = WAU
 	"active_month",      // param new/returning — once per calendar month per device → sum = MAU (2026-08-28)
@@ -7125,7 +7491,7 @@ const ALERT_ERROR_KINDS = new Set([
 	// Social Club Beat / relevance gate (2026-09-30). `haikuFailure` = the relevance classifier failed
 	// (posts unjudged → social/beat dropped, news kept league-wide); `beatListInvalid` = a malformed
 	// source-list overlay (seed served instead).
-	"haikuFailure", "beatListInvalid", "subrequestCapHit",
+	"haikuFailure", "beatListInvalid", "subrequestCapHit", "podcastFeedFail",
 ]);
 
 /** The ONE owner-email primitive (Resend). Every alerting path — the scheduled synthetic checks, the
