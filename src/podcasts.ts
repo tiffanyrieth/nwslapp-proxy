@@ -126,6 +126,9 @@ export interface ParsedPodcast {
 	artwork?: string;
 	/** The show's own author/network (`<itunes:author>` / `<managingEditor>`) — the credit byline. */
 	author?: string;
+	/** The podcaster set `<itunes:block>yes</itunes:block>` — an explicit "don't list me in directories"
+	 *  opt-out. We honor it: the show is dropped from Listen + the directory. */
+	blocked: boolean;
 	episodes: RawEpisode[];
 }
 
@@ -149,6 +152,11 @@ export function parsePodcastRSS(xml: string): ParsedPodcast {
 	const channel = xml.split(/<item[\s>]/i)[0];
 	const author = tagText(channel, "itunes:author") ?? tagText(channel, "managingEditor");
 
+	// Creator opt-out: honor a channel-level <itunes:block>yes</itunes:block> (podcasters use it to
+	// tell directories not to list them). An item-level block is per-episode and rarer; we only read
+	// the channel block, so an episode author can't flip the whole show.
+	const blocked = /^\s*yes\s*$/i.test(tagText(channel, "itunes:block") ?? "");
+
 	const episodes: RawEpisode[] = [];
 	const blocks = xml.match(/<item[\s>][\s\S]*?<\/item>/g) ?? [];
 	for (const block of blocks) {
@@ -169,7 +177,7 @@ export function parsePodcastRSS(xml: string): ParsedPodcast {
 			description: tagText(block, "description") ?? tagText(block, "itunes:summary") ?? tagText(block, "content:encoded"),
 		});
 	}
-	return { artwork, author: author ? decodeAmp(author) : undefined, episodes };
+	return { artwork, author: author ? decodeAmp(author) : undefined, blocked, episodes };
 }
 
 /** Minimal entity decode for the author byline (feeds vary). */

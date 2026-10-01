@@ -54,6 +54,18 @@ test("parsePodcastRSS: channel artwork + items with guid, duration, description"
 	assert.equal(p.episodes[0].link, "https://pod.example/ep/1");
 	assert.equal(p.episodes[0].durationRaw, "01:03:18");
 	assert.equal(p.episodes[1].guid, "https://cdn.example/2.mp3"); // falls back to enclosure url
+	assert.equal(p.blocked, false);
+});
+
+test("parsePodcastRSS: honors a channel-level itunes:block=yes opt-out", () => {
+	const blockedXml =
+		`<rss><channel><title>Private Pod</title>` +
+		`<itunes:block>Yes</itunes:block>` +
+		`<item><title>Ep 1</title><guid>g1</guid><pubDate>Sun, 28 Sep 2026 12:00:00 GMT</pubDate></item>` +
+		`</channel></rss>`;
+	assert.equal(parsePodcastRSS(blockedXml).blocked, true);
+	// A "no" (or absent) block must not opt the show out.
+	assert.equal(parsePodcastRSS(`<rss><channel><itunes:block>no</itunes:block></channel></rss>`).blocked, false);
 });
 
 test("normalizeDuration: seconds and colon forms", () => {

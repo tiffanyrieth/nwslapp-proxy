@@ -1158,6 +1158,12 @@ that needs more users) until you bring it back.</p>
 		if (url.pathname === "/podcasts/directory") {
 			return handlePodcastDirectory(env);
 		}
+		// Sources directory (public, 1h edge) — the "Reporters & outlets" settings screen, built from
+		// the CONFIGURED source lists (never transient feed cards), so every source always shows with
+		// its true coverage (All For XI reads as a league Outlet, not Gotham coverage).
+		if (url.pathname === "/social/sources/directory") {
+			return handleSourcesDirectory(env, ctx);
+		}
 		// Podcast show-list admin/routine surface (guarded).
 		if (url.pathname === "/social/podcasts" || url.pathname.startsWith("/social/podcasts/")) {
 			return handlePodcastsAdmin(request, env, ctx);
@@ -4391,6 +4397,9 @@ interface PodcastSlot {
 	lastEpisodeAt: number | null;
 	ok: boolean;
 	error?: string;
+	/** The show set <itunes:block>yes</itunes:block> — a creator opt-out. Kept in the slot so a
+	 *  later un-block clears on the next refresh; excluded from Listen + the directory while true. */
+	blocked?: boolean;
 	/** Per-club mention counts across this show's recent episodes (directory chip sort). */
 	clubCounts: Record<string, number>;
 	episodes: PodcastEpisode[];
@@ -4485,7 +4494,7 @@ async function buildPodcastSlot(show: PodcastShow, roster: Map<string, string>):
 		});
 		if (episodes.length >= MAX_EPISODES_PER_SHOW) break;
 	}
-	return { meta: show, artwork: httpsImage(parsed.artwork), author: parsed.author, lastEpisodeAt, ok: true, clubCounts, episodes };
+	return { meta: show, artwork: httpsImage(parsed.artwork), author: parsed.author, blocked: parsed.blocked, lastEpisodeAt, ok: true, clubCounts, episodes };
 }
 
 /** REFRESH the podcasts snapshot (own invocation via SELF — see SOCIAL_PODCASTS_KEY). Per-show
@@ -4522,6 +4531,10 @@ async function refreshPodcastsSnapshot(env: Env, ctx: ExecutionContext): Promise
 const PODCAST_ACTIVE_MS = PODCAST_INACTIVE_DAYS * 86_400_000;
 const isPodcastActive = (slot: PodcastSlot, now: number): boolean =>
 	slot.lastEpisodeAt !== null && now - slot.lastEpisodeAt <= PODCAST_ACTIVE_MS;
+/** Listable = fresh enough AND the creator hasn't opted out via itunes:block. Everything the app
+ *  sees (Listen cards + the directory) uses THIS; the Status board still shows blocked shows so the
+ *  owner knows why one vanished. */
+const isPodcastListable = (slot: PodcastSlot, now: number): boolean => isPodcastActive(slot, now) && !slot.blocked;
 
 /** One podcast episode → a ContentCard (only emitted to clients that declare `caps=podcast`).
  *  `episodeKind`: "club" = tied to a club the user follows (→ the app's "Your clubs" section);
@@ -4575,17 +4588,24 @@ function podcastEpisodeCard(ep: PodcastEpisode, slot: PodcastSlot, followed: Set
  *  Listen" opt-outs. Club-show episodes + league episodes routed to a followed club carry that
  *  club tag (episodeKind "club"); every other league episode rides as episodeKind "league" (the
  *  app's "Around the league" section). Zero upstream fetches — reads the snapshot. */
-function buildPodcastCards(snap: PodcastsSnapshot | null, teams: string[], hiddenShows: Set<string>, now: number): unknown[] {
+function buildPodcastCards(
+	snap: PodcastsSnapshot | null,
+	teams: string[],
+	hiddenShows: Set<string>,
+	addedShows: Set<string>,
+	now: number,
+): unknown[] {
 	if (!snap) return [];
 	const followed = new Set(teams);
 	const out: unknown[] = [];
 	for (const slot of Object.values(snap.shows)) {
-		if (hiddenShows.has(slot.meta.id) || !isPodcastActive(slot, now)) continue;
+		if (hiddenShows.has(slot.meta.id) || !isPodcastListable(slot, now)) continue;
 		const isClubShow = slot.meta.scope !== "league";
-		// A club pod reaches ONLY its club's followers ("Your clubs"); a league show reaches everyone
-		// ("Around the league"). The app de-dupes to the newest episode per show, so emit all here and
-		// let it pick the freshest (a show could drop several in a week).
-		if (isClubShow && !followed.has(slot.meta.scope)) continue;
+		// Club pods follow the Players model: a FOLLOWED club's pod is on by default ("Your clubs"); a
+		// pod for a club you don't follow is OFF unless you opted into it in the directory (addedShows)
+		// — a KC fan who follows an Angel City player can add the Angel City pod. League shows reach
+		// everyone ("Around the league"). The app de-dupes to the newest episode per show.
+		if (isClubShow && !followed.has(slot.meta.scope) && !addedShows.has(slot.meta.id)) continue;
 		for (const ep of slot.episodes) out.push(podcastEpisodeCard(ep, slot, followed));
 	}
 	return out;
@@ -4599,7 +4619,7 @@ async function handlePodcastDirectory(env: Env): Promise<Response> {
 	const now = Date.now();
 	const shows = snap
 		? Object.values(snap.shows)
-				.filter((s) => isPodcastActive(s, now))
+				.filter((s) => isPodcastListable(s, now))
 				.map((s) => ({
 					id: s.meta.id,
 					name: s.meta.name,
@@ -4615,6 +4635,56 @@ async function handlePodcastDirectory(env: Env): Promise<Response> {
 		: [];
 	const headers = new Headers({ "Content-Type": "application/json", "Cache-Control": "public, max-age=3600" });
 	return new Response(JSON.stringify({ shows }), { status: 200, headers });
+}
+
+/** Readable names for the default Bluesky handles (the list stores only handles). Routine-added
+ *  handles fall back to a prettified handle. Display-only: the handle does the real work (muting,
+ *  identity), so an imperfect name here never mis-targets anything. */
+const REPORTER_NAMES: Record<string, string> = {
+	"meglinehan.com": "Meg Linehan",
+	"jeffkassouf.bsky.social": "Jeff Kassouf",
+	"sandraherrera.bsky.social": "Sandra Herrera",
+	"pcattry.bsky.social": "Pardeep Cattry",
+	"katiewhyatt.bsky.social": "Katie Whyatt",
+	"scoutripley.bsky.social": "Claire Watkins",
+	"jennatonelli.bsky.social": "Jenna Tonelli",
+	"jeffrueter.bsky.social": "Jeff Rueter",
+	"jtannenwald.bsky.social": "Jonathan Tannenwald",
+	"girlssoccernetwork.bsky.social": "Girls Soccer Network",
+	"nwslsoccer.com": "NWSL",
+	"equalizersoccer.bsky.social": "The Equalizer",
+	"nwslthisweek.bsky.social": "NWSL This Week",
+	"nwslstat.bsky.social": "NWSL Stats",
+	"allforxi.bsky.social": "All For XI",
+};
+function prettyHandleName(handle: string): string {
+	const h = handle.replace(/^@/, "");
+	if (REPORTER_NAMES[h]) return REPORTER_NAMES[h];
+	return h.endsWith(".bsky.social") ? h.slice(0, -".bsky.social".length) : h;
+}
+
+/** GET /social/sources/directory — the "Reporters & outlets" settings screen, built from the three
+ *  CONFIGURED lists (news outlets + reporter handles + Club Beat), not from whatever cards happen to
+ *  be in the current feed. Grouped by COVERAGE for the app: league-wide (outlets + reporters) vs club
+ *  coverage (beat). Each row carries what the app needs to drive its mute toggle (name + handle);
+ *  `type` is "News site" or "Bluesky" for the subtitle. Public, 1h edge. */
+async function handleSourcesDirectory(env: Env, ctx: ExecutionContext): Promise<Response> {
+	const [outlets, handles, beats] = await Promise.all([loadNewsFeeds(env, ctx), loadFeedHandles(env), loadBeatSources(env, ctx)]);
+	const league = [
+		...outlets.map((f) => ({ id: `news:${f.url}`, name: f.source, type: "News site" as const })),
+		...handles.map((h) => ({ id: `bsky:${h.handle}`, name: prettyHandleName(h.handle), handle: `@${h.handle.replace(/^@/, "")}`, type: "Bluesky" as const })),
+	].sort((a, b) => a.name.localeCompare(b.name));
+	const clubs = beats
+		.map((b) => ({
+			id: `beat:${b.id}`,
+			abbr: b.abbr,
+			name: b.name,
+			handle: b.kind === "bluesky" && b.handle ? `@${b.handle.replace(/^@/, "")}` : undefined,
+			type: b.kind === "bluesky" ? ("Bluesky" as const) : ("News site" as const),
+		}))
+		.sort((a, b) => a.abbr.localeCompare(b.abbr) || a.name.localeCompare(b.name));
+	const headers = new Headers({ "Content-Type": "application/json", "Cache-Control": "public, max-age=3600" });
+	return new Response(JSON.stringify({ league, clubs }), { status: 200, headers });
 }
 
 /** Admin/routine surface for the podcast show list (pattern of handleBeatAudit). */
@@ -4671,6 +4741,7 @@ async function statusCheckPodcasts(env: Env): Promise<StatusSection> {
 		const label = `${s.scope} · ${s.name}`;
 		if (!slot) checks.push({ label, status: "warn", detail: "not fetched yet (next refresh)" });
 		else if (!slot.ok) checks.push({ label, status: "fail", detail: `last refresh failed: ${slot.error ?? "error"}` });
+		else if (slot.blocked) checks.push({ label, status: "warn", detail: "creator opt-out (itunes:block=yes) — hidden from Listen + directory" });
 		else if (!isPodcastActive(slot, now)) checks.push({ label, status: "fail", detail: `no episode in ${PODCAST_INACTIVE_DAYS}d — hidden (drop candidate)` });
 		else checks.push({ label, status: "ok", detail: `${slot.episodes.length} eps · newest ${slot.lastEpisodeAt ? Math.floor((now - slot.lastEpisodeAt) / 86_400_000) : "?"}d ago` });
 	}
@@ -4814,8 +4885,11 @@ async function handleFeed(url: URL, env: Env, ctx: ExecutionContext): Promise<Re
 	// Capability flags the CLIENT declares (build 43 sends none): only a `podcast`-capable build gets
 	// podcast episode cards, since older builds drop unknown card layouts on decode.
 	const caps = new Set(parseHandleList(url.searchParams.get("caps")));
-	// Podcast shows the user turned OFF in "Show in Listen" (opt-out; new shows stay on).
+	// Podcast shows the user turned OFF in "Show in Listen" (opt-out; followed-club pods + league
+	// shows are on by default). `addShows` = pods for clubs the user does NOT follow that she opted
+	// INTO (off by default, Players-style) — a KC fan adding the Angel City pod.
 	const hiddenShows = new Set(parseHandleList(url.searchParams.get("shows")));
+	const addedShows = new Set(parseHandleList(url.searchParams.get("addShows")));
 
 	const cache = caches.default;
 	const cacheUrl = new URL(url);
@@ -4834,6 +4908,8 @@ async function handleFeed(url: URL, env: Env, ctx: ExecutionContext): Promise<Re
 	else cacheUrl.searchParams.delete("caps");
 	if (hiddenShows.size) cacheUrl.searchParams.set("shows", [...hiddenShows].sort().join(","));
 	else cacheUrl.searchParams.delete("shows");
+	if (addedShows.size) cacheUrl.searchParams.set("addShows", [...addedShows].sort().join(","));
+	else cacheUrl.searchParams.delete("addShows");
 	const cacheKey = new Request(cacheUrl.toString(), { method: "GET" });
 
 	const hit = await cache.match(cacheKey);
@@ -4913,7 +4989,7 @@ async function handleFeed(url: URL, env: Env, ctx: ExecutionContext): Promise<Re
 		const userPlayerBskyCards = rawUserPlayerBsky.map((c) => ({ ...(c as Record<string, unknown>), userAdded: true }));
 		const playerSocial = socialFor(social, teams, new Set(["feed"]), userPlayers);
 		// Podcasts (podcast-capable clients only): episode cards from the hourly snapshot (zero fetches).
-		const podcastCards = buildPodcastCards(podcastsSnap, teams, hiddenShows, Date.now());
+		const podcastCards = buildPodcastCards(podcastsSnap, teams, hiddenShows, addedShows, Date.now());
 		cards = [...socialBluesky, ...userReporterCards, ...newsCards, ...beatCards, ...playerSocial, ...userPlayerBskyCards, ...podcastCards].sort(
 			byTimestampDesc,
 		);
