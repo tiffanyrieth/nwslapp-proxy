@@ -30,6 +30,9 @@ export interface PodcastShow {
 	titleMatch?: string;
 	/** One-line "what it covers" for the directory row. */
 	blurb: string;
+	/** Who makes it — drives the credit tag. "fan" = independent fan/creator show; "media" =
+	 *  a professional outlet/network (The Athletic, CBS, Just Women's Sports, the Equalizer, …). */
+	producer: "fan" | "media";
 }
 
 export interface PodcastEpisode {
@@ -41,7 +44,9 @@ export interface PodcastEpisode {
 	duration?: string; // display form "H:MM:SS" / "M:SS"
 	url?: string; // episode page (the Listen fallback target)
 	clubs: string[]; // routed club abbrs; [] means league-wide
-	matchedTerms: string[]; // which names matched (Mentions line + debugging)
+	/** Which names matched, each tagged with its club — so /feed can order a reader's own clubs
+	 *  first in the "Mentions" line. (A club-name match carries that club; a player match her club.) */
+	matched: { term: string; abbr: string }[];
 }
 
 /** The 16 app club abbreviations (must match the app's club join keys). */
@@ -81,29 +86,29 @@ export const CLUB_MATCH_NAMES: Record<string, string[]> = {
 
 /** Podcast seed — Apple-lookup-verified 2026-10-01 (16 club shows + 7 league; Beatline excluded). */
 export const PODCAST_SEED: PodcastShow[] = [
-	{ id: "league-nwsl-this-week", name: "NWSL This Week", rss: "https://api.substack.com/feed/podcast/2858197.rss", scope: "league", appleId: "1763620771", spotifyUrl: "https://open.spotify.com/show/6s0txn6wZB8HsUPYHpxxiY", blurb: "Weekly recap of every NWSL match from Equalizer writers" },
-	{ id: "league-full-time", name: "Full Time", rss: "https://feeds.acast.com/public/shows/6818801871c041c8cc75b143", scope: "league", appleId: "1518818543", spotifyUrl: "https://open.spotify.com/show/2Syy27diWBkaJsjI00RJtb", blurb: "Reporter-led women's soccer show from The Athletic" },
-	{ id: "league-attacking-third", name: "Attacking Third", rss: "https://rss.amperwave.net/v2/feed/audacynetwork/attackingthird", scope: "league", appleId: "1573642138", spotifyUrl: "https://open.spotify.com/show/32OVfPoFl8BMNEsFJCnnHN", blurb: "CBS Sports' NWSL panel: recaps, transfers, analysis" },
-	{ id: "league-expected-own-goals", name: "Expected Own Goals", rss: "https://feeds.megaphone.fm/RPPSG6845772467", scope: "league", appleId: "1698924172", spotifyUrl: "https://open.spotify.com/show/30ThmaUENe9hTGo00YLFyl", blurb: "NWSL tactics and analytics, every week" },
-	{ id: "league-the-late-sub", name: "The Late Sub", rss: "https://feeds.megaphone.fm/JWS5718566426", scope: "league", appleId: "1563105123", spotifyUrl: "https://open.spotify.com/show/4n4ZxsVs1Ix9DY9E0KPSc6", blurb: "Claire Watkins on the NWSL and USWNT" },
-	{ id: "league-time-wasting", name: "Time Wasting", rss: "https://feeds.megaphone.fm/JWS9777147888", scope: "league", appleId: "1522055041", spotifyUrl: "https://open.spotify.com/show/6RTMyWpdSBY9I4vO528qX3", blurb: "Ali Riley and Kelley O'Hara on life around the league" },
-	{ id: "league-soccerwise", name: "Soccerwise", rss: "https://feeds.captivate.fm/soccerwise/", scope: "league", appleId: "1752138229", spotifyUrl: "https://open.spotify.com/show/3avVYlzUnqlFaibuYsx7n9", titleMatch: "NWSL Soccerwise |", blurb: "The Wednesday NWSL show from Soccerwise" },
-	{ id: "la-above-the-clouds", name: "Above the Clouds", rss: "https://anchor.fm/s/82fa3ca0/podcast/rss", scope: "LA", appleId: "1615706074", blurb: "Angel City analysis after every match" },
-	{ id: "la-casual-fc", name: "Casual FC", rss: "https://feeds.transistor.fm/casual-fc", scope: "LA", appleId: "1691808062", blurb: "Weekly Angel City previews and recaps" },
-	{ id: "bos-the-swan-dive", name: "The Swan Dive", rss: "https://feeds.acast.com/public/shows/69a615062d879b9006479dab", scope: "BOS", appleId: "1828264969", spotifyUrl: "https://open.spotify.com/show/5oaJHCvE0KajWc11bi0gBa", blurb: "Boston Legacy fan show, weekly" },
-	{ id: "den-the-5280-pitch", name: "The 5280 Pitch", rss: "https://api.riverside.fm/hosting/4mMPZQWY.rss", scope: "DEN", appleId: "1859060272", spotifyUrl: "https://open.spotify.com/show/6jiBAbW0QXepwdqK0qhaaF", blurb: "Denver Summit coverage from a Denver sports reporter" },
-	{ id: "den-summit-up", name: "Summit Up", rss: "https://api.riverside.fm/hosting/zo8hz1Qi.rss", scope: "DEN", appleId: "1832640530", blurb: "Denver Summit match recaps and previews" },
-	{ id: "gfc-gothamites-roost", name: "Gothamites' Roost", rss: "https://anchor.fm/s/11405cf70/podcast/rss", scope: "GFC", appleId: "6782950164", blurb: "A weekly Gotham FC fancast" },
-	{ id: "kc-the-tea-l", name: "The Tea(L)", rss: "https://anchor.fm/s/660d5aa0/podcast/rss", scope: "KC", appleId: "1583748540", blurb: "KC Current coverage since 2021" },
-	{ id: "nc-the-lion-s-pitch", name: "The Lion's Pitch", rss: "https://feeds.acast.com/public/shows/65eb196f82e6910016356fa6", scope: "NC", appleId: "1735753132", blurb: "Independent NC Courage analysis, weekly" },
-	{ id: "orl-skopurp-soccer", name: "SkoPurp Soccer", rss: "https://anchor.fm/s/de37cd58/podcast/rss", scope: "ORL", appleId: "1682046626", spotifyUrl: "https://open.spotify.com/show/2Dg5YqAKLie4dpaaDQ1YiM", blurb: "The Mane Land's Orlando Pride podcast" },
-	{ id: "por-rose-city-red-card", name: "Rose City Red Card", rss: "https://rss.buzzsprout.com/2619164.rss", scope: "POR", appleId: "1896820142", blurb: "Portland Thorns fan show, weekly" },
-	{ id: "por-the-rose-city-breakdown", name: "The Rose City Breakdown", rss: "https://media.rss.com/the-rose-city-breakdown/feed.xml", scope: "POR", appleId: "1879295371", spotifyUrl: "https://open.spotify.com/show/0zV3J34HLlpnwTMyJzRSuB", blurb: "Thorns interviews and analytics with Stumptown Footy" },
-	{ id: "lou-butchertown-rundown", name: "Butchertown Rundown", rss: "https://api.substack.com/feed/podcast/2644937.rss", scope: "LOU", appleId: "1609100723", blurb: "Independent Racing Louisville coverage" },
-	{ id: "sd-the-breaking-wave", name: "The Breaking Wave", rss: "https://feeds.acast.com/public/shows/65ff5fc88d6ad800169c4e76", scope: "SD", appleId: "1737630102", spotifyUrl: "https://open.spotify.com/show/45vtVzBmoRlZcpQcEAozyr", blurb: "San Diego Wave weekly fan show" },
-	{ id: "sea-the-cooler-guild", name: "The Cooler Guild", rss: "https://feeds.zencastr.com/f/c4BmBYVw.rss", scope: "SEA", appleId: "1749401888", blurb: "Seattle Reign weekly from Sounder at Heart" },
-	{ id: "uta-royal-riot", name: "Royal Riot", rss: "https://rss.pdrl.fm/fca752/feeds.libsyn.com/411032/rss/?redirect=false", scope: "UTA", appleId: "1619446086", spotifyUrl: "https://open.spotify.com/show/55cyEbD8BNgsq388oz6Yc2", titleMatch: "URFC:", blurb: "Utah Royals coverage (URFC segments)" },
-	{ id: "was-hey-spirits", name: "Hey Spirits", rss: "https://anchor.fm/s/d9a05634/podcast/rss", scope: "WAS", appleId: "1674466647", blurb: "Washington Spirit analysis, weekly" },
+	{ id: "league-nwsl-this-week", name: "NWSL This Week", rss: "https://api.substack.com/feed/podcast/2858197.rss", scope: "league", appleId: "1763620771", spotifyUrl: "https://open.spotify.com/show/6s0txn6wZB8HsUPYHpxxiY", blurb: "Weekly recap of every NWSL match from Equalizer writers", producer: "media" },
+	{ id: "league-full-time", name: "Full Time", rss: "https://feeds.acast.com/public/shows/6818801871c041c8cc75b143", scope: "league", appleId: "1518818543", spotifyUrl: "https://open.spotify.com/show/2Syy27diWBkaJsjI00RJtb", blurb: "Reporter-led women's soccer show from The Athletic", producer: "media" },
+	{ id: "league-attacking-third", name: "Attacking Third", rss: "https://rss.amperwave.net/v2/feed/audacynetwork/attackingthird", scope: "league", appleId: "1573642138", spotifyUrl: "https://open.spotify.com/show/32OVfPoFl8BMNEsFJCnnHN", blurb: "CBS Sports' NWSL panel: recaps, transfers, analysis", producer: "media" },
+	{ id: "league-expected-own-goals", name: "Expected Own Goals", rss: "https://feeds.megaphone.fm/RPPSG6845772467", scope: "league", appleId: "1698924172", spotifyUrl: "https://open.spotify.com/show/30ThmaUENe9hTGo00YLFyl", blurb: "NWSL tactics and analytics, every week", producer: "fan" },
+	{ id: "league-the-late-sub", name: "The Late Sub", rss: "https://feeds.megaphone.fm/JWS5718566426", scope: "league", appleId: "1563105123", spotifyUrl: "https://open.spotify.com/show/4n4ZxsVs1Ix9DY9E0KPSc6", blurb: "Claire Watkins on the NWSL and USWNT", producer: "media" },
+	{ id: "league-time-wasting", name: "Time Wasting", rss: "https://feeds.megaphone.fm/JWS9777147888", scope: "league", appleId: "1522055041", spotifyUrl: "https://open.spotify.com/show/6RTMyWpdSBY9I4vO528qX3", blurb: "Ali Riley and Kelley O'Hara on life around the league", producer: "media" },
+	{ id: "league-soccerwise", name: "Soccerwise", rss: "https://feeds.captivate.fm/soccerwise/", scope: "league", appleId: "1752138229", spotifyUrl: "https://open.spotify.com/show/3avVYlzUnqlFaibuYsx7n9", titleMatch: "NWSL Soccerwise |", blurb: "The Wednesday NWSL show from Soccerwise", producer: "media" },
+	{ id: "la-above-the-clouds", name: "Above the Clouds", rss: "https://anchor.fm/s/82fa3ca0/podcast/rss", scope: "LA", appleId: "1615706074", blurb: "Angel City analysis after every match", producer: "fan" },
+	{ id: "la-casual-fc", name: "Casual FC", rss: "https://feeds.transistor.fm/casual-fc", scope: "LA", appleId: "1691808062", blurb: "Weekly Angel City previews and recaps", producer: "fan" },
+	{ id: "bos-the-swan-dive", name: "The Swan Dive", rss: "https://feeds.acast.com/public/shows/69a615062d879b9006479dab", scope: "BOS", appleId: "1828264969", spotifyUrl: "https://open.spotify.com/show/5oaJHCvE0KajWc11bi0gBa", blurb: "Boston Legacy fan show, weekly", producer: "fan" },
+	{ id: "den-the-5280-pitch", name: "The 5280 Pitch", rss: "https://api.riverside.fm/hosting/4mMPZQWY.rss", scope: "DEN", appleId: "1859060272", spotifyUrl: "https://open.spotify.com/show/6jiBAbW0QXepwdqK0qhaaF", blurb: "Denver Summit coverage from a Denver sports reporter", producer: "fan" },
+	{ id: "den-summit-up", name: "Summit Up", rss: "https://api.riverside.fm/hosting/zo8hz1Qi.rss", scope: "DEN", appleId: "1832640530", blurb: "Denver Summit match recaps and previews", producer: "fan" },
+	{ id: "gfc-gothamites-roost", name: "Gothamites' Roost", rss: "https://anchor.fm/s/11405cf70/podcast/rss", scope: "GFC", appleId: "6782950164", blurb: "A weekly Gotham FC fancast", producer: "fan" },
+	{ id: "kc-the-tea-l", name: "The Tea(L)", rss: "https://anchor.fm/s/660d5aa0/podcast/rss", scope: "KC", appleId: "1583748540", blurb: "KC Current coverage since 2021", producer: "fan" },
+	{ id: "nc-the-lion-s-pitch", name: "The Lion's Pitch", rss: "https://feeds.acast.com/public/shows/65eb196f82e6910016356fa6", scope: "NC", appleId: "1735753132", blurb: "Independent NC Courage analysis, weekly", producer: "fan" },
+	{ id: "orl-skopurp-soccer", name: "SkoPurp Soccer", rss: "https://anchor.fm/s/de37cd58/podcast/rss", scope: "ORL", appleId: "1682046626", spotifyUrl: "https://open.spotify.com/show/2Dg5YqAKLie4dpaaDQ1YiM", blurb: "The Mane Land's Orlando Pride podcast", producer: "fan" },
+	{ id: "por-rose-city-red-card", name: "Rose City Red Card", rss: "https://rss.buzzsprout.com/2619164.rss", scope: "POR", appleId: "1896820142", blurb: "Portland Thorns fan show, weekly", producer: "fan" },
+	{ id: "por-the-rose-city-breakdown", name: "The Rose City Breakdown", rss: "https://media.rss.com/the-rose-city-breakdown/feed.xml", scope: "POR", appleId: "1879295371", spotifyUrl: "https://open.spotify.com/show/0zV3J34HLlpnwTMyJzRSuB", blurb: "Thorns interviews and analytics with Stumptown Footy", producer: "fan" },
+	{ id: "lou-butchertown-rundown", name: "Butchertown Rundown", rss: "https://api.substack.com/feed/podcast/2644937.rss", scope: "LOU", appleId: "1609100723", blurb: "Independent Racing Louisville coverage", producer: "fan" },
+	{ id: "sd-the-breaking-wave", name: "The Breaking Wave", rss: "https://feeds.acast.com/public/shows/65ff5fc88d6ad800169c4e76", scope: "SD", appleId: "1737630102", spotifyUrl: "https://open.spotify.com/show/45vtVzBmoRlZcpQcEAozyr", blurb: "San Diego Wave weekly fan show", producer: "fan" },
+	{ id: "sea-the-cooler-guild", name: "The Cooler Guild", rss: "https://feeds.zencastr.com/f/c4BmBYVw.rss", scope: "SEA", appleId: "1749401888", blurb: "Seattle Reign weekly from Sounder at Heart", producer: "fan" },
+	{ id: "uta-royal-riot", name: "Royal Riot", rss: "https://rss.pdrl.fm/fca752/feeds.libsyn.com/411032/rss/?redirect=false", scope: "UTA", appleId: "1619446086", spotifyUrl: "https://open.spotify.com/show/55cyEbD8BNgsq388oz6Yc2", titleMatch: "URFC:", blurb: "Utah Royals coverage (URFC segments)", producer: "fan" },
+	{ id: "was-hey-spirits", name: "Hey Spirits", rss: "https://anchor.fm/s/d9a05634/podcast/rss", scope: "WAS", appleId: "1674466647", blurb: "Washington Spirit analysis, weekly", producer: "fan" },
 ];
 
 // ── RSS parsing ───────────────────────────────────────────────────────────────────────────────
@@ -119,6 +124,11 @@ export interface RawEpisode {
 
 export interface ParsedPodcast {
 	artwork?: string;
+	/** The show's own author/network (`<itunes:author>` / `<managingEditor>`) — the credit byline. */
+	author?: string;
+	/** The podcaster set `<itunes:block>yes</itunes:block>` — an explicit "don't list me in directories"
+	 *  opt-out. We honor it: the show is dropped from Listen + the directory. */
+	blocked: boolean;
 	episodes: RawEpisode[];
 }
 
@@ -136,6 +146,16 @@ export function parsePodcastRSS(xml: string): ParsedPodcast {
 	// Channel artwork: the FIRST itunes:image href is the channel's (items rarely carry their own).
 	const artM = /<itunes:image[^>]*\bhref="([^"]+)"/i.exec(xml);
 	const artwork = artM ? artM[1].replace(/&amp;/g, "&") : undefined;
+
+	// Author/network for the credit byline: channel <itunes:author>, then <managingEditor>. Use the
+	// channel block only (before the first <item>) so an episode author can't shadow the show's.
+	const channel = xml.split(/<item[\s>]/i)[0];
+	const author = tagText(channel, "itunes:author") ?? tagText(channel, "managingEditor");
+
+	// Creator opt-out: honor a channel-level <itunes:block>yes</itunes:block> (podcasters use it to
+	// tell directories not to list them). An item-level block is per-episode and rarer; we only read
+	// the channel block, so an episode author can't flip the whole show.
+	const blocked = /^\s*yes\s*$/i.test(tagText(channel, "itunes:block") ?? "");
 
 	const episodes: RawEpisode[] = [];
 	const blocks = xml.match(/<item[\s>][\s\S]*?<\/item>/g) ?? [];
@@ -157,7 +177,12 @@ export function parsePodcastRSS(xml: string): ParsedPodcast {
 			description: tagText(block, "description") ?? tagText(block, "itunes:summary") ?? tagText(block, "content:encoded"),
 		});
 	}
-	return { artwork, episodes };
+	return { artwork, author: author ? decodeAmp(author) : undefined, blocked, episodes };
+}
+
+/** Minimal entity decode for the author byline (feeds vary). */
+function decodeAmp(s: string): string {
+	return s.replace(/&amp;/g, "&").replace(/&#39;/g, "'").replace(/&quot;/g, '"').trim();
 }
 
 /** Normalize an itunes:duration (seconds like "2083", or "M:SS" / "H:MM:SS") → a display string.
@@ -209,26 +234,26 @@ export function routeEpisode(
 	title: string,
 	description: string,
 	roster: Map<string, string>,
-): { clubs: string[]; matchedTerms: string[] } {
+): { clubs: string[]; matched: { term: string; abbr: string }[] } {
 	const hay = ` ${normalizeForMatch(`${title} ${description}`)} `;
 	const clubs = new Set<string>();
-	const terms = new Set<string>();
-	for (const [abbr, names] of Object.entries(CLUB_MATCH_NAMES)) {
-		for (const n of names) {
-			if (containsPhrase(hay, n)) {
-				clubs.add(abbr);
-				terms.add(n);
-			}
+	const matched: { term: string; abbr: string }[] = [];
+	const seen = new Set<string>();
+	const add = (term: string, abbr: string) => {
+		clubs.add(abbr);
+		if (!seen.has(term)) {
+			seen.add(term);
+			matched.push({ term, abbr });
 		}
+	};
+	for (const [abbr, names] of Object.entries(CLUB_MATCH_NAMES)) {
+		for (const n of names) if (containsPhrase(hay, n)) add(n, abbr);
 	}
 	for (const [name, abbr] of roster) {
 		// Require a full "first last" (at least two words) — no surname-only matching (owner).
-		if (name.includes(" ") && containsPhrase(hay, name)) {
-			clubs.add(abbr);
-			terms.add(name);
-		}
+		if (name.includes(" ") && containsPhrase(hay, name)) add(name, abbr);
 	}
-	return { clubs: [...clubs], matchedTerms: [...terms] };
+	return { clubs: [...clubs], matched };
 }
 
 // ── Validation + guarded list edits ─────────────────────────────────────────────────────────────

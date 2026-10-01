@@ -65,10 +65,10 @@ for (const show of leagueShows) {
 		totalEpisodes++;
 		const title = stripHtml(ep.title);
 		const desc = stripHtml(ep.description).slice(0, 240);
-		const { clubs, matchedTerms } = routeEpisode(title, desc, roster);
+		const { clubs, matched } = routeEpisode(title, desc, roster);
 		if (clubs.length === 0) leaguePile++;
 		for (const c of clubs) perClub[c] = (perClub[c] ?? 0) + 1;
-		if (clubs.length) allMatches.push({ show: show.name, title: title.slice(0, 60), clubs, matchedTerms });
+		if (clubs.length) allMatches.push({ show: show.name, title: title.slice(0, 60), clubs, matchedTerms: matched.map((m) => m.term) });
 	}
 }
 
