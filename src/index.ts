@@ -4387,6 +4387,7 @@ const SOCIAL_PODCASTS_REFRESH_MS = 60 * 60 * 1000; // hourly — weekly shows do
 interface PodcastSlot {
 	meta: PodcastShow;
 	artwork?: string;
+	author?: string;
 	lastEpisodeAt: number | null;
 	ok: boolean;
 	error?: string;
@@ -4464,10 +4465,10 @@ async function buildPodcastSlot(show: PodcastShow, roster: Map<string, string>):
 		if (!timestamp) continue;
 		const title = decodeEntities(ep.title).trim();
 		const description = ep.description ? stripHtml(ep.description).slice(0, 240) : "";
-		const { clubs, matchedTerms } =
+		const { clubs, matched } =
 			show.scope === "league"
 				? routeEpisode(title, description, roster)
-				: { clubs: [show.scope], matchedTerms: [] as string[] };
+				: { clubs: [show.scope], matched: [] as { term: string; abbr: string }[] };
 		for (const c of clubs) clubCounts[c] = (clubCounts[c] ?? 0) + 1;
 		const ms = Date.parse(timestamp);
 		if (!Number.isNaN(ms)) lastEpisodeAt = Math.max(lastEpisodeAt ?? 0, ms);
@@ -4480,11 +4481,11 @@ async function buildPodcastSlot(show: PodcastShow, roster: Map<string, string>):
 			duration: normalizeDuration(ep.durationRaw),
 			url: ep.link,
 			clubs,
-			matchedTerms,
+			matched,
 		});
 		if (episodes.length >= MAX_EPISODES_PER_SHOW) break;
 	}
-	return { meta: show, artwork: httpsImage(parsed.artwork), lastEpisodeAt, ok: true, clubCounts, episodes };
+	return { meta: show, artwork: httpsImage(parsed.artwork), author: parsed.author, lastEpisodeAt, ok: true, clubCounts, episodes };
 }
 
 /** REFRESH the podcasts snapshot (own invocation via SELF — see SOCIAL_PODCASTS_KEY). Per-show
@@ -4526,8 +4527,17 @@ const isPodcastActive = (slot: PodcastSlot, now: number): boolean =>
  *  `episodeKind`: "club" = tied to a club the user follows (→ the app's "Your clubs" section);
  *  "league" = a league show's episode not about a followed club (→ "Around the league").
  *  `teamTag` is the followed club this episode is pinned to (undefined for a league card). */
-function podcastEpisodeCard(ep: PodcastEpisode, slot: PodcastSlot, teamTag: string | undefined, kind: "club" | "league"): unknown {
-	const followedClub = teamTag;
+function podcastEpisodeCard(ep: PodcastEpisode, slot: PodcastSlot, followed: Set<string>): unknown {
+	const isClubShow = slot.meta.scope !== "league";
+	// Club pods carry their club badge (and only reach that club's fans — filtered in buildPodcastCards).
+	// League shows carry NO club badge (a "GFC" tag on a league show reads like it's a Gotham show);
+	// they explain their relevance with the Mentions line instead, the reader's own clubs ordered first.
+	const kind: "club" | "league" = isClubShow ? "club" : "league";
+	// Defensive against a pre-upgrade snapshot (episodes built before `matched` existed).
+	const matched = ep.matched ?? [];
+	const orderedMentions = isClubShow
+		? []
+		: [...matched].sort((a, b) => Number(followed.has(b.abbr)) - Number(followed.has(a.abbr))).map((m) => m.term);
 	return {
 		id: `pod-${hashId(ep.showId + ep.guid)}`,
 		layout: "podcastEpisode",
@@ -4538,6 +4548,8 @@ function podcastEpisodeCard(ep: PodcastEpisode, slot: PodcastSlot, teamTag: stri
 		showId: ep.showId,
 		authorName: slot.meta.name,
 		sourceName: slot.meta.name,
+		podcastAuthor: slot.author, // the show's own creator/network — the credit byline
+		producer: slot.meta.producer, // "fan" | "media" — drives the Fan-made tag
 		headline: `${slot.meta.name} · ${ep.title}`, // unique key for dedupeByContent
 		title: ep.title,
 		blurb: ep.description,
@@ -4545,10 +4557,10 @@ function podcastEpisodeCard(ep: PodcastEpisode, slot: PodcastSlot, teamTag: stri
 		duration: ep.duration,
 		timestamp: ep.pubDate,
 		url: ep.url,
-		teamAbbreviation: followedClub,
-		isLeague: !followedClub,
+		teamAbbreviation: isClubShow ? slot.meta.scope : undefined,
+		isLeague: !isClubShow,
 		clubs: ep.clubs,
-		matchedTerms: ep.matchedTerms,
+		matchedTerms: orderedMentions,
 		episodeKind: kind,
 		// The show's Apple id + Spotify url so the Listen card can build the chosen podcast app's
 		// SHOW link client-side (episode-level deep links are unreliable across apps).
@@ -4570,18 +4582,11 @@ function buildPodcastCards(snap: PodcastsSnapshot | null, teams: string[], hidde
 	for (const slot of Object.values(snap.shows)) {
 		if (hiddenShows.has(slot.meta.id) || !isPodcastActive(slot, now)) continue;
 		const isClubShow = slot.meta.scope !== "league";
-		for (const ep of slot.episodes) {
-			if (isClubShow) {
-				// A club show's episodes reach ONLY that club's followers (like player IG / Club Beat).
-				if (!followed.has(slot.meta.scope)) continue;
-				out.push(podcastEpisodeCard(ep, slot, slot.meta.scope, "club"));
-			} else {
-				// A league show: episodes routed to a followed club pin to "Your clubs"; the rest are
-				// "Around the league" (the app windows those to the last 7 days).
-				const followedClub = ep.clubs.find((c) => followed.has(c));
-				out.push(podcastEpisodeCard(ep, slot, followedClub, followedClub ? "club" : "league"));
-			}
-		}
+		// A club pod reaches ONLY its club's followers ("Your clubs"); a league show reaches everyone
+		// ("Around the league"). The app de-dupes to the newest episode per show, so emit all here and
+		// let it pick the freshest (a show could drop several in a week).
+		if (isClubShow && !followed.has(slot.meta.scope)) continue;
+		for (const ep of slot.episodes) out.push(podcastEpisodeCard(ep, slot, followed));
 	}
 	return out;
 }
@@ -4601,6 +4606,8 @@ async function handlePodcastDirectory(env: Env): Promise<Response> {
 					scope: s.meta.scope,
 					blurb: s.meta.blurb,
 					artwork: s.artwork,
+					author: s.author,
+					producer: s.meta.producer,
 					lastEpisodeAt: s.lastEpisodeAt,
 					links: showLinks(s.meta),
 					clubCounts: s.clubCounts,

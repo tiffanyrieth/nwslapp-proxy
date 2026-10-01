@@ -16,7 +16,7 @@ import {
 
 test("seed: every show validates, ids unique, 23 shows, 16 club + 7 league", () => {
 	assert.equal(PODCAST_SEED.length, 23);
-	for (const s of PODCAST_SEED) assert.equal(podcastProblem(s), null, s.id);
+	for (const s of PODCAST_SEED) { assert.equal(podcastProblem(s), null, s.id); assert.ok(s.producer === "fan" || s.producer === "media", s.id); }
 	const ids = PODCAST_SEED.map((s) => s.id);
 	assert.equal(new Set(ids).size, ids.length);
 	const league = PODCAST_SEED.filter((s) => s.scope === "league");
@@ -34,6 +34,7 @@ test("parsePodcastRSS: channel artwork + items with guid, duration, description"
 	const xml =
 		`<rss><channel><title>Hey Spirits</title>` +
 		`<itunes:image href="https://img.example/art.jpg?v=2&amp;x=1"/>` +
+		`<itunes:author>Sounder at Heart</itunes:author>` +
 		`<item><title><![CDATA[Three 6 Midfield [Spirit v. Angel City Review]]]></title>` +
 		`<guid isPermaLink="false">abc-123</guid>` +
 		`<link>https://pod.example/ep/1</link>` +
@@ -46,6 +47,7 @@ test("parsePodcastRSS: channel artwork + items with guid, duration, description"
 		`</channel></rss>`;
 	const p = parsePodcastRSS(xml);
 	assert.equal(p.artwork, "https://img.example/art.jpg?v=2&x=1");
+	assert.equal(p.author, "Sounder at Heart");
 	assert.equal(p.episodes.length, 2);
 	assert.equal(p.episodes[0].guid, "abc-123");
 	assert.equal(p.episodes[0].title, "Three 6 Midfield [Spirit v. Angel City Review]");
@@ -82,7 +84,7 @@ test("routeEpisode: full player name matches, surname alone does not", () => {
 	]);
 	const hit = routeEpisode("Trinity Rodman is back", "", roster);
 	assert.deepEqual(hit.clubs, ["WAS"]);
-	assert.ok(hit.matchedTerms.includes("trinity rodman"));
+	assert.ok(hit.matched.some((m) => m.term === "trinity rodman" && m.abbr === "WAS"));
 	// Surname alone must not match.
 	assert.deepEqual(routeEpisode("Rodman watch", "", roster).clubs, []);
 	// Accent folding: the episode text has the accent, the roster key is folded.
@@ -105,8 +107,8 @@ test("podcastProblem / validation", () => {
 
 test("applyPodcastChanges: drop/add, dedupe, per-club rail, no mutation", () => {
 	const base: PodcastShow[] = [
-		{ id: "was-a", name: "A", rss: "https://a.example/f", scope: "WAS", blurb: "x" },
-		{ id: "league-b", name: "B", rss: "https://b.example/f", scope: "league", blurb: "x" },
+		{ id: "was-a", name: "A", rss: "https://a.example/f", scope: "WAS", blurb: "x", producer: "fan" },
+		{ id: "league-b", name: "B", rss: "https://b.example/f", scope: "league", blurb: "x", producer: "media" },
 	];
 	const frozen = JSON.stringify(base);
 	const r = applyPodcastChanges(base, {
@@ -124,17 +126,17 @@ test("applyPodcastChanges: drop/add, dedupe, per-club rail, no mutation", () => 
 	const dupFeed = applyPodcastChanges(base, { add: [{ id: "was-z", name: "z", rss: "https://a.example/f", scope: "WAS", blurb: "x" }] });
 	assert.equal(dupFeed.rejected[0].reason, "same feed already on the list");
 
-	const full = [...Array(6)].map((_, i) => ({ id: `was-${i}`, name: `n${i}`, rss: `https://f${i}.example`, scope: "WAS", blurb: "x" }) as PodcastShow);
+	const full = [...Array(6)].map((_, i) => ({ id: `was-${i}`, name: `n${i}`, rss: `https://f${i}.example`, scope: "WAS", blurb: "x", producer: "fan" }) as PodcastShow);
 	const rail = applyPodcastChanges(full, { add: [{ id: "was-over", name: "o", rss: "https://over.example", scope: "WAS", blurb: "x" }] });
 	assert.match(rail.rejected[0].reason, /per-club rail/);
 });
 
 test("showLinks: derives Apple/Overcast/Pocket Casts from the Apple id; Spotify from the stored url", () => {
-	const links = showLinks({ id: "x", name: "n", rss: "https://a.b", scope: "WAS", appleId: "1674466647", spotifyUrl: "https://open.spotify.com/show/abc", blurb: "x" });
+	const links = showLinks({ id: "x", name: "n", rss: "https://a.b", scope: "WAS", appleId: "1674466647", spotifyUrl: "https://open.spotify.com/show/abc", blurb: "x", producer: "fan" });
 	assert.equal(links.apple, "https://podcasts.apple.com/podcast/id1674466647");
 	assert.equal(links.overcast, "https://overcast.fm/itunes1674466647");
 	assert.equal(links.pocketcasts, "https://pca.st/itunes/1674466647");
 	assert.equal(links.spotify, "https://open.spotify.com/show/abc");
-	const noApple = showLinks({ id: "x", name: "n", rss: "https://a.b", scope: "WAS", blurb: "x" });
+	const noApple = showLinks({ id: "x", name: "n", rss: "https://a.b", scope: "WAS", blurb: "x", producer: "fan" });
 	assert.equal(noApple.apple, undefined);
 });
