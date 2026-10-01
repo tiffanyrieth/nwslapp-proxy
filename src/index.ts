@@ -32,6 +32,24 @@ import {
 } from "./bracket-engine.ts";
 import { buildHeadshotMap, handleHeadshots, normalizeName } from "./headshots.ts";
 import { moderateSnapshotBatch, carryForwardVerdicts, IMGMOD_MODEL, IMGMOD_BATCH } from "./social-moderation.ts";
+import {
+	BEAT_SEED,
+	NEWS_FEED_SEED,
+	BEAT_ITEMS_PER_SOURCE,
+	MAX_BEAT_PER_CLUB,
+	applyBeatChanges,
+	beatSourcesFor,
+	isValidBeatList,
+	isValidNewsFeeds,
+	parseBeehiivArchive,
+	parseWpJsonPosts,
+	sourceTier,
+	titlePasses,
+	type BeatSource,
+	type NewsFeedSource,
+	type RawItem,
+	type SourceTier,
+} from "./club-beat.ts";
 import { adminAuthed, adminGate, safeEqual, type AdminAuthEnv } from "./admin-auth.ts";
 import { handleAnalyticsAdmin, computeMetrics } from "./analytics-admin.ts";
 import { ADMIN_PORTAL_HTML } from "./admin-portal.ts";
@@ -416,6 +434,9 @@ async function fetchBounded(url: string, init?: RequestInit): Promise<Response> 
 	}
 }
 const isTimeout = (e: unknown): boolean => ["TimeoutError", "AbortError"].includes((e as Error)?.name ?? "");
+/** Workers' hard per-invocation subrequest cap ("Too many subrequests by single Worker invocation")
+ *  throws from fetch() — catch sites must surface it (`subrequestCapHit`), never swallow it. */
+const isSubrequestCap = (e: unknown): boolean => /too many subrequests/i.test(String((e as Error)?.message ?? e));
 
 // Claude Haiku relevance + team-tag (Step 2). Runs on the third-party Bluesky
 // bucket — REPORTER and LEAGUE-OUTLET accounts (both post off-topic/non-NWSL and
@@ -636,7 +657,7 @@ async function loadFeedHandles(env: Env): Promise<FeedHandle[]> {
 const FEED_HANDLES: FeedHandle[] = [
 	// Reporters / journalists (league-wide)
 	{ handle: "meglinehan.com", kind: "reporter" },
-	{ handle: "jeffkassouf.bsky.social", kind: "reporter" },
+	{ handle: "jeffkassouf.bsky.social", kind: "reporter" }, // Jeff Kassouf (ESPN; founder of The Equalizer)
 	{ handle: "sandraherrera.bsky.social", kind: "reporter" },
 	{ handle: "pcattry.bsky.social", kind: "reporter" },
 	{ handle: "katiewhyatt.bsky.social", kind: "reporter" },
@@ -648,7 +669,7 @@ const FEED_HANDLES: FeedHandle[] = [
 	// caitlinmurr.bsky.social removed 2026-08-17 (routine audit #1): no original posts in 236d
 	// (reposts only). The default list serves accounts that post original coverage here; an
 	// account can be re-added instantly if it becomes active again.
-	{ handle: "jeffrueter.bsky.social", kind: "reporter" }, // Jeff Rueter (The Athletic)
+	{ handle: "jeffrueter.bsky.social", kind: "reporter" }, // Jeff Rueter (The Guardian; formerly The Athletic)
 	{ handle: "jtannenwald.bsky.social", kind: "reporter" }, // Jonathan Tannenwald (Philadelphia Inquirer)
 	{ handle: "girlssoccernetwork.bsky.social", kind: "reporter" }, // Girls Soccer Network (outlet)
 	// League / official outlets
@@ -658,6 +679,108 @@ const FEED_HANDLES: FeedHandle[] = [
 	{ handle: "nwslstat.bsky.social", kind: "league" },
 	{ handle: "allforxi.bsky.social", kind: "league" },
 ];
+
+// ---------------------------------------------------------------------------
+// CLUB BEAT + curated NEWS OUTLETS (2026-09-30) — the data lists + the IO around them. Pure logic
+// (seed, validation, parsers, guarded edits) lives in ./club-beat.ts. Both lists are KV overlays
+// written through the guarded admin endpoints (/social/beat-audit, /social/news-feeds); the seed
+// constants serve until the first write.
+// ---------------------------------------------------------------------------
+const BEAT_LIST_KEY = "social:beat-list";
+const NEWS_FEEDS_KEY = "social:news-feeds";
+/** The SOCIAL SOURCES SNAPSHOT: every Club Beat source + every News outlet, fetched OFF the request
+ *  path by a refresh run (POST /social/sources/refresh — the 5-minute cron triggers it every ~30 min via
+ *  the SELF service binding, so the refresh gets its OWN invocation + 50-subrequest budget). /feed
+ *  reads it with ONE KV read (KV reads don't count toward the 50 external subrequests; fetch() and
+ *  Cache API calls DO — measured live 2026-09-30: per-source Cache-API caching on the request path
+ *  blew the cap). Owner 2026-09-30: articles may be 30–60 min old; this refreshes every ~30. */
+const SOCIAL_SOURCES_KEY = "social:sources-snapshot";
+const SOCIAL_SOURCES_REFRESH_MS = 30 * 60 * 1000;
+/** External fetches one refresh run may spend on SOURCE fetches (the rest of the 50 covers mixed-
+ *  source Haiku, a capped OG fill and the KV write). Past it, the stalest sources go first and the
+ *  remainder carry forward to the next run — so the list can grow without ever breaching the cap. */
+const REFRESH_SOURCE_BUDGET = 34;
+const REFRESH_OG_CAP = 5;
+/** OG scrapes ONE /feed build may spend filling brand-new imageless news articles (each is scraped
+ *  once, ever — KV `ogn-`). Uncapped, a burst of new outlet items blew the 50-subrequest cap live. */
+const NEWS_OG_CAP = 5;
+const NEWS_ITEMS_PER_OUTLET = 15; // newest items carried per outlet (pre-Haiku) — bounds snapshot size
+/** One source's slot in the snapshot. Beat items are FINAL cards (stamped to the club); news items
+ *  are pre-Haiku NewsCards (relevance + team tag still run per /feed build). */
+interface SourceSlot {
+	fetchedAt: number;
+	ok: boolean;
+	error?: string;
+	items: unknown[];
+	/** Newest UPSTREAM item (ms) BEFORE any relevance/title filter — health keys on this, so a `mixed`
+	 *  writer who's active but posting about another team reads 🟢 "active", not 🔴 "empty". */
+	newestRaw?: number | null;
+}
+interface SourcesSnapshot {
+	v: 1;
+	updatedAt: number;
+	at: number; // = updatedAt; the field dueBySnapshot() gates on
+	sources: Record<string, SourceSlot>;
+}
+const beatSlotKey = (b: BeatSource) => `beat:${b.id}`;
+const newsSlotKey = (f: NewsFeedSource) => `news:${f.url}`;
+
+async function readSourcesSnapshot(env: Env): Promise<SourcesSnapshot | null> {
+	try {
+		const snap = (await env.FEED_TAGS.get(SOCIAL_SOURCES_KEY, "json")) as SourcesSnapshot | null;
+		return snap && snap.v === 1 && snap.sources ? snap : null;
+	} catch {
+		return null;
+	}
+}
+
+async function loadBeatSources(env: Env, ctx?: ExecutionContext): Promise<BeatSource[]> {
+	try {
+		const raw = await env.FEED_TAGS.get(BEAT_LIST_KEY);
+		if (!raw) return BEAT_SEED;
+		const list = JSON.parse(raw) as unknown;
+		if (isValidBeatList(list)) return list;
+		// A malformed overlay must never silently hide a club's coverage → seed + LOUD.
+		if (ctx) emitDiag(env, ctx, "beatListInvalid", "social:beat-list failed validation — serving seed");
+	} catch {
+		if (ctx) emitDiag(env, ctx, "beatListInvalid", "social:beat-list unreadable — serving seed");
+	}
+	return BEAT_SEED;
+}
+
+async function loadNewsFeeds(env: Env, ctx?: ExecutionContext): Promise<NewsFeedSource[]> {
+	try {
+		const raw = await env.FEED_TAGS.get(NEWS_FEEDS_KEY);
+		if (!raw) return NEWS_FEED_SEED;
+		const list = JSON.parse(raw) as unknown;
+		if (isValidNewsFeeds(list)) return list;
+		if (ctx) emitDiag(env, ctx, "beatListInvalid", "social:news-feeds failed validation — serving seed");
+	} catch {
+		if (ctx) emitDiag(env, ctx, "beatListInvalid", "social:news-feeds unreadable — serving seed");
+	}
+	return NEWS_FEED_SEED;
+}
+
+/** Fetch + parse one article-type source (RSS/Atom, beehiiv archive, WP REST) → decoded items.
+ *  Throws on transport/HTTP failure (caller decides the diag); an empty parse is `[]`. */
+async function fetchSourceItems(kind: "rss" | "beehiiv" | "wpjson", url: string): Promise<RawItem[]> {
+	const accept =
+		kind === "rss" ? "application/rss+xml, application/atom+xml, application/xml, text/xml" : kind === "wpjson" ? "application/json" : "text/html";
+	const r = await fetchBounded(url, { headers: { "User-Agent": BROWSER_UA, Accept: accept } });
+	if (!r.ok) throw new Error(`HTTP ${r.status}`);
+	let items: RawItem[];
+	if (kind === "rss") items = parseOutletRSS(await r.text());
+	else if (kind === "beehiiv") items = parseBeehiivArchive(await r.text(), new URL(url).origin);
+	else items = parseWpJsonPosts(await r.json());
+	// Normalize to plain display text (RSS is already decoded by parseOutletRSS; beehiiv/WP carry
+	// entities / HTML in title + excerpt).
+	return items.map((it) => ({
+		...it,
+		title: decodeEntities(it.title).trim(),
+		description: it.description ? stripHtml(it.description).slice(0, 240) || undefined : undefined,
+		image: httpsImage(it.image),
+	}));
+}
 
 // ---------------------------------------------------------------------------
 // B3b — IG social handles (the Apify scrape targets).
@@ -992,6 +1115,24 @@ that needs more users) until you bring it back.</p>
 		}
 		if (url.pathname === "/social/reporter-audit" || url.pathname.startsWith("/social/reporter-audit/")) {
 			return handleReporterAudit(request, env, ctx);
+		}
+		// Club Beat + News-outlet source lists (2026-09-30): same auth + guarded-apply pattern.
+		if (url.pathname === "/social/beat-audit" || url.pathname.startsWith("/social/beat-audit/")) {
+			return handleBeatAudit(request, env, ctx);
+		}
+		if (url.pathname === "/social/news-feeds" || url.pathname.startsWith("/social/news-feeds/")) {
+			return handleNewsFeedsAdmin(request, env, ctx);
+		}
+		// Rebuild the social sources snapshot (Club Beat + News outlets). The */5 cron calls this
+		// through the SELF service binding so it runs in its OWN invocation (own 50-subrequest
+		// budget); the owner can also hit it by hand right after a source-list edit.
+		if (url.pathname === "/social/sources/refresh") {
+			if (!auditAuthed(request, env)) {
+				return new Response("Authentication required.", { status: 401, headers: { "WWW-Authenticate": adminRealm("NWSLApp Admin") } });
+			}
+			const summary = await refreshSocialSources(env, ctx);
+			emitDiag(env, ctx, "socialSourcesRefresh", `${summary.refreshed}/${summary.total} ok${summary.failed.length ? `, ${summary.failed.length} failed` : ""}${summary.carried ? `, ${summary.carried} carried` : ""}`);
+			return jsonResponse(summary, 200);
 		}
 
 		// POST telemetry ingest must be registered BEFORE the GET-only guard below.
@@ -1415,6 +1556,14 @@ that needs more users) until you bring it back.</p>
 				await attendanceSweep(env, (kind, detail) => emitDiag(env, ctx, kind, detail));
 			} catch {
 				/* swallow — best-effort; the next gated tick retries */
+			}
+			// Social sources snapshot refresh (Club Beat + News outlets), gated to ~30 min (owner: 30-60
+			// min freshness is fine for articles). ONE subrequest here: the work runs in its OWN invocation
+			// via the SELF service binding, so it never competes with this tick's alerting budget.
+			try {
+				await triggerSocialSourcesRefresh(env, ctx);
+			} catch {
+				/* best-effort; the next gated tick retries (staleness shows on the Status board) */
 			}
 			// Image-safety backstop (decoupled from the scrape): classify a small batch of unjudged player
 			// thumbnails from the CACHED snapshot — no Apify. Runs EVERY tick (idle-skips when a pool is
@@ -2378,7 +2527,7 @@ async function clubNewsFor(abbr: string, env: Env, ctx: ExecutionContext): Promi
 	// KV-cached enrichment the league/outlet feeds already use; run it BEFORE caching so the
 	// recovered image persists in the club cache. Cards that already have an image are skipped.
 	if (cards.length > 0) {
-		cards = await enrichNewsOG(cards, env, ctx);
+		cards = (await enrichNewsOG(cards, env, ctx)).cards;
 	}
 
 	if (cards.length === 0) {
@@ -3342,6 +3491,97 @@ async function bskySourceHealth(env: Env): Promise<BskyHealth[]> {
 	}));
 }
 
+/** One article/Bluesky source's health (fresh fetch, never the edge cache — this answers "is it
+ *  alive right now"). Shared by the Status board + GET /social/beat-audit + /social/news-feeds. */
+type SourceHealth = { id: string; label: string; abbr?: string; kind: string; tier: SourceTier; lastItemDays: number | null; items: number; error?: string };
+async function articleSourceHealth(
+	id: string,
+	label: string,
+	kind: "rss" | "beehiiv" | "wpjson" | "bluesky",
+	target: string,
+	opts: { abbr?: string; titleMatch?: string } = {},
+): Promise<SourceHealth> {
+	const now = Date.now();
+	const base = { id, label, abbr: opts.abbr, kind };
+	try {
+		if (kind === "bluesky") {
+			const feed = await bskyAuthorFeed(target, 15);
+			const age = latestOriginalAgeMs(feed, now);
+			const originals = feed.filter((it) => !it.reason && it.post?.record?.text).length;
+			return { ...base, tier: sourceTier(age === null ? null : now - age, now, true), lastItemDays: age === null ? null : Math.floor(age / 86_400_000), items: originals };
+		}
+		const items = (await fetchSourceItems(kind, target)).filter((it) => titlePasses(it.title, opts.titleMatch));
+		const times = items.map((it) => Date.parse(it.pubDate ?? "")).filter((t) => !Number.isNaN(t));
+		const newest = times.length ? Math.max(...times) : null;
+		return { ...base, tier: sourceTier(newest, now, true), lastItemDays: newest === null ? null : Math.floor((now - newest) / 86_400_000), items: items.length };
+	} catch (e) {
+		return { ...base, tier: "dead", lastItemDays: null, items: 0, error: String((e as Error)?.message ?? e).slice(0, 70) };
+	}
+}
+
+async function beatSourceHealth(env: Env): Promise<SourceHealth[]> {
+	const list = await loadBeatSources(env);
+	return Promise.all(
+		list.map((s) =>
+			articleSourceHealth(s.id, `${s.abbr} · ${s.name}${s.kind === "bluesky" ? ` (@${s.handle})` : ""}`, s.kind, (s.kind === "bluesky" ? s.handle : s.url) ?? "", {
+				abbr: s.abbr,
+				titleMatch: s.titleMatch,
+			}),
+		),
+	);
+}
+
+async function newsFeedHealth(env: Env): Promise<SourceHealth[]> {
+	const list = await loadNewsFeeds(env);
+	return Promise.all(list.map((f) => articleSourceHealth(f.url, f.source, f.kind ?? "rss", f.url, { titleMatch: f.titleMatch })));
+}
+
+/** SourceHealth → a Status-board row (same 🟢/🟡/🔴 vocabulary as the reporter Bluesky rows). */
+function sourceHealthCheck(h: SourceHealth): StatusCheck {
+	const when = h.lastItemDays !== null ? `newest post ${h.lastItemDays}d ago · ${h.items} served` : `${h.items} served`;
+	switch (h.tier) {
+		case "ok":      return { label: h.label, status: "ok", detail: when };
+		case "cooling": return { label: h.label, status: "warn", detail: `${when} — cooling` };
+		case "dormant": return { label: h.label, status: "fail", detail: `${when} — past the ~30d Social window, invisible (drop candidate)` };
+		case "empty":   return { label: h.label, status: "fail", detail: "reachable but no dated items — check the feed/filter" };
+		case "dead":    return { label: h.label, status: "fail", detail: `unreachable from the Worker: ${h.error ?? "error"}` };
+	}
+}
+
+/** A snapshot slot → health (newest item + last refresh outcome) — no upstream fetch. */
+function slotHealth(id: string, label: string, kind: string, slot: SourceSlot | undefined, abbr?: string): SourceHealth {
+	const now = Date.now();
+	if (!slot) return { id, label, abbr, kind, tier: "empty", lastItemDays: null, items: 0, error: "not fetched yet (next refresh run)" };
+	const times = (slot.items as Array<{ timestamp?: string }>).map((c) => Date.parse(c.timestamp ?? "")).filter((t) => !Number.isNaN(t));
+	const newest = slot.newestRaw ?? (times.length ? Math.max(...times) : null);
+	const tier: SourceTier = slot.ok ? sourceTier(newest, now, true) : "dead";
+	return { id, label, abbr, kind, tier, lastItemDays: newest === null ? null : Math.floor((now - newest) / 86_400_000), items: slot.items.length, error: slot.error };
+}
+
+async function statusCheckBeats(env: Env): Promise<StatusSection> {
+	const snap = await readSourcesSnapshot(env);
+	const list = await loadBeatSources(env);
+	const checks: StatusCheck[] = [];
+	if (!snap) {
+		checks.push({ label: "Sources snapshot", status: "fail", detail: "MISSING — the refresh hasn't run (check the SELF binding / sourcesRefreshFail diag)" });
+	} else {
+		const ageMin = Math.round((Date.now() - snap.updatedAt) / 60_000);
+		checks.push({ label: "Sources snapshot", status: ageMin > 90 ? "fail" : ageMin > 45 ? "warn" : "ok", detail: `refreshed ${ageMin} min ago (target every ~30)` });
+	}
+	const health = list
+		.map((b) => slotHealth(b.id, `${b.abbr} · ${b.name}${b.kind === "bluesky" ? ` (@${b.handle})` : ""}`, b.kind, snap?.sources[beatSlotKey(b)], b.abbr))
+		.sort((a, b) => (a.abbr ?? "").localeCompare(b.abbr ?? ""));
+	checks.push(...health.map(sourceHealthCheck));
+	const covered = new Set(list.map((s) => s.abbr));
+	const uncovered = [...NEWS_TEAM_ABBR_SET].filter((a) => !covered.has(a)).sort();
+	if (uncovered.length) checks.push({ label: "Clubs with no Club Beat source", status: "info", detail: uncovered.join(", ") });
+	return {
+		title: `Club Beat sources (${list.length}) — club-dedicated coverage, routed to that club's fans only`,
+		note: "Read from the social sources snapshot (refreshed every ~30 min off the request path). Tiers on the newest item: 🟢 <14d · 🟡 14–30d · 🔴 >30d, or the last refresh FAILED (red = unreachable from the Worker). GET /social/beat-audit re-fetches every source live.",
+		checks,
+	};
+}
+
 async function statusCheckFeedSources(env: Env): Promise<StatusSection> {
 	const bskyChecks = (await bskySourceHealth(env)).map((s): StatusCheck => {
 		const when = s.lastPostDays !== null ? `last post ${s.lastPostDays}d ago` : "";
@@ -3353,16 +3593,9 @@ async function statusCheckFeedSources(env: Env): Promise<StatusSection> {
 			case "dead":    return { label: s.handle, status: "fail", detail: "does NOT resolve on the keyless API — dead/renamed?" };
 		}
 	});
-	const rssChecks = await Promise.all(NEWS_FEEDS.map(async (f): Promise<StatusCheck> => {
-		try {
-			const r = await fetch(f.url, { headers: { "User-Agent": BROWSER_UA, Accept: "application/rss+xml, application/xml, text/xml" } });
-			if (!r.ok) return { label: f.source, status: "fail", detail: `HTTP ${r.status} · ${f.url}` };
-			const items = parseOutletRSS(await r.text()).length;
-			return items > 0 ? { label: f.source, status: "ok", detail: `${items} items` } : { label: f.source, status: "warn", detail: "reachable but 0 items" };
-		} catch (e) {
-			return { label: f.source, status: "fail", detail: String((e as Error)?.message ?? e).slice(0, 70) };
-		}
-	}));
+	// News outlets (the KV-backed list, incl. title-filtered + archive-scraped ones) — recency-tiered.
+	const snapForNews = await readSourcesSnapshot(env);
+	const rssChecks = (await loadNewsFeeds(env)).map((f) => sourceHealthCheck(slotHealth(f.url, f.source, f.kind ?? "rss", snapForNews?.sources[newsSlotKey(f)])));
 	return {
 		title: "Feed sources — reporters/league (Bluesky) + news (RSS)",
 		note: "Bluesky handles tier on their last ORIGINAL post (reposts don't count): 🟢 <14d · 🟡 14–30d cooling · 🔴 >30d (past the app's feed window → invisible in Social, drop candidate) or dead handle. Catches less-active vs gone.",
@@ -3458,6 +3691,7 @@ const STATUS_SECTIONS: Record<string, { label: string; run: (env: Env) => Promis
 	clubnews: { label: "Club news", run: (env) => statusCheckClubNews(env) },
 	espn: { label: "ESPN core", run: () => statusCheckESPN() },
 	feeds: { label: "Feed sources", run: (env) => statusCheckFeedSources(env) },
+	beats: { label: "Club Beat", run: (env) => statusCheckBeats(env) },
 	ig: { label: "Instagram", run: (env) => statusCheckIG(env) },
 	alerting: { label: "Alerting", run: (env) => statusCheckAlerting(env) },
 	errors: { label: "Diagnostics", run: (env) => statusCheckErrors(env) },
@@ -3840,67 +4074,81 @@ type NewsCard = {
 	[k: string]: unknown;
 };
 
-/** Build Feed "News" cards from the curated per-outlet RSS feeds: real publisher
- *  URL + description + image. Haiku then drops non-NWSL items and tags the rest;
- *  survivors missing an image/blurb are OG-scraped (the club-news plumbing, now on
- *  real article URLs). Per-feed failures are isolated (a dead feed → []), so one
- *  outlet down never trips the feed's stale fallback. */
-async function buildNewsCards(teams: string[], env: Env, ctx: ExecutionContext): Promise<unknown[]> {
-	const perFeed = await Promise.all(
-		NEWS_FEEDS.map(async (feed) => {
-			try {
-				const r = await fetchBounded(feed.url, {
-					headers: {
-						"User-Agent": BROWSER_UA,
-						Accept: "application/rss+xml, application/xml, text/xml",
-					},
-				});
-				if (!r.ok) return [] as NewsCard[];
-				const cards: NewsCard[] = [];
-				for (const it of parseOutletRSS(await r.text())) {
-					// `timestamp` is required app-side; skip an undatable item rather
-					// than fake a time (would mis-sort it to "now").
-					const timestamp = isoNoFraction(it.pubDate);
-					if (!timestamp) continue;
-					cards.push({
-						id: `news-${hashId(it.link)}`,
-						layout: "newsArticle",
-						platform: "article",
-						placement: "feed",
-						sourceType: "news",
-						teamAbbreviation: undefined, // set by tagNewsTeams (single-team)
-						isLeague: true, // default; tagNewsTeams narrows when single-team
-						headline: it.title,
-						blurb: it.description,
-						sourceName: feed.source,
-						thumbnailURL: it.image,
-						igFallback: false,
-						timestamp,
-						url: it.link,
-						ctaLabel: "Read article",
-					});
-				}
-				return cards;
-			} catch (e) {
-				// Hang-bound tripped (or outlet died): this outlet sits out THIS refresh only —
-				// loud to the engineer, retried fresh next cycle. Never a standing exclusion.
-				if (isTimeout(e)) emitDiag(env, ctx, "feedUpstreamTimeout", `rss:${feed.url.slice(0, 60)}`);
-				return [] as NewsCard[];
-			}
-		}),
-	);
+/** One outlet's items -> pre-Haiku News cards (title filter + datable items only, newest first). */
+async function fetchOutletCards(feed: NewsFeedSource): Promise<NewsCard[]> {
+	const cards: NewsCard[] = [];
+	for (const it of await fetchSourceItems(feed.kind ?? "rss", feed.url)) {
+		if (!titlePasses(it.title, feed.titleMatch)) continue;
+		// `timestamp` is required app-side; skip an undatable item rather
+		// than fake a time (would mis-sort it to "now").
+		const timestamp = isoNoFraction(it.pubDate);
+		if (!timestamp) continue;
+		cards.push({
+			id: `news-${hashId(it.link)}`,
+			layout: "newsArticle",
+			platform: "article",
+			placement: "feed",
+			sourceType: "news",
+			teamAbbreviation: undefined, // set by tagNewsTeams (single-team)
+			isLeague: true, // default; tagNewsTeams narrows when single-team
+			headline: it.title,
+			blurb: it.description,
+			sourceName: feed.source,
+			thumbnailURL: it.image,
+			igFallback: false,
+			timestamp,
+			url: it.link,
+			ctaLabel: "Read article",
+		});
+	}
+	return (cards.sort(byTimestampDesc) as NewsCard[]).slice(0, NEWS_ITEMS_PER_OUTLET);
+}
 
+/** Build Feed "News" cards: the outlets' items come from the SOCIAL SOURCES SNAPSHOT (one KV read,
+ *  refreshed off the request path ~every 30 min); Haiku then drops non-NWSL items and team-tags the
+ *  rest (verdicts KV-cached per article), and survivors missing an image/blurb get a CAPPED OG fill.
+ *  Fallback (snapshot missing - e.g. the minutes after first deploy): fetch the original four
+ *  outlets inline exactly as before, LOUD (`sourcesSnapshotMissing`), so News never blanks. */
+async function buildNewsCards(teams: string[], env: Env, ctx: ExecutionContext, snap: SourcesSnapshot | null): Promise<unknown[]> {
+	let raw: NewsCard[];
+	if (snap) {
+		const feeds = await loadNewsFeeds(env, ctx);
+		raw = feeds.flatMap((f) => (snap.sources[newsSlotKey(f)]?.items ?? []) as NewsCard[]);
+	} else {
+		emitDiag(env, ctx, "sourcesSnapshotMissing", "news served inline from the seed outlets");
+		const per = await Promise.all(
+			NEWS_FEEDS.map(async (feed) => {
+				try {
+					return await fetchOutletCards(feed);
+				} catch (e) {
+					if (isTimeout(e)) emitDiag(env, ctx, "feedUpstreamTimeout", `rss:${feed.url.slice(0, 60)}`);
+					else if (isSubrequestCap(e)) emitDiag(env, ctx, "subrequestCapHit", `news:${feed.source}`);
+					return [] as NewsCard[];
+				}
+			}),
+		);
+		raw = per.flat();
+	}
 	// Haiku FIRST (drop non-NWSL + non-followed-team + route), so we only spend OG
 	// scrapes on keepers.
-	const kept = await tagNewsTeams(perFeed.flat(), teams, env, ctx);
-	return enrichNewsOG(kept, env, ctx);
+	const kept = await tagNewsTeams(raw, teams, env, ctx);
+	return (await enrichNewsOG(kept, env, ctx, NEWS_OG_CAP)).cards;
 }
 
 /** Fill a missing thumbnail/blurb by Open-Graph-scraping the REAL article URL —
  *  the same fetchOG plumbing the club-news cards use. Cached in KV by card id
  *  (`ogn-<id>`, ~7d) so each article is scraped once; cards that already have both
  *  skip it. Best-effort: a scrape failure leaves the card as-is (headline still shows). */
-async function enrichNewsOG(cards: NewsCard[], env: Env, ctx: ExecutionContext): Promise<NewsCard[]> {
+async function enrichNewsOG(
+	cards: NewsCard[],
+	env: Env,
+	ctx: ExecutionContext,
+	scrapeLimit = Number.POSITIVE_INFINITY,
+): Promise<{ cards: NewsCard[]; scraped: number; skipped: number }> {
+	// `scrapeLimit` bounds the EXTERNAL OG fetches this build may spend (KV hits are free); cards past
+	// it keep their in-feed fields and get filled on a later build (the subrequest-cap guard).
+	let scraped = 0;
+	let skipped = 0;
 	await Promise.all(
 		cards.map(async (c) => {
 			if ((c.thumbnailURL && c.blurb) || !c.url) return;
@@ -3909,9 +4157,14 @@ async function enrichNewsOG(cards: NewsCard[], env: Env, ctx: ExecutionContext):
 				| { image?: string; description?: string }
 				| null;
 			if (!og) {
+				if (scraped >= scrapeLimit) {
+					skipped++;
+					return;
+				}
+				scraped++;
 				try {
-					const scraped = await fetchOG(c.url);
-					og = { image: scraped.image, description: scraped.description };
+					const fetched = await fetchOG(c.url);
+					og = { image: fetched.image, description: fetched.description };
 					ctx.waitUntil(env.FEED_TAGS.put(key, JSON.stringify(og), { expirationTtl: TAG_TTL }));
 				} catch {
 					og = {};
@@ -3921,7 +4174,151 @@ async function enrichNewsOG(cards: NewsCard[], env: Env, ctx: ExecutionContext):
 			if (!c.blurb && og.description) c.blurb = stripHtml(og.description).slice(0, 240);
 		}),
 	);
-	return cards;
+	return { cards, scraped, skipped };
+}
+
+/** CLUB BEAT → cards for the requested clubs only, read from the SOCIAL SOURCES SNAPSHOT (zero
+ *  upstream fetches on the request path). Every card is already stamped with its club
+ *  (`teamAbbreviation`, `isLeague:false`) → only that club's fans see it, under the app's EXISTING
+ *  layouts: articles = newsArticle/NEWS, Bluesky = blueskyReporter/REPORTER (no app change). */
+async function buildBeatCards(teams: string[], env: Env, ctx: ExecutionContext, snap: SourcesSnapshot | null): Promise<unknown[]> {
+	if (!snap) return []; // buildNewsCards already emitted sourcesSnapshotMissing for this build
+	const sources = beatSourcesFor(await loadBeatSources(env, ctx), teams);
+	return sources.flatMap((src) => snap.sources[beatSlotKey(src)]?.items ?? []);
+}
+
+/** Fetch + build one beat source's FINAL cards (refresh path only). `mixed` Bluesky sources keep
+ *  only posts the Haiku gate judges NWSL (fail CLOSED; `haikuFailure` is emitted by socialVerdicts).
+ *  `og.left` bounds this run's OG fill across all sources. */
+async function buildOneBeatSource(
+	src: BeatSource,
+	env: Env,
+	ctx: ExecutionContext,
+	og: { left: number },
+): Promise<{ items: unknown[]; newestRaw: number | null }> {
+	if (src.kind === "bluesky" && src.handle) {
+		// A `mixed` writer's newest few posts are often about another team they also cover (e.g. a
+		// KC Star writer on Sporting KC) — sample deeper so the club's posts surface. 20 = ONE Haiku batch.
+		const feed = await bskyAuthorFeed(src.handle, src.mixed ? HAIKU_BATCH : POSTS_PER_HANDLE);
+		let cards = feed
+			.filter((it) => !it.reason && it.post?.record?.text)
+			.map((it) => mapBskyPost(it.post as BskyPost, { handle: src.handle as string, kind: "reporter" }))
+			.filter(Boolean) as FeedCard[];
+		const ageMs = latestOriginalAgeMs(feed, Date.now());
+		const newestRaw = ageMs === null ? null : Date.now() - ageMs;
+		if (src.titleMatch) cards = cards.filter((c) => titlePasses(c.bodyText ?? "", src.titleMatch));
+		if (src.mixed && cards.length) {
+			const verdicts = await socialVerdicts(cards, env, ctx, `beat:${src.id}`);
+			cards = cards.filter((c) => !centersNonNWSLLeague(c.bodyText) && c.id !== undefined && verdicts.get(c.id)?.isNWSL === true);
+		}
+		return { items: cards.slice(0, BEAT_ITEMS_PER_SOURCE).map((c) => ({ ...c, teamAbbreviation: src.abbr, isLeague: false })), newestRaw };
+	}
+	if (!src.url || src.kind === "bluesky") return { items: [], newestRaw: null };
+	const all = await fetchSourceItems(src.kind, src.url);
+	const rawTimes = all.map((it) => Date.parse(it.pubDate ?? "")).filter((t) => !Number.isNaN(t));
+	const newestRaw = rawTimes.length ? Math.max(...rawTimes) : null;
+	const items = all.filter((it) => titlePasses(it.title, src.titleMatch));
+	const cards: NewsCard[] = [];
+	for (const it of items) {
+		const timestamp = isoNoFraction(it.pubDate);
+		if (!timestamp) continue; // undatable → skip (never fake "now")
+		cards.push({
+			id: `beat-${hashId(it.link)}`,
+			layout: "newsArticle",
+			platform: "article",
+			placement: "feed",
+			sourceType: "news",
+			teamAbbreviation: src.abbr,
+			isLeague: false,
+			headline: it.title,
+			blurb: it.description,
+			sourceName: src.name,
+			thumbnailURL: it.image,
+			igFallback: false,
+			timestamp,
+			url: it.link,
+			ctaLabel: "Read article",
+		});
+	}
+	const newest = (cards.sort(byTimestampDesc) as NewsCard[]).slice(0, BEAT_ITEMS_PER_SOURCE);
+	// OG-fill a missing image/blurb (KV-cached per article → each scraped once, ever), bounded by the
+	// run's OG cap; an unfilled article still renders (headline + link) and fills on a later run.
+	if (og.left > 0 && newest.some((c) => !(c.thumbnailURL && c.blurb) && c.url)) {
+		const used = await enrichNewsOG(newest, env, ctx, og.left);
+		og.left -= used.scraped;
+	}
+	return { items: newest, newestRaw };
+}
+
+/** Cron side of the refresh: if the snapshot is ~30 min old (or missing), ask our OWN worker to
+ *  rebuild it through the SELF service binding — a separate invocation with its own subrequest
+ *  budget. A missing binding / key or a failed call is LOUD (`sourcesRefreshFail`). */
+async function triggerSocialSourcesRefresh(env: Env, ctx: ExecutionContext): Promise<void> {
+	if (!(await dueBySnapshot(env, SOCIAL_SOURCES_KEY, SOCIAL_SOURCES_REFRESH_MS))) return;
+	const e = env as unknown as { SELF?: Fetcher; BRACKET_ADMIN_KEY?: string };
+	if (!e.SELF || !e.BRACKET_ADMIN_KEY) {
+		emitDiag(env, ctx, "sourcesRefreshFail", `not configured (SELF binding ${e.SELF ? "ok" : "missing"}, admin key ${e.BRACKET_ADMIN_KEY ? "ok" : "missing"})`);
+		return;
+	}
+	const r = await e.SELF.fetch(
+		new Request(`${PROXY_PUBLIC_ORIGIN}/social/sources/refresh`, { method: "POST", headers: { "x-admin-key": e.BRACKET_ADMIN_KEY } }),
+	);
+	if (!r.ok) emitDiag(env, ctx, "sourcesRefreshFail", `refresh returned HTTP ${r.status}`);
+}
+
+/** REFRESH the social sources snapshot (runs in its OWN invocation — see SOCIAL_SOURCES_KEY). Every
+ *  source is isolated (a failed one keeps its previous items, flagged `ok:false` + a diag). When the
+ *  lists outgrow REFRESH_SOURCE_BUDGET, the stalest sources refresh first and the rest carry
+ *  forward to the next run. ONE KV write per run (~48/day at the 30-min cadence). */
+async function refreshSocialSources(
+	env: Env,
+	ctx: ExecutionContext,
+): Promise<{ refreshed: number; failed: string[]; carried: number; total: number }> {
+	const prev = await readSourcesSnapshot(env);
+	const beats = await loadBeatSources(env, ctx);
+	const outlets = await loadNewsFeeds(env, ctx);
+	type Job = { key: string; run: () => Promise<{ items: unknown[]; newestRaw: number | null }> };
+	const og = { left: REFRESH_OG_CAP };
+	const jobs: Job[] = [
+		...outlets.map((f) => ({
+			key: newsSlotKey(f),
+			run: async () => {
+				const items = await fetchOutletCards(f);
+				const times = items.map((c) => Date.parse(String(c.timestamp ?? ""))).filter((t) => !Number.isNaN(t));
+				return { items: items as unknown[], newestRaw: times.length ? Math.max(...times) : null };
+			},
+		})),
+		...beats.map((b) => ({ key: beatSlotKey(b), run: () => buildOneBeatSource(b, env, ctx, og) })),
+	];
+	// Stalest first (never-fetched = 0), so a budget-bounded run always makes progress.
+	jobs.sort((x, y) => (prev?.sources[x.key]?.fetchedAt ?? 0) - (prev?.sources[y.key]?.fetchedAt ?? 0));
+	const now = Date.now();
+	const sources: Record<string, SourceSlot> = {};
+	const failed: string[] = [];
+	const due = jobs.slice(0, REFRESH_SOURCE_BUDGET);
+	const carried = jobs.slice(REFRESH_SOURCE_BUDGET);
+	await Promise.all(
+		due.map(async (j) => {
+			try {
+				const out = await j.run();
+				sources[j.key] = { fetchedAt: now, ok: true, items: out.items, newestRaw: out.newestRaw };
+			} catch (e) {
+				const msg = String((e as Error)?.message ?? e).slice(0, 80);
+				failed.push(j.key);
+				if (isTimeout(e)) emitDiag(env, ctx, "feedUpstreamTimeout", j.key.slice(0, 70));
+				else if (isSubrequestCap(e)) emitDiag(env, ctx, "subrequestCapHit", j.key.slice(0, 70));
+				else emitDiag(env, ctx, "feedSourceFail", `${j.key.slice(0, 60)}: ${msg}`);
+				// Keep the last good items (a transient blip shouldn't blank a club), flagged not-ok.
+				const old = prev?.sources[j.key];
+				sources[j.key] = { fetchedAt: old?.fetchedAt ?? 0, ok: false, error: msg, items: old?.items ?? [], newestRaw: old?.newestRaw ?? null };
+			}
+		}),
+	);
+	for (const j of carried) if (prev?.sources[j.key]) sources[j.key] = prev.sources[j.key];
+	const snap: SourcesSnapshot = { v: 1, updatedAt: now, at: now, sources };
+	await env.FEED_TAGS.put(SOCIAL_SOURCES_KEY, JSON.stringify(snap));
+	if (carried.length) emitDiag(env, ctx, "sourcesRefreshCarried", `${carried.length} source(s) past the per-run budget carried forward`);
+	return { refreshed: due.length - failed.length, failed, carried: carried.length, total: jobs.length };
 }
 
 /** videos.list for the given ids + part, chunked at the API's 50-id limit. */
@@ -4097,14 +4494,19 @@ async function handleFeed(url: URL, env: Env, ctx: ExecutionContext): Promise<Re
 		// "time out" from queueing alone. News + the KV snapshot go FIRST (fast, small); the
 		// Bluesky wave follows with its hang bound, so a Bluesky incident degrades ONLY the
 		// Bluesky sources and the rest of the feed always arrives.
-		const [newsCards, social] = await Promise.all([
-			// News (B1): per-outlet RSS → Haiku NWSL-gate + team-tag + followed-team
-			// filter → OG-enrich → newsArticle cards. Self-isolating; failures yield [].
-			buildNewsCards(teams, env, ctx),
+		// Social sources snapshot (Club Beat + News outlets): ONE KV read, refreshed off-path ~30 min.
+		const sourcesSnap = await readSourcesSnapshot(env);
+		const [newsCards, social, beatCards] = await Promise.all([
+			// News (B1): outlet items (snapshot) -> Haiku NWSL-gate + team-tag + followed-team
+			// filter -> capped OG-enrich -> newsArticle cards. Self-isolating; failures yield [].
+			buildNewsCards(teams, env, ctx, sourcesSnap),
 			// Social (B3b): the cron-built IG snapshot; here we take the player clips
 			// (placement "feed") for the followed teams PLUS the user's followed cross-team
 			// players. (Club-official Bluesky was retired from the Feed 2026-08.)
 			readSocialCards(env),
+			// Club Beat (2026-09-30): club-dedicated coverage for the FOLLOWED clubs only, already
+			// stamped to its club in the snapshot - zero upstream fetches here.
+			buildBeatCards(teams, env, ctx, sourcesSnap),
 		]);
 		// 2c: the USER's own player-Bluesky adds (the add-flow's reporter|player pick). NO Haiku.
 		// ⚠️ DEFAULT player-Bluesky discovery/serving was DROPPED (owner 2026-08-17): the backfill
@@ -4139,7 +4541,7 @@ async function handleFeed(url: URL, env: Env, ctx: ExecutionContext): Promise<Re
 		const userReporterCards = rawUserReporters.map((c) => ({ ...(c as Record<string, unknown>), userAdded: true }));
 		const userPlayerBskyCards = rawUserPlayerBsky.map((c) => ({ ...(c as Record<string, unknown>), userAdded: true }));
 		const playerSocial = socialFor(social, teams, new Set(["feed"]), userPlayers);
-		cards = [...socialBluesky, ...userReporterCards, ...newsCards, ...playerSocial, ...userPlayerBskyCards].sort(
+		cards = [...socialBluesky, ...userReporterCards, ...newsCards, ...beatCards, ...playerSocial, ...userPlayerBskyCards].sort(
 			byTimestampDesc,
 		);
 		// Collapse identical-text duplicates (bot double-posts) BEFORE the cap, so a
@@ -4218,6 +4620,7 @@ async function blueskyCardsFor(h: FeedHandle, env?: Env, ctx?: ExecutionContext)
 		// Hang-bound tripped: this handle sits out THIS refresh only (retried fresh next
 		// cycle) — diag'd so a repeat-offender upstream is visible, never silently skipped.
 		if (isTimeout(e) && env && ctx) emitDiag(env, ctx, "feedUpstreamTimeout", `bsky:${h.handle}`);
+		else if (isSubrequestCap(e) && env && ctx) emitDiag(env, ctx, "subrequestCapHit", `bsky:${h.handle}`);
 		return [];
 	}
 }
@@ -5269,6 +5672,82 @@ async function handlePlayerAudit(request: Request, env: Env, ctx: ExecutionConte
  *  and the fans' add-signals from anonymous analytics (the Stage-3 counter feeds this — built
  *  consumer-first per the backbone rule, empty until that ships). Discovery beyond signals is
  *  the ROUTINE's web research (follows-of-follows graph signals REJECTED by owner). */
+/** CLUB BEAT admin surface (auth: owner x-admin-key OR the routine's x-audit-key).
+ *  GET  /social/beat-audit        → the live list + fresh per-source health + per-club coverage.
+ *  POST /social/beat-audit/apply  → {add:[BeatSource…], drop:[id…]} with server guards (schema,
+ *       dedupe, per-club anti-spree rail) — the write path the owner's seed edits AND the future
+ *       monthly routine (Part C) use. Quality judgment lives with the owner/routine; mechanics here. */
+async function handleBeatAudit(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
+	if (!auditAuthed(request, env)) {
+		return new Response("Authentication required.", { status: 401, headers: { "WWW-Authenticate": adminRealm("NWSLApp Admin") } });
+	}
+	const path = new URL(request.url).pathname;
+	if (request.method === "POST" && path === "/social/beat-audit/apply") {
+		let body: { add?: Partial<BeatSource>[]; drop?: string[] };
+		try {
+			body = (await request.json()) as typeof body;
+		} catch {
+			return jsonResponse({ error: "unparseable JSON" }, 400);
+		}
+		const res = applyBeatChanges(await loadBeatSources(env, ctx), body);
+		if (res.added.length || res.dropped.length) await env.FEED_TAGS.put(BEAT_LIST_KEY, JSON.stringify(res.list));
+		emitDiag(env, ctx, "socialBeatApply", `+${res.added.length} -${res.dropped.length} → ${res.list.length}${res.rejected.length ? ` (${res.rejected.length} rejected)` : ""}`);
+		return jsonResponse({ added: res.added, dropped: res.dropped, rejected: res.rejected, total: res.list.length, perClubRail: MAX_BEAT_PER_CLUB }, 200);
+	}
+	if (request.method !== "GET") return jsonResponse({ error: "method not allowed" }, 405);
+	const list = await loadBeatSources(env, ctx);
+	const health = await beatSourceHealth(env);
+	const perClub: Record<string, number> = {};
+	for (const s of list) perClub[s.abbr] = (perClub[s.abbr] ?? 0) + 1;
+	const uncovered = [...NEWS_TEAM_ABBR_SET].filter((a) => !perClub[a]).sort();
+	return jsonResponse({ total: list.length, perClub, uncovered, sources: list, health }, 200);
+}
+
+/** NEWS OUTLETS admin surface (same auth). GET → list + fresh health. POST /apply →
+ *  {add:[{url, source, kind?, titleMatch?}], drop:[url…]} with validation + dedupe by url. */
+async function handleNewsFeedsAdmin(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
+	if (!auditAuthed(request, env)) {
+		return new Response("Authentication required.", { status: 401, headers: { "WWW-Authenticate": adminRealm("NWSLApp Admin") } });
+	}
+	const path = new URL(request.url).pathname;
+	if (request.method === "POST" && path === "/social/news-feeds/apply") {
+		let body: { add?: Partial<NewsFeedSource>[]; drop?: string[] };
+		try {
+			body = (await request.json()) as typeof body;
+		} catch {
+			return jsonResponse({ error: "unparseable JSON" }, 400);
+		}
+		const list = [...(await loadNewsFeeds(env, ctx))];
+		const added: string[] = [];
+		const dropped: string[] = [];
+		const rejected: { url?: string; reason: string }[] = [];
+		for (const d of body.drop ?? []) {
+			const i = list.findIndex((f) => f.url === d);
+			if (i === -1) rejected.push({ url: d, reason: "not on the list" });
+			else dropped.push(list.splice(i, 1)[0].url);
+		}
+		for (const a of body.add ?? []) {
+			const f: NewsFeedSource = {
+				url: String(a.url ?? ""),
+				source: String(a.source ?? "").trim(),
+				...(a.kind === "beehiiv" ? { kind: "beehiiv" as const } : {}),
+				...(a.titleMatch ? { titleMatch: String(a.titleMatch) } : {}),
+			};
+			if (!isValidNewsFeeds([f])) rejected.push({ url: f.url, reason: "invalid (https url + source name required; kind rss|beehiiv)" });
+			else if (list.some((x) => x.url === f.url)) rejected.push({ url: f.url, reason: "already on the list" });
+			else {
+				list.push(f);
+				added.push(f.url);
+			}
+		}
+		if (added.length || dropped.length) await env.FEED_TAGS.put(NEWS_FEEDS_KEY, JSON.stringify(list));
+		emitDiag(env, ctx, "socialNewsFeedsApply", `+${added.length} -${dropped.length} → ${list.length}${rejected.length ? ` (${rejected.length} rejected)` : ""}`);
+		return jsonResponse({ added, dropped, rejected, total: list.length }, 200);
+	}
+	if (request.method !== "GET") return jsonResponse({ error: "method not allowed" }, 405);
+	return jsonResponse({ feeds: await loadNewsFeeds(env, ctx), health: await newsFeedHealth(env) }, 200);
+}
+
 const REPORTER_AUDIT_STREAK_KEY = "social:reporter-dormant-streak";
 async function handleReporterAudit(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
 	if (!auditAuthed(request, env)) {
@@ -5562,51 +6041,7 @@ async function classifySocialBluesky(
 	const typed = cards as FeedCard[];
 	if (typed.length === 0) return [];
 	const followed = new Set(teams);
-	const verdicts = new Map<string, SocialVerdict>();
-	// sv2→sv3 (2026-08-16): player-centric international rule — bump orphans week-old verdicts
-	// judged under the old "USWNT-only" policy so the new rule applies immediately.
-	const vkey = (id: string) => `sv3-${id}`;
-
-	// 1. Load cached verdicts (one KV read per card; misses return null).
-	const cached = await Promise.all(
-		typed.map((c) => (c.id ? env.FEED_TAGS.get(vkey(c.id), "json") : Promise.resolve(null))),
-	);
-	const uncached: FeedCard[] = [];
-	typed.forEach((c, i) => {
-		const v = cached[i] as SocialVerdict | null;
-		if (v) verdicts.set(c.id!, v);
-		else if (c.id) uncached.push(c);
-	});
-
-	// 2. Classify the misses via Haiku, batched. No key → skip (those fail closed below).
-	if (uncached.length > 0 && env.ANTHROPIC_API_KEY) {
-		const playerMap = featuredPlayerMapBlock(await loadPlayerSocial(env));
-		for (let i = 0; i < uncached.length; i += HAIKU_BATCH) {
-			const batch = uncached.slice(i, i + HAIKU_BATCH);
-			let out: SocialVerdict[] | null;
-			try {
-				out = await haikuClassifySocialBatch(batch, env.ANTHROPIC_API_KEY, playerMap);
-			} catch {
-				out = null; // fail closed: this batch stays unjudged → dropped below
-			}
-			if (out) {
-				for (const v of out) {
-					if (!v?.id) continue;
-					const tms = (v.teams ?? []).filter((t) => NEWS_TEAM_ABBR_SET.has(t));
-					const clean: SocialVerdict = {
-						id: v.id,
-						isNWSL: v.isNWSL === true,
-						teams: tms,
-						leagueNews: v.leagueNews === true,
-					};
-					verdicts.set(v.id, clean);
-					ctx.waitUntil(
-						env.FEED_TAGS.put(vkey(v.id), JSON.stringify(clean), { expirationTtl: TAG_TTL }),
-					);
-				}
-			}
-		}
-	}
+	const verdicts = await socialVerdicts(typed, env, ctx, "social");
 
 	// 3. Keep + tag (or drop). Social fails CLOSED on an unjudged post. The league-wide
 	//    bar is split by source: official LEAGUE outlets must clear the hard-news bar
@@ -5633,6 +6068,72 @@ async function classifySocialBluesky(
 		keepers.push(c);
 	}
 	return keepers;
+}
+
+/** The Haiku social verdicts for a set of Bluesky cards: cached `sv3-<id>` verdicts first (one KV
+ *  read per card), misses classified in HAIKU_BATCH batches and written back. Shared by the
+ *  reporter/league gate (classifySocialBluesky) and the Club Beat `mixed` gate (buildBeatCards).
+ *  A Haiku failure leaves those posts unjudged (callers fail CLOSED) and emits `haikuFailure` —
+ *  never silent. `onHaikuCall` lets a budgeted caller count the external call. */
+async function socialVerdicts(
+	typed: FeedCard[],
+	env: Env,
+	ctx: ExecutionContext,
+	scope: string,
+	onHaikuCall?: () => void,
+): Promise<Map<string, SocialVerdict>> {
+	const verdicts = new Map<string, SocialVerdict>();
+	// sv2→sv3 (2026-08-16): player-centric international rule — bump orphans week-old verdicts
+	// judged under the old "USWNT-only" policy so the new rule applies immediately.
+	const vkey = (id: string) => `sv3-${id}`;
+
+	// 1. Load cached verdicts (one KV read per card; misses return null).
+	const cached = await Promise.all(
+		typed.map((c) => (c.id ? env.FEED_TAGS.get(vkey(c.id), "json") : Promise.resolve(null))),
+	);
+	const uncached: FeedCard[] = [];
+	typed.forEach((c, i) => {
+		const v = cached[i] as SocialVerdict | null;
+		if (v) verdicts.set(c.id!, v);
+		else if (c.id) uncached.push(c);
+	});
+
+	// 2. Classify the misses via Haiku, batched. No key / a failed batch → those stay unjudged
+	//    (callers fail CLOSED) and it's LOUD (`haikuFailure`), never a silent empty.
+	if (uncached.length > 0 && !env.ANTHROPIC_API_KEY) {
+		emitDiag(env, ctx, "haikuFailure", `${scope}: no ANTHROPIC_API_KEY — ${uncached.length} post(s) unjudged`);
+	}
+	if (uncached.length > 0 && env.ANTHROPIC_API_KEY) {
+		const playerMap = featuredPlayerMapBlock(await loadPlayerSocial(env));
+		for (let i = 0; i < uncached.length; i += HAIKU_BATCH) {
+			const batch = uncached.slice(i, i + HAIKU_BATCH);
+			let out: SocialVerdict[] | null;
+			try {
+				onHaikuCall?.();
+				out = await haikuClassifySocialBatch(batch, env.ANTHROPIC_API_KEY, playerMap);
+			} catch (e) {
+				out = null; // fail closed: this batch stays unjudged → dropped by the caller
+				emitDiag(env, ctx, "haikuFailure", `${scope}: ${String((e as Error)?.message ?? e).slice(0, 80)} (${batch.length} unjudged)`);
+			}
+			if (out) {
+				for (const v of out) {
+					if (!v?.id) continue;
+					const tms = (v.teams ?? []).filter((t) => NEWS_TEAM_ABBR_SET.has(t));
+					const clean: SocialVerdict = {
+						id: v.id,
+						isNWSL: v.isNWSL === true,
+						teams: tms,
+						leagueNews: v.leagueNews === true,
+					};
+					verdicts.set(v.id, clean);
+					ctx.waitUntil(
+						env.FEED_TAGS.put(vkey(v.id), JSON.stringify(clean), { expirationTtl: TAG_TTL }),
+					);
+				}
+			}
+		}
+	}
+	return verdicts;
 }
 
 /** Classify one batch of social posts via a single Haiku call (forced JSON). */
@@ -5718,7 +6219,10 @@ async function tagNewsTeams(
 		else uncached.push(c);
 	});
 
-	// 2. Tag the misses via Haiku, batched. No key → skip (everything fails open).
+	// 2. Tag the misses via Haiku, batched. No key → skip (everything fails open) — LOUDLY.
+	if (uncached.length > 0 && !env.ANTHROPIC_API_KEY) {
+		emitDiag(env, ctx, "haikuFailure", `news: no ANTHROPIC_API_KEY — ${uncached.length} article(s) unjudged, kept league-wide`);
+	}
 	if (uncached.length > 0 && env.ANTHROPIC_API_KEY) {
 		const playerMap = featuredPlayerMapBlock(await loadPlayerSocial(env));
 		for (let i = 0; i < uncached.length; i += HAIKU_BATCH) {
@@ -5726,8 +6230,9 @@ async function tagNewsTeams(
 			let out: NewsVerdict[] | null;
 			try {
 				out = await haikuTagNewsBatch(batch, env.ANTHROPIC_API_KEY, playerMap);
-			} catch {
+			} catch (e) {
 				out = null; // fail open: batch unjudged → kept league-wide below
+				emitDiag(env, ctx, "haikuFailure", `news: ${String((e as Error)?.message ?? e).slice(0, 80)} (${batch.length} unjudged, kept league-wide)`);
 			}
 			if (out) {
 				for (const v of out) {
@@ -6617,6 +7122,10 @@ const ALERT_ERROR_KINDS = new Set([
 	// requested a round past the published season (a missed annual refresh); throttled 1/day, so it's really
 	// report-only visibility — health_check_trivia.mjs is the true "wrong-season pool" gate.
 	"triviaGroupInfeasible", "triviaStaleServe",
+	// Social Club Beat / relevance gate (2026-09-30). `haikuFailure` = the relevance classifier failed
+	// (posts unjudged → social/beat dropped, news kept league-wide); `beatListInvalid` = a malformed
+	// source-list overlay (seed served instead).
+	"haikuFailure", "beatListInvalid", "subrequestCapHit",
 ]);
 
 /** The ONE owner-email primitive (Resend). Every alerting path — the scheduled synthetic checks, the

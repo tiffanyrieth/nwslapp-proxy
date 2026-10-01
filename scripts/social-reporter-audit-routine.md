@@ -60,6 +60,19 @@ without content — activity recency is a HARD check, verified via getAuthorFeed
 count). Mixed beats are fine (NWSL + other soccer) — Haiku filters per-post; what matters is
 that the NWSL posts themselves are worth a fan's tap.
 
+**HIGH EFFORT + GOOD FAITH (owner, 2026-09-30 — the bar in two words).** The list exists to
+surface real analysis and reporting: match breakdowns, tactics, reporting with access, informed
+takes. REJECT outright: (a) **AI-generated / auto-generated content** — templated recaps,
+"daily show" networks with a cookie-cutter show per club (the Beatline pattern), posts that read
+like a box score narrated by a bot; (b) **bad-faith voices** — rage-bait, dunking for engagement,
+takes built to provoke rather than inform. A big following or a media job does not exempt an
+account from either. When fans flag an existing default by name for repeated factual errors or
+bad-faith takes, do a quality RE-READ of that account next run (sample 20 originals; report what
+you found) — one complaint is a prompt to look, never a drop by itself.
+
+**One-off for the next run:** fans named **Jenna Tonelli** for quality concerns. Re-read per the
+paragraph above and report; do not drop on that signal alone.
+
 ### 5. Apply (guarded) + report
 
 `POST {base}/apply` body `{"add":[{"handle":"...","kind":"reporter|league"}],"drop":["handle"]}`

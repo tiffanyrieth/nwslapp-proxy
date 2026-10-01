@@ -14,6 +14,12 @@
 			"id": "3c1372c0f8174cdcb3e2e52ca5de14ad",
 		},
 	],
+	// SELF — a service binding to THIS worker. The */5 cron calls POST /social/sources/refresh through it
+	// (~every 30 min) so the social-sources refresh (Club Beat + News outlets, ~32 upstream fetches) runs
+	// in its OWN invocation with its own 50-subrequest budget, never competing with the tick's alerting.
+	"services": [
+		{ "binding": "SELF", "service": "nwslapp-proxy" },
+	],
 	// Workers AI — backs the Social feed's IMAGE-MODERATION backstop. DECOUPLED from the scrape
 	// (FREE tier = 50 subrequests / 10ms CPU per run can't classify a ~300-image scrape at once):
 	// a small batch runs on the 5-min cron (gated ~30 min, moderateSnapshotTick), reading the CACHED
