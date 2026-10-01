@@ -4550,6 +4550,10 @@ function podcastEpisodeCard(ep: PodcastEpisode, slot: PodcastSlot, teamTag: stri
 		clubs: ep.clubs,
 		matchedTerms: ep.matchedTerms,
 		episodeKind: kind,
+		// The show's Apple id + Spotify url so the Listen card can build the chosen podcast app's
+		// SHOW link client-side (episode-level deep links are unreliable across apps).
+		appleId: slot.meta.appleId,
+		spotifyUrl: slot.meta.spotifyUrl,
 		igFallback: false,
 		ctaLabel: "Listen",
 	};
