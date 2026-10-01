@@ -4656,6 +4656,12 @@ const REPORTER_NAMES: Record<string, string> = {
 	"nwslthisweek.bsky.social": "NWSL This Week",
 	"nwslstat.bsky.social": "NWSL Stats",
 	"allforxi.bsky.social": "All For XI",
+	// Routine-added reporters (names pulled from their Bluesky profiles 2026-10-01).
+	"andre-carlisle.bsky.social": "André Carlisle", // Beyond the Vaudevillian Cane
+	"lesleyryder.bsky.social": "Lesley Ryder",
+	"phuocerman.bsky.social": "Phuoc Nguyen",
+	"tayvincent6.bsky.social": "Taylor Vincent",
+	"theolloydhughes.bsky.social": "Alison Gale",
 };
 function prettyHandleName(handle: string): string {
 	const h = handle.replace(/^@/, "");
