@@ -12,7 +12,13 @@ human facts and stage a verified human-only pool. On **Monday** the app's watche
 goes live for the 10am nudge). Running on the weekend gives the owner a window to hand-fix anything you flag
 before it reaches users.
 
-You received `INGEST_KEY` (a secret; never print/persist it). Base URL:
+The key is the environment variable `$INGEST_KEY`, set on the routines' shared cloud environment (never pasted into
+the prompt). Reference it ONLY as `$INGEST_KEY` in commands: never type a literal key value, never print it, never write
+it to a file, never commit it or include it in your report. If `$INGEST_KEY` is empty or the proxy answers 401, STOP and
+report FAILURE ("INGEST_KEY missing or rejected in the routine environment"); never work around a permission denial
+(no helper scripts, subagents, re-quoting, or alternate tools). Why: a key pasted into the prompt forces the agent
+to inline it, auto-mode blocks that as credential leakage, and the run stalls on an approval prompt (2026-10-03).
+Base URL:
 `https://nwslapp-proxy.tiffany-rieth.workers.dev`.
 
 ## Why you exist (read once)

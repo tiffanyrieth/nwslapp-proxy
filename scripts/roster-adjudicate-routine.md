@@ -6,8 +6,12 @@ page — your job is to read it and report it, with a citation. When you cannot 
 authoritative answer, **decline by simply not posting that item.** An unposted mismatch costs
 nothing (the owner sees it in her portal); a wrong ruling is pinned for 90 days.
 
-You received `ADJUDICATE_KEY` in your instructions (it is a secret — never print it, never write
-it to a file, never include it in your report).
+The key is the environment variable `$ADJUDICATE_KEY`, set on the routines' shared cloud environment (never pasted into
+the prompt). Reference it ONLY as `$ADJUDICATE_KEY` in commands: never type a literal key value, never print it, never write
+it to a file, never commit it or include it in your report. If `$ADJUDICATE_KEY` is empty or the proxy answers 401, STOP and
+report FAILURE ("ADJUDICATE_KEY missing or rejected in the routine environment"); never work around a permission denial
+(no helper scripts, subagents, re-quoting, or alternate tools). Why: a key pasted into the prompt forces the agent
+to inline it, auto-mode blocks that as credential leakage, and the run stalls on an approval prompt (2026-10-03).
 
 ## 1. Fetch the work list
 
