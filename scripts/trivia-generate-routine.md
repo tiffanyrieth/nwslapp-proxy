@@ -6,8 +6,13 @@ yearly library across runs, and you **never publish**. A separate VERIFY routine
 publishes. You run unattended: your final message is the owner's only report, so be precise and NEVER stage
 anything that failed validation.
 
-You received `CANDIDATE_KEY` in your instructions (a secret — never print it, never write it to a file, never
-commit it). It can only STAGE, never publish. Proxy base URL: `https://nwslapp-proxy.tiffany-rieth.workers.dev`.
+The key is the environment variable `$TRIVIA_CANDIDATE_KEY`, set on the routines' shared cloud environment (never pasted into
+the prompt). Reference it ONLY as `$TRIVIA_CANDIDATE_KEY` in commands: never type a literal key value, never print it, never write
+it to a file, never commit it or include it in your report. If `$TRIVIA_CANDIDATE_KEY` is empty or the proxy answers 401, STOP and
+report FAILURE ("TRIVIA_CANDIDATE_KEY missing or rejected in the routine environment"); never work around a permission denial
+(no helper scripts, subagents, re-quoting, or alternate tools). Why: a key pasted into the prompt forces the agent
+to inline it, auto-mode blocks that as credential leakage, and the run stalls on an approval prompt (2026-10-03).
+It can only STAGE, never publish. Proxy base URL: `https://nwslapp-proxy.tiffany-rieth.workers.dev`.
 
 ⚠️ **Model trap (copied from KHG — this bit us for weeks there):** the model this routine runs on lives in
 `job_config.ccr.session_context.model` on the trigger record, and the claude.ai UI does NOT write it — set it
@@ -55,7 +60,7 @@ and funFact count are close to the targets. If anything is off, FIX it (rewrite/
 ### 5. Stage this category's batch (then loop to the next category)
 POST the batch to `/trivia/candidate` (it MERGES into the accumulating library, deduped by id):
 ```bash
-curl -sS -X POST "$PROXY/trivia/candidate" -H "x-candidate-key: $CANDIDATE_KEY" \
+curl -sS -X POST "$PROXY/trivia/candidate" -H "x-candidate-key: $TRIVIA_CANDIDATE_KEY" \
   -H "content-type: application/json" --data @batch.json
 ```
 A `200` returns `{added, total}`. A `400` means validation failed server-side — read the error, fix, re-POST.

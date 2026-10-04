@@ -6,7 +6,13 @@ is ONLY the parts that need web research and judgment, and then applying the res
 **fully automated** (owner ruling 2026-08-16): what you apply goes live; your final report is
 transparency for troubleshooting, not an approval request.
 
-Auth: every call uses the `x-audit-key` header with the SOCIAL_AUDIT_KEY from your prompt.
+Auth: every call uses the `x-audit-key` header with `$SOCIAL_AUDIT_KEY`.
+The key is the environment variable `$SOCIAL_AUDIT_KEY`, set on the routines' shared cloud environment (never pasted into
+the prompt). Reference it ONLY as `$SOCIAL_AUDIT_KEY` in commands: never type a literal key value, never print it, never write
+it to a file, never commit it or include it in your report. If `$SOCIAL_AUDIT_KEY` is empty or the proxy answers 401, STOP and
+report FAILURE ("SOCIAL_AUDIT_KEY missing or rejected in the routine environment"); never work around a permission denial
+(no helper scripts, subagents, re-quoting, or alternate tools). Why: a key pasted into the prompt forces the agent
+to inline it, auto-mode blocks that as credential leakage, and the run stalls on an approval prompt (2026-10-03).
 Base: `https://nwslapp-proxy.tiffany-rieth.workers.dev/social/player-audit`
 
 ## Background you must respect (the eligibility law)
