@@ -23,7 +23,7 @@
 // Wikipedia is aggregates-only, FBref/FotMob/Sofascore/FootyStats are bot-walled and
 // Opta-fed) is recorded in docs/backend.md — do not re-litigate it from scratch.
 
-import { ESPN_HEADERS } from "./espn-ua.ts";
+import { ESPN_HEADERS, PROXY_UA } from "./espn-ua.ts";
 
 // Self-declared ESPN bases (index.ts's consts aren't importable without a cycle; these are the
 // same stable strings). NWSL default only — the backstop deliberately covers NWSL matches, not
@@ -299,7 +299,7 @@ async function fetchSdpMatches(emit: Emit): Promise<SdpMatch[]> {
 	}
 	try {
 		const res = await fetch(`${SDP_BASE}/seasons/${guid}/matches`, {
-			headers: { Accept: "application/json" },
+			headers: { "User-Agent": PROXY_UA, Accept: "application/json" },
 		});
 		if (!res.ok) throw new Error(`sdp matches ${res.status}`);
 		const parsed = (await res.json()) as SdpMatch[] | { matches?: SdpMatch[] };
@@ -317,7 +317,7 @@ async function fetchMatchfactsSpectators(matchId: string, emit: Emit): Promise<n
 	if (!guid) return 0;
 	try {
 		const res = await fetch(`${SDP_BASE}/seasons/${guid}/match/${matchId}/matchfacts`, {
-			headers: { Accept: "application/json" },
+			headers: { "User-Agent": PROXY_UA, Accept: "application/json" },
 		});
 		if (!res.ok) return 0;
 		// "enviroment" is the league API's own spelling — do not correct it.

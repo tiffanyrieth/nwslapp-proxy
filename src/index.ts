@@ -704,13 +704,15 @@ const FEED_HANDLES: FeedHandle[] = [
 const BEAT_LIST_KEY = "social:beat-list";
 const NEWS_FEEDS_KEY = "social:news-feeds";
 /** The SOCIAL SOURCES SNAPSHOT: every Club Beat source + every News outlet, fetched OFF the request
- *  path by a refresh run (POST /social/sources/refresh — the 5-minute cron triggers it every ~30 min via
+ *  path by a refresh run (POST /social/sources/refresh — the 5-minute cron triggers it every ~60 min via
  *  the SELF service binding, so the refresh gets its OWN invocation + 50-subrequest budget). /feed
  *  reads it with ONE KV read (KV reads don't count toward the 50 external subrequests; fetch() and
  *  Cache API calls DO — measured live 2026-09-30: per-source Cache-API caching on the request path
- *  blew the cap). Owner 2026-09-30: articles may be 30–60 min old; this refreshes every ~30. */
+ *  blew the cap). Owner 2026-09-30: articles may be 30–60 min old. Owner 2026-10-05: HOURLY — a 30-min
+ *  cadence was more polling than a fan app needs and drew publisher rate limits (Substack 429, a
+ *  Tribune paper's bot-wall 403). Can widen to 2h if hourly still trips limits. */
 const SOCIAL_SOURCES_KEY = "social:sources-snapshot";
-const SOCIAL_SOURCES_REFRESH_MS = 30 * 60 * 1000;
+const SOCIAL_SOURCES_REFRESH_MS = 60 * 60 * 1000;
 /** External fetches one refresh run may spend on SOURCE fetches (the rest of the 50 covers mixed-
  *  source Haiku, a capped OG fill and the KV write). Past it, the stalest sources go first and the
  *  remainder carry forward to the next run — so the list can grow without ever breaching the cap. */
@@ -1591,8 +1593,8 @@ that needs more users) until you bring it back.</p>
 			} catch {
 				/* swallow — best-effort; the next gated tick retries */
 			}
-			// Social sources snapshot refresh (Club Beat + News outlets), gated to ~30 min (owner: 30-60
-			// min freshness is fine for articles). ONE subrequest here: the work runs in its OWN invocation
+			// Social sources snapshot refresh (Club Beat + News outlets), gated to ~60 min (owner 2026-10-05:
+			// hourly is plenty for articles; gentler on publishers). ONE subrequest here: the work runs in its OWN invocation
 			// via the SELF service binding, so it never competes with this tick's alerting budget.
 			try {
 				await triggerSocialSourcesRefresh(env, ctx);
@@ -3607,7 +3609,7 @@ async function statusCheckBeats(env: Env): Promise<StatusSection> {
 		checks.push({ label: "Sources snapshot", status: "fail", detail: "MISSING — the refresh hasn't run (check the SELF binding / sourcesRefreshFail diag)" });
 	} else {
 		const ageMin = Math.round((Date.now() - snap.updatedAt) / 60_000);
-		checks.push({ label: "Sources snapshot", status: ageMin > 90 ? "fail" : ageMin > 45 ? "warn" : "ok", detail: `refreshed ${ageMin} min ago (target every ~30)` });
+		checks.push({ label: "Sources snapshot", status: ageMin > 150 ? "fail" : ageMin > 75 ? "warn" : "ok", detail: `refreshed ${ageMin} min ago (hourly)` });
 	}
 	const health = list
 		.map((b) => slotHealth(b.id, `${b.abbr} · ${b.name}${b.kind === "bluesky" ? ` (@${b.handle})` : ""}`, b.kind, snap?.sources[beatSlotKey(b)], b.abbr))
@@ -3618,7 +3620,7 @@ async function statusCheckBeats(env: Env): Promise<StatusSection> {
 	if (uncovered.length) checks.push({ label: "Clubs with no Club Beat source", status: "info", detail: uncovered.join(", ") });
 	return {
 		title: `Club Beat sources (${list.length}) — club-dedicated coverage, routed to that club's fans only`,
-		note: "Read from the social sources snapshot (refreshed every ~30 min off the request path). Tiers on the newest item: 🟢 <14d · 🟡 14–30d · 🔴 >30d, or the last refresh FAILED (red = unreachable from the Worker). GET /social/beat-audit re-fetches every source live.",
+		note: "Read from the social sources snapshot (refreshed hourly off the request path). Tiers on the newest item: 🟢 <14d · 🟡 14–30d · 🔴 >30d, or the last refresh FAILED (red = unreachable from the Worker). GET /social/beat-audit re-fetches every source live.",
 		checks,
 	};
 }
@@ -4147,7 +4149,7 @@ async function fetchOutletCards(feed: NewsFeedSource): Promise<NewsCard[]> {
 }
 
 /** Build Feed "News" cards: the outlets' items come from the SOCIAL SOURCES SNAPSHOT (one KV read,
- *  refreshed off the request path ~every 30 min); Haiku then drops non-NWSL items and team-tags the
+ *  refreshed off the request path ~hourly); Haiku then drops non-NWSL items and team-tags the
  *  rest (verdicts KV-cached per article), and survivors missing an image/blurb get a CAPPED OG fill.
  *  Fallback (snapshot missing - e.g. the minutes after first deploy): fetch the original four
  *  outlets inline exactly as before, LOUD (`sourcesSnapshotMissing`), so News never blanks. */
@@ -4292,7 +4294,7 @@ async function buildOneBeatSource(
 	return { items: newest, newestRaw };
 }
 
-/** Cron side of the refresh: if the snapshot is ~30 min old (or missing), ask our OWN worker to
+/** Cron side of the refresh: if the snapshot is ~60 min old (or missing), ask our OWN worker to
  *  rebuild it through the SELF service binding — a separate invocation with its own subrequest
  *  budget. A missing binding / key or a failed call is LOUD (`sourcesRefreshFail`). */
 async function triggerSocialSourcesRefresh(env: Env, ctx: ExecutionContext): Promise<void> {
@@ -4309,7 +4311,7 @@ async function triggerSocialSourcesRefresh(env: Env, ctx: ExecutionContext): Pro
 }
 
 /** Podcasts refresh trigger — its OWN hourly SELF invocation (own 50-subrequest budget), separate
- *  from the 30-min Club-Beat/outlet family so the 23 feed fetches never compete with it. */
+ *  from the hourly Club-Beat/outlet family so the 23 feed fetches never compete with it. */
 async function triggerPodcastsRefresh(env: Env, ctx: ExecutionContext): Promise<void> {
 	if (!(await dueBySnapshot(env, SOCIAL_PODCASTS_KEY, SOCIAL_PODCASTS_REFRESH_MS))) return;
 	const e = env as unknown as { SELF?: Fetcher; BRACKET_ADMIN_KEY?: string };
@@ -4326,7 +4328,7 @@ async function triggerPodcastsRefresh(env: Env, ctx: ExecutionContext): Promise<
 /** REFRESH the social sources snapshot (runs in its OWN invocation — see SOCIAL_SOURCES_KEY). Every
  *  source is isolated (a failed one keeps its previous items, flagged `ok:false` + a diag). When the
  *  lists outgrow REFRESH_SOURCE_BUDGET, the stalest sources refresh first and the rest carry
- *  forward to the next run. ONE KV write per run (~48/day at the 30-min cadence). */
+ *  forward to the next run. ONE KV write per run (~24/day at the hourly cadence). */
 async function refreshSocialSources(
 	env: Env,
 	ctx: ExecutionContext,
@@ -4381,7 +4383,7 @@ async function refreshSocialSources(
 // ---------------------------------------------------------------------------
 // PODCASTS (2026-10-01) — a curated directory + the Listen chip. Shows are DATA (KV overlay
 // `social:podcast-list`, seed = PODCAST_SEED). The hourly refresh fetches every feed in its OWN
-// invocation (its own 50-subrequest budget, separate from the 30-min Club-Beat/outlet family) and
+// invocation (its own 50-subrequest budget, separate from the hourly Club-Beat/outlet family) and
 // writes ONE snapshot KV key; /feed and /podcasts/directory only READ it. Pure logic (parse, route,
 // validate) lives in ./podcasts.ts. Routing reads the proxy's EXISTING roster copy in KV — ZERO new
 // ESPN calls.
@@ -4945,7 +4947,7 @@ async function handleFeed(url: URL, env: Env, ctx: ExecutionContext): Promise<Re
 		// "time out" from queueing alone. News + the KV snapshot go FIRST (fast, small); the
 		// Bluesky wave follows with its hang bound, so a Bluesky incident degrades ONLY the
 		// Bluesky sources and the rest of the feed always arrives.
-		// Social sources snapshot (Club Beat + News outlets): ONE KV read, refreshed off-path ~30 min.
+		// Social sources snapshot (Club Beat + News outlets): ONE KV read, refreshed off-path ~hourly.
 		// Podcasts snapshot only when the client is podcast-capable (build 43 sends no caps).
 		const sourcesSnap = await readSourcesSnapshot(env);
 		const podcastsSnap = caps.has("podcast") ? await readPodcastsSnapshot(env) : null;

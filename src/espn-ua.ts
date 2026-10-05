@@ -12,3 +12,10 @@ export const ESPN_UA = "okhttp/4.9.0";
 
 /** The standard headers for any ESPN JSON fetch. */
 export const ESPN_HEADERS: Record<string, string> = { "User-Agent": ESPN_UA, Accept: "application/json" };
+
+// Every OTHER unauthenticated third-party fetch (NWSL SDP API, Open-Meteo, …) sends this honest,
+// identifying UA. Workers attach NO User-Agent by default, and a UA-less request is the classic
+// bot signal publishers block or rate-limit first (the ESPN lesson above). Authenticated APIs
+// (Supabase, Anthropic, Apify, Resend, Apple) don't need it. Article/RSS scrapes deliberately use
+// index.ts BROWSER_UA instead (they need the full SSR'd page, not a stripped bot page).
+export const PROXY_UA = "nwslapp-proxy/0.3 (+https://nwslapp-proxy.tiffany-rieth.workers.dev)";
