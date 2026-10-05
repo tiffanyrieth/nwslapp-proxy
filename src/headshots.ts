@@ -21,9 +21,10 @@
 // Exported for `roster-truth.ts`, which cross-checks ESPN rosters against the same SDP
 // feed using the same season/team resolution and the same name-join semantics — the join
 // this module has proven at ~98% for months. One source of truth, not a second copy.
-import { ESPN_HEADERS } from "./espn-ua.ts";
+import { ESPN_HEADERS, PROXY_UA } from "./espn-ua.ts";
 
 export const SDP = "https://api-sdp.nwslsoccer.com/v1/nwsl/football";
+const SDP_INIT = { headers: { "User-Agent": PROXY_UA, Accept: "application/json" } };
 const ESPN_SITE = "https://site.api.espn.com/apis/site/v2/sports/soccer/usa.nwsl";
 
 const MAP_KEY = "headshot-map-v1"; // KV: { [espnAthleteId]: nwslGuid }
@@ -63,13 +64,13 @@ interface NwslPlayer {
 // (the regular-season league, not Challenge Cup / Fall Series / etc.) → its seasons, newest
 // by start date. Resolved dynamically so the yearly rollover needs no code change.
 export async function currentNwslSeasonId(): Promise<string> {
-	const comps = (await (await fetch(`${SDP}/competitions`)).json()) as {
+	const comps = (await (await fetch(`${SDP}/competitions`, SDP_INIT)).json()) as {
 		competitions?: { competitionId?: string; name?: string }[];
 	};
 	const comp = (comps.competitions ?? []).find((c) => c.name === "NWSL");
 	if (!comp?.competitionId) throw new Error("headshots: NWSL competition not found");
 
-	const seasons = (await (await fetch(`${SDP}/competitions/${comp.competitionId}/seasons`)).json()) as {
+	const seasons = (await (await fetch(`${SDP}/competitions/${comp.competitionId}/seasons`, SDP_INIT)).json()) as {
 		seasons?: { seasonId?: string; startDateUtc?: string | null }[];
 	};
 	const sorted = (seasons.seasons ?? [])
@@ -82,7 +83,7 @@ export async function currentNwslSeasonId(): Promise<string> {
 // teamId → abbreviation (acronymName, e.g. "WAS"), so each player's team resolves to the
 // same abbreviation key the app and ESPN use.
 export async function fetchNwslTeamAbbrs(seasonId: string): Promise<Map<string, string>> {
-	const json = (await (await fetch(`${SDP}/seasons/${seasonId}/teams`)).json()) as {
+	const json = (await (await fetch(`${SDP}/seasons/${seasonId}/teams`, SDP_INIT)).json()) as {
 		teams?: { teamId?: string; acronymName?: string }[];
 	};
 	const map = new Map<string, string>();
@@ -101,7 +102,7 @@ async function fetchNwslPlayers(seasonId: string, teamAbbrs: Map<string, string>
 	let totalPages = 1;
 	do {
 		const json = (await (
-			await fetch(`${SDP}/seasons/${seasonId}/stats/players?page=${page}`)
+			await fetch(`${SDP}/seasons/${seasonId}/stats/players?page=${page}`, SDP_INIT)
 		).json()) as {
 			players?: {
 				playerId?: string;

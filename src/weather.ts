@@ -31,6 +31,8 @@
 // `indoor: true` suppresses the game-time forecast card (a domed/roofed venue's outdoor forecast
 // is meaningless). ZERO venues are flagged today — every 2026 NWSL site is outdoor (PayPal Park has
 // no roof) — but the flag future-proofs a one-off/preseason indoor site per the design handoff.
+import { PROXY_UA } from "./espn-ua.ts";
+
 export const VENUE_COORDS: Record<string, { lat: number; lon: number; name: string; indoor?: boolean }> = {
 	"7604": { lat: 38.8687, lon: -77.0126, name: "Audi Field" },                                  // WAS
 	"9895": { lat: 39.1097, lon: -94.5735, name: "CPKC Stadium" },                                // KC
@@ -514,7 +516,7 @@ async function forecastResponse(
 
 	let payload: unknown;
 	try {
-		const r = await fetch(buildForecastUrl(coords, kickoffMs), { headers: { Accept: "application/json" } });
+		const r = await fetch(buildForecastUrl(coords, kickoffMs), { headers: { "User-Agent": PROXY_UA, Accept: "application/json" } });
 		if (!r.ok) throw new Error(`open-meteo ${r.status}`);
 		payload = await r.json();
 	} catch (e) {
@@ -559,7 +561,7 @@ async function fetchReading(
 		if (api === "forecast" && daysAgo > FORECAST_PAST_MAX) continue;
 		try {
 			const r = await fetch(buildOpenMeteoUrl(api, coords, kickoffMs, nowMs), {
-				headers: { Accept: "application/json" },
+				headers: { "User-Agent": PROXY_UA, Accept: "application/json" },
 			});
 			if (!r.ok) continue;
 			const reading = extractHour(await r.json(), isoHour);
