@@ -410,7 +410,7 @@ const BROWSER_UA =
 
 // ⚠️ ESPN bot rule: EVERY ESPN fetch needs the shared UA (ESPN 403s UA-less Worker fetches,
 // 2026-08-04) — the constant + full story live in espn-ua.ts so no module can miss it again.
-import { ESPN_UA, ESPN_HEADERS } from "./espn-ua.ts";
+import { ESPN_UA, ESPN_HEADERS, PROXY_UA } from "./espn-ua.ts";
 import {
 	isPausedMonday as isKHGPausedMonday, loadKnowHerCalendar, mondayStart as khgMondayStart,
 	readOverride as readKHGOverride, writeOverride as writeKHGOverride, ymd as khgYMD,
@@ -778,13 +778,36 @@ async function loadNewsFeeds(env: Env, ctx?: ExecutionContext): Promise<NewsFeed
 	return NEWS_FEED_SEED;
 }
 
+/** "HTTP 403 · cf-challenge" style detail for a failed upstream fetch: WHO refused (a Cloudflare bot
+ *  challenge/block via `cf-mitigated`, else the `server` header), plus `retry-after` on a 429. Kept short —
+ *  the snapshot slot + diag sample truncate the message at ~80 chars. */
+async function describeHttpFailure(r: Response): Promise<string> {
+	const mitigated = r.headers.get("cf-mitigated");
+	const server = r.headers.get("server");
+	const parts = [`HTTP ${r.status}`];
+	parts.push(mitigated ? `cf-${mitigated}` : server ? `server=${server.slice(0, 20)}` : "server=?");
+	const retry = r.headers.get("retry-after");
+	if (retry) parts.push(`retry-after=${retry.slice(0, 10)}`);
+	try {
+		const title = /<title[^>]*>([^<]{1,60})/i.exec((await r.text()).slice(0, 4000))?.[1]?.trim();
+		if (title) parts.push(`"${title.slice(0, 30)}"`);
+	} catch {
+		/* body unreadable — the status + responder are enough */
+	}
+	return parts.join(" · ");
+}
+
 /** Fetch + parse one article-type source (RSS/Atom, beehiiv archive, WP REST) → decoded items.
  *  Throws on transport/HTTP failure (caller decides the diag); an empty parse is `[]`. */
 async function fetchSourceItems(kind: "rss" | "beehiiv" | "wpjson", url: string): Promise<RawItem[]> {
 	const accept =
 		kind === "rss" ? "application/rss+xml, application/atom+xml, application/xml, text/xml" : kind === "wpjson" ? "application/json" : "text/html";
-	const r = await fetchBounded(url, { headers: { "User-Agent": BROWSER_UA, Accept: accept } });
-	if (!r.ok) throw new Error(`HTTP ${r.status}`);
+	// WP REST is a JSON API — it has no SSR'd page to unlock, so it gets the honest PROXY_UA rather than a
+	// spoofed browser UA (a Chrome UA on a non-Chrome TLS fingerprint is a classic bot-score signal; a
+	// Tribune paper's bot wall began 403ing the browser-UA WP fetch ~a day after it went live, 2026-10-01).
+	const ua = kind === "wpjson" ? PROXY_UA : BROWSER_UA;
+	const r = await fetchBounded(url, { headers: { "User-Agent": ua, Accept: accept } });
+	if (!r.ok) throw new Error(await describeHttpFailure(r));
 	let items: RawItem[];
 	if (kind === "rss") items = parseOutletRSS(await r.text());
 	else if (kind === "beehiiv") items = parseBeehiivArchive(await r.text(), new URL(url).origin);
