@@ -93,4 +93,30 @@ describe("proxyAndCache recovery ladder", () => {
 		expect(snap.headers.get("Cache-Control")).toBe("public, max-age=30");
 		expect(await snap.text()).toBe(scoreboardBody);
 	});
+
+	it("step 3.5: a failed scoreboard request with no snapshot of its own gets this colo's full-season snapshot", async () => {
+		// A successful full-season (year-mode) fetch writes the canonical full-season snapshot…
+		const yr = new Date().getUTCFullYear();
+		const season = JSON.stringify({ events: [{ id: "3501" }, { id: "3502" }] });
+		fetchMock
+			.get(ESPN)
+			.intercept({ path: (p) => p.startsWith(SB_PATH) && p.includes(`dates=${yr}`) })
+			.reply(200, season, { headers: { "Content-Type": "application/json" } });
+		const warm = await get(`${PROXY}/scoreboard?dates=${yr}&limit=1000`);
+		expect(warm.status).toBe(200);
+
+		// …then a different scoreboard request (no snapshot of its own) hits a total outage.
+		fetchMock
+			.get(ESPN)
+			.intercept({ path: (p) => p.startsWith(SB_PATH) })
+			.reply(502, "down")
+			.times(2); // busted attempt + un-busted retry
+		const res = await get(`${PROXY}/scoreboard?seasontype=2`);
+		expect(res.status).toBe(200);
+		expect(res.headers.get("X-Proxy-Cache")).toBe("STALE");
+		const body = (await res.json()) as { events: { id: string }[]; proxyCachedAsOf?: string };
+		expect(body.events.map((e) => e.id)).toEqual(["3501", "3502"]);
+		// Served by step 3.5 (the per-colo snapshot), not step 3.6 (the KV last-good adds this marker).
+		expect(body.proxyCachedAsOf).toBeUndefined();
+	});
 });

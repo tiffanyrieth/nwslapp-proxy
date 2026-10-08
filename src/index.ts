@@ -2181,15 +2181,15 @@ async function proxyAndCache(
 		// Step 3.5 — SCOREBOARD ONLY: fall back to the FULL-SEASON snapshot for this league. A windowed
 		// live-poll (app) or per-feed watcher query has a snapshot key that SHIFTS daily (dates are kept
 		// in the key), so its own snapshot rarely exists — but the full-season snapshot is stable and kept
-		// warm by the app's `dates=YYYY0101-YYYY1231` load. Serving it (whole schedule, degraded-but-present)
+		// warm by the app's full-season (`dates=YYYY`) load. Serving it (whole schedule, degraded-but-present)
 		// beats 502ing, which is what turns an ESPN scoreboard outage into an app error AND a watcher retry
 		// storm (2026-09-15 incident: ESPN 400'd every fresh fetch; the watcher re-swept all feeds every tick).
 		if (url.pathname === "/scoreboard") {
-			const full = new URL(url.toString());
 			const yr = new Date().getUTCFullYear();
-			full.searchParams.set("dates", `${yr}0101-${yr}1231`);
-			full.searchParams.set("limit", "500");
-			const fullSnap = await cache.match(new Request(snapshotKeyURL(full), { method: "GET" }));
+			// The canonical full-season snapshot (fullSeasonSnapshotURL) — written by every successful
+			// year-mode season fetch. (Until 2026-10-08 this looked up the old `dates=YYYY0101-YYYY1231&limit=500`
+			// shape, which nothing has written since the 2026-09-16 year rewrite, so this step never fired.)
+			const fullSnap = await cache.match(new Request(fullSeasonSnapshotURL(url.searchParams.get("league") ?? "usa.nwsl", yr), { method: "GET" }));
 			if (fullSnap) {
 				emitDiagCoalesced(env, ctx, "staleServe", `${failDetail} — served full-season snapshot`, url.pathname);
 				const out = new Response(fullSnap.body, fullSnap);
@@ -2260,7 +2260,9 @@ async function proxyAndCache(
 	// costs nothing per write (unlike KV's 1k/day free-tier budget) and is per-colo, which is fine:
 	// the watcher's every-minute polls keep ITS colo's snapshot warm, and that colo is exactly where
 	// its future failures will look.
-	if (bustUpstream) {
+	// Skipped for the watcher's `_lc` forced-fresh reads: their snapshot key carries the unique `_lc`, so no
+	// later request could ever look it up — the write was pure waste (one dead entry per live poll).
+	if (bustUpstream && !url.searchParams.has("_lc")) {
 		const snapHeaders = new Headers(headers);
 		snapHeaders.set("Cache-Control", `public, max-age=${SNAPSHOT_TTL}`);
 		ctx.waitUntil(
@@ -2279,6 +2281,14 @@ async function proxyAndCache(
 	if (bustUpstream && url.pathname === "/scoreboard" && /^\d{4}$/.test(url.searchParams.get("dates") ?? "")) {
 		const league = url.searchParams.get("league") ?? "usa.nwsl";
 		const year = Number(url.searchParams.get("dates"));
+		// Per-colo canonical full-season snapshot for recovery-ladder step 3.5 (Cache API: free, no KV write).
+		// Host- and limit-agnostic, so a failed window/day request in this colo can find it.
+		const fullHeaders = new Headers(headers);
+		fullHeaders.set("Cache-Control", `public, max-age=${SNAPSHOT_TTL}`);
+		ctx.waitUntil(cache.put(
+			new Request(fullSeasonSnapshotURL(league, year), { method: "GET" }),
+			new Response(body, { status: 200, headers: fullHeaders }),
+		));
 		const bytes = body; // ArrayBuffer of the (possibly enriched) response
 		ctx.waitUntil((async () => {
 			try {
@@ -2306,6 +2316,13 @@ async function proxyAndCache(
  * marker so it can never collide with the live entry. One snapshot per (route, league, dates,
  * limit), shared by the watcher's busted polls and the app's clean ones.
  */
+/** Recovery-ladder step 3.5's key: ONE full-season snapshot per (league, year) per colo, independent of the
+ *  caller's host and `limit` — written on each successful year-mode season fetch, read when a scoreboard
+ *  request fails with no snapshot of its own. Never a real URL; the Cache API only needs a stable key. */
+export function fullSeasonSnapshotURL(league: string, year: number): string {
+	return `https://snapshot.internal/scoreboard-full?league=${encodeURIComponent(league)}&year=${year}&_e=${CACHE_EPOCH}`;
+}
+
 export function snapshotKeyURL(url: URL): string {
 	const k = new URL(url.toString());
 	k.searchParams.delete("_cb");
