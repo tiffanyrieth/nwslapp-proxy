@@ -514,6 +514,7 @@ async function classifierCall(
 }
 const HAIKU_BATCH = 20; // posts per Haiku call (one numbered list → array of verdicts)
 const TAG_TTL = 7 * 24 * 3600; // a post's verdict is stable; cache it a week
+const OG_FAIL_TTL = 24 * 3600; // a failed article-page OG fetch is retried at most once a day
 const MAX_PER_HANDLE = 3; // free anti-flood cap: keep at most N posts per account
 
 // B3b — Instagram social pipe, LOAD-BALANCED across two scrape services (swapped 2026-08-14):
@@ -2644,11 +2645,12 @@ async function clubNewsFor(abbr: string, env: Env, ctx: ExecutionContext): Promi
 		cards = (await enrichNewsOG(cards, env, ctx)).cards;
 	}
 
-	if (cards.length === 0) {
-		emitDiag(env, ctx, "clubNewsEmpty", abbr); // true miss — flagged, not hidden
-	} else {
-		ctx.waitUntil(env.FEED_TAGS.put(cacheKey, JSON.stringify(cards), { expirationTtl: CLUBNEWS_TTL }));
-	}
+	// Cache the result EITHER WAY (an empty `[]` too). Uncached, an empty club re-scraped its site + the
+	// outlet fallbacks on every /team-videos miss — far past the hourly ceiling for unofficial sources
+	// (owner policy 2026-10-08, docs/decisions.md). Same 2h TTL as a full result → one KV write per club per
+	// 2h regardless, so no added write load. The app's device-IP fallback still keys on "no official news".
+	if (cards.length === 0) emitDiag(env, ctx, "clubNewsEmpty", abbr); // true miss — flagged, not hidden
+	ctx.waitUntil(env.FEED_TAGS.put(cacheKey, JSON.stringify(cards), { expirationTtl: CLUBNEWS_TTL }));
 	return cards;
 }
 
@@ -4282,7 +4284,11 @@ async function enrichNewsOG(
 					og = { image: fetched.image, description: fetched.description };
 					ctx.waitUntil(env.FEED_TAGS.put(key, JSON.stringify(og), { expirationTtl: TAG_TTL }));
 				} catch {
+					// Remember the FAILURE for a day too (an empty `{}`): uncached, a page that 403s/404s/hangs was
+					// re-fetched on every /feed build and refresh — past the hourly ceiling for unofficial sources
+					// (owner policy 2026-10-08). The card simply keeps its in-feed fields until the retry.
 					og = {};
+					ctx.waitUntil(env.FEED_TAGS.put(key, "{}", { expirationTtl: OG_FAIL_TTL }));
 				}
 			}
 			if (!c.thumbnailURL && og.image) c.thumbnailURL = httpsImage(og.image); // http og:image → ATS-blocked in-app
@@ -7715,6 +7721,7 @@ async function dueBySnapshot(env: Env, lastKey: string, intervalMs: number): Pro
 // drift (a dormant reporter, a club on press fallback) is deliberately NOT checked here — that stays in the
 // pull Status tab + the daily digest; only genuine outages page.
 const SYNTHETIC_LAST_KEY = "synthetic:last";
+const SYNTHETIC_ESPN_INTERVAL_MS = 24 * 60 * 60 * 1000; // ESPN probes at most once a day (owner 2026-10-08)
 const SYNTHETIC_PAGE_KEY = "synthetic:last-page";
 const SYNTHETIC_PAGE_THROTTLE_MS = 60 * 60 * 1000; // at most one synthetic-fail email/hour
 
@@ -7741,12 +7748,34 @@ async function statusFetchPaging(env: Env, ctx: ExecutionContext, label: string,
 
 async function runSyntheticChecks(env: Env, ctx: ExecutionContext): Promise<void> {
 	const checks: StatusCheck[] = [];
-	// ESPN core (the Aug-4 outage path: a scoreboard failure takes Home + Schedule dark).
-	checks.push(await statusFetchPaging(env, ctx, "ESPN scoreboard", ESPN_SCOREBOARD, ESPN_UA,
-		(d) => Array.isArray((d as { events?: unknown[] }).events) && ((d as { events?: unknown[] }).events?.length ?? 0) > 0,
-		(d) => `${(d as { events?: unknown[] }).events?.length ?? 0} events`));
-	checks.push(await statusFetchPaging(env, ctx, "ESPN standings", "https://site.api.espn.com/apis/v2/sports/soccer/usa.nwsl/standings", ESPN_UA,
-		(d) => JSON.stringify(d).length > 200, () => "reachable"));
+	// Checks carried forward from an earlier run (not re-probed now) — shown on the board, never re-paged.
+	const carried = new Set<string>();
+	// ESPN core (the Aug-4 outage path). Probed at most ONCE A DAY (owner 2026-10-08): ESPN is an
+	// unofficial source (hourly ceiling, docs/decisions.md), and a failure here is no longer an outage —
+	// the schedule falls back to the durable last-good, so users never see it; this is a to-do signal for
+	// the owner. The probe time rides the SYNTHETIC_LAST_KEY record this pass already rewrites (no extra
+	// KV write). Between probes the last result carries forward, labelled with its age. The ESPN circuit
+	// breaker + schedule-freshness checks below are KV-only and still run every pass.
+	const prev = (await env.FEED_TAGS.get(SYNTHETIC_LAST_KEY, "json").catch(() => null)) as
+		| { espnAt?: number; checks?: StatusCheck[] }
+		| null;
+	const espnLabels = ["ESPN scoreboard", "ESPN standings"];
+	const prevEspn = (prev?.checks ?? []).filter((c) => espnLabels.includes(c.label));
+	let espnAt = prev?.espnAt ?? 0;
+	if (prevEspn.length === espnLabels.length && Date.now() - espnAt < SYNTHETIC_ESPN_INTERVAL_MS) {
+		const ageH = Math.floor((Date.now() - espnAt) / 3_600_000);
+		for (const c of prevEspn) {
+			checks.push({ ...c, detail: `${c.detail.replace(/ \(checked \d+h ago\)$/, "")} (checked ${ageH}h ago)` });
+			carried.add(c.label);
+		}
+	} else {
+		espnAt = Date.now();
+		checks.push(await statusFetchPaging(env, ctx, "ESPN scoreboard", ESPN_SCOREBOARD, ESPN_UA,
+			(d) => Array.isArray((d as { events?: unknown[] }).events) && ((d as { events?: unknown[] }).events?.length ?? 0) > 0,
+			(d) => `${(d as { events?: unknown[] }).events?.length ?? 0} events`));
+		checks.push(await statusFetchPaging(env, ctx, "ESPN standings", "https://site.api.espn.com/apis/v2/sports/soccer/usa.nwsl/standings", ESPN_UA,
+			(d) => JSON.stringify(d).length > 200, () => "reachable"));
+	}
 	// Fan Zone content pools live in KV — an emptied/expired pool = the game opens to nothing.
 	const khg = (await env.FEED_TAGS.get(KNOWHER_POOL_KEY, "json").catch(() => null)) as { players?: unknown[] } | null;
 	checks.push({ label: "Know Her Game pool", status: (khg?.players?.length ?? 0) > 0 ? "ok" : "fail",
@@ -7801,10 +7830,12 @@ async function runSyntheticChecks(env: Env, ctx: ExecutionContext): Promise<void
 		});
 	}
 
-	const fails = checks.filter((c) => c.status === "fail");
+	const allFails = checks.filter((c) => c.status === "fail");
 	await env.FEED_TAGS.put(SYNTHETIC_LAST_KEY,
-		JSON.stringify({ at: Date.now(), fails: fails.length, checks: checks.map((c) => ({ label: c.label, status: c.status, detail: c.detail })) }),
+		JSON.stringify({ at: Date.now(), espnAt, fails: allFails.length, checks: checks.map((c) => ({ label: c.label, status: c.status, detail: c.detail })) }),
 		{ expirationTtl: 60 * 60 * 24 * 7 });
+	// Page only on FRESH results — a carried-forward ESPN failure was already paged when it was probed.
+	const fails = allFails.filter((c) => !carried.has(c.label));
 	if (fails.length === 0) return;
 
 	// A hard failure is definitive (not editorial drift): record it + page immediately (own throttle).
