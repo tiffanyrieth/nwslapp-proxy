@@ -27,6 +27,14 @@
 	// ONE KV write; unsafe cards are dropped so they never reach the app. Cost is Neurons, flat with
 	// scrape volume not users (~$0/mo, inside the 10k/day free allotment). Approve allowlist =
 	// imgmod:approved. Uses @cf/meta/llama-3.2-11b-vision-instruct (one-time Meta license accept).
+	// ESPN SHARED FETCHER (Option A, 2026-10-08 — src/espn-fetcher.ts): ONE copy of each ESPN pass-through
+	// response for every data center, so ESPN sees ~one request per cache period in total. SQLite-backed —
+	// the only Durable Object storage on the Free plan (same pattern as the watcher's TickMetronome).
+	// Rollback without a deploy: set KV `espn:fetcher:off` (the edge returns to its direct ESPN path).
+	"durable_objects": {
+		"bindings": [{ "name": "ESPN_FETCHER", "class_name": "EspnFetcher" }],
+	},
+	"migrations": [{ "tag": "v1", "new_sqlite_classes": ["EspnFetcher"] }],
 	"ai": {
 		"binding": "AI",
 	},
