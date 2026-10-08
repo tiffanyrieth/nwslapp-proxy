@@ -411,6 +411,10 @@ const BROWSER_UA =
 // ⚠️ ESPN bot rule: EVERY ESPN fetch needs the shared UA (ESPN 403s UA-less Worker fetches,
 // 2026-08-04) — the constant + full story live in espn-ua.ts so no module can miss it again.
 import { ESPN_UA, ESPN_HEADERS, PROXY_UA } from "./espn-ua.ts";
+import { edgeTtlFor, type FetcherKind, type FetcherResult } from "./espn-fetcher.ts";
+// The ESPN shared fetcher Durable Object (Option A, 2026-10-08) — exported from the main module so the
+// runtime can instantiate it (wrangler.jsonc `durable_objects` binds ESPN_FETCHER to this class).
+export { EspnFetcher } from "./espn-fetcher.ts";
 import {
 	isPausedMonday as isKHGPausedMonday, loadKnowHerCalendar, mondayStart as khgMondayStart,
 	readOverride as readKHGOverride, writeOverride as writeKHGOverride, ymd as khgYMD,
@@ -1768,6 +1772,65 @@ export async function isEspnManuallyPaused(env: Env): Promise<boolean> {
 	return espnPauseMemo.until > now;
 }
 
+// ESPN SHARED FETCHER switch (Option A, 2026-10-08 — see src/espn-fetcher.ts). Setting this KV key (any
+// value) sends every app ESPN pass-through back to the old per-data-center direct path within ~30s, with
+// no deploy — the rollback lever. Delete the key to turn sharing back on.
+const ESPN_FETCHER_OFF_KEY = "espn:fetcher:off";
+let espnFetcherOffMemo: { off: boolean; at: number } | null = null;
+/** How long the edge waits on the shared fetcher before falling back to its own direct ESPN fetch. Long
+ *  enough for a cold 2.6 MB full-season pull through the fetcher; a hang never strands the request. */
+const ESPN_FETCHER_TIMEOUT_MS = 10_000;
+
+/** Test hook: drop the 30s kill-switch memo so a test can flip `espn:fetcher:off` and see it at once. */
+export function resetEspnFetcherSwitchMemo(): void {
+	espnFetcherOffMemo = null;
+}
+
+async function isEspnFetcherOff(env: Env): Promise<boolean> {
+	const now = Date.now();
+	if (!espnFetcherOffMemo || now - espnFetcherOffMemo.at >= 30_000) {
+		let off = false;
+		try {
+			off = (await env.FEED_TAGS.get(ESPN_FETCHER_OFF_KEY)) !== null;
+		} catch {
+			/* a KV read error leaves sharing ON — the fetcher itself falls back on any failure */
+		}
+		espnFetcherOffMemo = { off, at: now };
+	}
+	return espnFetcherOffMemo.off;
+}
+
+/** Does this pass-through read go through the shared fetcher? NOT for the match watcher (its service-
+ *  binding host is `proxy`) and NOT for `_lc` forced-fresh reads — the watcher's live polls are the
+ *  device-proven, owner-sanctioned exception and stay byte-for-byte on the direct path. */
+async function useSharedFetcher(url: URL, env: Env): Promise<boolean> {
+	if (!env.ESPN_FETCHER) return false;
+	if (url.hostname === "proxy" || url.searchParams.has("_lc")) return false;
+	return !(await isEspnFetcherOff(env));
+}
+
+function espnFetcherStub(env: Env) {
+	const ns = env.ESPN_FETCHER!;
+	// Pinned to East North America: the hop from US data centers stays ~20–80 ms.
+	return ns.get(ns.idFromName("espn"), { locationHint: "enam" });
+}
+
+/** Ask the shared fetcher, bounded by ESPN_FETCHER_TIMEOUT_MS. Throws on timeout/unavailable — the
+ *  caller treats any throw as "fall back to the direct path". */
+async function fetchViaShared(env: Env, upstreamUrl: string, kind: FetcherKind, bust: boolean, windowBucket: string | null): Promise<FetcherResult> {
+	let timer: ReturnType<typeof setTimeout> | undefined;
+	try {
+		return await Promise.race([
+			espnFetcherStub(env).fetchShared(upstreamUrl, kind, bust, windowBucket) as Promise<FetcherResult>,
+			new Promise<never>((_, reject) => {
+				timer = setTimeout(() => reject(new Error(`shared fetcher timeout >${ESPN_FETCHER_TIMEOUT_MS}ms`)), ESPN_FETCHER_TIMEOUT_MS);
+			}),
+		]);
+	} finally {
+		clearTimeout(timer);
+	}
+}
+
 const ESPN_BREAKER_THRESHOLD = 3; // consecutive upstream failures before opening
 // EXPONENTIAL BACKOFF (Gemini: WAF blocks run 15-60 min; polling one WHILE blocked escalates toward a
 // ban). A transient ESPN blip opens the breaker once, its first successful probe closes it and resets
@@ -1987,33 +2050,70 @@ async function proxyAndCache(
 	// hammering (and escalating) an active WAF block.
 	const breakerOpen = bustUpstream && (await isEspnBreakerOpen(env) || await isEspnManuallyPaused(env));
 	let espnResponse: Response | null = null;
+	// Set when the body came through the SHARED fetcher (Option A): its fetch time + TTL, so the edge copy
+	// never outlives the shared one (edgeTtlFor). `fetcherTag` is surfaced as `X-Espn-Fetcher`.
+	let sharedLife: { fetchedAt: number; ttlSec: number } | null = null;
+	let fetcherTag = "bypass";
 	if (breakerOpen) {
 		emitDiagCoalesced(env, ctx, "espnBreakerSkip", `${url.pathname} — ESPN paused/broken, skipped`, url.pathname);
 	} else {
-		try {
-			espnResponse = await fetchUpstream(bustUpstream);
-		} catch {
-			espnResponse = null;
-		}
-
-		// Recovery ladder step 1 — the `_cb` recompute is what ESPN chokes on under live load, so an
-		// un-busted retry usually succeeds from ESPN's own cache: near-fresh for windowed queries,
-		// strictly better than any snapshot, and it un-blinds a watcher tick that would otherwise skip.
-		if (!espnResponse?.ok && bustUpstream) {
-			const firstFail = espnResponse ? String(espnResponse.status) : "threw";
+		// SHARED FETCHER first (one ESPN copy for every data center — src/espn-fetcher.ts). It runs the same
+		// `_cb` bust + un-busted retry as the direct path below and never caches a failure, so a non-OK
+		// answer drops into the unchanged recovery ladder. ANY problem reaching it → the direct path.
+		let sharedHandled = false;
+		if (await useSharedFetcher(url, env)) {
 			try {
-				const retry = await fetchUpstream(false);
-				if (retry.ok) {
-					emitDiag(env, ctx, "espnRetryRecovered", `${url.pathname} upstream ${firstFail}`);
-					espnResponse = retry;
+				const kind: FetcherKind = chooseTTL === chooseSummaryTTL ? "summary" : "scoreboard";
+				const r = await fetchViaShared(env, upstream.toString(), kind, bustUpstream, url.searchParams.get("w"));
+				sharedHandled = true;
+				fetcherTag = r.source;
+				for (const n of r.notes) emitDiagCoalesced(env, ctx, n.kind, n.detail, url.pathname);
+				if (r.retryRecovered) emitDiag(env, ctx, "espnRetryRecovered", `${url.pathname} upstream ${r.retryRecovered} (shared)`);
+				if (r.ok && r.body) {
+					espnResponse = new Response(r.body, { status: 200, headers: { "Content-Type": r.contentType ?? "application/json" } });
+					sharedLife = { fetchedAt: r.fetchedAt, ttlSec: r.ttlSec };
+				} else if (r.status >= 200 && r.status <= 599) {
+					// Rebuild ESPN's rejection so the espnUpstreamBody diag below reads exactly as before.
+					const fi = r.failInfo;
+					espnResponse = new Response(fi?.snippet ?? "", {
+						status: r.status,
+						headers: { server: fi?.server ?? "", "retry-after": fi?.retryAfter ?? "", "cf-ray": fi?.cfRay ?? "" },
+					});
 				}
-			} catch {
-				// fall through to steps 2-4
+				// Feed the breaker ONCE per real ESPN call (coalesced joiners report calledUpstream=false).
+				if (bustUpstream && r.calledUpstream) ctx.waitUntil(recordEspnResult(env, ctx, r.ok));
+			} catch (e) {
+				fetcherTag = "fallback";
+				emitDiagCoalesced(env, ctx, "espnFetcherFallback",
+					`${url.pathname} — shared fetcher unavailable (${String((e as Error)?.message ?? e).slice(0, 80)}), direct ESPN`, url.pathname);
 			}
 		}
+		if (!sharedHandled) {
+			try {
+				espnResponse = await fetchUpstream(bustUpstream);
+			} catch {
+				espnResponse = null;
+			}
 
-		// Feed the breaker the definitive ESPN outcome for this call (only when we actually called it).
-		if (bustUpstream) ctx.waitUntil(recordEspnResult(env, ctx, !!espnResponse?.ok));
+			// Recovery ladder step 1 — the `_cb` recompute is what ESPN chokes on under live load, so an
+			// un-busted retry usually succeeds from ESPN's own cache: near-fresh for windowed queries,
+			// strictly better than any snapshot, and it un-blinds a watcher tick that would otherwise skip.
+			if (!espnResponse?.ok && bustUpstream) {
+				const firstFail = espnResponse ? String(espnResponse.status) : "threw";
+				try {
+					const retry = await fetchUpstream(false);
+					if (retry.ok) {
+						emitDiag(env, ctx, "espnRetryRecovered", `${url.pathname} upstream ${firstFail}`);
+						espnResponse = retry;
+					}
+				} catch {
+					// fall through to steps 2-4
+				}
+			}
+
+			// Feed the breaker the definitive ESPN outcome for this call (only when we actually called it).
+			if (bustUpstream) ctx.waitUntil(recordEspnResult(env, ctx, !!espnResponse?.ok));
+		}
 	}
 
 	if (!espnResponse?.ok) {
@@ -2105,7 +2205,13 @@ async function proxyAndCache(
 	// pick a TTL.
 	let body = await espnResponse.arrayBuffer();
 	if (enrich) body = await enrich(body);
-	const ttl = chooseTTL(body);
+	// Through the shared fetcher, the edge keeps the copy only for the time the SHARED copy has left (so a
+	// live copy is never older than the 30s live TTL). Without `enrich` the fetcher's TTL is the edge's own
+	// chooser on the same bytes, so the 2.6 MB season isn't re-parsed here; `enrich` can change the TTL
+	// (a filled attendance settles a summary), so that path still asks the chooser.
+	const ttl = sharedLife
+		? edgeTtlFor(enrich ? chooseTTL(body) : sharedLife.ttlSec, sharedLife.fetchedAt, sharedLife.ttlSec, Date.now())
+		: chooseTTL(body);
 
 	const headers = new Headers();
 	headers.set(
@@ -2157,7 +2263,9 @@ async function proxyAndCache(
 		})());
 	}
 
-	return withCacheStatus(withClientTTL(toCache), "MISS");
+	const out = withCacheStatus(withClientTTL(toCache), "MISS");
+	out.headers.set("X-Espn-Fetcher", fetcherTag);
+	return out;
 }
 
 /**
@@ -2230,7 +2338,7 @@ async function serveStaleOr502(env: Env, ctx: ExecutionContext, cache: Cache, ca
  * briefly. If the body isn't the JSON we expect, fall back to the default TTL —
  * the raw bytes are still returned unchanged regardless.
  */
-function chooseScoreboardTTL(body: ArrayBuffer): number {
+export function chooseScoreboardTTL(body: ArrayBuffer): number {
 	try {
 		const json = JSON.parse(new TextDecoder().decode(body)) as {
 			events?: Array<{

@@ -24,6 +24,10 @@ interface Env {
 	// and the image-moderation verdict cache (imgmod:{url}, ~30d).
 	FEED_TAGS: KVNamespace;
 
+	// ESPN shared fetcher Durable Object (wrangler.jsonc `durable_objects`, src/espn-fetcher.ts). Optional so
+	// a missing binding (an older deploy, a test config) just means every read takes the direct ESPN path.
+	ESPN_FETCHER?: DurableObjectNamespace<import("./src/espn-fetcher").EspnFetcher>;
+
 	// Workers AI binding (wrangler.jsonc `ai`). Backs the Social feed image-moderation
 	// backstop (moderateFeedImages): a vision safety check on each player-IG thumbnail at
 	// scrape time. Typed structurally (a `run` method) so this hand-maintained file needn't

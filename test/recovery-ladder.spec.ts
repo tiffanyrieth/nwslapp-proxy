@@ -16,6 +16,10 @@ const ESPN = "https://site.api.espn.com";
 const SB_PATH = "/apis/site/v2/sports/soccer/usa.nwsl/scoreboard";
 
 const scoreboardBody = JSON.stringify({ events: [] });
+// These cases exercise the DIRECT ESPN path, so they use the match watcher's service-binding host
+// (`proxy`), which bypasses the shared ESPN fetcher exactly as in production. The shared fetcher's own
+// interplay with this ladder is covered in espn-fetcher.spec.ts.
+const PROXY = "https://proxy";
 
 /** Drive the worker with waitUntil completion (the snapshot write rides ctx.waitUntil). */
 async function get(url: string): Promise<Response> {
@@ -48,7 +52,7 @@ describe("proxyAndCache recovery ladder", () => {
 			.intercept({ path: (p) => p.startsWith(SB_PATH) && !p.includes("_cb=") })
 			.reply(200, scoreboardBody, { headers: { "Content-Type": "application/json" } });
 
-		const res = await get("https://proxy.test/scoreboard?dates=20260810&limit=500");
+		const res = await get(`${PROXY}/scoreboard?dates=20260810&limit=500`);
 		expect(res.status).toBe(200);
 		expect(res.headers.get("X-Proxy-Cache")).toBe("MISS");
 		expect(await res.text()).toBe(scoreboardBody);
@@ -63,7 +67,7 @@ describe("proxyAndCache recovery ladder", () => {
 			.intercept({ path: (p) => p.startsWith(SB_PATH) })
 			.reply(502, "down")
 			.times(2); // busted attempt + un-busted retry
-		const bare = await get("https://proxy.test/scoreboard?dates=20260810&limit=500&_cb=1");
+		const bare = await get(`${PROXY}/scoreboard?dates=20260810&limit=500&_cb=1`);
 		expect(bare.status).toBe(200);
 		expect(bare.headers.get("X-Proxy-Cache")).toBe("STALE");
 		expect(await bare.json()).toEqual({ events: [] });
@@ -73,7 +77,7 @@ describe("proxyAndCache recovery ladder", () => {
 			.get(ESPN)
 			.intercept({ path: (p) => p.startsWith(SB_PATH) })
 			.reply(200, scoreboardBody, { headers: { "Content-Type": "application/json" } });
-		const warm = await get("https://proxy.test/scoreboard?dates=20260810&limit=500&_cb=2");
+		const warm = await get(`${PROXY}/scoreboard?dates=20260810&limit=500&_cb=2`);
 		expect(warm.status).toBe(200);
 
 		// …then a total outage on a NEW busted URL (unique edge key → no HIT, no stale copy)
@@ -83,7 +87,7 @@ describe("proxyAndCache recovery ladder", () => {
 			.intercept({ path: (p) => p.startsWith(SB_PATH) })
 			.reply(502, "down")
 			.times(2);
-		const snap = await get("https://proxy.test/scoreboard?dates=20260810&limit=500&_cb=3");
+		const snap = await get(`${PROXY}/scoreboard?dates=20260810&limit=500&_cb=3`);
 		expect(snap.status).toBe(200);
 		expect(snap.headers.get("X-Proxy-Cache")).toBe("STALE");
 		expect(snap.headers.get("Cache-Control")).toBe("public, max-age=30");
