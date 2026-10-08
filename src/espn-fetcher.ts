@@ -25,7 +25,9 @@
 
 import { DurableObject } from "cloudflare:workers";
 import { ESPN_UA } from "./espn-ua.ts";
-import { chooseScoreboardTTL, chooseSummaryTTL } from "./index.ts";
+import { chooseScoreboardTTL, chooseSummaryTTL, TEAM_STATS_TTL, KNOWHER_ELIGIBLE_TTL } from "./index.ts";
+import { fetchTeamSeasonStats, type BracketEnv } from "./bracket-engine.ts";
+import { computeEligiblePlayers, readFeaturedIds, type KnowHerEnv } from "./knowher.ts";
 
 export type FetcherKind = "scoreboard" | "summary";
 export type FetcherSource = "fresh" | "memory" | "stored";
@@ -49,6 +51,22 @@ export interface FetcherResult {
 	/** Diagnostics for the edge to emit (this object can't reach the diag spine without a circular call). */
 	notes: { kind: string; detail: string }[];
 }
+
+/** A SHARED COMPUTED result (phase 2, 2026-10-08): a per-team aggregate built from ~29 ESPN calls, computed
+ *  ONCE here for every data center instead of once per data center per hour. `json` is the producer's
+ *  serialized output; `ok:false` carries the producer's error (never cached). */
+export interface SharedJsonResult {
+	ok: boolean;
+	json?: string;
+	fetchedAt: number;
+	ttlSec: number;
+	source: FetcherSource;
+	error?: string;
+	notes: { kind: string; detail: string }[];
+}
+
+/** A producer's answer: the JSON to return, and whether it may be shared (an empty roster isn't). */
+type Produced = { json: string; cache: boolean };
 
 /** Compressed bodies above this stay in memory only (DO storage caps a value at 2 MB). */
 export const FETCHER_MAX_STORED_GZIP = 1_500_000;
@@ -92,6 +110,7 @@ export class EspnFetcher extends DurableObject<Env> {
 	private mem = new Map<string, Entry>();
 	private memBytes = 0;
 	private inflight = new Map<string, Promise<FetcherResult>>();
+	private computing = new Map<string, Promise<SharedJsonResult>>();
 	private writes = 0;
 
 	constructor(ctx: DurableObjectState, env: Env) {
@@ -128,6 +147,77 @@ export class EspnFetcher extends DurableObject<Env> {
 		}
 		const p = this.fetchUpstream(key, upstreamUrl, kind, bust).finally(() => this.inflight.delete(key));
 		this.inflight.set(key, p);
+		return p;
+	}
+
+	/** `/team-stats`: one club's rostered athletes with full flattened season stats (`fetchTeamSeasonStats`,
+	 *  ~29 ESPN calls). Shared for TEAM_STATS_TTL. An empty roster is returned but never shared (the edge
+	 *  turns it into the same error + diag as before, so the app falls back to its own path). */
+	async teamStats(teamId: string, year: number): Promise<SharedJsonResult> {
+		return this.computeShared(`team-stats:${teamId}:${year}`, TEAM_STATS_TTL, async () => {
+			const players = await fetchTeamSeasonStats(this.env as unknown as BracketEnv, teamId, year);
+			return { json: JSON.stringify(players), cache: players.length > 0 };
+		});
+	}
+
+	/** `/knowher/eligible` AND `/knowher/todo`: one team's eligible players (`computeEligiblePlayers`, ~29
+	 *  ESPN calls) with this season's already-featured players excluded — one copy now serves BOTH routes
+	 *  (they each re-fetched before). Shared for KNOWHER_ELIGIBLE_TTL, the same window the edge cached it. */
+	async knowherEligible(team: string, year: number): Promise<SharedJsonResult> {
+		return this.computeShared(`knowher-eligible:${team}:${year}`, KNOWHER_ELIGIBLE_TTL, async () => {
+			const env = this.env as unknown as KnowHerEnv;
+			const featured = await readFeaturedIds(env, year);
+			const players = await computeEligiblePlayers(env, team, year, featured);
+			return { json: JSON.stringify({ players, featuredCount: featured.size }), cache: players.length > 0 };
+		});
+	}
+
+	/** Compute-once-share-everywhere for a JSON aggregate: same memory → storage → coalesced-producer path
+	 *  as fetchShared. A producer error is returned (never cached); a non-shareable answer is returned once. */
+	private async computeShared(key: string, ttlSec: number, produce: () => Promise<Produced>): Promise<SharedJsonResult> {
+		const now = Date.now();
+		const asJson = (e: Entry, source: FetcherSource): SharedJsonResult => ({
+			ok: true, json: new TextDecoder().decode(e.body), fetchedAt: e.fetchedAt, ttlSec: e.ttlSec, source, notes: [],
+		});
+		const m = this.mem.get(key);
+		if (m && isFresh(m.fetchedAt, m.ttlSec, now)) {
+			this.touch(key, m);
+			return asJson(m, "memory");
+		}
+		if (!m) {
+			const stored = await this.readStored(key);
+			if (stored && isFresh(stored.fetchedAt, stored.ttlSec, now)) {
+				this.remember(key, stored);
+				return asJson(stored, "stored");
+			}
+		}
+		const pending = this.computing.get(key);
+		if (pending) {
+			const r = await pending;
+			return { ...r, source: r.ok ? "memory" : r.source, notes: [] };
+		}
+		const p = (async (): Promise<SharedJsonResult> => {
+			let out: Produced;
+			try {
+				out = await produce();
+			} catch (e) {
+				return { ok: false, fetchedAt: Date.now(), ttlSec: 0, source: "fresh", error: String((e as Error)?.message ?? e).slice(0, 160), notes: [] };
+			}
+			const entry: Entry = {
+				body: new TextEncoder().encode(out.json).buffer as ArrayBuffer,
+				contentType: "application/json",
+				fetchedAt: Date.now(),
+				ttlSec,
+			};
+			const notes: SharedJsonResult["notes"] = [];
+			if (out.cache) {
+				this.remember(key, entry);
+				const oversize = await this.persist(key, entry);
+				if (oversize) notes.push({ kind: "espnFetcherOversize", detail: `${key} gzip=${oversize}B (memory only)` });
+			}
+			return { ...asJson(entry, "fresh"), ttlSec: out.cache ? ttlSec : 0, notes };
+		})().finally(() => this.computing.delete(key));
+		this.computing.set(key, p);
 		return p;
 	}
 

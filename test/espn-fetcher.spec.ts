@@ -235,3 +235,62 @@ describe("shared fetcher — through the worker", () => {
 		});
 	});
 });
+
+// ── Phase 2: shared COMPUTED aggregates (team stats + Know Her Game eligible) ─────────────────────────
+// Each is ~(1 teams + 1 roster + N athlete stats) ESPN calls. fetchMock's exact `.times(…)` counts prove the
+// aggregate is computed ONCE for two data centers (any extra ESPN call would hit disableNetConnect and fail).
+const SITE = "/apis/site/v2/sports/soccer/usa.nwsl";
+const CORE_HOST = "https://sports.core.api.espn.com";
+const SQUAD = 16; // ROSTER_GOOD_MIN — a plausible squad, so no KV last-good fallback path
+
+function mockTeamComputation(teamId: string, abbr: string): void {
+	fetchMock.get(ESPN).intercept({ path: `${SITE}/teams` })
+		.reply(200, JSON.stringify({ sports: [{ leagues: [{ teams: [{ team: { id: teamId, abbreviation: abbr } }] }] }] }), JSON_HEADERS);
+	fetchMock.get(ESPN).intercept({ path: `${SITE}/teams/${teamId}/roster` })
+		.reply(200, JSON.stringify({
+			athletes: Array.from({ length: SQUAD }, (_, i) => ({
+				id: `${teamId}${i}`, displayName: `Player ${i}`, jersey: String(i + 1), position: { abbreviation: i === 0 ? "G" : "F" },
+			})),
+		}), JSON_HEADERS);
+	fetchMock.get(CORE_HOST).intercept({ path: (p) => p.includes("/athletes/") && p.endsWith("/statistics") })
+		.reply(200, JSON.stringify({
+			splits: { categories: [{ name: "general", stats: [{ name: "starts", value: 5 }, { name: "minutes", value: 450 }, { name: "appearances", value: 6 }] }] },
+		}), JSON_HEADERS)
+		.times(SQUAD);
+}
+
+describe("shared fetcher — computed aggregates", () => {
+	it("/team-stats is computed ONCE for two data centers", async () => {
+		mockTeamComputation("9101", "TSA");
+		const a = await get("https://dc-a.test/team-stats?team=9101&year=2026");
+		const b = await get("https://dc-b.test/team-stats?team=9101&year=2026");
+		expect(a.status).toBe(200);
+		expect(b.status).toBe(200);
+		expect(a.headers.get("X-Espn-Fetcher")).toBe("fresh");
+		expect(b.headers.get("X-Espn-Fetcher")).toBe("memory");
+		const players = ((await b.json()) as { players: unknown[] }).players;
+		expect(players.length).toBe(SQUAD);
+	});
+
+	it("/knowher/eligible and /knowher/todo share ONE per-team computation", async () => {
+		mockTeamComputation("9102", "TSB");
+		const elig = await get("https://dc-a.test/knowher/eligible?team=TSB&year=2026");
+		const todo = await get("https://dc-b.test/knowher/todo?team=TSB&year=2026");
+		expect(elig.status).toBe(200);
+		expect(todo.status).toBe(200);
+		expect(elig.headers.get("X-Espn-Fetcher")).toBe("fresh");
+		expect(todo.headers.get("X-Espn-Fetcher")).toBe("memory");
+		expect(((await elig.json()) as { count: number }).count).toBe(SQUAD);
+	});
+
+	it("a failed computation is never shared — the next request computes again", async () => {
+		// /teams fails 3× (espnJSON retries) → the computation throws → error, nothing cached.
+		fetchMock.get(ESPN).intercept({ path: `${SITE}/teams` }).reply(503, "down").times(3);
+		const bad = await get("https://dc-a.test/team-stats?team=9103&year=2026");
+		expect(bad.ok).toBe(false);
+		mockTeamComputation("9103", "TSC");
+		const good = await get("https://dc-b.test/team-stats?team=9103&year=2026");
+		expect(good.status).toBe(200);
+		expect(good.headers.get("X-Espn-Fetcher")).toBe("fresh");
+	});
+});
