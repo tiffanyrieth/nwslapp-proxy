@@ -288,7 +288,7 @@ const TEAM_VIDEOS_TTL = 7200; // 2hr (read-load pass 2026-09-02: raised 1h→2h 
 // CLUBNEWS_TTL below — club news is already 2h-bounded so this adds ZERO club-news staleness, only ~2h vs ~1h
 // YouTube-upload freshness; ~2× fewer /team-videos hits. NOT higher: club news is demand-refreshed at 2h with
 // no cron to align a longer TTL to, so >2h would stale breaking club news across the shared cache key.)
-const TEAM_STATS_TTL = 3600; // 1hr — a squad's season stat totals only move after a match (a few times/week);
+export const TEAM_STATS_TTL = 3600; // 1hr — a squad's season stat totals only move after a match (a few times/week);
 // 1h keeps the shared cache warm so the team page's ~27-athlete stat bundle is one edge-cached call, not 27
 // per-device ESPN calls. Not a live surface — the live match card is elsewhere.
 
@@ -411,7 +411,7 @@ const BROWSER_UA =
 // ⚠️ ESPN bot rule: EVERY ESPN fetch needs the shared UA (ESPN 403s UA-less Worker fetches,
 // 2026-08-04) — the constant + full story live in espn-ua.ts so no module can miss it again.
 import { ESPN_UA, ESPN_HEADERS, PROXY_UA } from "./espn-ua.ts";
-import { edgeTtlFor, type FetcherKind, type FetcherResult } from "./espn-fetcher.ts";
+import { edgeTtlFor, type FetcherKind, type FetcherResult, type SharedJsonResult } from "./espn-fetcher.ts";
 // The ESPN shared fetcher Durable Object (Option A, 2026-10-08) — exported from the main module so the
 // runtime can instantiate it (wrangler.jsonc `durable_objects` binds ESPN_FETCHER to this class).
 export { EspnFetcher } from "./espn-fetcher.ts";
@@ -1818,16 +1818,47 @@ function espnFetcherStub(env: Env) {
 /** Ask the shared fetcher, bounded by ESPN_FETCHER_TIMEOUT_MS. Throws on timeout/unavailable — the
  *  caller treats any throw as "fall back to the direct path". */
 async function fetchViaShared(env: Env, upstreamUrl: string, kind: FetcherKind, bust: boolean, windowBucket: string | null): Promise<FetcherResult> {
+	return withFetcherTimeout(
+		espnFetcherStub(env).fetchShared(upstreamUrl, kind, bust, windowBucket) as Promise<FetcherResult>,
+		ESPN_FETCHER_TIMEOUT_MS,
+	);
+}
+
+/** A shared COMPUTED aggregate (team stats / KHG eligible: ~29 ESPN calls each) takes longer than one
+ *  pass-through fetch, so it gets a longer bound before the edge falls back to computing it itself. */
+const ESPN_FETCHER_COMPUTE_TIMEOUT_MS = 25_000;
+
+async function withFetcherTimeout<T>(p: Promise<T>, ms: number): Promise<T> {
 	let timer: ReturnType<typeof setTimeout> | undefined;
 	try {
 		return await Promise.race([
-			espnFetcherStub(env).fetchShared(upstreamUrl, kind, bust, windowBucket) as Promise<FetcherResult>,
+			p,
 			new Promise<never>((_, reject) => {
-				timer = setTimeout(() => reject(new Error(`shared fetcher timeout >${ESPN_FETCHER_TIMEOUT_MS}ms`)), ESPN_FETCHER_TIMEOUT_MS);
+				timer = setTimeout(() => reject(new Error(`shared fetcher timeout >${ms}ms`)), ms);
 			}),
 		]);
 	} finally {
 		clearTimeout(timer);
+	}
+}
+
+/** Ask the shared fetcher for a computed aggregate. Returns null when sharing is off/unavailable (the
+ *  caller computes directly, as before); emits `espnFetcherFallback` when the fetcher failed to answer. */
+async function sharedAggregate(
+	url: URL,
+	env: Env,
+	ctx: ExecutionContext,
+	call: (stub: ReturnType<typeof espnFetcherStub>) => Promise<SharedJsonResult>,
+): Promise<SharedJsonResult | null> {
+	if (!(await useSharedFetcher(url, env))) return null;
+	try {
+		const r = await withFetcherTimeout(call(espnFetcherStub(env)), ESPN_FETCHER_COMPUTE_TIMEOUT_MS);
+		for (const n of r.notes) emitDiagCoalesced(env, ctx, n.kind, n.detail, url.pathname);
+		return r;
+	} catch (e) {
+		emitDiagCoalesced(env, ctx, "espnFetcherFallback",
+			`${url.pathname} — shared fetcher unavailable (${String((e as Error)?.message ?? e).slice(0, 80)}), computing directly`, url.pathname);
+		return null;
 	}
 }
 
@@ -7049,7 +7080,7 @@ async function handleTriviaLegacyFlat(url: URL, env: Env, ctx: ExecutionContext)
 
 const KNOWHER_TTL = 5 * 60; // 5 min — SHORT so owner content edits (iteration + the weekly swap) go live
 // near-instantly, not after 6h. The pool is tiny, so a 5-min edge/client cache still sheds ~all load.
-const KNOWHER_ELIGIBLE_TTL = 3600; // 1h — roster stats move a few times/day
+export const KNOWHER_ELIGIBLE_TTL = 3600; // 1h — roster stats move a few times/day
 
 /** Know Her Game's weekly pool, filtered to the requested `teams` (docs §3/§4): the app
  *  fetches `?teams=WAS,POR` and gets only those followed teams' featured players. Returns an
@@ -7390,10 +7421,17 @@ async function handleKnowHerEligible(url: URL, env: Env, ctx: ExecutionContext):
 
 	let players;
 	let featuredCount = 0;
+	const shared = await sharedAggregate(url, env, ctx, (stub) => stub.knowherEligible(team, year) as Promise<SharedJsonResult>);
 	try {
-		const featured = await readFeaturedIds(env as unknown as KnowHerEnv, year);
-		featuredCount = featured.size;
-		players = await computeEligiblePlayers(env as unknown as KnowHerEnv, team, year, featured);
+		if (shared && !shared.ok) throw new Error(shared.error ?? "shared fetcher error");
+		if (shared?.ok && shared.json) {
+			// One shared copy per team (2026-10-08) — also serves /knowher/todo.
+			({ players, featuredCount } = JSON.parse(shared.json) as { players: Awaited<ReturnType<typeof computeEligiblePlayers>>; featuredCount: number });
+		} else {
+			const featured = await readFeaturedIds(env as unknown as KnowHerEnv, year);
+			featuredCount = featured.size;
+			players = await computeEligiblePlayers(env as unknown as KnowHerEnv, team, year, featured);
+		}
 	} catch (e) {
 		// NO SILENT FAILURES: this route's bare upstreamError() emitted nothing, so an ESPN/roster
 		// failure behind /knowher/eligible was invisible to the pager (the same class as the KHG-todo bug).
@@ -7402,13 +7440,15 @@ async function handleKnowHerEligible(url: URL, env: Env, ctx: ExecutionContext):
 	}
 	const headers = new Headers();
 	headers.set("Content-Type", "application/json");
-	headers.set("Cache-Control", `public, max-age=${KNOWHER_ELIGIBLE_TTL}`);
+	headers.set("Cache-Control", `public, max-age=${shared?.ok ? edgeTtlFor(KNOWHER_ELIGIBLE_TTL, shared.fetchedAt, shared.ttlSec || 1, Date.now()) : KNOWHER_ELIGIBLE_TTL}`);
 	const body = new Response(JSON.stringify({ team, year, count: players.length, featuredThisSeason: featuredCount, players }), { status: 200, headers });
 	if (players.length > 0) {
 		// Note: no ctx here (admin/debug endpoint) — cache synchronously via the returned clone.
 		await cache.put(cacheKey, body.clone());
 	}
-	return withCacheStatus(body, "MISS");
+	const out = withCacheStatus(body, "MISS");
+	out.headers.set("X-Espn-Fetcher", shared ? shared.source : "bypass");
+	return out;
 }
 
 /** `GET /team-stats?team={id}` — every rostered athlete of a club with their FULL flattened season stats
@@ -7427,11 +7467,24 @@ async function handleTeamStats(url: URL, env: Env, ctx: ExecutionContext): Promi
 	if (hit) return withCacheStatus(hit, "HIT");
 
 	let players: Awaited<ReturnType<typeof fetchTeamSeasonStats>>;
-	try {
-		players = await fetchTeamSeasonStats(env as unknown as BracketEnv, id, year);
-	} catch (e) {
-		emitDiag(env, ctx, "teamStatsError", `${id}: ${(e as Error).message.slice(0, 50)}`);
+	// Shared fetcher (2026-10-08): ONE computation per team per TEAM_STATS_TTL for every data center (was
+	// ~29 ESPN calls per data center per hour). Off/unavailable → computed here exactly as before.
+	const shared = await sharedAggregate(url, env, ctx, (stub) => stub.teamStats(id, year) as Promise<SharedJsonResult>);
+	let edgeTtl = TEAM_STATS_TTL;
+	if (shared && !shared.ok) {
+		emitDiag(env, ctx, "teamStatsError", `${id}: ${(shared.error ?? "shared fetcher error").slice(0, 50)}`);
 		return upstreamError();
+	}
+	if (shared?.ok && shared.json) {
+		players = JSON.parse(shared.json) as typeof players;
+		edgeTtl = edgeTtlFor(TEAM_STATS_TTL, shared.fetchedAt, shared.ttlSec || 1, Date.now());
+	} else {
+		try {
+			players = await fetchTeamSeasonStats(env as unknown as BracketEnv, id, year);
+		} catch (e) {
+			emitDiag(env, ctx, "teamStatsError", `${id}: ${(e as Error).message.slice(0, 50)}`);
+			return upstreamError();
+		}
 	}
 	if (players.length === 0) {
 		// No roster resolved (bad id, or an ESPN roster outage with no last-known-good). Don't cache an
@@ -7441,10 +7494,12 @@ async function handleTeamStats(url: URL, env: Env, ctx: ExecutionContext): Promi
 	}
 	const headers = new Headers();
 	headers.set("Content-Type", "application/json");
-	headers.set("Cache-Control", `public, max-age=${TEAM_STATS_TTL}`);
+	headers.set("Cache-Control", `public, max-age=${edgeTtl}`);
 	const body = new Response(JSON.stringify({ team: id, year, players }), { status: 200, headers });
 	ctx.waitUntil(cache.put(cacheKey, body.clone()));
-	return withCacheStatus(body, "MISS");
+	const out = withCacheStatus(body, "MISS");
+	out.headers.set("X-Espn-Fetcher", shared ? shared.source : "bypass");
+	return out;
 }
 
 /** `GET /knowher/todo?team=WAS` — the weekly generation feed (docs §5b): THIS week's featured pick for one
@@ -7462,9 +7517,17 @@ async function handleKnowHerTodo(url: URL, env: Env, ctx: ExecutionContext): Pro
 	if (hit) return withCacheStatus(hit, "HIT");
 
 	let player;
+	const shared = await sharedAggregate(url, env, ctx, (stub) => stub.knowherEligible(team, year) as Promise<SharedJsonResult>);
 	try {
-		const featured = await readFeaturedIds(env as unknown as KnowHerEnv, year);
-		const eligible = await computeEligiblePlayers(env as unknown as KnowHerEnv, team, year, featured);
+		if (shared && !shared.ok) throw new Error(shared.error ?? "shared fetcher error");
+		let eligible: Awaited<ReturnType<typeof computeEligiblePlayers>>;
+		if (shared?.ok && shared.json) {
+			// The SAME shared per-team copy /knowher/eligible uses (2026-10-08) — no second ESPN pass.
+			eligible = (JSON.parse(shared.json) as { players: typeof eligible }).players;
+		} else {
+			const featured = await readFeaturedIds(env as unknown as KnowHerEnv, year);
+			eligible = await computeEligiblePlayers(env as unknown as KnowHerEnv, team, year, featured);
+		}
 		player = pickWeeklyFeatured(eligible);
 	} catch (e) {
 		// NO SILENT FAILURES: a bare upstreamError() here mislabeled a UA/403 bug in fetchTeamAbbrs as
@@ -7481,9 +7544,12 @@ async function handleKnowHerTodo(url: URL, env: Env, ctx: ExecutionContext): Pro
 	const headers = new Headers();
 	headers.set("Content-Type", "application/json");
 	headers.set("Cache-Control", `public, max-age=${KNOWHER_ELIGIBLE_TTL}`);
+	if (shared?.ok) headers.set("Cache-Control", `public, max-age=${edgeTtlFor(KNOWHER_ELIGIBLE_TTL, shared.fetchedAt, shared.ttlSec || 1, Date.now())}`);
 	const body = new Response(JSON.stringify({ team, year, season: year, player }), { status: 200, headers });
 	if (player) ctx.waitUntil(cache.put(cacheKey, body.clone()));
-	return withCacheStatus(body, "MISS");
+	const out = withCacheStatus(body, "MISS");
+	out.headers.set("X-Espn-Fetcher", shared ? shared.source : "bypass");
+	return out;
 }
 
 const CREST_TTL = 30 * 24 * 3600; // 30d edge cache — team crests effectively never change
