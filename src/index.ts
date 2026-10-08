@@ -463,7 +463,55 @@ const isSubrequestCap = (e: unknown): boolean => /too many subrequests/i.test(St
 // hit Haiku on a miss. This bucket fails toward DROP when unjudged (no key / Haiku
 // outage / unsure) — the club + player fast paths keep the feed populated.
 const ANTHROPIC_API = "https://api.anthropic.com/v1/messages";
-const HAIKU_MODEL = "claude-haiku-4-5";
+// Haiku 5.5 since 2026-10-08 (~6× cheaper than 4.5; side-by-side via /admin/selftest?do=classifier-compare
+// agreed 88–97% with 4.5, the differences mostly 5.5 following the policy MORE closely).
+const HAIKU_MODEL = "claude-haiku-5-5";
+/** Effort for Haiku 5.5+ classifier calls (ignored for Haiku 4.5, which rejects the parameter). */
+const CLASSIFIER_EFFORT = "medium"; // ~10% more output than "low" for steadier judgment — still fractions of a cent
+/** Token usage of one classifier call — read by /admin/selftest?do=classifier-compare for cost math. */
+type ClassifierUsage = { input_tokens?: number; output_tokens?: number };
+
+/** One forced-JSON classifier call (social + news share it). Haiku 4.5 runs without thinking and
+ *  rejects `effort`; Haiku 5.5+ think adaptively by default (thinking bills as output + counts toward
+ *  max_tokens), so they get effort "low" — classification gains nothing from deep thinking — and a
+ *  larger cap. A refusal or a truncated answer THROWS (callers emit haikuFailure + fail as designed). */
+async function classifierCall(
+	apiKey: string,
+	model: string,
+	content: string,
+	schema: unknown,
+	label: string,
+	effort: string = CLASSIFIER_EFFORT,
+): Promise<{ text: string; usage: ClassifierUsage }> {
+	const legacy = model.startsWith("claude-haiku-4");
+	const r = await fetch(ANTHROPIC_API, {
+		method: "POST",
+		headers: {
+			"Content-Type": "application/json",
+			"x-api-key": apiKey,
+			"anthropic-version": "2023-06-01",
+		},
+		body: JSON.stringify({
+			model,
+			max_tokens: legacy ? 2048 : 8192,
+			messages: [{ role: "user", content }],
+			output_config: legacy
+				? { format: { type: "json_schema", schema } }
+				: { format: { type: "json_schema", schema }, effort },
+		}),
+	});
+	if (!r.ok) throw new Error(`${label} ${r.status}`);
+	const json = (await r.json()) as {
+		stop_reason?: string;
+		content?: Array<{ type?: string; text?: string }>;
+		usage?: ClassifierUsage;
+	};
+	if (json.stop_reason === "refusal") throw new Error(`${label}: refused`);
+	if (json.stop_reason === "max_tokens") throw new Error(`${label}: hit max_tokens`);
+	const text = json.content?.find((b) => b.type === "text")?.text;
+	if (!text) throw new Error(`${label}: no text block`);
+	return { text, usage: json.usage ?? {} };
+}
 const HAIKU_BATCH = 20; // posts per Haiku call (one numbered list → array of verdicts)
 const TAG_TTL = 7 * 24 * 3600; // a post's verdict is stable; cache it a week
 const MAX_PER_HANDLE = 3; // free anti-flood cap: keep at most N posts per account
@@ -520,7 +568,7 @@ const SOCIAL_CACHE_TTL = 3 * 24 * 3600; // 3d KV safety net — the every-2-day 
 const SOCIAL_POLICY = `You are filtering and tagging Bluesky posts for an NWSL (US National Women's Soccer League) fan app. The posts come from soccer reporters/journalists and NWSL media/league accounts, who also post off-topic things (other sports, foreign leagues, men's soccer, personal life, general chatter).
 
 For each post (handle + text) decide three things:
-1. "isNWSL": true ONLY if the post is clearly about the NWSL — an NWSL club, an NWSL match/result/standing/award, a player at an NWSL club, a transfer into or out of an NWSL club, or the US women's national team (USWNT) — OR if an NWSL-rostered player is a PRIMARY SUBJECT of the post in ANY competition, including her own country's national team (a hat trick at WAFCON, a World Cup or Olympics performance, a continental tournament, an international friendly). Soccer is worldwide and NWSL players represent many countries: the NWSL connection is the PLAYER, not the competition. "Banda scores a hat trick for Zambia at WAFCON" → isNWSL true (Barbra Banda plays for Orlando Pride). PRIMARY SUBJECT is a real bar: the post must be meaningfully about her — her performance, her news, her story. Being one name among many (a tournament preview naming dozens of players, a best-XI list, a full squad announcement for a non-US country) is a passing mention, NOT primary-subject. false for everything else, INCLUDING women's soccer that isn't NWSL with no NWSL player as a primary subject (England's WSL, Liga F, the UEFA Women's Champions League, other foreign leagues), other sports (PWHL, WNBA), men's soccer (including the men's World Cup), and the author's personal/off-topic posts. A post that only mentions another league, market, or country in passing — the size of the WSL's audience, a foreign transfer market, broadcast deals abroad — is NOT about the NWSL. Example: "Japan is the joint-largest market for the WSL outside of the UK" is about England's WSL → isNWSL false. When you are unsure, return false.
+1. "isNWSL": true ONLY if the post is clearly about the NWSL — an NWSL club, an NWSL match/result/standing/award, a player at an NWSL club, a transfer into or out of an NWSL club, or the US women's national team (USWNT) — OR if an NWSL-rostered player is a PRIMARY SUBJECT of the post in ANY competition, including her own country's national team (a hat trick at WAFCON, a World Cup or Olympics performance, a continental tournament, an international friendly). Soccer is worldwide and NWSL players represent many countries: the NWSL connection is the PLAYER, not the competition. "Banda scores a hat trick for Zambia at WAFCON" → isNWSL true (Barbra Banda plays for Orlando Pride). PRIMARY SUBJECT is a real bar: the post must be meaningfully about her — her performance, her news, her story. Being one name among many (a tournament preview naming dozens of players, a best-XI list, a full squad announcement for a non-US country) is a passing mention, NOT primary-subject. false for everything else, INCLUDING women's soccer that isn't NWSL with no NWSL player as a primary subject (England's WSL, Liga F, the UEFA Women's Champions League, other foreign leagues), other sports (PWHL, WNBA), men's soccer (including the men's World Cup), and the author's personal/off-topic posts. A post that only mentions another league, market, or country in passing — the size of the WSL's audience, a foreign transfer market, broadcast deals abroad — is NOT about the NWSL. Example: "Japan is the joint-largest market for the WSL outside of the UK" is about England's WSL → isNWSL false. USWNT content counts ON ITS OWN, with no NWSL club or player named: camp/training updates, roster calls, results, injuries, coverage and analysis of the US women's national team — however it's written ("USWNT", "the US", "USA", "a young US team") → isNWSL true. When you are unsure, return false.
 2. "teams": if isNWSL, the NWSL club abbreviation(s) the post is primarily about; for a national-team post kept because of an NWSL player, tag HER NWSL CLUB (use the FEATURED NWSL PLAYERS list when present, plus your knowledge of current NWSL rosters); [] for genuinely league-wide/general NWSL or USWNT posts. If isNWSL is false, return [].
 3. "leagueNews": true ONLY when isNWSL is true AND teams is empty AND the post is genuine league-wide NWSL NEWS — expansion, the schedule/fixtures release, awards/honors, the playoff race, rule/CBA/roster-rule changes, or other league-wide announcements. false for general opinion, hot takes, predictions, banter, or chatter not tied to hard news. If isNWSL is false or teams is non-empty, return false.
 
@@ -604,7 +652,7 @@ const NEWS_TEAM_ABBR_SET = new Set(NEWS_TEAM_ABBRS);
 const NEWS_POLICY = `You are filtering and tagging news articles for an NWSL (US National Women's Soccer League) fan app. The articles come from women's-soccer outlets whose feeds also carry non-NWSL items (other women's sports like the PWHL/WNBA, the English WSL or other foreign leagues, men's soccer, general news).
 
 For each article (headline + outlet) decide two things:
-1. "isNWSL": true ONLY if the article is primarily about the NWSL itself — an NWSL club, an NWSL match/standing/award/power-ranking, a player AT an NWSL club, a transfer INTO or OUT OF an NWSL club, or the US women's national team (USWNT) — OR if an NWSL-rostered player is a PRIMARY SUBJECT of the article in ANY competition, including her own country's national team (WAFCON, the World Cup, the Olympics, continental tournaments, friendlies). Soccer is worldwide and NWSL players represent many countries: she plays for her club AND her country, so an article about her national-team goal is news about an NWSL club's player. "Banda hat trick sends Zambia to the WAFCON final" → isNWSL true (Barbra Banda plays for Orlando Pride). PRIMARY SUBJECT is a real bar: the article must be meaningfully about her — her performance, her news, her story. Being one name among many (a tournament preview naming dozens, a squad-list announcement for a non-US country, a best-XI round-up) is a passing mention, NOT primary-subject. false for everything else, INCLUDING: women's soccer that isn't NWSL with no NWSL player as a primary subject (England's WSL, Spain's Liga F, the UEFA Women's Champions League, other foreign leagues); players moving between two non-NWSL clubs; other sports (PWHL, WNBA); and men's soccer. When unsure, return false.
+1. "isNWSL": true ONLY if the article is primarily about the NWSL itself — an NWSL club, an NWSL match/standing/award/power-ranking, a player AT an NWSL club, a transfer INTO or OUT OF an NWSL club, or the US women's national team (USWNT) — OR if an NWSL-rostered player is a PRIMARY SUBJECT of the article in ANY competition, including her own country's national team (WAFCON, the World Cup, the Olympics, continental tournaments, friendlies). Soccer is worldwide and NWSL players represent many countries: she plays for her club AND her country, so an article about her national-team goal is news about an NWSL club's player. "Banda hat trick sends Zambia to the WAFCON final" → isNWSL true (Barbra Banda plays for Orlando Pride). PRIMARY SUBJECT is a real bar: the article must be meaningfully about her — her performance, her news, her story. Being one name among many (a tournament preview naming dozens, a squad-list announcement for a non-US country, a best-XI round-up) is a passing mention, NOT primary-subject. false for everything else, INCLUDING: women's soccer that isn't NWSL with no NWSL player as a primary subject (England's WSL, Spain's Liga F, the UEFA Women's Champions League, other foreign leagues); players moving between two non-NWSL clubs; other sports (PWHL, WNBA); and men's soccer. USWNT content counts ON ITS OWN, with no NWSL club or player named: camp/training news, roster calls, results, injuries, coverage and analysis of the US women's national team — however it's written ("USWNT", "the US", "USA", "a young US team") → isNWSL true. When unsure, return false.
 2. "teams": if isNWSL, the NWSL club abbreviation(s) it is primarily about; for a national-team article kept because of an NWSL player, tag HER NWSL CLUB (use the FEATURED NWSL PLAYERS list when present, plus your knowledge of current NWSL rosters); [] for genuinely league-wide/general NWSL or USWNT news. If isNWSL is false, return [].
 
 The 16 NWSL teams and their abbreviations:
@@ -6624,7 +6672,14 @@ async function socialVerdicts(
 }
 
 /** Classify one batch of social posts via a single Haiku call (forced JSON). */
-async function haikuClassifySocialBatch(cards: FeedCard[], apiKey: string, playerMap: string): Promise<SocialVerdict[]> {
+async function haikuClassifySocialBatch(
+	cards: FeedCard[],
+	apiKey: string,
+	playerMap: string,
+	model: string = HAIKU_MODEL,
+	onUsage?: (u: ClassifierUsage) => void,
+	effort?: string,
+): Promise<SocialVerdict[]> {
 	const list = cards
 		.map((c) => {
 			const handle = (c.handle ?? "").replace(/^@/, "");
@@ -6633,30 +6688,15 @@ async function haikuClassifySocialBatch(cards: FeedCard[], apiKey: string, playe
 		})
 		.join("\n\n");
 
-	const r = await fetch(ANTHROPIC_API, {
-		method: "POST",
-		headers: {
-			"Content-Type": "application/json",
-			"x-api-key": apiKey,
-			"anthropic-version": "2023-06-01",
-		},
-		body: JSON.stringify({
-			model: HAIKU_MODEL,
-			max_tokens: 2048,
-			messages: [
-				{
-					role: "user",
-					content: `${SOCIAL_POLICY}\n\n${playerMap}\n\nClassify each post. Echo its id exactly.\n\n${list}`,
-				},
-			],
-			output_config: { format: { type: "json_schema", schema: SOCIAL_SCHEMA } },
-		}),
-	});
-	if (!r.ok) throw new Error(`haiku ${r.status}`);
-
-	const json = (await r.json()) as { content?: Array<{ type?: string; text?: string }> };
-	const text = json.content?.find((b) => b.type === "text")?.text;
-	if (!text) throw new Error("haiku: no text block");
+	const { text, usage } = await classifierCall(
+		apiKey,
+		model,
+		`${SOCIAL_POLICY}\n\n${playerMap}\n\nClassify each post. Echo its id exactly.\n\n${list}`,
+		SOCIAL_SCHEMA,
+		"haiku",
+		effort,
+	);
+	onUsage?.(usage);
 	return (JSON.parse(text) as { verdicts?: SocialVerdict[] }).verdicts ?? [];
 }
 
@@ -6755,7 +6795,14 @@ async function tagNewsTeams(
 }
 
 /** Tag one batch of news cards to team(s) via a single Haiku call (forced JSON). */
-async function haikuTagNewsBatch(cards: NewsCard[], apiKey: string, playerMap: string): Promise<NewsVerdict[]> {
+async function haikuTagNewsBatch(
+	cards: NewsCard[],
+	apiKey: string,
+	playerMap: string,
+	model: string = HAIKU_MODEL,
+	onUsage?: (u: ClassifierUsage) => void,
+	effort?: string,
+): Promise<NewsVerdict[]> {
 	const list = cards
 		.map((c) => {
 			const src = c.sourceName ?? "";
@@ -6765,30 +6812,15 @@ async function haikuTagNewsBatch(cards: NewsCard[], apiKey: string, playerMap: s
 		})
 		.join("\n\n");
 
-	const r = await fetch(ANTHROPIC_API, {
-		method: "POST",
-		headers: {
-			"Content-Type": "application/json",
-			"x-api-key": apiKey,
-			"anthropic-version": "2023-06-01",
-		},
-		body: JSON.stringify({
-			model: HAIKU_MODEL,
-			max_tokens: 2048,
-			messages: [
-				{
-					role: "user",
-					content: `${NEWS_POLICY}\n\n${playerMap}\n\nTag each article. Echo its id exactly.\n\n${list}`,
-				},
-			],
-			output_config: { format: { type: "json_schema", schema: NEWS_SCHEMA } },
-		}),
-	});
-	if (!r.ok) throw new Error(`haiku news ${r.status}`);
-
-	const json = (await r.json()) as { content?: Array<{ type?: string; text?: string }> };
-	const text = json.content?.find((b) => b.type === "text")?.text;
-	if (!text) throw new Error("haiku news: no text block");
+	const { text, usage } = await classifierCall(
+		apiKey,
+		model,
+		`${NEWS_POLICY}\n\n${playerMap}\n\nTag each article. Echo its id exactly.\n\n${list}`,
+		NEWS_SCHEMA,
+		"haiku news",
+		effort,
+	);
+	onUsage?.(usage);
 	return (JSON.parse(text) as { verdicts?: NewsVerdict[] }).verdicts ?? [];
 }
 
@@ -7934,6 +7966,91 @@ async function sendDigest(env: Env, ctx: ExecutionContext): Promise<void> {
 		`Full detail: the /admin Status + Analytics tabs.`);
 }
 
+/** `/admin/selftest?do=classifier-compare` — a one-off SIDE-BY-SIDE of two classifier models on the SAME
+ *  live sample with the SAME production prompts (SOCIAL_POLICY / NEWS_POLICY + the featured-player map).
+ *  Read-only: nothing is cached or served — verdicts are only returned for review. Sample = recent
+ *  original posts from up to 10 feed handles + news items already in the sources snapshot (zero news
+ *  fetches), capped so the run stays far under the 50-subrequest budget (~10 Bluesky + ~12 model calls).
+ *  Built for the Haiku 4.5 → 5.5 switch (2026-10-08); reusable for any future model change. */
+async function runClassifierCompare(env: Env, modelA: string, modelB: string, effortB?: string): Promise<unknown> {
+	const apiKey = env.ANTHROPIC_API_KEY;
+	if (!apiKey) return { error: "no ANTHROPIC_API_KEY" };
+	const playerMap = featuredPlayerMapBlock(await loadPlayerSocial(env));
+
+	// Social sample: recent ORIGINAL posts (reposts aren't classified in production either).
+	const handles = (await loadFeedHandles(env)).slice(0, 10);
+	const feeds = await Promise.all(handles.map((h) => bskyAuthorFeed(h.handle, 10).catch(() => [] as BskyItem[])));
+	const social: FeedCard[] = [];
+	feeds.forEach((items, i) => {
+		for (const it of items) {
+			const text = it.post?.record?.text;
+			if (it.reason || !text || !it.post?.uri) continue;
+			social.push({ id: `cmp-${hashId(it.post.uri)}`, handle: handles[i].handle, bodyText: text } as unknown as FeedCard);
+		}
+	});
+	const socialSample = social.slice(0, 60);
+
+	// News sample: the pre-Haiku outlet items already sitting in the sources snapshot.
+	const snap = await readSourcesSnapshot(env);
+	const news: NewsCard[] = [];
+	for (const [key, slot] of Object.entries(snap?.sources ?? {})) {
+		if (!key.startsWith("news:")) continue;
+		for (const it of slot.items as NewsCard[]) if (it?.id) news.push(it);
+	}
+	const newsSample = news.slice(0, 60);
+
+	const usage: Record<string, { input: number; output: number; calls: number; errors: string[] }> = {};
+	const run = async <C, V>(label: string, cards: C[], batchFn: (b: C[], onU: (u: ClassifierUsage) => void) => Promise<V[]>) => {
+		const u = (usage[label] ??= { input: 0, output: 0, calls: 0, errors: [] });
+		const out: V[] = [];
+		for (let i = 0; i < cards.length; i += HAIKU_BATCH) {
+			try {
+				out.push(...(await batchFn(cards.slice(i, i + HAIKU_BATCH), (x) => {
+					u.calls++;
+					u.input += x.input_tokens ?? 0;
+					u.output += x.output_tokens ?? 0;
+				})));
+			} catch (e) {
+				u.errors.push(String((e as Error)?.message ?? e).slice(0, 120));
+			}
+		}
+		return out;
+	};
+	// A once; B at each effort level — all on the SAME sample, so the arms are directly comparable
+	// (run-to-run sampling noise on borderline posts is real — compare B@low vs B@medium vs A here).
+	const efforts = effortB ? [effortB] : ["low", "medium"];
+	const arms = [{ label: modelA, model: modelA, effort: undefined as string | undefined }, ...efforts.map((e) => ({ label: `${modelB}@${e}`, model: modelB, effort: e }))];
+	const results = await Promise.all(arms.map(async (arm) => ({
+		label: arm.label,
+		social: await run(`${arm.label}`, socialSample, (b, onU) => haikuClassifySocialBatch(b, apiKey, playerMap, arm.model, onU, arm.effort)),
+		news: await run(`${arm.label}`, newsSample, (b, onU) => haikuTagNewsBatch(b, apiKey, playerMap, arm.model, onU, arm.effort)),
+	})));
+
+	const key = (v?: { isNWSL?: boolean; teams?: string[]; leagueNews?: boolean }) =>
+		v ? `${v.isNWSL ? "NWSL" : "drop"} [${[...(v.teams ?? [])].sort().join(",")}]${v.leagueNews ? " leagueNews" : ""}` : "(no verdict)";
+	const byId = <V extends { id: string }>(vs: V[]) => new Map(vs.map((v) => [v.id, key(v as never)]));
+	const table = (kind: "social" | "news", cards: { id?: string }[], text: (i: number) => string) => {
+		const maps = results.map((r) => byId(r[kind] as { id: string }[]));
+		const agreeWithA = results.slice(1).map((r, n) => ({
+			arm: r.label,
+			agreePct: cards.length ? Math.round((cards.filter((c) => maps[0].get(c.id!) === maps[n + 1].get(c.id!)).length / cards.length) * 1000) / 10 : null,
+		}));
+		const disagreements = cards.flatMap((c, i) => {
+			const verdicts = Object.fromEntries(results.map((r, n) => [r.label, maps[n].get(c.id!) ?? "(no verdict)"]));
+			return new Set(Object.values(verdicts)).size > 1 ? [{ text: text(i), ...verdicts }] : [];
+		});
+		return { total: cards.length, agreeWithA, disagreements };
+	};
+	return {
+		do: "classifier-compare",
+		arms: arms.map((a) => a.label),
+		social: table("social", socialSample, (i) => `@${socialSample[i].handle}: ${(socialSample[i].bodyText ?? "").replace(/\s+/g, " ").slice(0, 200)}`),
+		news: table("news", newsSample, (i) => `(${newsSample[i].sourceName ?? ""}) ${newsSample[i].headline ?? ""}`.slice(0, 200)),
+		usage,
+		note: "read-only side-by-side on ONE live sample with the production prompts; nothing cached or served",
+	};
+}
+
 /** GET /admin/selftest?do=… — force each PUSH alerting path on demand (admin-gated) so email delivery
  *  and each detector can be proven end-to-end without waiting for the gates. Returns a small JSON report.
  *  `email` sends a test email; `synthetic`/`aggregate` run the scans NOW (bypassing the ~30-min gate) and
@@ -7963,6 +8080,10 @@ async function handleAlertSelfTest(request: Request, env: Env, ctx: ExecutionCon
 		case "digest": {
 			await sendDigest(env, ctx);
 			return json({ do: "digest", sent: true, note: "the daily digest was built + sent now (bypassing the once/day gate) — check your inbox" });
+		}
+		case "classifier-compare": {
+			const q = new URL(request.url).searchParams;
+			return json(await runClassifierCompare(env, q.get("a") ?? "claude-haiku-4-5", q.get("b") ?? "claude-haiku-5-5", q.get("effort") ?? undefined));
 		}
 		case "heartbeat": {
 			const hc = (env as unknown as { HEALTHCHECK_URL_PROXY?: string }).HEALTHCHECK_URL_PROXY;
