@@ -27,6 +27,7 @@ interface Env {
 	// ESPN shared fetcher Durable Object (wrangler.jsonc `durable_objects`, src/espn-fetcher.ts). Optional so
 	// a missing binding (an older deploy, a test config) just means every read takes the direct ESPN path.
 	ESPN_FETCHER?: DurableObjectNamespace<import("./src/espn-fetcher").EspnFetcher>;
+	CONTENT_STORE?: DurableObjectNamespace<import("./src/content-store").ContentStore>;
 
 	// Workers AI binding (wrangler.jsonc `ai`). Backs the Social feed image-moderation
 	// backstop (moderateFeedImages): a vision safety check on each player-IG thumbnail at

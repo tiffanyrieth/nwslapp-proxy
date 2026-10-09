@@ -45,8 +45,8 @@ import { adminGate, adminRealm, type AdminAuthEnv } from "./admin-auth.ts";
 export interface BracketEnv {
   SUPABASE_URL: string;
   SUPABASE_SERVICE_ROLE_KEY: string;
-  // Optional KV (the full Worker Env carries it) — backs NO-SILENT-FAILURES diag telemetry,
-  // surfaced in the owner's GET /telemetry/recent. Best-effort; absent in pure unit contexts.
+  // Optional KV (the full Worker Env carries it) — only the bracket scoring marker uses it now
+  // (diagnostics go to Supabase). Absent in pure unit contexts.
   FEED_TAGS?: {
     put(key: string, value: string, options?: { expirationTtl?: number }): Promise<void>;
     get(key: string): Promise<string | null>;
@@ -174,20 +174,22 @@ async function sbUpsert(env: BracketEnv, table: string, rows: unknown[], onConfl
   if (!r.ok) throw new Error(`Supabase UPSERT ${table} → ${r.status} ${await r.text()}`);
 }
 
-/** NO SILENT FAILURES (proxy edition): write one operational event to KV in the same shape
- *  the app's POST /telemetry sink uses, so a bracket gap surfaces in GET /telemetry/recent.
- *  Best-effort + non-PII; never throws (a diag failure must not break the tick). */
+/** NO SILENT FAILURES (proxy edition): fold one operational event into the Supabase `server_diagnostics`
+ *  rollup (record_server_diagnostics — the same sink index.ts emitDiag flushes to), so a bracket gap surfaces
+ *  in GET /telemetry/recent + the daily digest. NEVER KV: KV writes are reserved for live matches
+ *  (docs/decisions.md 2026-10-08; this was the one `diag:` KV writer the 2026-09-18 move missed). Bracket
+ *  events are rare (generation / roster fallback), so one RPC per event. Best-effort; never throws. */
 async function emitDiag(env: BracketEnv, kind: string, detail: string): Promise<void> {
   try {
-    if (!env.FEED_TAGS) return;
-    const record = {
-      at: new Date().toISOString(),
-      app: "proxy",
-      os: "worker",
-      events: [{ kind: kind.slice(0, 40), detail: detail.slice(0, 80), ts: Date.now() }],
-    };
-    const key = `diag:${1e15 - Date.now()}:${crypto.randomUUID().slice(0, 8)}`;
-    await env.FEED_TAGS.put(key, JSON.stringify(record), { expirationTtl: 60 * 60 * 24 * 30 });
+    if (!env.SUPABASE_URL || !env.SUPABASE_SERVICE_ROLE_KEY) return;
+    const base = env.SUPABASE_URL.replace(/\/$/, "");
+    const key = env.SUPABASE_SERVICE_ROLE_KEY;
+    const r = await fetch(`${base}/rest/v1/rpc/record_server_diagnostics`, {
+      method: "POST",
+      headers: { apikey: key, Authorization: `Bearer ${key}`, "Content-Type": "application/json" },
+      body: JSON.stringify({ p_events: [{ kind: kind.slice(0, 40), n: 1, detail: detail.slice(0, 80) }] }),
+    });
+    if (!r.ok) console.log(`[bracket diag] record_server_diagnostics failed: ${r.status}`);
   } catch {
     /* best-effort */
   }
