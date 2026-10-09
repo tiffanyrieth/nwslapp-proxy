@@ -7,9 +7,12 @@ import { env, createExecutionContext, waitOnExecutionContext, fetchMock } from "
 import { describe, it, expect, beforeAll, afterEach } from "vitest";
 import worker, {
 	capCuratedPerDayPerClub,
+	contentGetJSON,
+	contentPut,
 	curatedBlueskyCards,
 	mergeSlotItems,
 	refreshBlueskySnapshot,
+	resetContentMemo,
 } from "../src/index";
 
 const IncomingRequest = Request<unknown, IncomingRequestCfProperties>;
@@ -18,11 +21,36 @@ const AUTHOR_FEED = "/xrpc/app.bsky.feed.getAuthorFeed";
 const DAY = 24 * 60 * 60 * 1000;
 const iso = (msAgo: number) => new Date(Date.now() - msAgo).toISOString().replace(/\.\d{3}Z$/, "Z");
 
-async function get(url: string): Promise<Response> {
+/** `env` with every KV write recorded — the content pipeline must make NONE (docs/decisions.md 2026-10-08:
+ *  KV writes are reserved for live matches; content lives in the ContentStore Durable Object). */
+function spyEnv(): { env: Env; kvPuts: string[] } {
+	const kvPuts: string[] = [];
+	const kv = env.FEED_TAGS;
+	const FEED_TAGS = new Proxy(kv, {
+		get(target, prop) {
+			if (prop === "put") return (key: string, ...rest: unknown[]) => {
+				kvPuts.push(key);
+				return (target.put as (...a: unknown[]) => Promise<void>)(key, ...rest);
+			};
+			const v = (target as unknown as Record<string | symbol, unknown>)[prop];
+			return typeof v === "function" ? (v as (...a: unknown[]) => unknown).bind(target) : v;
+		},
+	});
+	return { env: { ...env, FEED_TAGS } as Env, kvPuts };
+}
+
+async function get(url: string, e: Env = env): Promise<Response> {
 	const ctx = createExecutionContext();
-	const res = await worker.fetch(new IncomingRequest(url), env, ctx);
+	const res = await worker.fetch(new IncomingRequest(url), e, ctx);
 	await waitOnExecutionContext(ctx);
 	return res;
+}
+
+/** Seed a ContentStore value (where Social snapshots live now). */
+async function seed(key: string, value: unknown): Promise<void> {
+	const ctx = createExecutionContext();
+	expect(await contentPut(env, ctx, [{ key, value: JSON.stringify(value) }])).toBe(true);
+	await waitOnExecutionContext(ctx);
 }
 
 /** A getAuthorFeed item (an ORIGINAL post) as Bluesky returns it. */
@@ -45,9 +73,8 @@ beforeAll(() => {
 
 afterEach(async () => {
 	fetchMock.assertNoPendingInterceptors();
-	await env.FEED_TAGS.delete("social:bluesky-snapshot");
-	await env.FEED_TAGS.delete("social:sources-snapshot");
 	await env.FEED_TAGS.delete("social:reporter-list");
+	resetContentMemo(); // the per-isolate snapshot memo would otherwise leak a snapshot into the next test
 });
 
 describe("curated flood guard — per account, per day, per club", () => {
@@ -130,18 +157,21 @@ describe("refreshBlueskySnapshot — fetched + judged in the background, accumul
 		const feed = (items: unknown[]) => JSON.stringify({ feed: items });
 		fetchMock.get(BSKY).intercept({ path: (p) => p.startsWith(AUTHOR_FEED) })
 			.reply(200, feed([post("rep.bsky.social", "p1", "first post", 3_600_000)]), { headers: { "Content-Type": "application/json" } });
+		const spy = spyEnv();
 		const ctx1 = createExecutionContext();
-		await refreshBlueskySnapshot(env, ctx1);
+		await refreshBlueskySnapshot(spy.env, ctx1);
 		await waitOnExecutionContext(ctx1);
 
 		// Next run: the account's newest page only shows the NEW post — the first one must survive.
 		fetchMock.get(BSKY).intercept({ path: (p) => p.startsWith(AUTHOR_FEED) })
 			.reply(200, feed([post("rep.bsky.social", "p2", "second post", 0)]), { headers: { "Content-Type": "application/json" } });
 		const ctx2 = createExecutionContext();
-		const r = await refreshBlueskySnapshot(env, ctx2);
+		const r = await refreshBlueskySnapshot(spy.env, ctx2);
 		await waitOnExecutionContext(ctx2);
 		expect(r.posts).toBe(2);
-		const snap = (await env.FEED_TAGS.get("social:bluesky-snapshot", "json")) as { handles: Record<string, { items: { card: { id: string } }[] }> };
+		expect(spy.kvPuts).toEqual([]); // the snapshot lives in the ContentStore — zero KV writes
+		resetContentMemo();
+		const snap = (await contentGetJSON(env, undefined, "social:bluesky-snapshot")) as { handles: Record<string, { items: { card: { id: string } }[] }> };
 		expect(snap.handles["rep.bsky.social"].items.map((i) => i.card.id).sort()).toEqual(["bsky-p1", "bsky-p2"]);
 	});
 });
@@ -149,17 +179,19 @@ describe("refreshBlueskySnapshot — fetched + judged in the background, accumul
 describe("/feed — what a request does", () => {
 	it("a new client (caps=devicebsky) with snapshots present makes ZERO outbound calls", async () => {
 		await env.FEED_TAGS.put("social:reporter-list", JSON.stringify([{ handle: "rep.bsky.social", kind: "reporter" }]));
-		await env.FEED_TAGS.put("social:bluesky-snapshot", JSON.stringify({
+		await seed("social:bluesky-snapshot", {
 			v: 1, at: Date.now(), updatedAt: Date.now(),
 			handles: { "rep.bsky.social": { kind: "reporter", fetchedAt: Date.now(), ok: true, items: [
 				{ card: { id: "bsky-r1", layout: "blueskyReporter", handle: "@rep.bsky.social", bodyText: "Spirit analysis", timestamp: iso(0) },
 					verdict: { id: "bsky-r1", isNWSL: true, teams: ["WAS"], leagueNews: false } },
 			] } },
-		}));
-		await env.FEED_TAGS.put("social:sources-snapshot", JSON.stringify({ v: 1, at: Date.now(), updatedAt: Date.now(), sources: {} }));
+		});
+		await seed("social:sources-snapshot", { v: 1, at: Date.now(), updatedAt: Date.now(), sources: {} });
 		// No interceptors registered + disableNetConnect: ANY outbound fetch (Bluesky, Haiku, OG) would throw.
-		const res = await get("https://dc-a.test/feed?teams=WAS&caps=podcast,devicebsky&handles=someone.bsky.social&muted=rep.bsky.social");
+		const spy = spyEnv();
+		const res = await get("https://dc-a.test/feed?teams=WAS&caps=podcast,devicebsky&handles=someone.bsky.social&muted=rep.bsky.social", spy.env);
 		expect(res.status).toBe(200);
+		expect(spy.kvPuts).toEqual([]); // a /feed request writes nothing to KV
 		const cards = (await res.json()) as { id: string; teamAbbreviation?: string }[];
 		// The curated card is there (mutes + adds are ignored for new clients — the app applies them).
 		expect(cards.map((c) => c.id)).toContain("bsky-r1");
@@ -168,8 +200,8 @@ describe("/feed — what a request does", () => {
 
 	it("an old client's added account is still fetched live and served unfiltered (compat path)", async () => {
 		await env.FEED_TAGS.put("social:reporter-list", JSON.stringify([{ handle: "rep.bsky.social", kind: "reporter" }]));
-		await env.FEED_TAGS.put("social:bluesky-snapshot", JSON.stringify({ v: 1, at: Date.now(), updatedAt: Date.now(), handles: {} }));
-		await env.FEED_TAGS.put("social:sources-snapshot", JSON.stringify({ v: 1, at: Date.now(), updatedAt: Date.now(), sources: {} }));
+		await seed("social:bluesky-snapshot", { v: 1, at: Date.now(), updatedAt: Date.now(), handles: {} });
+		await seed("social:sources-snapshot", { v: 1, at: Date.now(), updatedAt: Date.now(), sources: {} });
 		fetchMock.get(BSKY).intercept({ path: (p) => p.startsWith(AUTHOR_FEED) && p.includes("added.bsky.social") })
 			.reply(200, JSON.stringify({ feed: [post("added.bsky.social", "u1", "anything at all", 0)] }), { headers: { "Content-Type": "application/json" } });
 		const res = await get("https://dc-b.test/feed?teams=WAS&handles=added.bsky.social");

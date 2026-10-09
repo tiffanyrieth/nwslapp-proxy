@@ -414,6 +414,9 @@ import { edgeTtlFor, type FetcherKind, type FetcherResult, type SharedJsonResult
 // The ESPN shared fetcher Durable Object (Option A, 2026-10-08) — exported from the main module so the
 // runtime can instantiate it (wrangler.jsonc `durable_objects` binds ESPN_FETCHER to this class).
 export { EspnFetcher } from "./espn-fetcher.ts";
+// Non-live content state (Social snapshots, verdicts, previews, club news) — DO SQLite, never KV.
+export { ContentStore } from "./content-store.ts";
+import type { ContentPut } from "./content-store.ts";
 import {
 	isPausedMonday as isKHGPausedMonday, loadKnowHerCalendar, mondayStart as khgMondayStart,
 	readOverride as readKHGOverride, writeOverride as writeKHGOverride, ymd as khgYMD,
@@ -796,9 +799,9 @@ interface SourcesSnapshot {
 const beatSlotKey = (b: BeatSource) => `beat:${b.id}`;
 const newsSlotKey = (f: NewsFeedSource) => `news:${f.url}`;
 
-async function readSourcesSnapshot(env: Env): Promise<SourcesSnapshot | null> {
+async function readSourcesSnapshot(env: Env, ctx?: ExecutionContext): Promise<SourcesSnapshot | null> {
 	try {
-		const snap = (await env.FEED_TAGS.get(SOCIAL_SOURCES_KEY, "json")) as SourcesSnapshot | null;
+		const snap = await contentGetJSON<SourcesSnapshot>(env, ctx, SOCIAL_SOURCES_KEY, { memo: true });
 		return snap && snap.v === 1 && snap.sources ? snap : null;
 	} catch {
 		return null;
@@ -1841,6 +1844,158 @@ async function fetchViaShared(env: Env, upstreamUrl: string, kind: FetcherKind, 
  *  pass-through fetch, so it gets a longer bound before the edge falls back to computing it itself. */
 const ESPN_FETCHER_COMPUTE_TIMEOUT_MS = 25_000;
 
+// ── CONTENT STORE ACCESS (2026-10-08 — src/content-store.ts) ───────────────────────────────────────────
+// Non-live content state lives in the ContentStore Durable Object, never KV: KV writes are reserved for live
+// matches (docs/decisions.md; test/kv-write-guard.spec.ts fails the build on a new KV write). Every content
+// read/write goes through these helpers. A write that can't reach the store emits a diag and returns false —
+// it NEVER falls back to KV. A read that can't reach it falls back to a KV READ (reads don't touch the cap).
+const CONTENT_STORE_TIMEOUT_MS = 8_000;
+/** TEMP (2026-10-08): read-through migration. A key the store doesn't have yet is read from its old KV home
+ *  (a READ, never a write) and copied into the store, so existing verdicts/previews carry over with no Haiku
+ *  re-spend. The old KV keys all expire by ~10-15 (7-day TTLs); remove this window + the KV read after
+ *  CONTENT_KV_READTHROUGH_UNTIL. */
+const CONTENT_KV_READTHROUGH_UNTIL = Date.parse("2026-10-17T00:00:00Z");
+/** Per-isolate memo for the three Social snapshots, so each /feed build doesn't cost a store request. */
+const CONTENT_MEMO_MS = 60_000;
+const contentMemo = new Map<string, { value: string | null; at: number }>();
+export function resetContentMemo(): void {
+	contentMemo.clear();
+}
+
+function contentStoreStub(env: Env) {
+	const ns = env.CONTENT_STORE!;
+	// Pinned next to the ESPN fetcher (East North America): the hop from US data centers stays short.
+	return ns.get(ns.idFromName("content"), { locationHint: "enam" });
+}
+
+/** Values for these keys (null = missing). `memo` serves from / fills the per-isolate snapshot memo. */
+export async function contentGet(
+	env: Env,
+	ctx: ExecutionContext | undefined,
+	keys: string[],
+	opts: { memo?: boolean } = {},
+): Promise<Map<string, string | null>> {
+	const out = new Map<string, string | null>();
+	const now = Date.now();
+	let remaining = [...new Set(keys)];
+	if (opts.memo) {
+		remaining = remaining.filter((k) => {
+			const m = contentMemo.get(k);
+			if (m && now - m.at < CONTENT_MEMO_MS) {
+				out.set(k, m.value);
+				return false;
+			}
+			return true;
+		});
+	}
+	if (remaining.length === 0) return out;
+
+	let fromStore: Record<string, string | null> | null = null;
+	if (env.CONTENT_STORE) {
+		try {
+			fromStore = (await withFetcherTimeout(
+				contentStoreStub(env).getMany(remaining) as Promise<Record<string, string | null>>,
+				CONTENT_STORE_TIMEOUT_MS,
+			)) as Record<string, string | null>;
+		} catch (e) {
+			if (ctx) emitDiagCoalesced(env, ctx, "contentStoreUnavailable", `read: ${String((e as Error)?.message ?? e).slice(0, 80)}`, "content");
+		}
+	} else if (ctx) {
+		emitDiagCoalesced(env, ctx, "contentStoreUnavailable", "read: no CONTENT_STORE binding", "content");
+	}
+
+	const kvReadAll = fromStore === null; // store unreachable → KV READ fallback for everything
+	const toCopy: ContentPut[] = [];
+	await Promise.all(
+		remaining.map(async (k) => {
+			let v = fromStore?.[k] ?? null;
+			if (v === null && (kvReadAll || now < CONTENT_KV_READTHROUGH_UNTIL)) {
+				v = await env.FEED_TAGS.get(k).catch(() => null);
+				if (v !== null && !kvReadAll && ctx) toCopy.push({ key: k, value: v, ttlSec: readThroughTtl(k, v) });
+			}
+			out.set(k, v);
+			if (opts.memo) contentMemo.set(k, { value: v, at: now });
+		}),
+	);
+	if (toCopy.length && ctx) ctx.waitUntil(contentPut(env, ctx, toCopy).then(() => undefined));
+	return out;
+}
+
+/** Parse a stored JSON value (null on missing / unparseable). */
+function parseJSON<T>(v: string | null | undefined): T | null {
+	if (v == null) return null;
+	try {
+		return JSON.parse(v) as T;
+	} catch {
+		return null;
+	}
+}
+
+/** One JSON value (null on missing / unparseable). */
+export async function contentGetJSON<T>(env: Env, ctx: ExecutionContext | undefined, key: string, opts: { memo?: boolean } = {}): Promise<T | null> {
+	const v = (await contentGet(env, ctx, [key], opts)).get(key) ?? null;
+	if (v === null) return null;
+	try {
+		return JSON.parse(v) as T;
+	} catch {
+		return null;
+	}
+}
+
+/** Store these values. Returns false (after a diag) when the store couldn't take them — never writes KV. */
+export async function contentPut(env: Env, ctx: ExecutionContext, entries: ContentPut[]): Promise<boolean> {
+	if (entries.length === 0) return true;
+	if (!env.CONTENT_STORE) {
+		emitDiagCoalesced(env, ctx, "contentStoreUnavailable", "write: no CONTENT_STORE binding", "content");
+		return false;
+	}
+	try {
+		const res = (await withFetcherTimeout(
+			contentStoreStub(env).putMany(entries) as Promise<{ stored: number; oversize: string[] }>,
+			CONTENT_STORE_TIMEOUT_MS,
+		)) as { stored: number; oversize: string[] };
+		const at = Date.now();
+		for (const e of entries) if (contentMemo.has(e.key)) contentMemo.set(e.key, { value: e.value, at });
+		if (res.oversize.length) emitDiag(env, ctx, "contentStoreOversize", res.oversize.join(", ").slice(0, 200));
+		return res.oversize.length === 0;
+	} catch (e) {
+		emitDiagCoalesced(env, ctx, "contentStoreUnavailable", `write: ${String((e as Error)?.message ?? e).slice(0, 80)}`, "content");
+		return false;
+	}
+}
+
+/** Store a Social snapshot. Throws when the store can't take it (contentPut already emitted the diag), so the
+ *  refresh run reports failure instead of looking like success; the previous snapshot keeps serving. */
+async function putSnapshot(env: Env, ctx: ExecutionContext, key: string, snap: unknown): Promise<void> {
+	if (!(await contentPut(env, ctx, [{ key, value: JSON.stringify(snap) }]))) {
+		throw new Error(`content store write failed: ${key}`);
+	}
+}
+
+/** When `key` was last written (ms), or null when it has never been. On a store failure this answers
+ *  "just now" so a due-check can't turn into a retry loop against unofficial sources (hourly-max policy). */
+export async function contentWrittenAt(env: Env, ctx: ExecutionContext, key: string): Promise<number | null> {
+	if (!env.CONTENT_STORE) return Date.now();
+	try {
+		const res = (await withFetcherTimeout(
+			contentStoreStub(env).writtenAt([key]) as Promise<Record<string, number | null>>,
+			CONTENT_STORE_TIMEOUT_MS,
+		)) as Record<string, number | null>;
+		return res[key] ?? null;
+	} catch (e) {
+		emitDiagCoalesced(env, ctx, "contentStoreUnavailable", `writtenAt: ${String((e as Error)?.message ?? e).slice(0, 80)}`, "content");
+		return Date.now();
+	}
+}
+
+/** The TTL a read-through copy keeps (its old KV TTL family; snapshots none). */
+function readThroughTtl(key: string, value: string): number | undefined {
+	if (key.startsWith("ogn-") && value === "{}") return OG_FAIL_TTL; // a remembered failure keeps its 1-day retry
+	if (key.startsWith("sv3-") || key.startsWith("nv3-") || key.startsWith("ogn-")) return TAG_TTL;
+	if (key.startsWith("clubnews-")) return CLUBNEWS_TTL;
+	return undefined;
+}
+
 async function withFetcherTimeout<T>(p: Promise<T>, ms: number): Promise<T> {
 	let timer: ReturnType<typeof setTimeout> | undefined;
 	try {
@@ -2785,7 +2940,7 @@ async function clubNewsFor(abbr: string, env: Env, ctx: ExecutionContext): Promi
 	if (DEVICE_FALLBACK_CLUBS.has(abbr)) return [];
 
 	const cacheKey = `clubnews-${abbr}`;
-	const cached = (await env.FEED_TAGS.get(cacheKey, "json")) as NewsCard[] | null;
+	const cached = await contentGetJSON<NewsCard[]>(env, ctx, cacheKey);
 	if (cached) return cached;
 
 	let cards: NewsCard[] = [];
@@ -2825,10 +2980,10 @@ async function clubNewsFor(abbr: string, env: Env, ctx: ExecutionContext): Promi
 
 	// Cache the result EITHER WAY (an empty `[]` too). Uncached, an empty club re-scraped its site + the
 	// outlet fallbacks on every /team-videos miss — far past the hourly ceiling for unofficial sources
-	// (owner policy 2026-10-08, docs/decisions.md). Same 2h TTL as a full result → one KV write per club per
-	// 2h regardless, so no added write load. The app's device-IP fallback still keys on "no official news".
+	// (owner policy 2026-10-08, docs/decisions.md). Same 2h TTL as a full result. Stored in the ContentStore,
+	// not KV (KV writes are reserved for live matches). The app's device-IP fallback still keys on "no official news".
 	if (cards.length === 0) emitDiag(env, ctx, "clubNewsEmpty", abbr); // true miss — flagged, not hidden
-	ctx.waitUntil(env.FEED_TAGS.put(cacheKey, JSON.stringify(cards), { expirationTtl: CLUBNEWS_TTL }));
+	ctx.waitUntil(contentPut(env, ctx, [{ key: cacheKey, value: JSON.stringify(cards), ttlSec: CLUBNEWS_TTL }]).then(() => undefined));
 	return cards;
 }
 
@@ -4445,8 +4600,8 @@ async function buildNewsCards(teams: string[], env: Env, ctx: ExecutionContext, 
 }
 
 /** Fill a missing thumbnail/blurb by Open-Graph-scraping the REAL article URL —
- *  the same fetchOG plumbing the club-news cards use. Cached in KV by card id
- *  (`ogn-<id>`, ~7d) so each article is scraped once; cards that already have both
+ *  the same fetchOG plumbing the club-news cards use. Cached in the ContentStore by card id
+ *  (`ogn-<id>`, ~7d; a failure `{}` for 1d) so each article is scraped once; cards that already have both
  *  skip it. Best-effort: a scrape failure leaves the card as-is (headline still shows). */
 async function enrichNewsOG(
 	cards: NewsCard[],
@@ -4458,13 +4613,15 @@ async function enrichNewsOG(
 	// it keep their in-feed fields and get filled on a later build (the subrequest-cap guard).
 	let scraped = 0;
 	let skipped = 0;
+	const need = cards.filter((c) => !(c.thumbnailURL && c.blurb) && c.url);
+	const stored = need.length ? await contentGet(env, ctx, need.map((c) => `ogn-${c.id}`)) : new Map<string, string | null>();
+	const fresh: ContentPut[] = [];
 	await Promise.all(
-		cards.map(async (c) => {
-			if ((c.thumbnailURL && c.blurb) || !c.url) return;
+		need.map(async (c) => {
+			const url = c.url;
+			if (!url) return;
 			const key = `ogn-${c.id}`;
-			let og = (await env.FEED_TAGS.get(key, "json")) as
-				| { image?: string; description?: string }
-				| null;
+			let og = parseJSON<{ image?: string; description?: string }>(stored.get(key));
 			if (!og) {
 				if (scraped >= scrapeLimit) {
 					skipped++;
@@ -4472,21 +4629,22 @@ async function enrichNewsOG(
 				}
 				scraped++;
 				try {
-					const fetched = await fetchOG(c.url);
+					const fetched = await fetchOG(url);
 					og = { image: fetched.image, description: fetched.description };
-					ctx.waitUntil(env.FEED_TAGS.put(key, JSON.stringify(og), { expirationTtl: TAG_TTL }));
+					fresh.push({ key, value: JSON.stringify(og), ttlSec: TAG_TTL });
 				} catch {
 					// Remember the FAILURE for a day too (an empty `{}`): uncached, a page that 403s/404s/hangs was
 					// re-fetched on every /feed build and refresh — past the hourly ceiling for unofficial sources
 					// (owner policy 2026-10-08). The card simply keeps its in-feed fields until the retry.
 					og = {};
-					ctx.waitUntil(env.FEED_TAGS.put(key, "{}", { expirationTtl: OG_FAIL_TTL }));
+					fresh.push({ key, value: "{}", ttlSec: OG_FAIL_TTL });
 				}
 			}
 			if (!c.thumbnailURL && og.image) c.thumbnailURL = httpsImage(og.image); // http og:image → ATS-blocked in-app
 			if (!c.blurb && og.description) c.blurb = stripHtml(og.description).slice(0, 240);
 		}),
 	);
+	if (fresh.length) ctx.waitUntil(contentPut(env, ctx, fresh).then(() => undefined));
 	return { cards, scraped, skipped };
 }
 
@@ -4572,7 +4730,7 @@ async function buildOneBeatSource(
  *  rebuild it through the SELF service binding — a separate invocation with its own subrequest
  *  budget. A missing binding / key or a failed call is LOUD (`sourcesRefreshFail`). */
 async function triggerSocialSourcesRefresh(env: Env, ctx: ExecutionContext): Promise<void> {
-	if (!(await dueBySnapshot(env, SOCIAL_SOURCES_KEY, SOCIAL_SOURCES_REFRESH_MS))) return;
+	if (!(await dueByContent(env, ctx, SOCIAL_SOURCES_KEY, SOCIAL_SOURCES_REFRESH_MS))) return;
 	const e = env as unknown as { SELF?: Fetcher; BRACKET_ADMIN_KEY?: string };
 	if (!e.SELF || !e.BRACKET_ADMIN_KEY) {
 		emitDiag(env, ctx, "sourcesRefreshFail", `not configured (SELF binding ${e.SELF ? "ok" : "missing"}, admin key ${e.BRACKET_ADMIN_KEY ? "ok" : "missing"})`);
@@ -4587,7 +4745,7 @@ async function triggerSocialSourcesRefresh(env: Env, ctx: ExecutionContext): Pro
 /** Podcasts refresh trigger — its OWN hourly SELF invocation (own 50-subrequest budget), separate
  *  from the hourly Club-Beat/outlet family so the 23 feed fetches never compete with it. */
 async function triggerPodcastsRefresh(env: Env, ctx: ExecutionContext): Promise<void> {
-	if (!(await dueBySnapshot(env, SOCIAL_PODCASTS_KEY, SOCIAL_PODCASTS_REFRESH_MS))) return;
+	if (!(await dueByContent(env, ctx, SOCIAL_PODCASTS_KEY, SOCIAL_PODCASTS_REFRESH_MS))) return;
 	const e = env as unknown as { SELF?: Fetcher; BRACKET_ADMIN_KEY?: string };
 	if (!e.SELF || !e.BRACKET_ADMIN_KEY) {
 		emitDiag(env, ctx, "sourcesRefreshFail", `podcasts: not configured (SELF ${e.SELF ? "ok" : "missing"}, key ${e.BRACKET_ADMIN_KEY ? "ok" : "missing"})`);
@@ -4624,7 +4782,7 @@ async function refreshSocialSources(
 	env: Env,
 	ctx: ExecutionContext,
 ): Promise<{ refreshed: number; failed: string[]; carried: number; total: number }> {
-	const prev = await readSourcesSnapshot(env);
+	const prev = await readSourcesSnapshot(env, ctx);
 	const beats = await loadBeatSources(env, ctx);
 	const outlets = await loadNewsFeeds(env, ctx);
 	type Job = { key: string; run: () => Promise<{ items: unknown[]; newestRaw: number | null }> };
@@ -4694,7 +4852,7 @@ async function refreshSocialSources(
 		emitDiag(env, ctx, "haikuFailure", `news refresh: ${String((e as Error)?.message ?? e).slice(0, 80)} (kept league-wide until next run)`);
 	}
 	const snap: SourcesSnapshot = { v: 1, updatedAt: now, at: now, sources };
-	await env.FEED_TAGS.put(SOCIAL_SOURCES_KEY, JSON.stringify(snap));
+	await putSnapshot(env, ctx, SOCIAL_SOURCES_KEY, snap);
 	if (carried.length) emitDiag(env, ctx, "sourcesRefreshCarried", `${carried.length} source(s) past the per-run budget carried forward`);
 	return { refreshed: due.length - failed.length, failed, carried: carried.length, total: jobs.length };
 }
@@ -4729,9 +4887,9 @@ interface BlueskySnapshot {
 	handles: Record<string, BskySnapHandle>;
 }
 
-async function readBlueskySnapshot(env: Env): Promise<BlueskySnapshot | null> {
+async function readBlueskySnapshot(env: Env, ctx?: ExecutionContext): Promise<BlueskySnapshot | null> {
 	try {
-		const snap = (await env.FEED_TAGS.get(SOCIAL_BLUESKY_KEY, "json")) as BlueskySnapshot | null;
+		const snap = await contentGetJSON<BlueskySnapshot>(env, ctx, SOCIAL_BLUESKY_KEY, { memo: true });
 		return snap && snap.v === 1 && snap.handles ? snap : null;
 	} catch {
 		return null;
@@ -4747,7 +4905,7 @@ export async function refreshBlueskySnapshot(
 	env: Env,
 	ctx: ExecutionContext,
 ): Promise<{ accounts: number; failed: string[]; posts: number; judged: number }> {
-	const prev = await readBlueskySnapshot(env);
+	const prev = await readBlueskySnapshot(env, ctx);
 	const handles = await loadFeedHandles(env); // the FULL default list — mutes are applied per request
 	const now = Date.now();
 	const cutoff = now - SOCIAL_KEEP_MS;
@@ -4802,7 +4960,7 @@ export async function refreshBlueskySnapshot(
 		posts += acct.items.length;
 	}
 	const snap: BlueskySnapshot = { v: 1, at: now, updatedAt: now, handles: merged };
-	await env.FEED_TAGS.put(SOCIAL_BLUESKY_KEY, JSON.stringify(snap));
+	await putSnapshot(env, ctx, SOCIAL_BLUESKY_KEY, snap);
 	return { accounts: handles.length, failed: fetched.filter((f) => !f.ok).map((f) => f.h.handle), posts, judged };
 }
 
@@ -4911,9 +5069,9 @@ async function loadPodcastShows(env: Env, ctx?: ExecutionContext): Promise<Podca
 	return PODCAST_SEED;
 }
 
-async function readPodcastsSnapshot(env: Env): Promise<PodcastsSnapshot | null> {
+async function readPodcastsSnapshot(env: Env, ctx?: ExecutionContext): Promise<PodcastsSnapshot | null> {
 	try {
-		const snap = (await env.FEED_TAGS.get(SOCIAL_PODCASTS_KEY, "json")) as PodcastsSnapshot | null;
+		const snap = await contentGetJSON<PodcastsSnapshot>(env, ctx, SOCIAL_PODCASTS_KEY, { memo: true });
 		return snap && snap.v === 1 && snap.shows ? snap : null;
 	} catch {
 		return null;
@@ -4987,7 +5145,7 @@ async function buildPodcastSlot(show: PodcastShow, roster: Map<string, string>):
 /** REFRESH the podcasts snapshot (own invocation via SELF — see SOCIAL_PODCASTS_KEY). Per-show
  *  isolation: a failed feed keeps its previous slot flagged `ok:false`. ONE KV write/run (~24/day). */
 async function refreshPodcastsSnapshot(env: Env, ctx: ExecutionContext): Promise<{ refreshed: number; failed: string[]; total: number }> {
-	const prev = await readPodcastsSnapshot(env);
+	const prev = await readPodcastsSnapshot(env, ctx);
 	const shows = await loadPodcastShows(env, ctx);
 	const roster = await loadRosterNameMap(env);
 	const now = Date.now();
@@ -5011,7 +5169,7 @@ async function refreshPodcastsSnapshot(env: Env, ctx: ExecutionContext): Promise
 		}),
 	);
 	const snap: PodcastsSnapshot = { v: 1, updatedAt: now, at: now, shows: out };
-	await env.FEED_TAGS.put(SOCIAL_PODCASTS_KEY, JSON.stringify(snap));
+	await putSnapshot(env, ctx, SOCIAL_PODCASTS_KEY, snap);
 	return { refreshed: shows.length - failed.length, failed, total: shows.length };
 }
 
@@ -5200,7 +5358,7 @@ async function handlePodcastsAdmin(request: Request, env: Env, ctx: ExecutionCon
 	}
 	if (request.method !== "GET") return jsonResponse({ error: "method not allowed" }, 405);
 	const list = await loadPodcastShows(env, ctx);
-	const snap = await readPodcastsSnapshot(env);
+	const snap = await readPodcastsSnapshot(env, ctx);
 	const now = Date.now();
 	const health = list.map((s) => {
 		const slot = snap?.shows[s.id];
@@ -5437,10 +5595,10 @@ async function handleFeed(url: URL, env: Env, ctx: ExecutionContext): Promise<Re
 		// Bluesky sources and the rest of the feed always arrives.
 		// Social sources snapshot (Club Beat + News outlets): ONE KV read, refreshed off-path ~hourly.
 		// Podcasts snapshot only when the client is podcast-capable (build 43 sends no caps).
-		const sourcesSnap = await readSourcesSnapshot(env);
-		const podcastsSnap = caps.has("podcast") ? await readPodcastsSnapshot(env) : null;
+		const sourcesSnap = await readSourcesSnapshot(env, ctx);
+		const podcastsSnap = caps.has("podcast") ? await readPodcastsSnapshot(env, ctx) : null;
 		// Curated reporter + league Bluesky: READ from the 15-min snapshot (judged as posts came in).
-		const bskySnap = await readBlueskySnapshot(env);
+		const bskySnap = await readBlueskySnapshot(env, ctx);
 		if (!bskySnap) {
 			emitDiagCoalesced(env, ctx, "blueskySnapshotMissing", "curated Bluesky snapshot missing — requesting a rebuild", "/feed");
 			if (Date.now() - blueskyKickAt > 60_000) {
@@ -7055,16 +7213,16 @@ async function socialVerdicts(
 	// judged under the old "USWNT-only" policy so the new rule applies immediately.
 	const vkey = (id: string) => `sv3-${id}`;
 
-	// 1. Load cached verdicts (one KV read per card; misses return null).
-	const cached = await Promise.all(
-		typed.map((c) => (c.id ? env.FEED_TAGS.get(vkey(c.id), "json") : Promise.resolve(null))),
-	);
+	// 1. Load cached verdicts in ONE ContentStore batch (never KV — docs/decisions.md 2026-10-08).
+	const cached = await contentGet(env, ctx, typed.filter((c) => c.id).map((c) => vkey(c.id!)));
 	const uncached: FeedCard[] = [];
-	typed.forEach((c, i) => {
-		const v = cached[i] as SocialVerdict | null;
-		if (v) verdicts.set(c.id!, v);
-		else if (c.id) uncached.push(c);
-	});
+	for (const c of typed) {
+		if (!c.id) continue;
+		const v = parseJSON<SocialVerdict>(cached.get(vkey(c.id)));
+		if (v) verdicts.set(c.id, v);
+		else uncached.push(c);
+	}
+	const fresh: ContentPut[] = [];
 
 	// 2. Classify the misses via Haiku, batched. No key / a failed batch → those stay unjudged
 	//    (callers fail CLOSED) and it's LOUD (`haikuFailure`), never a silent empty.
@@ -7094,13 +7252,13 @@ async function socialVerdicts(
 						leagueNews: v.leagueNews === true,
 					};
 					verdicts.set(v.id, clean);
-					ctx.waitUntil(
-						env.FEED_TAGS.put(vkey(v.id), JSON.stringify(clean), { expirationTtl: TAG_TTL }),
-					);
+					fresh.push({ key: vkey(v.id), value: JSON.stringify(clean), ttlSec: TAG_TTL });
 				}
 			}
 		}
 	}
+	// One batched store write for every new verdict (was one KV write per post).
+	if (fresh.length) ctx.waitUntil(contentPut(env, ctx, fresh).then(() => undefined));
 	return verdicts;
 }
 
@@ -7166,7 +7324,7 @@ async function tagNewsTeams(
 	return applyNewsVerdicts(cards, await newsVerdicts(cards, env, ctx, allowHaiku), teams);
 }
 
-/** News verdicts for these cards: cached `nv3-<id>` first (one KV read per card), misses via Haiku in
+/** News verdicts for these cards: cached `nv3-<id>` first (one ContentStore batch read), misses via Haiku in
  *  HAIKU_BATCH batches (written back) — unless `allowHaiku` is false (the request-path fallback), in which
  *  case misses stay unjudged and fail OPEN. Since 2026-10-08 this runs in the hourly sources refresh (the
  *  verdict is stored on each snapshot item), never when a fan opens Social. */
@@ -7182,19 +7340,20 @@ async function newsVerdicts(
 	// waiting out every cached verdict's TTL. (nv1→nv2: dropped the USWNT/NT allowance. nv2→nv3,
 	// 2026-08-16: that exclusion is REVERSED into the unified player-centric international rule.)
 	const vkey = (id: string) => `nv3-${id}`;
-	const cached = await Promise.all(cards.map((c) => env.FEED_TAGS.get(vkey(c.id), "json")));
+	const cached = await contentGet(env, ctx, cards.map((c) => vkey(c.id)));
 	const uncached: NewsCard[] = [];
-	cards.forEach((c, i) => {
-		const v = cached[i] as NewsVerdict | null;
+	for (const c of cards) {
+		const v = parseJSON<NewsVerdict>(cached.get(vkey(c.id)));
 		if (v) verdicts.set(c.id, v);
 		else uncached.push(c);
-	});
+	}
 	if (!allowHaiku || uncached.length === 0) return verdicts;
 	if (!env.ANTHROPIC_API_KEY) {
 		emitDiag(env, ctx, "haikuFailure", `news: no ANTHROPIC_API_KEY — ${uncached.length} article(s) unjudged, kept league-wide`);
 		return verdicts;
 	}
 	const playerMap = featuredPlayerMapBlock(await loadPlayerSocial(env));
+	const fresh: ContentPut[] = [];
 	for (let i = 0; i < uncached.length; i += HAIKU_BATCH) {
 		const batch = uncached.slice(i, i + HAIKU_BATCH);
 		let out: NewsVerdict[] | null;
@@ -7209,9 +7368,10 @@ async function newsVerdicts(
 			const teams = (v.teams ?? []).filter((t) => NEWS_TEAM_ABBR_SET.has(t));
 			const clean: NewsVerdict = { id: v.id, isNWSL: v.isNWSL !== false, teams };
 			verdicts.set(v.id, clean);
-			ctx.waitUntil(env.FEED_TAGS.put(vkey(v.id), JSON.stringify(clean), { expirationTtl: TAG_TTL }));
+			fresh.push({ key: vkey(v.id), value: JSON.stringify(clean), ttlSec: TAG_TTL });
 		}
 	}
+	if (fresh.length) ctx.waitUntil(contentPut(env, ctx, fresh).then(() => undefined));
 	return verdicts;
 }
 
@@ -8171,6 +8331,16 @@ async function dueByMarker(env: Env, key: string, intervalMs: number): Promise<b
  *  (never run, or `at` older than intervalMs). Read-only, so a due pass still writes exactly its one
  *  `:last`. Nothing reads the old `:due` markers, so dropping them is invisible. (2026-08-30 KV
  *  write-budget pass, docs/stress-testing.md §7 — cuts the alerting bookkeeping floor 192→96/day.) */
+/** `dueBySnapshot` for a ContentStore snapshot: due when never written or older than intervalMs. During the
+ *  read-through window a snapshot the store hasn't seen yet takes its age from the old KV copy, so the move
+ *  doesn't cost an extra off-schedule pull of unofficial sources (hourly-max policy). */
+async function dueByContent(env: Env, ctx: ExecutionContext, key: string, intervalMs: number): Promise<boolean> {
+	const at = await contentWrittenAt(env, ctx, key);
+	if (at !== null) return Date.now() - at >= intervalMs;
+	if (Date.now() < CONTENT_KV_READTHROUGH_UNTIL) return dueBySnapshot(env, key, intervalMs);
+	return true;
+}
+
 async function dueBySnapshot(env: Env, lastKey: string, intervalMs: number): Promise<boolean> {
 	const snap = (await env.FEED_TAGS.get(lastKey, "json").catch(() => null)) as { at?: number } | null;
 	return !snap?.at || Date.now() - snap.at >= intervalMs;

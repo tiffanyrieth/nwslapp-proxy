@@ -31,10 +31,19 @@
 	// response for every data center, so ESPN sees ~one request per cache period in total. SQLite-backed —
 	// the only Durable Object storage on the Free plan (same pattern as the watcher's TickMetronome).
 	// Rollback without a deploy: set KV `espn:fetcher:off` (the edge returns to its direct ESPN path).
+	// CONTENT STORE (2026-10-08 — src/content-store.ts): non-live content state (Social snapshots, Haiku
+	// verdict caches, link previews, Home club-news cache) lives in DO SQLite, NOT KV. KV writes are reserved
+	// for live matches (docs/decisions.md; enforced by test/kv-write-guard.spec.ts).
 	"durable_objects": {
-		"bindings": [{ "name": "ESPN_FETCHER", "class_name": "EspnFetcher" }],
+		"bindings": [
+			{ "name": "ESPN_FETCHER", "class_name": "EspnFetcher" },
+			{ "name": "CONTENT_STORE", "class_name": "ContentStore" },
+		],
 	},
-	"migrations": [{ "tag": "v1", "new_sqlite_classes": ["EspnFetcher"] }],
+	"migrations": [
+		{ "tag": "v1", "new_sqlite_classes": ["EspnFetcher"] },
+		{ "tag": "v2", "new_sqlite_classes": ["ContentStore"] },
+	],
 	"ai": {
 		"binding": "AI",
 	},
