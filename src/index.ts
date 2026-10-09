@@ -35,7 +35,6 @@ import { moderateSnapshotBatch, carryForwardVerdicts, IMGMOD_MODEL, IMGMOD_BATCH
 import {
 	BEAT_SEED,
 	NEWS_FEED_SEED,
-	BEAT_ITEMS_PER_SOURCE,
 	MAX_BEAT_PER_CLUB,
 	applyBeatChanges,
 	beatSourcesFor,
@@ -293,7 +292,7 @@ export const TEAM_STATS_TTL = 3600; // 1hr — a squad's season stat totals only
 // per-device ESPN calls. Not a live surface — the live match card is elsewhere.
 
 const YT_API = "https://www.googleapis.com/youtube/v3";
-const UPLOADS_PER_TEAM = 5; // recent uploads to pull per club (the app filters/caps)
+const UPLOADS_PER_TEAM = 15; // recent uploads per club (official API: same 1-unit quota at any size); the app applies the window (owner 2026-10-08; was 5)
 
 // One verified video id per club, used only to RESOLVE the club's YouTube channel
 // at runtime: videos.list(part=snippet) → snippet.channelId → uploads playlist
@@ -519,7 +518,6 @@ async function classifierCall(
 const HAIKU_BATCH = 20; // posts per Haiku call (one numbered list → array of verdicts)
 const TAG_TTL = 7 * 24 * 3600; // a post's verdict is stable; cache it a week
 const OG_FAIL_TTL = 24 * 3600; // a failed article-page OG fetch is retried at most once a day
-const MAX_PER_HANDLE = 3; // free anti-flood cap: keep at most N posts per account
 
 // B3b — Instagram social pipe, LOAD-BALANCED across two scrape services (swapped 2026-08-14):
 //   PLAYERS (→ Feed tab) = Apify sones/instagram-posts-scraper-lowcost ($0.30/1k items).
@@ -765,15 +763,18 @@ const NEWS_FEEDS_KEY = "social:news-feeds";
  *  cadence was more polling than a fan app needs and drew publisher rate limits (Substack 429, a
  *  Tribune paper's bot-wall 403). Can widen to 2h if hourly still trips limits. */
 const SOCIAL_SOURCES_KEY = "social:sources-snapshot";
+/** The longest window any Social/Home surface shows (owner 2026-10-08): 7 days, reaching back to 21 for a quiet
+ *  club. Snapshots keep content this long and prune past it; the APP applies the 7-day + reach-back rule. */
+const SOCIAL_KEEP_DAYS = 21;
+const SOCIAL_KEEP_MS = SOCIAL_KEEP_DAYS * 24 * 60 * 60 * 1000;
+/** Curated-Bluesky flood guard: max posts per account, per UTC day, per club (owner 2026-10-08). */
+const CURATED_POSTS_PER_DAY_PER_CLUB = 4;
 const SOCIAL_SOURCES_REFRESH_MS = 60 * 60 * 1000;
 /** External fetches one refresh run may spend on SOURCE fetches (the rest of the 50 covers mixed-
  *  source Haiku, a capped OG fill and the KV write). Past it, the stalest sources go first and the
  *  remainder carry forward to the next run — so the list can grow without ever breaching the cap. */
 const REFRESH_SOURCE_BUDGET = 34;
-const REFRESH_OG_CAP = 5;
-/** OG scrapes ONE /feed build may spend filling brand-new imageless news articles (each is scraped
- *  once, ever — KV `ogn-`). Uncapped, a burst of new outlet items blew the 50-subrequest cap live. */
-const NEWS_OG_CAP = 5;
+const REFRESH_OG_CAP = 5; // OG fills per sources-refresh run (news keepers + Club Beat); /feed does none since 2026-10-08
 const NEWS_ITEMS_PER_OUTLET = 15; // newest items carried per outlet (pre-Haiku) — bounds snapshot size
 /** One source's slot in the snapshot. Beat items are FINAL cards (stamped to the club); news items
  *  are pre-Haiku NewsCards (relevance + team tag still run per /feed build). */
@@ -1223,6 +1224,11 @@ that needs more users) until you bring it back.</p>
 			if (!auditAuthed(request, env)) {
 				return new Response("Authentication required.", { status: 401, headers: { "WWW-Authenticate": adminRealm("NWSLApp Admin") } });
 			}
+			if (url.searchParams.get("family") === "bluesky") {
+				const b = await refreshBlueskySnapshot(env, ctx);
+				emitDiag(env, ctx, "blueskyRefresh", `${b.accounts - b.failed.length}/${b.accounts} ok, ${b.posts} posts, ${b.judged} newly judged${b.failed.length ? `, failed: ${b.failed.join(" ").slice(0, 80)}` : ""}`);
+				return jsonResponse(b, 200);
+			}
 			if (url.searchParams.get("family") === "podcasts") {
 				const p = await refreshPodcastsSnapshot(env, ctx);
 				emitDiag(env, ctx, "podcastRefresh", `${p.refreshed}/${p.total} ok${p.failed.length ? `, ${p.failed.length} failed` : ""}`);
@@ -1516,7 +1522,7 @@ that needs more users) until you bring it back.</p>
 			return handlePlayerDirectory(env);
 		}
 		if (url.pathname === "/feed/validate-reporter") {
-			return handleValidateReporter(url, env, ctx);
+			return handleValidateReporter(request, url, env, ctx);
 		}
 		if (url.pathname === "/club-news/sources") {
 			return handleClubNewsSources();
@@ -1683,6 +1689,13 @@ that needs more users) until you bring it back.</p>
 				await triggerPodcastsRefresh(env, ctx);
 			} catch {
 				/* best-effort; the next gated tick retries (staleness shows on the Status board) */
+			}
+			// Curated Bluesky snapshot (reporters + league accounts): every 15 min, its OWN invocation via
+			// SELF — Bluesky is an official API, so the hourly ceiling for unofficial sources doesn't apply.
+			try {
+				await triggerBlueskyRefresh(env, ctx);
+			} catch {
+				/* best-effort; the next quarter hour retries (staleness shows on /feed diags) */
 			}
 			// Image-safety backstop (decoupled from the scrape): classify a small batch of unjudged player
 			// thumbnails from the CACHED snapshot — no Apify. Runs EVERY tick (idle-skips when a pool is
@@ -2740,7 +2753,13 @@ type Card = { timestamp?: string };
  * throws), so a news hiccup can't take down the YouTube cards it's merged with.
  */
 const CLUBNEWS_TTL = 2 * 60 * 60; // 2h per-club cache (Home's own route cache is 1h)
-const CLUBNEWS_PER_CLUB = 4; // most-recent articles surfaced per club
+// Club News = everything the club published in the window (owner 2026-10-08; was the newest 4). This is a
+// SAFETY ceiling, never a target — the 21-day window (SOCIAL_KEEP_DAYS) is what decides; the app shows 7
+// days on Home's "See more", reaching back to 21 for a quiet club.
+const CLUBNEWS_MAX_PER_CLUB = 30;
+/** OG fills one club-news build may spend (each article is filled once, ever — KV `ogn-`): with every
+ *  article in the window now kept, an uncapped fill on a cold cache could crowd the 50-subrequest budget. */
+const CLUBNEWS_OG_CAP = 8;
 
 /** Home "Club News": each followed club's own recent article-news, via its configured
  *  CLUB_NEWS strategy (rss / index-scrape / fallback). Per-club + best-effort: one
@@ -2797,8 +2816,11 @@ async function clubNewsFor(abbr: string, env: Env, ctx: ExecutionContext): Promi
 	// so an article whose image isn't inline lands here text-only. This is the same best-effort,
 	// KV-cached enrichment the league/outlet feeds already use; run it BEFORE caching so the
 	// recovered image persists in the club cache. Cards that already have an image are skipped.
+	// Keep everything in the window, newest first (owner 2026-10-08).
+	const cutoff = Date.now() - SOCIAL_KEEP_MS;
+	cards = cards.filter((c) => Date.parse(String(c.timestamp)) >= cutoff).sort(byTimestampDesc) as NewsCard[];
 	if (cards.length > 0) {
-		cards = (await enrichNewsOG(cards, env, ctx)).cards;
+		cards = (await enrichNewsOG(cards, env, ctx, CLUBNEWS_OG_CAP)).cards;
 	}
 
 	// Cache the result EITHER WAY (an empty `[]` too). Uncached, an empty club re-scraped its site + the
@@ -2877,7 +2899,7 @@ function indexHtmlToClubCards(abbr: string, html: string, sourceUrl: string, art
 		const timestamp = dates.get(path);
 		if (!title || !timestamp || isPlaceholderArticle(title)) continue;
 		cards.push(clubNewsCard(abbr, origin + path, title, undefined, name, undefined, timestamp, "club"));
-		if (cards.length >= CLUBNEWS_PER_CLUB) break;
+		if (cards.length >= CLUBNEWS_MAX_PER_CLUB) break;
 	}
 	return cards;
 }
@@ -2917,7 +2939,7 @@ function rssTextToClubCards(abbr: string, xml: string): NewsCard[] {
 		if (!timestamp) continue; // undatable → skip rather than fake "now"
 		if (isPlaceholderArticle(it.title)) continue; // stub-site default post → not real news
 		cards.push(clubNewsCard(abbr, it.link, it.title, it.description, name, it.image, timestamp, "club"));
-		if (cards.length >= CLUBNEWS_PER_CLUB) break;
+		if (cards.length >= CLUBNEWS_MAX_PER_CLUB) break;
 	}
 	return cards;
 }
@@ -2946,7 +2968,7 @@ async function clubIndexCards(abbr: string, indexUrl: string, articlePath: strin
 			}
 		}),
 	);
-	return built.filter((c): c is NewsCard => c !== null).slice(0, CLUBNEWS_PER_CLUB);
+	return built.filter((c): c is NewsCard => c !== null).slice(0, CLUBNEWS_MAX_PER_CLUB);
 }
 
 /** Strategy: a club's JSON news API. NC Courage is a Next.js/RSC site whose HTML carries no
@@ -2974,7 +2996,7 @@ async function clubApiCards(abbr: string, url: string): Promise<NewsCard[]> {
 		// broken image. Live-verified 2026-09-04: `t_w_768` → 400, `w_768` → 200. (NC Courage.)
 		const image = thumb?.templateUrl?.replace("{formatInstructions}", "w_768") ?? thumb?.thumbnailUrl;
 		cards.push(clubNewsCard(abbr, link, title, summary, name, image, timestamp, "club"));
-		if (cards.length >= CLUBNEWS_PER_CLUB) break;
+		if (cards.length >= CLUBNEWS_MAX_PER_CLUB) break;
 	}
 	return cards;
 }
@@ -3017,7 +3039,7 @@ async function buildOutletFallbackCards(abbr: string): Promise<NewsCard[]> {
 			}
 		}),
 	);
-	return perFeed.flat().sort(byTimestampDesc).slice(0, CLUBNEWS_PER_CLUB) as NewsCard[];
+	return perFeed.flat().sort(byTimestampDesc).slice(0, CLUBNEWS_MAX_PER_CLUB) as NewsCard[];
 }
 
 /** Match an article's text to a club for the outlet fallback: the club's name (with and
@@ -4377,9 +4399,9 @@ async function fetchOutletCards(feed: NewsFeedSource): Promise<NewsCard[]> {
 	return (cards.sort(byTimestampDesc) as NewsCard[]).slice(0, NEWS_ITEMS_PER_OUTLET);
 }
 
-/** Build Feed "News" cards: the outlets' items come from the SOCIAL SOURCES SNAPSHOT (one KV read,
- *  refreshed off the request path ~hourly); Haiku then drops non-NWSL items and team-tags the
- *  rest (verdicts KV-cached per article), and survivors missing an image/blurb get a CAPPED OG fill.
+/** Build Feed "News" cards from the SOCIAL SOURCES SNAPSHOT (one KV read, refreshed off the request path
+ *  hourly). Each item already carries its Haiku verdict + OG fill from that refresh (2026-10-08); here we
+ *  only drop non-NWSL / other-team items and tag the rest.
  *  Fallback (snapshot missing - e.g. the minutes after first deploy): fetch the original four
  *  outlets inline exactly as before, LOUD (`sourcesSnapshotMissing`), so News never blanks. */
 async function buildNewsCards(teams: string[], env: Env, ctx: ExecutionContext, snap: SourcesSnapshot | null): Promise<unknown[]> {
@@ -4402,10 +4424,24 @@ async function buildNewsCards(teams: string[], env: Env, ctx: ExecutionContext, 
 		);
 		raw = per.flat();
 	}
-	// Haiku FIRST (drop non-NWSL + non-followed-team + route), so we only spend OG
-	// scrapes on keepers.
-	const kept = await tagNewsTeams(raw, teams, env, ctx);
-	return (await enrichNewsOG(kept, env, ctx, NEWS_OG_CAP)).cards;
+	if (snap) {
+		// Judged + OG-filled when they came in (hourly sources refresh) → per-team keep/tag only. No Haiku,
+		// no OG scrape on the request path (owner 2026-10-08).
+		const stored = new Map<string, NewsVerdict>();
+		const notYetJudged: NewsCard[] = [];
+		for (const c of raw) {
+			const v = (c as NewsCard & { nwslVerdict?: NewsVerdict }).nwslVerdict;
+			if (v) stored.set(c.id, v);
+			else notYetJudged.push(c);
+		}
+		// Items the refresh hasn't judged yet (e.g. a snapshot written before verdicts were stored): read their
+		// CACHED verdicts (KV only, never Haiku) so off-topic items don't slip through on fail-open meanwhile.
+		if (notYetJudged.length) for (const [id, v] of await newsVerdicts(notYetJudged, env, ctx, false)) stored.set(id, v);
+		return applyNewsVerdicts(raw, stored, teams);
+	}
+	// Snapshot missing (a cold first deploy): cached verdicts only — no Haiku, no OG — failing OPEN as news
+	// always has; the next hourly refresh judges the rest.
+	return tagNewsTeams(raw, teams, env, ctx, false);
 }
 
 /** Fill a missing thumbnail/blurb by Open-Graph-scraping the REAL article URL —
@@ -4488,7 +4524,9 @@ async function buildOneBeatSource(
 			const verdicts = await socialVerdicts(cards, env, ctx, `beat:${src.id}`);
 			cards = cards.filter((c) => !centersNonNWSLLeague(c.bodyText) && c.id !== undefined && verdicts.get(c.id)?.isNWSL === true);
 		}
-		return { items: cards.slice(0, BEAT_ITEMS_PER_SOURCE).map((c) => ({ ...c, teamAbbreviation: src.abbr, isLeague: false })), newestRaw };
+		// Everything in the window (owner 2026-10-08) — no per-source count; the refresh merges + prunes to
+		// SOCIAL_KEEP_DAYS, and /feed's curated flood guard bounds a chatty account per day.
+		return { items: cards.map((c) => ({ ...c, teamAbbreviation: src.abbr, isLeague: false })), newestRaw };
 	}
 	if (!src.url || src.kind === "bluesky") return { items: [], newestRaw: null };
 	const all = await fetchSourceItems(src.kind, src.url);
@@ -4517,7 +4555,10 @@ async function buildOneBeatSource(
 			ctaLabel: "Read article",
 		});
 	}
-	const newest = (cards.sort(byTimestampDesc) as NewsCard[]).slice(0, BEAT_ITEMS_PER_SOURCE);
+	// Every article in the window (owner 2026-10-08: was the newest 4 — "quality, not quota" means a good beat
+	// writer's whole week shows). The refresh merges with stored items and prunes past SOCIAL_KEEP_DAYS.
+	const cutoff = Date.now() - SOCIAL_KEEP_MS;
+	const newest = (cards.sort(byTimestampDesc) as NewsCard[]).filter((c) => Date.parse(String(c.timestamp)) >= cutoff);
 	// OG-fill a missing image/blurb (KV-cached per article → each scraped once, ever), bounded by the
 	// run's OG cap; an unfilled article still renders (headline + link) and fills on a later run.
 	if (og.left > 0 && newest.some((c) => !(c.thumbnailURL && c.blurb) && c.url)) {
@@ -4562,6 +4603,23 @@ async function triggerPodcastsRefresh(env: Env, ctx: ExecutionContext): Promise<
  *  source is isolated (a failed one keeps its previous items, flagged `ok:false` + a diag). When the
  *  lists outgrow REFRESH_SOURCE_BUDGET, the stalest sources refresh first and the rest carry
  *  forward to the next run. ONE KV write per run (~24/day at the hourly cadence). */
+/** Merge a source's freshly fetched items into its stored ones (by `id`), keeping fields the fresh copy
+ *  lacks (a stored verdict, an OG-filled image), pruning past the SOCIAL_KEEP_DAYS window, newest first,
+ *  optionally capped to `keep`. Pure. */
+export function mergeSlotItems(prevItems: unknown[] | undefined, fresh: unknown[], keep?: number, now = Date.now()): unknown[] {
+	const byId = new Map<string, Record<string, unknown>>();
+	for (const it of (prevItems ?? []) as Record<string, unknown>[]) if (typeof it?.id === "string") byId.set(it.id, it);
+	for (const it of fresh as Record<string, unknown>[]) {
+		if (typeof it?.id !== "string") continue;
+		const merged: Record<string, unknown> = { ...(byId.get(it.id) ?? {}) };
+		for (const [k, v] of Object.entries(it)) if (v !== undefined) merged[k] = v;
+		byId.set(it.id, merged);
+	}
+	const cutoff = now - SOCIAL_KEEP_MS;
+	const out = [...byId.values()].filter((it) => cardTime(it) >= cutoff).sort((a, b) => cardTime(b) - cardTime(a));
+	return keep ? out.slice(0, keep) : out;
+}
+
 async function refreshSocialSources(
 	env: Env,
 	ctx: ExecutionContext,
@@ -4593,7 +4651,15 @@ async function refreshSocialSources(
 		due.map(async (j) => {
 			try {
 				const out = await j.run();
-				sources[j.key] = { fetchedAt: now, ok: true, items: out.items, newestRaw: out.newestRaw };
+				// ACCUMULATE within the window (2026-10-08): a re-fetch only sees each source's newest items,
+				// so merge with what's stored instead of replacing it. News keeps its newest 15 per source.
+				const isNews = j.key.startsWith("news:");
+				sources[j.key] = {
+					fetchedAt: now,
+					ok: true,
+					items: mergeSlotItems(prev?.sources[j.key]?.items, out.items, isNews ? NEWS_ITEMS_PER_OUTLET : undefined),
+					newestRaw: out.newestRaw,
+				};
 			} catch (e) {
 				const msg = String((e as Error)?.message ?? e).slice(0, 80);
 				failed.push(j.key);
@@ -4607,10 +4673,196 @@ async function refreshSocialSources(
 		}),
 	);
 	for (const j of carried) if (prev?.sources[j.key]) sources[j.key] = prev.sources[j.key];
+	// NEWS is judged HERE, once per run across every outlet (one Haiku batch typically — not one per outlet,
+	// which would crowd the 50-subrequest budget), and the keepers get the run's remaining OG fill. Each
+	// verdict rides its item (`nwslVerdict`), so /feed never calls Haiku or scrapes OG (owner 2026-10-08).
+	try {
+		const newsItems = outlets.flatMap((f) => (sources[newsSlotKey(f)]?.items ?? []) as (NewsCard & { nwslVerdict?: NewsVerdict })[]);
+		const unjudged = newsItems.filter((c) => !c.nwslVerdict);
+		if (unjudged.length) {
+			const verdicts = await newsVerdicts(unjudged, env, ctx, true);
+			for (const c of unjudged) {
+				const v = verdicts.get(c.id);
+				if (v) c.nwslVerdict = v;
+			}
+		}
+		const keepers = newsItems.filter((c) => c.nwslVerdict?.isNWSL !== false);
+		if (og.left > 0 && keepers.some((c) => !(c.thumbnailURL && c.blurb) && c.url)) {
+			og.left -= (await enrichNewsOG(keepers, env, ctx, og.left)).scraped;
+		}
+	} catch (e) {
+		emitDiag(env, ctx, "haikuFailure", `news refresh: ${String((e as Error)?.message ?? e).slice(0, 80)} (kept league-wide until next run)`);
+	}
 	const snap: SourcesSnapshot = { v: 1, updatedAt: now, at: now, sources };
 	await env.FEED_TAGS.put(SOCIAL_SOURCES_KEY, JSON.stringify(snap));
 	if (carried.length) emitDiag(env, ctx, "sourcesRefreshCarried", `${carried.length} source(s) past the per-run budget carried forward`);
 	return { refreshed: due.length - failed.length, failed, carried: carried.length, total: jobs.length };
+}
+
+// ── CURATED BLUESKY SNAPSHOT (2026-10-08) ────────────────────────────────────────────────────────────
+// Owner requirement: Haiku runs when content COMES IN, never when a fan opens Social. Every default
+// reporter/league account is fetched + Haiku-judged by a 15-min background run (its own SELF invocation),
+// and its posts ACCUMULATE here within SOCIAL_KEEP_DAYS — a 12-post sample every 15 min misses nothing
+// (busiest account measured 10/08: ~14 posts/day). Posts Haiku judged NOT NWSL are dropped from the
+// snapshot (they can never show), which keeps it small. `/feed` only READS this and applies the cheap
+// per-team rule (`decideFeedItem`) — no Bluesky fetch, no Haiku, no OG on the request path.
+const SOCIAL_BLUESKY_KEY = "social:bluesky-snapshot";
+/** Stale threshold for the 15-min snapshot before /feed flags it (`blueskySnapshotStale`). */
+const SOCIAL_BLUESKY_STALE_MS = 45 * 60 * 1000;
+/** Isolate memo: a missing snapshot asks for ONE rebuild per minute per isolate, not one per request. */
+let blueskyKickAt = 0;
+interface BskySnapItem {
+	card: FeedCard & Record<string, unknown>;
+	verdict?: SocialVerdict;
+}
+interface BskySnapHandle {
+	kind: FeedHandle["kind"];
+	fetchedAt: number;
+	ok: boolean;
+	error?: string;
+	items: BskySnapItem[];
+}
+interface BlueskySnapshot {
+	v: 1;
+	at: number;
+	updatedAt: number;
+	handles: Record<string, BskySnapHandle>;
+}
+
+async function readBlueskySnapshot(env: Env): Promise<BlueskySnapshot | null> {
+	try {
+		const snap = (await env.FEED_TAGS.get(SOCIAL_BLUESKY_KEY, "json")) as BlueskySnapshot | null;
+		return snap && snap.v === 1 && snap.handles ? snap : null;
+	} catch {
+		return null;
+	}
+}
+
+const cardTime = (c: Record<string, unknown>): number => Date.parse(String(c.timestamp ?? ""));
+
+/** REFRESH the curated Bluesky snapshot (its own invocation — `?family=bluesky`). Per-account isolation:
+ *  a failed fetch keeps that account's stored posts, flagged `ok:false` + a diag. Only posts without a
+ *  stored verdict go to `socialVerdicts` (KV-cached; Haiku on misses), so steady state is ~1 small batch. */
+export async function refreshBlueskySnapshot(
+	env: Env,
+	ctx: ExecutionContext,
+): Promise<{ accounts: number; failed: string[]; posts: number; judged: number }> {
+	const prev = await readBlueskySnapshot(env);
+	const handles = await loadFeedHandles(env); // the FULL default list — mutes are applied per request
+	const now = Date.now();
+	const cutoff = now - SOCIAL_KEEP_MS;
+	const fetched = await Promise.all(
+		handles.map(async (h) => {
+			try {
+				const feed = await bskyAuthorFeed(h.handle, POSTS_PER_HANDLE);
+				const cards = feed
+					.filter((it) => !it.reason && it.post?.record?.text)
+					.map((it) => mapBskyPost(it.post as BskyPost, h))
+					.filter(Boolean) as (FeedCard & Record<string, unknown>)[];
+				return { h, cards, ok: true, error: undefined as string | undefined };
+			} catch (e) {
+				const msg = String((e as Error)?.message ?? e).slice(0, 80);
+				if (isTimeout(e)) emitDiag(env, ctx, "feedUpstreamTimeout", `bsky:${h.handle}`);
+				else emitDiag(env, ctx, "feedSourceFail", `bsky:${h.handle}: ${msg}`);
+				return { h, cards: [] as (FeedCard & Record<string, unknown>)[], ok: false, error: msg };
+			}
+		}),
+	);
+	const merged: Record<string, BskySnapHandle> = {};
+	const needVerdict: FeedCard[] = [];
+	for (const f of fetched) {
+		const key = f.h.handle.toLowerCase();
+		const old = prev?.handles[key];
+		const byId = new Map<string, BskySnapItem>();
+		for (const it of old?.items ?? []) if (it.card?.id) byId.set(it.card.id, it);
+		// A re-fetched post refreshes its card (likes/reposts) but keeps its stored verdict.
+		for (const c of f.cards) if (c.id) byId.set(c.id, { card: c, verdict: byId.get(c.id)?.verdict });
+		const items = [...byId.values()].filter((it) => cardTime(it.card) >= cutoff);
+		for (const it of items) if (!it.verdict) needVerdict.push(it.card);
+		merged[key] = { kind: f.h.kind, fetchedAt: f.ok ? now : (old?.fetchedAt ?? 0), ok: f.ok, error: f.error, items };
+	}
+	let judged = 0;
+	if (needVerdict.length) {
+		const verdicts = await socialVerdicts(needVerdict, env, ctx, "bluesky-refresh");
+		for (const acct of Object.values(merged)) {
+			for (const it of acct.items) {
+				const v = !it.verdict && it.card.id ? verdicts.get(it.card.id) : undefined;
+				if (v) {
+					it.verdict = v;
+					judged++;
+				}
+			}
+		}
+	}
+	// Judged off-topic posts can never show → drop them. Unjudged ones (a Haiku outage) stay and are
+	// retried next run; /feed fails them CLOSED meanwhile, exactly as before.
+	let posts = 0;
+	for (const acct of Object.values(merged)) {
+		acct.items = acct.items.filter((it) => !it.verdict || it.verdict.isNWSL);
+		posts += acct.items.length;
+	}
+	const snap: BlueskySnapshot = { v: 1, at: now, updatedAt: now, handles: merged };
+	await env.FEED_TAGS.put(SOCIAL_BLUESKY_KEY, JSON.stringify(snap));
+	return { accounts: handles.length, failed: fetched.filter((f) => !f.ok).map((f) => f.h.handle), posts, judged };
+}
+
+/** Cron side: on the FIRST 5-minute cron tick of each quarter hour, ask our own worker (SELF) to rebuild the
+ *  curated Bluesky snapshot. A clock check, not `dueBySnapshot` — that would parse the whole snapshot
+ *  every 5 min just to read its timestamp. A missed tick waits for the next quarter hour. */
+async function triggerBlueskyRefresh(env: Env, ctx: ExecutionContext, force = false): Promise<void> {
+	if (!force && new Date().getUTCMinutes() % 15 >= 5) return;
+	const e = env as unknown as { SELF?: Fetcher; BRACKET_ADMIN_KEY?: string };
+	if (!e.SELF || !e.BRACKET_ADMIN_KEY) {
+		emitDiag(env, ctx, "sourcesRefreshFail", `bluesky: not configured (SELF ${e.SELF ? "ok" : "missing"}, key ${e.BRACKET_ADMIN_KEY ? "ok" : "missing"})`);
+		return;
+	}
+	const r = await e.SELF.fetch(
+		new Request(`${PROXY_PUBLIC_ORIGIN}/social/sources/refresh?family=bluesky`, { method: "POST", headers: { "x-admin-key": e.BRACKET_ADMIN_KEY } }),
+	);
+	if (!r.ok) emitDiag(env, ctx, "sourcesRefreshFail", `bluesky refresh returned HTTP ${r.status}`);
+}
+
+/** Request side: the curated reporter/league Bluesky cards for these followed teams, from the snapshot.
+ *  Same keep/tag rule `classifySocialBluesky` applied live before (foreign-league backstop, then
+ *  `decideFeedItem`, fail CLOSED; league accounts must clear the league-news bar, reporters needn't). */
+export function curatedBlueskyCards(
+	snap: BlueskySnapshot | null,
+	active: FeedHandle[],
+	teams: string[],
+): (FeedCard & Record<string, unknown>)[] {
+	if (!snap) return [];
+	const followed = new Set(teams);
+	const out: (FeedCard & Record<string, unknown>)[] = [];
+	for (const h of active) {
+		if (h.kind !== "reporter" && h.kind !== "league") continue;
+		for (const it of snap.handles[h.handle.toLowerCase()]?.items ?? []) {
+			if (centersNonNWSLLeague(it.card.bodyText)) continue;
+			const d = decideFeedItem(it.verdict, followed, { requireLeagueNews: h.kind !== "reporter", failClosed: true });
+			if (!d.keep) continue;
+			out.push({ ...it.card, teamAbbreviation: d.abbr ?? undefined, isLeague: !d.abbr });
+		}
+	}
+	return out;
+}
+
+/** Flood guard for CURATED Bluesky only (ours, Haiku-filtered — owner 2026-10-08): at most
+ *  CURATED_POSTS_PER_DAY_PER_CLUB posts per account, per UTC day, per club (league-wide = its own group).
+ *  Replaces the old "3 per account across the whole feed": a noisy account can't take over a club's day,
+ *  while an account like the xG bot still gets its one summary per match for EVERY club on a full round. */
+export function capCuratedPerDayPerClub<T extends Record<string, unknown>>(cards: T[], perDay = CURATED_POSTS_PER_DAY_PER_CLUB): T[] {
+	const sorted = [...cards].sort((a, b) => cardTime(b) - cardTime(a));
+	const counts = new Map<string, number>();
+	return sorted.filter((c) => {
+		const handle = typeof c.handle === "string" ? c.handle.toLowerCase() : "";
+		if (!handle) return true;
+		const day = String(c.timestamp ?? "").slice(0, 10);
+		const club = (typeof c.teamAbbreviation === "string" && c.teamAbbreviation) || "league";
+		const key = `${handle}|${day}|${club}`;
+		const n = counts.get(key) ?? 0;
+		if (n >= perDay) return false;
+		counts.set(key, n + 1);
+		return true;
+	});
 }
 
 // ---------------------------------------------------------------------------
@@ -5117,15 +5369,20 @@ async function handleFeed(url: URL, env: Env, ctx: ExecutionContext): Promise<Re
 	// 2b layering (owner design): `muted` = DEFAULT handles the user toggled off — excluded
 	// from the curated fetch, and NOT allowed to supersede a same-handle user add (row 4 of
 	// the layering table: default off + user-added ⇒ the unfiltered add resurfaces).
-	const userHandles = parseHandleList(url.searchParams.get("handles")).slice(0, MAX_USER_HANDLES);
+	// Capability flags the CLIENT declares (build 43 sends none): only a `podcast`-capable build gets
+	// podcast episode cards, since older builds drop unknown card layouts on decode. `devicebsky`
+	// (2026-10-08): the build fetches the user's OWN added Bluesky accounts on the phone and applies
+	// mutes itself — so this route serves ONLY our curated content, keyed per team set (not per person).
+	const caps = new Set(parseHandleList(url.searchParams.get("caps")));
+	const deviceBsky = caps.has("devicebsky");
+	// Older builds (no `devicebsky`) still send their added accounts + mutes; served as before (compat)
+	// until MIN_APP_BUILD retires them.
+	const userHandles = deviceBsky ? [] : parseHandleList(url.searchParams.get("handles")).slice(0, MAX_USER_HANDLES);
 	const userPlayers = new Set(parseHandleList(url.searchParams.get("players")));
-	const mutedDefaults = new Set(parseHandleList(url.searchParams.get("muted")));
+	const mutedDefaults = new Set(deviceBsky ? [] : parseHandleList(url.searchParams.get("muted")));
 	// 2c: Bluesky handles the user added AS PLAYERS (the add-flow's reporter|player pick).
 	// Player voices NEVER go through Haiku (owner law) — served unfiltered like player IG.
-	const userPlayerBsky = parseHandleList(url.searchParams.get("playerBsky")).slice(0, MAX_USER_HANDLES);
-	// Capability flags the CLIENT declares (build 43 sends none): only a `podcast`-capable build gets
-	// podcast episode cards, since older builds drop unknown card layouts on decode.
-	const caps = new Set(parseHandleList(url.searchParams.get("caps")));
+	const userPlayerBsky = deviceBsky ? [] : parseHandleList(url.searchParams.get("playerBsky")).slice(0, MAX_USER_HANDLES);
 	// Podcast shows the user turned OFF in "Show in Listen" (opt-out; followed-club pods + league
 	// shows are on by default). `addShows` = pods for clubs the user does NOT follow that she opted
 	// INTO (off by default, Players-style) — a KC fan adding the Angel City pod.
@@ -5167,8 +5424,6 @@ async function handleFeed(url: URL, env: Env, ctx: ExecutionContext): Promise<Re
 		// default is muted, the user add wins and serves unfiltered below.
 		const activeDefaults = (await loadFeedHandles(env)).filter((h) => !mutedDefaults.has(h.handle.toLowerCase()));
 		const activeDefaultSet = new Set(activeDefaults.map((h) => h.handle.toLowerCase()));
-		const reporterHandles = activeDefaults.filter((h) => h.kind === "reporter");
-		const leagueHandles = activeDefaults.filter((h) => h.kind === "league");
 		// Phase 3 "make it yours": the user's own-added Bluesky reporters, fetched alongside
 		// the curated set (per-handle failures isolated in blueskyCardsFor).
 		const userReporterHandles: FeedHandle[] = userHandles
@@ -5184,6 +5439,17 @@ async function handleFeed(url: URL, env: Env, ctx: ExecutionContext): Promise<Re
 		// Podcasts snapshot only when the client is podcast-capable (build 43 sends no caps).
 		const sourcesSnap = await readSourcesSnapshot(env);
 		const podcastsSnap = caps.has("podcast") ? await readPodcastsSnapshot(env) : null;
+		// Curated reporter + league Bluesky: READ from the 15-min snapshot (judged as posts came in).
+		const bskySnap = await readBlueskySnapshot(env);
+		if (!bskySnap) {
+			emitDiagCoalesced(env, ctx, "blueskySnapshotMissing", "curated Bluesky snapshot missing — requesting a rebuild", "/feed");
+			if (Date.now() - blueskyKickAt > 60_000) {
+				blueskyKickAt = Date.now();
+				ctx.waitUntil(triggerBlueskyRefresh(env, ctx, true).catch(() => {}));
+			}
+		} else if (Date.now() - bskySnap.at > SOCIAL_BLUESKY_STALE_MS) {
+			emitDiagCoalesced(env, ctx, "blueskySnapshotStale", `curated Bluesky snapshot ${Math.round((Date.now() - bskySnap.at) / 60000)} min old`, "/feed");
+		}
 		const [newsCards, social, beatCards] = await Promise.all([
 			// News (B1): outlet items (snapshot) -> Haiku NWSL-gate + team-tag + followed-team
 			// filter -> capped OG-enrich -> newsArticle cards. Self-isolating; failures yield [].
@@ -5204,23 +5470,14 @@ async function handleFeed(url: URL, env: Env, ctx: ExecutionContext): Promise<Re
 		// user adds remain free to include player bsky (their explicit choice).
 		const userPlayerBskyHandles: FeedHandle[] = userPlayerBsky.map((h) => ({ handle: h, kind: "player" }));
 
-		const [rawReporters, rawLeague, rawUserReporters, rawUserPlayerBsky] = await Promise.all([
-			buildBlueskyCards(reporterHandles, env, ctx),
-			buildBlueskyCards(leagueHandles, env, ctx),
-			buildBlueskyCards(userReporterHandles, env, ctx),
-			buildBlueskyCards(userPlayerBskyHandles, env, ctx),
+		// Old builds only: their added accounts, fetched live as before (never Haiku). New builds send none.
+		const [rawUserReporters, rawUserPlayerBsky] = await Promise.all([
+			userReporterHandles.length ? buildBlueskyCards(userReporterHandles, env, ctx) : Promise.resolve([]),
+			userPlayerBskyHandles.length ? buildBlueskyCards(userPlayerBskyHandles, env, ctx) : Promise.resolve([]),
 		]);
-		// Reporter + league-outlet Bluesky carry no team tag of their own and post
-		// off-topic too → one Haiku pass gates relevance, team-tags, and filters to
-		// the followed teams (classifySocialBluesky). Player IG (playerSocial) is a
-		// trusted fast path — already team-tagged, no Haiku. News is gated+filtered
-		// inside buildNewsCards.
-		const socialBluesky = await classifySocialBluesky(
-			[...rawReporters, ...rawLeague],
-			teams,
-			env,
-			ctx,
-		);
+		// Curated reporter + league Bluesky, already Haiku-judged in the snapshot → per-team keep/tag here,
+		// then the per-account-per-day-per-club flood guard (curated content only).
+		const socialBluesky = capCuratedPerDayPerClub(curatedBlueskyCards(bskySnap, activeDefaults, teams));
 		// ⚠️ COST FIREWALL (owner design, 2b): user-added handles NEVER touch Haiku. The user
 		// chose to follow them — show everything, unfiltered (that's the value of a personal
 		// add; the curated default list is the filtered experience). This bounds Haiku spend
@@ -5231,14 +5488,15 @@ async function handleFeed(url: URL, env: Env, ctx: ExecutionContext): Promise<Re
 		const playerSocial = socialFor(social, teams, new Set(["feed"]), userPlayers);
 		// Podcasts (podcast-capable clients only): episode cards from the hourly snapshot (zero fetches).
 		const podcastCards = buildPodcastCards(podcastsSnap, teams, hiddenShows, addedShows, Date.now());
-		cards = [...socialBluesky, ...userReporterCards, ...newsCards, ...beatCards, ...playerSocial, ...userPlayerBskyCards, ...podcastCards].sort(
+		// Club Beat's Bluesky voices are curated too → the same daily guard (its articles have no handle).
+		const guardedBeat = capCuratedPerDayPerClub(beatCards as Record<string, unknown>[]);
+		cards = [...socialBluesky, ...userReporterCards, ...newsCards, ...guardedBeat, ...playerSocial, ...userPlayerBskyCards, ...podcastCards].sort(
 			byTimestampDesc,
 		);
-		// Collapse identical-text duplicates (bot double-posts) BEFORE the cap, so a
-		// dup never costs a cap slot and we keep the freshest copy.
+		// Collapse identical-text duplicates (bot double-posts), keeping the freshest copy. No blanket
+		// per-account count cap any more (owner 2026-10-08: show everything in the window; the only count
+		// limit is the curated flood guard above). User adds, player IG and podcasts are never count-capped.
 		cards = dedupeByContent(cards);
-		// Free anti-flood cap (no API): no single account may dominate the feed.
-		cards = capPerHandle(cards, MAX_PER_HANDLE);
 	} catch {
 		return serveStaleOr502(env, ctx, cache, cacheKey, url.pathname);
 	}
@@ -5270,9 +5528,18 @@ async function handlePlayerDirectory(env: Env): Promise<Response> {
  *  added handles are never team-scoped). `found` = the account resolves; `hasNWSLPosts` = at
  *  least one recent post survived the gate. Never throws to the caller — a bad handle returns
  *  { found: false }. */
-async function handleValidateReporter(url: URL, env: Env, ctx: ExecutionContext): Promise<Response> {
+async function handleValidateReporter(request: Request, url: URL, env: Env, ctx: ExecutionContext): Promise<Response> {
 	const raw = url.searchParams.get("handle")?.trim().toLowerCase().replace(/^@/, "") ?? "";
 	if (!raw) return jsonResponse({ found: false }, 200);
+	// The one place a USER-TYPED handle reaches Haiku (the add-a-reporter NWSL check) → bounded
+	// (2026-10-08): one answer per handle per 24h from the edge cache, and the per-IP ingest limiter.
+	const cache = caches.default;
+	const cacheKey = new Request(`https://validate.internal/reporter?h=${encodeURIComponent(raw)}`, { method: "GET" });
+	const hit = await cache.match(cacheKey);
+	if (hit) return hit;
+	if (await overIngestLimit(request, env, "validate-reporter")) {
+		return jsonResponse({ found: false, error: "rate_limited" }, 429);
+	}
 	let feed: BskyItem[];
 	try {
 		feed = await bskyAuthorFeed(raw, POSTS_PER_HANDLE);
@@ -5292,7 +5559,11 @@ async function handleValidateReporter(url: URL, env: Env, ctx: ExecutionContext)
 		.map((it) => mapBskyPost(it.post as BskyPost, { handle: raw, kind: "reporter" }))
 		.filter(Boolean);
 	const kept = cards.length ? await classifySocialBluesky(cards, [...NEWS_TEAM_ABBR_SET], env, ctx) : [];
-	return jsonResponse({ found: true, displayName, handle: `@${raw}`, hasNWSLPosts: kept.length > 0 }, 200);
+	const res = jsonResponse({ found: true, displayName, handle: `@${raw}`, hasNWSLPosts: kept.length > 0 }, 200);
+	const toCache = new Response(res.clone().body, res);
+	toCache.headers.set("Cache-Control", "public, max-age=86400");
+	ctx.waitUntil(cache.put(cacheKey, toCache));
+	return res;
 }
 
 /** Build cards for a set of Bluesky handles (per-handle failures isolated). */
@@ -5784,7 +6055,7 @@ async function loadModApproved(env: Env): Promise<Set<string>> {
 	}
 }
 
-// Keep only the freshest few posts per player in the SNAPSHOT (the Feed serves at most MAX_PER_HANDLE=3).
+// Keep only the freshest few posts per player in the SNAPSHOT (measured 10/08: no player posts more than 4 a week).
 // Storing/moderating more than this is pure waste — trimming shrinks the moderation universe ~3x so a
 // cold backlog clears in a few hours, not a day, and keeps the snapshot small.
 const MODERATE_KEEP_PER_HANDLE = 4;
@@ -6745,7 +7016,7 @@ async function classifySocialBluesky(
 	//    (requireLeagueNews), but REPORTERS don't — a reporter's value is exactly the
 	//    analysis / rumor / transfer chatter that bar would drop, so general league-wide
 	//    NWSL reporter posts are kept (still gated on isNWSL + still fail-closed). The
-	//    MAX_PER_HANDLE cap bounds how many any one reporter contributes.
+	//    curated flood guard (capCuratedPerDayPerClub) bounds how many any one reporter contributes per day.
 	const keepers: unknown[] = [];
 	for (const c of typed) {
 		// Deterministic foreign-league backstop — drop before trusting the Haiku verdict
@@ -6889,16 +7160,27 @@ async function tagNewsTeams(
 	teams: string[],
 	env: Env,
 	ctx: ExecutionContext,
+	allowHaiku = true,
 ): Promise<NewsCard[]> {
 	if (cards.length === 0) return cards;
-	const followed = new Set(teams);
-	const verdicts = new Map<string, NewsVerdict>();
+	return applyNewsVerdicts(cards, await newsVerdicts(cards, env, ctx, allowHaiku), teams);
+}
 
-	// 1. Load cached verdicts (one KV read per card; misses return null). The key is
-	//    versioned (`nv3-`) so a policy/schema change rolls by bumping the version rather
-	//    than waiting out every cached verdict's TTL. (nv1→nv2: dropped the USWNT/NT
-	//    allowance. nv2→nv3, 2026-08-16: that exclusion is REVERSED into the unified
-	//    player-centric international rule — an NWSL player as primary subject matches.)
+/** News verdicts for these cards: cached `nv3-<id>` first (one KV read per card), misses via Haiku in
+ *  HAIKU_BATCH batches (written back) — unless `allowHaiku` is false (the request-path fallback), in which
+ *  case misses stay unjudged and fail OPEN. Since 2026-10-08 this runs in the hourly sources refresh (the
+ *  verdict is stored on each snapshot item), never when a fan opens Social. */
+async function newsVerdicts(
+	cards: NewsCard[],
+	env: Env,
+	ctx: ExecutionContext,
+	allowHaiku: boolean,
+): Promise<Map<string, NewsVerdict>> {
+	const verdicts = new Map<string, NewsVerdict>();
+	if (cards.length === 0) return verdicts;
+	// The key is versioned (`nv3-`) so a policy/schema change rolls by bumping the version rather than
+	// waiting out every cached verdict's TTL. (nv1→nv2: dropped the USWNT/NT allowance. nv2→nv3,
+	// 2026-08-16: that exclusion is REVERSED into the unified player-centric international rule.)
 	const vkey = (id: string) => `nv3-${id}`;
 	const cached = await Promise.all(cards.map((c) => env.FEED_TAGS.get(vkey(c.id), "json")));
 	const uncached: NewsCard[] = [];
@@ -6907,51 +7189,43 @@ async function tagNewsTeams(
 		if (v) verdicts.set(c.id, v);
 		else uncached.push(c);
 	});
-
-	// 2. Tag the misses via Haiku, batched. No key → skip (everything fails open) — LOUDLY.
-	if (uncached.length > 0 && !env.ANTHROPIC_API_KEY) {
+	if (!allowHaiku || uncached.length === 0) return verdicts;
+	if (!env.ANTHROPIC_API_KEY) {
 		emitDiag(env, ctx, "haikuFailure", `news: no ANTHROPIC_API_KEY — ${uncached.length} article(s) unjudged, kept league-wide`);
+		return verdicts;
 	}
-	if (uncached.length > 0 && env.ANTHROPIC_API_KEY) {
-		const playerMap = featuredPlayerMapBlock(await loadPlayerSocial(env));
-		for (let i = 0; i < uncached.length; i += HAIKU_BATCH) {
-			const batch = uncached.slice(i, i + HAIKU_BATCH);
-			let out: NewsVerdict[] | null;
-			try {
-				out = await haikuTagNewsBatch(batch, env.ANTHROPIC_API_KEY, playerMap);
-			} catch (e) {
-				out = null; // fail open: batch unjudged → kept league-wide below
-				emitDiag(env, ctx, "haikuFailure", `news: ${String((e as Error)?.message ?? e).slice(0, 80)} (${batch.length} unjudged, kept league-wide)`);
-			}
-			if (out) {
-				for (const v of out) {
-					if (!v?.id) continue;
-					const teams = (v.teams ?? []).filter((t) => NEWS_TEAM_ABBR_SET.has(t));
-					const clean: NewsVerdict = { id: v.id, isNWSL: v.isNWSL !== false, teams };
-					verdicts.set(v.id, clean);
-					ctx.waitUntil(
-						env.FEED_TAGS.put(vkey(v.id), JSON.stringify(clean), { expirationTtl: TAG_TTL }),
-					);
-				}
-			}
+	const playerMap = featuredPlayerMapBlock(await loadPlayerSocial(env));
+	for (let i = 0; i < uncached.length; i += HAIKU_BATCH) {
+		const batch = uncached.slice(i, i + HAIKU_BATCH);
+		let out: NewsVerdict[] | null;
+		try {
+			out = await haikuTagNewsBatch(batch, env.ANTHROPIC_API_KEY, playerMap);
+		} catch (e) {
+			out = null; // fail open: batch unjudged → kept league-wide
+			emitDiag(env, ctx, "haikuFailure", `news: ${String((e as Error)?.message ?? e).slice(0, 80)} (${batch.length} unjudged, kept league-wide)`);
+		}
+		for (const v of out ?? []) {
+			if (!v?.id) continue;
+			const teams = (v.teams ?? []).filter((t) => NEWS_TEAM_ABBR_SET.has(t));
+			const clean: NewsVerdict = { id: v.id, isNWSL: v.isNWSL !== false, teams };
+			verdicts.set(v.id, clean);
+			ctx.waitUntil(env.FEED_TAGS.put(vkey(v.id), JSON.stringify(clean), { expirationTtl: TAG_TTL }));
 		}
 	}
+	return verdicts;
+}
 
-	// 3. Keep + tag (or drop) per the shared rule. News fails OPEN on an unjudged
-	//    card (kept league-wide) and has no league-news bar (an article is news).
+/** Keep + tag (or drop) news cards per the shared rule — pure, cheap, per request. News fails OPEN on an
+ *  unjudged card (kept league-wide) and has no league-news bar (an article is news). Returns COPIES (the
+ *  snapshot items are shared across requests). */
+function applyNewsVerdicts(cards: NewsCard[], verdicts: Map<string, NewsVerdict>, teams: string[]): NewsCard[] {
+	const followed = new Set(teams);
 	const keepers: NewsCard[] = [];
 	for (const c of cards) {
-		const v = verdicts.get(c.id);
-		const d = decideFeedItem(v, followed, { requireLeagueNews: false, failClosed: false });
+		const d = decideFeedItem(verdicts.get(c.id), followed, { requireLeagueNews: false, failClosed: false });
 		if (!d.keep) continue;
-		if (d.abbr) {
-			c.teamAbbreviation = d.abbr;
-			c.isLeague = false;
-		} else {
-			c.teamAbbreviation = undefined;
-			c.isLeague = true;
-		}
-		keepers.push(c);
+		const { nwslVerdict: _stored, ...card } = c as NewsCard & { nwslVerdict?: NewsVerdict };
+		keepers.push(d.abbr ? { ...card, teamAbbreviation: d.abbr, isLeague: false } : { ...card, teamAbbreviation: undefined, isLeague: true });
 	}
 	return keepers;
 }

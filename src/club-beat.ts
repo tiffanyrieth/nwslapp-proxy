@@ -54,8 +54,6 @@ export const CLUB_ABBRS = new Set([
 /** Anti-spree rail for the guarded apply path — NOT a quality ceiling (owner: quality, not quota).
  *  Every source was verified live 2026-09-30 before it went on this list. */
 export const MAX_BEAT_PER_CLUB = 8;
-/** Newest items kept per beat source per build — one prolific source can't flood a club's feed. */
-export const BEAT_ITEMS_PER_SOURCE = 4;
 
 // WordPress REST (MediaNews/Tribune papers block their section RSS with 403, but the public posts API
 // serves the same club section: dated, with a featured image). `categories=<id>` = the club section.
