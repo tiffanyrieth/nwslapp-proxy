@@ -2583,19 +2583,30 @@ export function chooseScoreboardTTL(body: ArrayBuffer): number {
 		// and 45 min AGO (ESPN's observed flip lag), cache at the live cadence so we track ESPN's
 		// transition within ~30s instead of ~5 min. ESPN's own lateness is not ours to fix.
 		const now = Date.now();
-		const nearKickoff = events.some((event) => {
+		const leadMs = 2 * 60 * 1000;
+		let nearKickoff = false;
+		// NEVER STRADDLE A KICKOFF (2026-10-13, USA–ESP): the default TTL went 300 s → 1 h in the 2026-09-15
+		// ESPN-footprint pass, but this guard's 2-min lead was sized for 300 s. A "pre" snapshot fetched anywhere
+		// in the hour before kickoff was then cached THROUGH kickoff: USA–ESP read "pre" for ~45 min after the
+		// whistle in the app AND the watcher (the per-day window merge strips `_cb`). So a pre-match entry now
+		// expires no later than its earliest upcoming kickoff's lead point, where the live-cadence window below
+		// takes over. Cost: ~1 extra ESPN fetch per day key per kickoff — still 1 h whenever no kickoff is near.
+		let untilNextLeadMs = Infinity;
+		for (const event of events) {
 			const state = event.status?.type?.state ?? (event.competitions ?? [])[0]?.status?.type?.state;
-			if (state !== "pre" || !event.date) return false;
+			if (state !== "pre" || !event.date) continue;
 			// Normalize ESPN's seconds-less timestamps ("…T17:00Z") before parsing, mirroring the
 			// watcher's fixtures.kickoffMs. (V8's Date.parse actually accepts "17:00Z" today, so this is
 			// parity + future-proofing on a live-transition-critical path — a silent parse miss here would
-			// cache at the 5-min default across kickoff and lag the live flip — not a current-format fix.)
+			// cache at the default across kickoff and lag the live flip — not a current-format fix.)
 			const rawDate = /T\d{2}:\d{2}Z$/.test(event.date) ? event.date.replace("Z", ":00Z") : event.date;
 			const kickoff = Date.parse(rawDate);
-			if (!Number.isFinite(kickoff)) return false;
-			return now >= kickoff - 2 * 60 * 1000 && now <= kickoff + 45 * 60 * 1000;
-		});
-		return nearKickoff ? LIVE_TTL : SCOREBOARD_DEFAULT_TTL;
+			if (!Number.isFinite(kickoff)) continue;
+			if (now >= kickoff - leadMs && now <= kickoff + 45 * 60 * 1000) nearKickoff = true;
+			else if (kickoff - leadMs > now) untilNextLeadMs = Math.min(untilNextLeadMs, kickoff - leadMs - now);
+		}
+		if (nearKickoff) return LIVE_TTL;
+		return Math.max(LIVE_TTL, Math.min(SCOREBOARD_DEFAULT_TTL, Math.floor(untilNextLeadMs / 1000)));
 	} catch {
 		return SCOREBOARD_DEFAULT_TTL;
 	}

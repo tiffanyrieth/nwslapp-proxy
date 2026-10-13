@@ -6,6 +6,7 @@ import {
 } from "cloudflare:test";
 import { describe, it, expect } from "vitest";
 import worker, {
+	chooseScoreboardTTL,
 	chooseSummaryTTL,
 	snapshotKeyURL,
 	dedupeByContent,
@@ -37,6 +38,31 @@ const IncomingRequest = Request<unknown, IncomingRequestCfProperties>;
 // These cover the route guards only — they return before any ESPN fetch, so
 // they're deterministic and network-free. The live fetch + cache HIT/MISS/TTL
 // behaviour is verified end-to-end with `wrangler dev` + curl.
+describe("chooseScoreboardTTL — a pre-match snapshot never straddles kickoff (2026-10-13 USA–ESP)", () => {
+	const body = (events: unknown[]) => new TextEncoder().encode(JSON.stringify({ events })).buffer as ArrayBuffer;
+	const pre = (msFromNow: number) => ({ date: new Date(Date.now() + msFromNow).toISOString(), status: { type: { state: "pre" } } });
+	it("15 min before kickoff: expires by the 2-min lead point, not in an hour", () => {
+		const ttl = chooseScoreboardTTL(body([pre(15 * 60_000)]));
+		expect(ttl).toBeGreaterThanOrEqual(12 * 60);
+		expect(ttl).toBeLessThanOrEqual(13 * 60);
+	});
+	it("inside the lead window or just after kickoff: live cadence (30 s)", () => {
+		expect(chooseScoreboardTTL(body([pre(60_000)]))).toBe(30);
+		expect(chooseScoreboardTTL(body([pre(-10 * 60_000)]))).toBe(30);
+	});
+	it("no kickoff within the hour: the 1 h static TTL is unchanged", () => {
+		expect(chooseScoreboardTTL(body([pre(5 * 3_600_000)]))).toBe(3600);
+		expect(chooseScoreboardTTL(body([{ status: { type: { state: "post" } } }]))).toBe(3600);
+	});
+	it("uses the EARLIEST upcoming kickoff of the day", () => {
+		const ttl = chooseScoreboardTTL(body([pre(3 * 3_600_000), pre(20 * 60_000)]));
+		expect(ttl).toBeLessThanOrEqual(18 * 60);
+	});
+	it("a live match is live cadence regardless", () => {
+		expect(chooseScoreboardTTL(body([{ status: { type: { state: "in" } } }, pre(5 * 3_600_000)]))).toBe(30);
+	});
+});
+
 describe("nwslapp-proxy route guards", () => {
 	it("404s any unknown path", async () => {
 		const request = new IncomingRequest("https://proxy.test/teams");
