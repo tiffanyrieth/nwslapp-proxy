@@ -29,29 +29,33 @@ export interface WatchSummaryEntry {
 	unknownLeague: boolean;
 }
 
-/** Parse `e=<event>:<league>[:1],…`. A malformed entry (bad id / flag / shape) rejects the whole request — the
- *  watcher builds this string itself, so that's a bug to surface. An unknown league is per-entry (see
+/** Parse `e=<event>:<league>[:1],…`. Only a missing/empty/oversized list rejects the whole request. A malformed
+ *  entry (non-numeric id, bad flag, bad shape) is SKIPPED and reported in `skipped` — the watcher reads a missing
+ *  id as "no summary", exactly like a failed per-match fetch — so one bad entry (e.g. a fake-match id) can never
+ *  cost the real matches in the same batch their summaries. An unknown league is answered per entry (see
  *  `unknownLeague`). */
 export function parseWatchSummaryEntries(
 	raw: string | null,
 	allowedLeagues: ReadonlySet<string>,
-): { entries: WatchSummaryEntry[] } | { error: string } {
+): { entries: WatchSummaryEntry[]; skipped: string[] } | { error: string } {
 	if (!raw) return { error: "missing e=" };
 	const parts = raw.split(",").filter((p) => p.length > 0);
 	if (parts.length === 0) return { error: "empty e=" };
 	if (parts.length > WATCH_SUMMARIES_MAX) return { error: `too many entries (${parts.length} > ${WATCH_SUMMARIES_MAX})` };
 	const entries: WatchSummaryEntry[] = [];
+	const skipped: string[] = [];
 	const seen = new Set<string>();
 	for (const p of parts) {
 		const [id, league, flag, ...rest] = p.split(":");
-		if (rest.length > 0 || !id || !/^\d{1,12}$/.test(id)) return { error: `bad event in "${p}"` };
-		if (!league) return { error: `missing league in "${p}"` };
-		if (flag !== undefined && flag !== "1") return { error: `bad flag in "${p}"` };
+		if (rest.length > 0 || !id || !/^\d{1,12}$/.test(id) || !league || (flag !== undefined && flag !== "1")) {
+			skipped.push(p.slice(0, 40));
+			continue;
+		}
 		if (seen.has(id)) continue; // a duplicate id is harmless — serve it once
 		seen.add(id);
 		entries.push({ id, league, bust: flag === "1", unknownLeague: !allowedLeagues.has(league) });
 	}
-	return { entries };
+	return { entries, skipped };
 }
 
 /** The exact /summary URL the watcher used to fetch for this entry (same param order, same NWSL default with
