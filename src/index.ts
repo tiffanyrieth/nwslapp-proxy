@@ -5541,6 +5541,38 @@ function byTimestampDesc(a: unknown, b: unknown): number {
 	return ((a as Card).timestamp ?? "") < ((b as Card).timestamp ?? "") ? 1 : -1;
 }
 
+/** An https URL string, else undefined (never pass an http/odd URL into the app's image loader). */
+function httpsOnly(u: unknown): string | undefined {
+	return typeof u === "string" && u.startsWith("https://") ? u : undefined;
+}
+
+/**
+ * Per-ACCOUNT avatar stamp (Social card avatars, 2026-10-13). The Bluesky snapshot keeps posts for 21 days but only
+ * re-maps each account's newest posts on a refresh, so cards stored before avatars existed would show the fallback
+ * icon for weeks. Every account's newest post IS re-mapped each refresh, so: learn `handle → avatar` from every
+ * card we have (the response + the full snapshot), newest first, and fill it onto that handle's cards that lack it.
+ * Returns a new array; stamped cards are copies (inputs untouched).
+ */
+export function stampAuthorAvatars(cards: unknown[], sources: unknown[] = []): unknown[] {
+	type C = { handle?: unknown; authorAvatarURL?: unknown; timestamp?: unknown };
+	const best = new Map<string, { url: string; ts: number }>();
+	for (const c of [...cards, ...sources] as C[]) {
+		if (!c || typeof c.handle !== "string") continue;
+		const url = httpsOnly(c.authorAvatarURL);
+		if (!url) continue;
+		const ts = Date.parse(String(c.timestamp ?? "")) || 0;
+		const cur = best.get(c.handle);
+		if (!cur || ts > cur.ts) best.set(c.handle, { url, ts });
+	}
+	if (best.size === 0) return cards;
+	// Copy-on-stamp: snapshot cards are shared (the per-isolate read memo), so never mutate them in place.
+	return (cards as C[]).map((c) => {
+		if (!c || typeof c.handle !== "string" || httpsOnly(c.authorAvatarURL)) return c;
+		const hit = best.get(c.handle);
+		return hit ? { ...c, authorAvatarURL: hit.url } : c;
+	});
+}
+
 /**
  * Collapse cards with identical visible TEXT — content-level dedup, not just by id.
  * A post-id check misses the real case: a bot (e.g. the nwslstat xG account)
@@ -5709,6 +5741,9 @@ async function handleFeed(url: URL, env: Env, ctx: ExecutionContext): Promise<Re
 		// per-account count cap any more (owner 2026-10-08: show everything in the window; the only count
 		// limit is the curated flood guard above). User adds, player IG and podcasts are never count-capped.
 		cards = dedupeByContent(cards);
+		// One picture per account on every Bluesky card, including ones stored before avatars existed.
+		const snapCards = Object.values(bskySnap?.handles ?? {}).flatMap((h) => h.items.map((i) => i.card));
+		cards = stampAuthorAvatars(cards, snapCards);
 	} catch {
 		return serveStaleOr502(env, ctx, cache, cacheKey, url.pathname);
 	}
@@ -5812,7 +5847,7 @@ interface BskyItem {
 }
 interface BskyPost {
 	uri?: string;
-	author?: { handle?: string; displayName?: string };
+	author?: { handle?: string; displayName?: string; avatar?: string };
 	record?: { text?: string; createdAt?: string };
 	embed?: { $type?: string; [k: string]: unknown };
 	likeCount?: number;
@@ -5863,6 +5898,9 @@ function mapBskyPost(post: BskyPost, h: FeedHandle): unknown | null {
 		isLeague: h.kind !== "player" || !h.abbr,
 		playerId: h.kind === "player" ? h.playerId : undefined,
 		authorName: post.author?.displayName || handle,
+		// The account's profile picture (Social card avatar, 2026-10-13). Rides the same getAuthorFeed response —
+		// no extra fetch. https only; absent → the app's symbol fallback.
+		authorAvatarURL: httpsOnly(post.author?.avatar),
 		handle: `@${handle}`,
 		bodyText: post.record?.text,
 		thumbnailURL: image,

@@ -13,6 +13,7 @@ import worker, {
 	mergeSlotItems,
 	refreshBlueskySnapshot,
 	resetContentMemo,
+	stampAuthorAvatars,
 } from "../src/index";
 
 const IncomingRequest = Request<unknown, IncomingRequestCfProperties>;
@@ -58,7 +59,7 @@ function post(handle: string, rkey: string, text: string, msAgo: number) {
 	return {
 		post: {
 			uri: `at://did:plc:${handle.replace(/\W/g, "")}/app.bsky.feed.post/${rkey}`,
-			author: { handle, displayName: handle },
+			author: { handle, displayName: handle, avatar: `https://cdn.bsky.app/img/avatar/plain/${handle}/a@jpeg` },
 			record: { text, createdAt: iso(msAgo) },
 			likeCount: 1,
 			repostCount: 0,
@@ -171,8 +172,38 @@ describe("refreshBlueskySnapshot — fetched + judged in the background, accumul
 		expect(r.posts).toBe(2);
 		expect(spy.kvPuts).toEqual([]); // the snapshot lives in the ContentStore — zero KV writes
 		resetContentMemo();
-		const snap = (await contentGetJSON(env, undefined, "social:bluesky-snapshot")) as { handles: Record<string, { items: { card: { id: string } }[] }> };
+		const snap = (await contentGetJSON(env, undefined, "social:bluesky-snapshot")) as { handles: Record<string, { items: { card: { id: string; authorAvatarURL?: string } }[] }> };
 		expect(snap.handles["rep.bsky.social"].items.map((i) => i.card.id).sort()).toEqual(["bsky-p1", "bsky-p2"]);
+		// The author's profile picture rides the same getAuthorFeed response onto every mapped card.
+		for (const i of snap.handles["rep.bsky.social"].items) {
+			expect(i.card.authorAvatarURL).toBe("https://cdn.bsky.app/img/avatar/plain/rep.bsky.social/a@jpeg");
+		}
+	});
+});
+
+describe("stampAuthorAvatars — one picture per account, incl. cards stored before avatars existed", () => {
+	const A = "https://cdn.bsky.app/a-old", B = "https://cdn.bsky.app/a-new";
+	it("fills a handle's avatar-less cards from its newest card that has one (response or snapshot)", () => {
+		const cards = [
+			{ id: "1", handle: "@rep", timestamp: iso(0) },
+			{ id: "2", handle: "@rep", timestamp: iso(9_000_000) },
+			{ id: "3", handle: "@other", timestamp: iso(0) },
+			{ id: "4", title: "news, no handle" },
+		];
+		const snapshot = [
+			{ handle: "@rep", authorAvatarURL: A, timestamp: iso(5_000_000) },
+			{ handle: "@rep", authorAvatarURL: B, timestamp: iso(1_000_000) },
+		];
+		const out = stampAuthorAvatars(cards, snapshot) as Array<{ id: string; authorAvatarURL?: string }>;
+		expect(out.map((c) => c.authorAvatarURL)).toEqual([B, B, undefined, undefined]);
+		expect((cards[0] as { authorAvatarURL?: string }).authorAvatarURL).toBeUndefined(); // inputs untouched
+	});
+	it("keeps a card's own avatar and ignores non-https sources", () => {
+		const out = stampAuthorAvatars(
+			[{ handle: "@rep", authorAvatarURL: A, timestamp: iso(0) }, { handle: "@x", timestamp: iso(0) }],
+			[{ handle: "@rep", authorAvatarURL: B, timestamp: iso(-1) }, { handle: "@x", authorAvatarURL: "http://insecure/a", timestamp: iso(0) }],
+		) as Array<{ authorAvatarURL?: string }>;
+		expect(out.map((c) => c.authorAvatarURL)).toEqual([A, undefined]);
 	});
 });
 
@@ -196,6 +227,23 @@ describe("/feed — what a request does", () => {
 		// The curated card is there (mutes + adds are ignored for new clients — the app applies them).
 		expect(cards.map((c) => c.id)).toContain("bsky-r1");
 		expect(cards.find((c) => c.id === "bsky-r1")?.teamAbbreviation).toBe("WAS");
+	});
+
+	it("a card stored before avatars existed gets its account's picture from a newer snapshot card", async () => {
+		await env.FEED_TAGS.put("social:reporter-list", JSON.stringify([{ handle: "rep.bsky.social", kind: "reporter" }]));
+		const v = (id: string) => ({ id, isNWSL: true, teams: ["WAS"], leagueNews: false });
+		await seed("social:bluesky-snapshot", {
+			v: 1, at: Date.now(), updatedAt: Date.now(),
+			handles: { "rep.bsky.social": { kind: "reporter", fetchedAt: Date.now(), ok: true, items: [
+				{ card: { id: "bsky-old", layout: "blueskyReporter", handle: "@rep.bsky.social", bodyText: "older Spirit note", timestamp: iso(86_400_000) }, verdict: v("bsky-old") },
+				{ card: { id: "bsky-new", layout: "blueskyReporter", handle: "@rep.bsky.social", bodyText: "newer Spirit note", timestamp: iso(0),
+					authorAvatarURL: "https://cdn.bsky.app/rep" }, verdict: v("bsky-new") },
+			] } },
+		});
+		await seed("social:sources-snapshot", { v: 1, at: Date.now(), updatedAt: Date.now(), sources: {} });
+		const res = await get("https://dc-b.test/feed?teams=WAS&caps=podcast,devicebsky", spyEnv().env);
+		const cards = (await res.json()) as { id: string; authorAvatarURL?: string }[];
+		expect(cards.find((c) => c.id === "bsky-old")?.authorAvatarURL).toBe("https://cdn.bsky.app/rep");
 	});
 
 	it("an old client's added account is still fetched live and served unfiltered (compat path)", async () => {
