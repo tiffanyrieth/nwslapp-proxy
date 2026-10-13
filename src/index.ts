@@ -4763,6 +4763,9 @@ async function handleWatchSummaries(url: URL, env: Env, ctx: ExecutionContext): 
 	}));
 	// NO SILENT FAILURES — but only for the UNEXPECTED: a 4xx (ESPN serves no summary for some competitions)
 	// is already logged per match by the watcher; a throw / 5xx is one coalesced diag per batch.
+	if (parsed.skipped.length > 0) {
+		emitDiag(env, ctx, "watchSummariesRejected", `malformed entr${parsed.skipped.length === 1 ? "y" : "ies"} skipped: ${parsed.skipped.slice(0, 5).join(",")}`);
+	}
 	const unknown = parsed.entries.filter((e) => e.unknownLeague);
 	if (unknown.length > 0) {
 		emitDiag(env, ctx, "watchSummariesRejected", `unknown league: ${unknown.slice(0, 5).map((e) => `${e.id}:${e.league}`).join(",")}`);

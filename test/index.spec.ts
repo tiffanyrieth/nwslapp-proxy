@@ -67,9 +67,15 @@ describe("nwslapp-proxy route guards", () => {
 		expect(response.status).toBe(404);
 	});
 
-	it("400s a malformed /watch/summaries batch on the internal host (before any fetch)", async () => {
-		const response = await SELF.fetch("https://proxy/watch/summaries?e=notanid:usa.nwsl");
+	it("400s an empty /watch/summaries batch on the internal host (before any fetch)", async () => {
+		const response = await SELF.fetch("https://proxy/watch/summaries?e=");
 		expect(response.status).toBe(400);
+	});
+
+	it("skips a malformed entry instead of rejecting the batch", async () => {
+		const response = await SELF.fetch("https://proxy/watch/summaries?e=fakematch-1:usa.nwsl,1:evil.league");
+		expect(response.status).toBe(200);
+		expect(await response.json()).toEqual([{ id: "1", status: 400 }]);
 	});
 
 	it("answers an unknown-league entry status-only without fetching", async () => {

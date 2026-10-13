@@ -13,7 +13,7 @@ test("parses entries with and without the bust flag", () => {
 	assert.deepEqual(r, { entries: [
 		{ id: "401", league: "usa.nwsl", bust: false, unknownLeague: false },
 		{ id: "402", league: "fifa.friendly.w", bust: true, unknownLeague: false },
-	] });
+	], skipped: [] });
 });
 
 test("an unknown league fails only its own entry", () => {
@@ -22,15 +22,20 @@ test("an unknown league fails only its own entry", () => {
 	assert.deepEqual(r.entries.map((e) => e.unknownLeague), [true, false]);
 });
 
-test("rejects bad ids, bad flags, missing league, missing/empty input", () => {
-	for (const raw of ["401", "401:", "abc:usa.nwsl", "401:usa.nwsl:2", "401:usa.nwsl:1:x", "", null, ","]) {
-		assert.ok("error" in parseWatchSummaryEntries(raw, LEAGUES), `expected error for ${raw}`);
-	}
+test("malformed entries are skipped, never sinking the real ones beside them", () => {
+	const r = parseWatchSummaryEntries("fakematch-1791929352530:usa.nwsl,401:usa.nwsl,402:usa.nwsl:2,403,404:,405:usa.nwsl:1:x,406:usa.nwsl:1", LEAGUES);
+	assert.ok("entries" in r);
+	assert.deepEqual(r.entries.map((e) => e.id), ["401", "406"]);
+	assert.equal(r.skipped.length, 5);
 });
 
-test("caps the batch at WATCH_SUMMARIES_MAX and dedupes ids", () => {
+test("only a missing / empty / oversized list rejects the whole request", () => {
+	for (const raw of ["", null, ","]) assert.ok("error" in parseWatchSummaryEntries(raw, LEAGUES), `expected error for ${raw}`);
 	const many = Array.from({ length: WATCH_SUMMARIES_MAX + 1 }, (_, i) => `${i + 1}:usa.nwsl`).join(",");
 	assert.ok("error" in parseWatchSummaryEntries(many, LEAGUES));
+});
+
+test("dedupes ids", () => {
 	const dup = parseWatchSummaryEntries("7:usa.nwsl,7:usa.nwsl:1", LEAGUES);
 	assert.ok("entries" in dup && dup.entries.length === 1);
 });
