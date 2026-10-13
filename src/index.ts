@@ -410,6 +410,7 @@ const BROWSER_UA =
 // ⚠️ ESPN bot rule: EVERY ESPN fetch needs the shared UA (ESPN 403s UA-less Worker fetches,
 // 2026-08-04) — the constant + full story live in espn-ua.ts so no module can miss it again.
 import { ESPN_UA, ESPN_HEADERS, PROXY_UA } from "./espn-ua.ts";
+import { buildWatchSummariesEnvelope, parseWatchSummaryEntries, summaryUrlFor, WATCH_INTERNAL_HOST, type WatchSummaryResult } from "./watch-summaries.ts";
 import { edgeTtlFor, type FetcherKind, type FetcherResult, type SharedJsonResult } from "./espn-fetcher.ts";
 // The ESPN shared fetcher Durable Object (Option A, 2026-10-08) — exported from the main module so the
 // runtime can instantiate it (wrangler.jsonc `durable_objects` binds ESPN_FETCHER to this class).
@@ -1514,6 +1515,10 @@ that needs more users) until you bring it back.</p>
 			// (attendance.ts — the one allowed pass-through mutation).
 			return proxyAndCache(url, summaryUpstream(league), chooseSummaryTTL, ctx, env, true,
 				(body) => enrichSummaryAttendance(env, url.searchParams.get("event"), body));
+		}
+		if (url.pathname === "/watch/summaries") {
+			// The watcher's ONE call per poll for all the /summary bodies it needs (src/watch-summaries.ts).
+			return handleWatchSummaries(url, env, ctx);
 		}
 		if (url.pathname === "/team-videos") {
 			return handleTeamVideos(url, env, ctx);
@@ -4724,6 +4729,52 @@ async function buildOneBeatSource(
 		og.left -= used.scraped;
 	}
 	return { items: newest, newestRaw };
+}
+
+/** `GET /watch/summaries?e=<event>:<league>[:1],…` — internal-only batch of /summary bodies for the match
+ *  watcher (see src/watch-summaries.ts for why). Each entry is fetched through SELF from the NORMAL /summary
+ *  route, so it gets its own invocation (cache, breaker, shared fetcher, last-good ladder unchanged) and costs
+ *  this run one subrequest; the envelope is byte-concatenated, never parsed. */
+async function handleWatchSummaries(url: URL, env: Env, ctx: ExecutionContext): Promise<Response> {
+	if (url.hostname !== WATCH_INTERNAL_HOST) return new Response("Not found.", { status: 404 });
+	const parsed = parseWatchSummaryEntries(url.searchParams.get("e"), SCOREBOARD_LEAGUES);
+	if ("error" in parsed) {
+		emitDiag(env, ctx, "watchSummariesRejected", parsed.error);
+		return new Response(`Bad request: ${parsed.error}`, { status: 400 });
+	}
+	const self = (env as unknown as { SELF?: Fetcher }).SELF;
+	if (!self) {
+		emitDiag(env, ctx, "watchSummariesFail", "SELF binding missing");
+		return new Response("SELF binding missing.", { status: 503 });
+	}
+	const now = Date.now();
+	const results: WatchSummaryResult[] = await Promise.all(parsed.entries.map(async (e) => {
+		if (e.unknownLeague) return { id: e.id, status: 400, body: null };
+		try {
+			const r = await self.fetch(summaryUrlFor(e, now), { headers: { Accept: "application/json" } });
+			if (!r.ok) {
+				await r.body?.cancel();
+				return { id: e.id, status: r.status, body: null };
+			}
+			return { id: e.id, status: r.status, body: new Uint8Array(await r.arrayBuffer()) };
+		} catch {
+			return { id: e.id, status: 0, body: null };
+		}
+	}));
+	// NO SILENT FAILURES — but only for the UNEXPECTED: a 4xx (ESPN serves no summary for some competitions)
+	// is already logged per match by the watcher; a throw / 5xx is one coalesced diag per batch.
+	const unknown = parsed.entries.filter((e) => e.unknownLeague);
+	if (unknown.length > 0) {
+		emitDiag(env, ctx, "watchSummariesRejected", `unknown league: ${unknown.slice(0, 5).map((e) => `${e.id}:${e.league}`).join(",")}`);
+	}
+	const broken = results.filter((r) => r.status === 0 || r.status >= 500);
+	if (broken.length > 0) {
+		emitDiag(env, ctx, "watchSummariesEntryFail",
+			`${broken.length}/${results.length} — ${broken.slice(0, 5).map((r) => `${r.id}:${r.status}`).join(",")}`);
+	}
+	return new Response(buildWatchSummariesEnvelope(results), {
+		headers: { "Content-Type": "application/json", "Cache-Control": "no-store" },
+	});
 }
 
 /** Cron side of the refresh: if the snapshot is ~60 min old (or missing), ask our OWN worker to
