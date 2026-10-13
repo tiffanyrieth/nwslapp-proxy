@@ -62,6 +62,22 @@ describe("nwslapp-proxy route guards", () => {
 		expect(response.headers.get("Allow")).toBe("GET");
 	});
 
+	it("404s /watch/summaries on any host but the internal service-binding host", async () => {
+		const response = await SELF.fetch("https://nwslapp-proxy.example.workers.dev/watch/summaries?e=1:usa.nwsl");
+		expect(response.status).toBe(404);
+	});
+
+	it("400s a malformed /watch/summaries batch on the internal host (before any fetch)", async () => {
+		const response = await SELF.fetch("https://proxy/watch/summaries?e=notanid:usa.nwsl");
+		expect(response.status).toBe(400);
+	});
+
+	it("answers an unknown-league entry status-only without fetching", async () => {
+		const response = await SELF.fetch("https://proxy/watch/summaries?e=1:evil.league");
+		expect(response.status).toBe(200);
+		expect(await response.json()).toEqual([{ id: "1", status: 400 }]);
+	});
+
 	it("405s non-GET requests to /team-videos", async () => {
 		const response = await SELF.fetch("https://proxy.test/team-videos?teams=WAS", {
 			method: "POST",
