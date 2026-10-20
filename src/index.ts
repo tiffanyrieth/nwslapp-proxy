@@ -76,6 +76,7 @@ import {
 	readNumber,
 	readResolvedTeamStats,
 	readTeamStatsCopies,
+	resolveTeamStats,
 	writeStats,
 	type SettledMatch,
 	type TeamStatsCopy,
@@ -3914,6 +3915,21 @@ function ageLabel(ms: number): string {
 	return `${Math.round(h / 24)}d ago`;
 }
 
+/** A snapshot's freshness row, judged against ITS OWN cadence (2026-10-20: the feeds moved hourly → 4h and the
+ *  rows still warned at 75 min). ok ≤ cadence + grace · warn ≤ 2× cadence + grace · fail beyond. */
+export function cadenceCheck(label: string, ageMs: number, cadenceMs: number, cadenceText: string, graceMs = 30 * 60_000): StatusCheck {
+	const status = ageMs > 2 * cadenceMs + graceMs ? "fail" : ageMs > cadenceMs + graceMs ? "warn" : "ok";
+	return { label, status, detail: `refreshed ${ageLabel(ageMs)} (${cadenceText})` };
+}
+
+/** A failing feed's backoff state, for its status row ("" when healthy). */
+export function backoffNote(h: FeedHealth | undefined, now: number): string {
+	if (!h?.failStreak) return "";
+	const next = h.nextAttemptAt && h.nextAttemptAt > now ? `next try in ${Math.max(1, Math.round((h.nextAttemptAt - now) / 3_600_000))}h` : "retrying on the next run";
+	const since = h.failingSince ? `, failing ${ageLabel(now - h.failingSince).replace(" ago", "")}` : "";
+	return ` · backing off (${h.failStreak}× in a row${since}; ${next})`;
+}
+
 /** Read one blocked club's device beacon. SOURCE OF TRUTH = Supabase `club_news_device_health`
  *  (2026-09-02: the app now upserts it there directly, off the Worker request budget). Falls back to
  *  the legacy KV beacon (`clubnews-devhealth-*`) during the transition, since app builds <=39 still
@@ -4107,7 +4123,7 @@ function slotHealth(id: string, label: string, kind: string, slot: SourceSlot | 
 	const times = (slot.items as Array<{ timestamp?: string }>).map((c) => Date.parse(c.timestamp ?? "")).filter((t) => !Number.isNaN(t));
 	const newest = slot.newestRaw ?? (times.length ? Math.max(...times) : null);
 	const tier: SourceTier = slot.ok ? sourceTier(newest, now, true) : "dead";
-	return { id, label, abbr, kind, tier, lastItemDays: newest === null ? null : Math.floor((now - newest) / 86_400_000), items: slot.items.length, error: slot.error };
+	return { id, label, abbr, kind, tier, lastItemDays: newest === null ? null : Math.floor((now - newest) / 86_400_000), items: slot.items.length, error: slot.error ? `${slot.error}${backoffNote(slot, now)}` : slot.error };
 }
 
 async function statusCheckBeats(env: Env): Promise<StatusSection> {
@@ -4117,8 +4133,7 @@ async function statusCheckBeats(env: Env): Promise<StatusSection> {
 	if (!snap) {
 		checks.push({ label: "Sources snapshot", status: "fail", detail: "MISSING — the refresh hasn't run (check the SELF binding / sourcesRefreshFail diag)" });
 	} else {
-		const ageMin = Math.round((Date.now() - snap.updatedAt) / 60_000);
-		checks.push({ label: "Sources snapshot", status: ageMin > 150 ? "fail" : ageMin > 75 ? "warn" : "ok", detail: `refreshed ${ageMin} min ago (hourly)` });
+		checks.push(cadenceCheck("Sources snapshot", Date.now() - snap.updatedAt, SOCIAL_SOURCES_REFRESH_MS, "every 4h"));
 	}
 	const health = list
 		.map((b) => slotHealth(b.id, `${b.abbr} · ${b.name}${b.kind === "bluesky" ? ` (@${b.handle})` : ""}`, b.kind, snap?.sources[beatSlotKey(b)], b.abbr))
@@ -4157,20 +4172,82 @@ async function statusCheckFeedSources(env: Env): Promise<StatusSection> {
 
 async function statusCheckIG(env: Env): Promise<StatusSection> {
 	const checks: StatusCheck[] = [];
-	for (const [label, k] of [["Players pool A (Feed IG)", poolKey("A")], ["Players pool B (Feed IG)", poolKey("B")], ["Clubs (Home IG)", SOCIAL_CLUB_KEY]] as [string, string][]) {
-		const raw = await env.FEED_TAGS.get(k).catch(() => null);
+	const DAY = 86_400_000;
+	// Cadence per snapshot (2026-10-20): clubs every 2 days (Bright Data); each player pool every 4 days
+	// (Apify, pools alternate). Grace 12h covers the 15:00 UTC one-shot retry + webhook latency.
+	for (const [label, k, cadenceMs, cadenceText] of [
+		["Players pool A (Feed IG)", poolKey("A"), 4 * DAY, "every 4 days, alternating with B"],
+		["Players pool B (Feed IG)", poolKey("B"), 4 * DAY, "every 4 days, alternating with A"],
+		["Clubs (Home IG)", SOCIAL_CLUB_KEY, 2 * DAY, "every 2 days"],
+	] as [string, string, number, string][]) {
+		const got = await env.FEED_TAGS.getWithMetadata<SnapshotStamp>(k).catch(() => null);
+		const raw = got?.value ?? null;
 		if (!raw) {
 			checks.push({ label, status: "fail", detail: "snapshot MISSING (cron failed or KV expired → no IG on that tab)" });
 			continue;
 		}
 		let n = 0;
+		let copied = 0;
 		try {
 			const p = JSON.parse(raw) as unknown;
-			n = Array.isArray(p) ? p.length : Array.isArray((p as { instagram?: unknown[] }).instagram) ? (p as { instagram: unknown[] }).instagram.length : Object.keys(p as object).length;
+			const arr = Array.isArray(p) ? p : Array.isArray((p as { instagram?: unknown[] }).instagram) ? (p as { instagram: unknown[] }).instagram : [];
+			n = arr.length || Object.keys(p as object).length;
+			copied = arr.filter((c) => String((c as { thumbnailURL?: string }).thumbnailURL ?? "").startsWith("https://img.crestside.app/")).length;
 		} catch { /* keep 0 */ }
-		checks.push({ label, status: n > 0 ? "ok" : "warn", detail: `${n > 0 ? `${n} cards` : "present"} · ${Math.round(raw.length / 1024)}KB cached` });
+		const at = stampAt(got?.metadata);
+		const fresh = at ? cadenceCheck(label, Date.now() - at, cadenceMs, cadenceText, 12 * 3600_000) : { label, status: "info" as const, detail: "saved before write-stamps existed (2026-10-20)" };
+		const images = k === SOCIAL_CLUB_KEY ? "" : ` · ${copied}/${n} images copied to img.crestside.app`;
+		checks.push({ ...fresh, status: n > 0 ? fresh.status : "warn", detail: `${fresh.detail} · ${n > 0 ? `${n} cards` : "present but empty"}${images}` });
 	}
-	return { title: "Instagram snapshot (cron-refreshed every other day)", note: "IG is the fragile scrape path; a stale/empty snapshot = no player/club IG until the next cron.", checks };
+	return { title: "Instagram snapshots", note: "Clubs refresh every 2 days (Bright Data); each player pool every 4 days, alternating (Apify). A missed run is retried once at 15:00 UTC on scrape days.", checks };
+}
+
+/** Player season stats — the saved per-club copies (2026-10-20, src/team-stats-store.ts). NWSL backup nightly
+ *  (roster-truth); ESPN after each club's match; the durable ESPN-refused marker. One ESPN site call (team ids). */
+async function statusCheckStats(env: Env): Promise<StatusSection> {
+	const checks: StatusCheck[] = [];
+	const now = Date.now();
+	const year = new Date(now).getUTCFullYear();
+	let teams: { id: string; abbr: string }[] = [];
+	try {
+		teams = await fetchTeamAbbrs();
+	} catch (e) {
+		return { title: "Player stats (saved copies)", checks: [{ label: "Team list", status: "fail", detail: String((e as Error)?.message ?? e).slice(0, 80) }] };
+	}
+	let copies: Awaited<ReturnType<typeof readTeamStatsCopies>>;
+	try {
+		copies = await readTeamStatsCopies(env, teams.map((t) => t.id), year);
+	} catch (e) {
+		return { title: "Player stats (saved copies)", checks: [{ label: "Stats store", status: "fail", detail: String((e as Error)?.message ?? e).slice(0, 80) }] };
+	}
+	const nwsl = [...copies.values()].map((c) => c.nwsl).filter(Boolean) as TeamStatsCopy[];
+	const espn = [...copies.values()].map((c) => c.espn).filter(Boolean) as TeamStatsCopy[];
+	if (nwsl.length === 0) checks.push({ label: "NWSL backup (nightly)", status: "fail", detail: "no club has a backup copy — check roster-truth (runs 08:00 UTC) / statsBackupFail" });
+	else {
+		const oldest = Math.min(...nwsl.map((c) => c.fetchedAt));
+		const row = cadenceCheck("NWSL backup (nightly)", now - oldest, 24 * 3600_000, "nightly 08:00 UTC", 6 * 3600_000);
+		checks.push({ ...row, status: nwsl.length < teams.length && row.status === "ok" ? "warn" : row.status, detail: `${nwsl.length}/${teams.length} clubs · oldest ${row.detail.replace("refreshed ", "")}` });
+	}
+	const blockedUntil = await readNumber(env, STATS_ESPN_BLOCK_KEY).catch(() => 0);
+	if (blockedUntil > now) {
+		checks.push({ label: "ESPN stats API", status: "warn", detail: `refusing Cloudflare — paused until ${new Date(blockedUntil).toISOString().slice(11, 16)} UTC; the NWSL backup is serving` });
+	}
+	if (espn.length === 0) checks.push({ label: "ESPN copies (after each match)", status: "info", detail: "none yet — refresh ~2h after each club's next settled match (or ESPN still refusing)" });
+	else {
+		const newest = Math.max(...espn.map((c) => c.fetchedAt));
+		const retry = espn.filter((c) => c.retryAfter && !c.retried).length;
+		checks.push({ label: "ESPN copies (after each match)", status: "ok", detail: `${espn.length}/${teams.length} clubs · newest ${ageLabel(now - newest)}${retry ? ` · ${retry} waiting on ESPN's late update (retry ~22h)` : ""}` });
+	}
+	const serving = teams.map((t) => ({ abbr: t.abbr, r: resolveTeamStats(copies.get(t.id)?.espn ?? null, copies.get(t.id)?.nwsl ?? null) }));
+	const none = serving.filter((s) => !s.r).map((s) => s.abbr);
+	if (none.length) checks.push({ label: "Clubs with no stats", status: "fail", detail: `${none.join(", ")} — team pages fall back to the phone; Know Her Game has no pick` });
+	const bySource = serving.reduce((m, s) => (s.r ? m.set(s.r.source, (m.get(s.r.source) ?? 0) + 1) : m), new Map<string, number>());
+	checks.push({ label: "Serving from", status: "info", detail: [...bySource].map(([k, n]) => `${k} ${n}`).join(" · ") || "—" });
+	return {
+		title: "Player stats (saved copies)",
+		note: "No reader calls ESPN's stats API. ESPN copy = refreshed ~2h after each club's settled regular-season match (+1 lag retry); NWSL copy = nightly backup from the league feed. Readers use ESPN unless the NWSL copy holds more appearances.",
+		checks,
+	};
 }
 
 async function statusCheckErrors(env: Env): Promise<StatusSection> {
@@ -4246,6 +4323,7 @@ const STATUS_SECTIONS: Record<string, { label: string; run: (env: Env) => Promis
 	beats: { label: "Club Beat", run: (env) => statusCheckBeats(env) },
 	podcasts: { label: "Podcasts", run: (env) => statusCheckPodcasts(env) },
 	ig: { label: "Instagram", run: (env) => statusCheckIG(env) },
+	stats: { label: "Player stats", run: (env) => statusCheckStats(env) },
 	alerting: { label: "Alerting", run: (env) => statusCheckAlerting(env) },
 	errors: { label: "Diagnostics", run: (env) => statusCheckErrors(env) },
 };
@@ -5577,16 +5655,15 @@ async function statusCheckPodcasts(env: Env): Promise<StatusSection> {
 	const now = Date.now();
 	const checks: StatusCheck[] = [];
 	if (!snap) {
-		checks.push({ label: "Podcasts snapshot", status: "fail", detail: "MISSING — the hourly refresh hasn't run (check SELF binding / podcastRefresh diag)" });
+		checks.push({ label: "Podcasts snapshot", status: "fail", detail: "MISSING — the 4-hourly refresh hasn't run (check SELF binding / podcastRefresh diag)" });
 	} else {
-		const ageMin = Math.round((now - snap.updatedAt) / 60_000);
-		checks.push({ label: "Podcasts snapshot", status: ageMin > 150 ? "fail" : ageMin > 75 ? "warn" : "ok", detail: `refreshed ${ageMin} min ago (hourly)` });
+		checks.push(cadenceCheck("Podcasts snapshot", now - snap.updatedAt, SOCIAL_PODCASTS_REFRESH_MS, "every 4h"));
 	}
 	for (const s of list.sort((a, b) => a.scope.localeCompare(b.scope))) {
 		const slot = snap?.shows[s.id];
 		const label = `${s.scope} · ${s.name}`;
 		if (!slot) checks.push({ label, status: "warn", detail: "not fetched yet (next refresh)" });
-		else if (!slot.ok) checks.push({ label, status: "fail", detail: `last refresh failed: ${slot.error ?? "error"}` });
+		else if (!slot.ok) checks.push({ label, status: "fail", detail: `last refresh failed: ${slot.error ?? "error"}${backoffNote(slot, now)}` });
 		else if (slot.blocked) checks.push({ label, status: "warn", detail: "creator opt-out (itunes:block=yes) — hidden from Listen + directory" });
 		else if (!isPodcastActive(slot, now)) checks.push({ label, status: "fail", detail: `no episode in ${PODCAST_INACTIVE_DAYS}d — hidden (drop candidate)` });
 		else checks.push({ label, status: "ok", detail: `${slot.episodes.length} eps · newest ${slot.lastEpisodeAt ? Math.floor((now - slot.lastEpisodeAt) / 86_400_000) : "?"}d ago` });
