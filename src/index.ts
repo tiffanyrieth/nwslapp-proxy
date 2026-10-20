@@ -56,6 +56,20 @@ import {
 	type SnapshotStamp,
 } from "./ig-scrape.ts";
 import {
+	buildMatchAnalytics,
+	emptySeason,
+	foldMatchIntoSeason,
+	type AsaGame,
+	type AsaGameXg,
+	type AsaPlayer,
+	type AsaPlayerXg,
+	type AsaTeam,
+	type AnalyticsIndex,
+	planAnalyticsBuilds,
+	type MatchAnalytics,
+	type TeamSeasonAnalytics,
+} from "./match-analytics.ts";
+import {
 	FEED_REFRESH_MS,
 	FeedHttpError,
 	conditionalHeaders,
@@ -1364,6 +1378,12 @@ that needs more users) until you bring it back.</p>
 			return handleTeamStatsRefresh(request, url, env, ctx);
 		}
 
+		// POST one match's analytics build (shots, xG, season rollups, heat) — SELF-only (admin key), scheduled by
+		// scheduleMatchAnalytics on the 5-min tick's :00/:30 check; its own invocation = its own budget.
+		if (url.pathname === "/internal/match-analytics/build") {
+			return handleMatchAnalyticsBuild(request, url, env, ctx);
+		}
+
 		// Admin-only: refresh the IG social snapshot on demand (the every-2-day cron does
 		// this automatically; this forces an immediate pull after a token swap or an aborted
 		// run). Same BRACKET_ADMIN_KEY gate as /headshots/run.
@@ -1680,6 +1700,12 @@ that needs more users) until you bring it back.</p>
 		}
 		if (url.pathname === "/roster") {
 			return handleRoster(url, env, ctx);
+		}
+		if (url.pathname === "/match-analytics") {
+			return handleMatchAnalyticsGet(url, env, ctx);
+		}
+		if (url.pathname === "/team-analytics") {
+			return handleTeamAnalyticsGet(url, env, ctx);
 		}
 		if (url.pathname === "/team-stats") {
 			return handleTeamStats(url, env, ctx);
@@ -4324,6 +4350,7 @@ const STATUS_SECTIONS: Record<string, { label: string; run: (env: Env) => Promis
 	podcasts: { label: "Podcasts", run: (env) => statusCheckPodcasts(env) },
 	ig: { label: "Instagram", run: (env) => statusCheckIG(env) },
 	stats: { label: "Player stats", run: (env) => statusCheckStats(env) },
+	analytics: { label: "Match analytics", run: (env) => statusCheckAnalytics(env) },
 	alerting: { label: "Alerting", run: (env) => statusCheckAlerting(env) },
 	errors: { label: "Diagnostics", run: (env) => statusCheckErrors(env) },
 };
@@ -8424,10 +8451,17 @@ async function maybeScheduleStatsRefresh(env: Env, ctx: ExecutionContext, schedu
 	// The ESPN kill switch + circuit breaker gate at the EDGE, before the shared fetcher — this path skips the
 	// edge, so it checks them itself (never poll a paused or failing ESPN).
 	if ((await isEspnManuallyPaused(env)) || (await isEspnBreakerOpen(env))) return;
-	const blockedUntil = await readNumber(env, STATS_ESPN_BLOCK_KEY);
-	if (now < blockedUntil) return; // ESPN refusing Cloudflare — the NWSL backup serves meanwhile
 	const { finals } = (await espnFetcherStub(env).recentFinals(year, 12 * 3600 * 1000)) as { finals: SettledMatch[] };
 	if (finals.length === 0) return;
+	// Match analytics (shots from the summary = ESPN's SITE service, not the blocked Core stats API) — planned
+	// before the stats block check below so a Core refusal never stops shot maps.
+	try {
+		await scheduleMatchAnalytics(env, ctx, finals, now, year);
+	} catch (e) {
+		emitDiag(env, ctx, "matchAnalyticsScheduleFail", String((e as Error)?.message ?? e).slice(0, 80));
+	}
+	const blockedUntil = await readNumber(env, STATS_ESPN_BLOCK_KEY);
+	if (now < blockedUntil) return; // ESPN refusing Cloudflare — the NWSL backup serves meanwhile
 	const teamIds = [...new Set(finals.flatMap((f) => f.teamIds))];
 	const copies = await readTeamStatsCopies(env, teamIds, year);
 	const espnCopies = new Map([...copies].map(([t, c]) => [t, c.espn]));
@@ -8477,6 +8511,208 @@ async function handleTeamStatsRefresh(request: Request, url: URL, env: Env, ctx:
 	const ok = await writeStats(env, [copy]);
 	emitDiag(env, ctx, "teamStatsRefresh", `${abbr} event ${eventId}: ${roster.length - report.failed}/${roster.length} ok, apps ${copy.appearancesTotal}${copy.retryAfter ? " (ESPN not updated yet — retry in 22h)" : ""}${ok ? "" : " — STORE WRITE FAILED"}`);
 	return jsonResponse({ team: abbr, event: eventId, players: players.length, failed: report.failed, appearancesTotal: copy.appearancesTotal, retryScheduled: !!copy.retryAfter, stored: ok }, 200);
+}
+
+// ── Match analytics: shot maps, xG, heat maps (2026-10-20, src/match-analytics.ts) ─────────────────────────────
+// Built ONCE per settled match (+ one ASA retry, + heat when ESPN Core accepts us), saved permanently in the
+// ContentStore; readers (/match-analytics, /team-analytics) never call ESPN or ASA. Sources + second sources:
+// docs/backend.md "Match analytics".
+const analyticsMatchKey = (eventId: string) => `analytics:match:${eventId}`;
+const analyticsTeamKey = (teamId: string, year: number) => `analytics:team:${teamId}:${year}`;
+const analyticsIndexKey = (year: number) => `analytics:index:${year}`;
+/** Builds per 30-min check — paces the one-time 2026 backfill to ≤8/hour (polite to ESPN's site API + ASA). */
+const ANALYTICS_BUILDS_PER_CHECK = 4;
+const HEAT_RETRY_MS = 24 * 3600_000;
+const ASA_API = "https://app.americansocceranalysis.com/api/v1/nwsl";
+
+/** Which settled matches need a build: never built · ASA's real xG due (one retry) · heat due (Core reachable). */
+async function scheduleMatchAnalytics(env: Env, ctx: ExecutionContext, finals: SettledMatch[], now: number, year: number): Promise<void> {
+	const e = env as unknown as { SELF?: Fetcher; BRACKET_ADMIN_KEY?: string };
+	if (!e.SELF || !e.BRACKET_ADMIN_KEY) return;
+	const index = (await contentGetJSON<AnalyticsIndex>(env, ctx, analyticsIndexKey(year))) ?? {};
+	const coreBlocked = now < (await readNumber(env, STATS_ESPN_BLOCK_KEY));
+	// Newest first: this weekend's matches beat the backfill.
+	const due = planAnalyticsBuilds({ finals, index, now, coreBlocked, afterKickoffMs: STATS_REFRESH_AFTER_KICKOFF_MS, max: ANALYTICS_BUILDS_PER_CHECK });
+	for (const eventId of due) {
+		const r = await e.SELF.fetch(new Request(`${PROXY_PUBLIC_ORIGIN}/internal/match-analytics/build?event=${eventId}`, {
+			method: "POST",
+			headers: { "x-admin-key": e.BRACKET_ADMIN_KEY },
+		}));
+		if (!r.ok) emitDiag(env, ctx, "matchAnalyticsBuildFail", `${eventId}: HTTP ${r.status}`);
+	}
+}
+
+/** ASA data for the match day, cached in the ContentStore so every match that day (and the next-day retry)
+ *  shares one fetch: the day's games + team xG + per-player rows (6h), the team list (30d), the player list (7d).
+ *  Any failure → null (the build uses our estimate, labelled) + a diag. */
+async function loadAsaForKickoff(env: Env, ctx: ExecutionContext, kickoffIso: string): Promise<{ teams: AsaTeam[]; games: AsaGame[]; gameXg: AsaGameXg[]; playerXg: AsaPlayerXg[]; players: AsaPlayer[] } | null> {
+	const day = kickoffIso.slice(0, 10);
+	const d0 = new Date(Date.parse(`${day}T00:00:00Z`) - 86_400_000).toISOString().slice(0, 10);
+	const d1 = new Date(Date.parse(`${day}T00:00:00Z`) + 86_400_000).toISOString().slice(0, 10);
+	const get = async <T>(key: string, url: string, ttlSec: number): Promise<T> => {
+		const cached = await contentGetJSON<T>(env, ctx, key);
+		if (cached) return cached;
+		const r = await fetchBounded(url, { headers: { "User-Agent": PROXY_UA, Accept: "application/json" } });
+		if (!r.ok) throw new Error(`ASA ${new URL(url).pathname.split("/").slice(-2).join("/")} HTTP ${r.status}`);
+		const body = (await r.json()) as T;
+		await contentPut(env, ctx, [{ key, value: JSON.stringify(body), ttlSec }]);
+		return body;
+	};
+	try {
+		const range = `start_date=${d0}&end_date=${d1}`;
+		const [teams, players, games, gameXg, playerXg] = await Promise.all([
+			get<AsaTeam[]>("asa:teams", `${ASA_API}/teams`, 30 * 86_400),
+			get<AsaPlayer[]>("asa:players", `${ASA_API}/players`, 7 * 86_400),
+			get<AsaGame[]>(`asa:games:${day}`, `${ASA_API}/games?${range}`, 6 * 3600),
+			get<AsaGameXg[]>(`asa:gamexg:${day}`, `${ASA_API}/games/xgoals?${range}`, 6 * 3600),
+			get<AsaPlayerXg[]>(`asa:playerxg:${day}`, `${ASA_API}/players/xgoals?split_by_games=true&${range}`, 6 * 3600),
+		]);
+		return { teams, players, games, gameXg, playerXg };
+	} catch (err) {
+		emitDiag(env, ctx, "asaFetchFail", String((err as Error)?.message ?? err).slice(0, 80));
+		return null;
+	}
+}
+
+/** `POST /internal/match-analytics/build?event=<id>` (SELF, admin key) — build/refresh ONE match's saved copy,
+ *  fold it into both clubs' season rollups, update the index. Summary comes through the proxy's OWN /summary
+ *  route (shared cache + last-good ladder → typically 0 ESPN calls). */
+async function handleMatchAnalyticsBuild(request: Request, url: URL, env: Env, ctx: ExecutionContext): Promise<Response> {
+	const adminKey = (env as unknown as { BRACKET_ADMIN_KEY?: string }).BRACKET_ADMIN_KEY;
+	if (request.method !== "POST" || !adminAuthed(request, adminKey)) return new Response("forbidden", { status: 403 });
+	const eventId = (url.searchParams.get("event") ?? "").replace(/[^0-9]/g, "");
+	if (!eventId) return new Response("event required", { status: 400 });
+	const e = env as unknown as { SELF?: Fetcher };
+	const now = Date.now();
+	const sres = e.SELF
+		? await e.SELF.fetch(new Request(`${PROXY_PUBLIC_ORIGIN}/summary?event=${eventId}`))
+		: await fetchBounded(`${PROXY_PUBLIC_ORIGIN}/summary?event=${eventId}`);
+	if (!sres.ok) {
+		emitDiag(env, ctx, "matchAnalyticsBuildFail", `${eventId}: summary HTTP ${sres.status}`);
+		return new Response("summary unavailable", { status: 502 });
+	}
+	const summary = (await sres.json()) as Parameters<typeof buildMatchAnalytics>[0]["summary"];
+	const kickoff = summary.header?.competitions?.[0]?.date ?? "";
+	const year = Number(kickoff.slice(0, 4)) || new Date(now).getUTCFullYear();
+	const homeId = String(summary.header?.competitions?.[0]?.competitors?.find((c) => c.homeAway === "home")?.team?.id ?? "");
+	const awayId = String(summary.header?.competitions?.[0]?.competitors?.find((c) => c.homeAway === "away")?.team?.id ?? "");
+	if (!kickoff || !homeId || !awayId) return new Response("not a match summary", { status: 422 });
+
+	const got = await contentGet(env, ctx, [analyticsIndexKey(year), analyticsMatchKey(eventId), analyticsTeamKey(homeId, year), analyticsTeamKey(awayId, year)]);
+	const parse = <T>(v: string | null | undefined): T | null => { try { return v ? (JSON.parse(v) as T) : null; } catch { return null; } };
+	const index = parse<AnalyticsIndex>(got.get(analyticsIndexKey(year))) ?? {};
+	const prev = parse<MatchAnalytics>(got.get(analyticsMatchKey(eventId)));
+	const prevIx = index[eventId];
+
+	// ASA: needed on a first build or a due retry; a match that already has ASA xG reuses its copy's numbers.
+	const asa = prev?.xg.source === "asa" ? null : await loadAsaForKickoff(env, ctx, kickoff);
+
+	// Heat: reuse a saved one; otherwise ask Core once (never while paused / breaker open / Core refusing us).
+	let heat: Record<string, number[]> | null = prev?.heatStatus === "ok" ? prev.heat : null;
+	let heatStatus: MatchAnalytics["heatStatus"] = heat ? "ok" : "unavailable";
+	if (!heat && env.ESPN_FETCHER && !(await isEspnManuallyPaused(env)) && !(await isEspnBreakerOpen(env)) && now >= (await readNumber(env, STATS_ESPN_BLOCK_KEY))) {
+		try {
+			const h = (await espnFetcherStub(env).matchHeat(eventId)) as { status: string; grids?: Record<string, number[]>; detail?: string };
+			if (h.status === "ok" && h.grids) { heat = h.grids; heatStatus = "ok"; }
+			else if (h.status === "blocked") await writeStats(env, [], [{ key: STATS_ESPN_BLOCK_KEY, value: String(now + STATS_ESPN_BLOCK_MS) }]);
+			if (h.status !== "ok") emitDiag(env, ctx, "matchHeatUnavailable", `${eventId}: ${h.status} ${h.detail ?? ""}`.trim());
+		} catch (err) {
+			emitDiag(env, ctx, "matchHeatUnavailable", `${eventId}: ${String((err as Error)?.message ?? err).slice(0, 60)}`);
+		}
+	}
+
+	let built = buildMatchAnalytics({ summary, asa, heat, heatStatus, now });
+	if (!built) return new Response("could not build", { status: 422 });
+	// Keep ASA's real numbers once we have them (a heat-only rebuild skips the ASA fetch).
+	if (prev?.xg.source === "asa") built = { ...built, xg: prev.xg, players: prev.players, asaRetryAfter: null };
+	const asaRetried = !!prevIx && prevIx.source === "estimate" && built.xg.source === "estimate" && prevIx.asaRetryAfter !== null && now >= prevIx.asaRetryAfter;
+	const home = foldMatchIntoSeason(parse<TeamSeasonAnalytics>(got.get(analyticsTeamKey(homeId, year))) ?? emptySeason(homeId, year), built, now);
+	const away = foldMatchIntoSeason(parse<TeamSeasonAnalytics>(got.get(analyticsTeamKey(awayId, year))) ?? emptySeason(awayId, year), built, now);
+	index[eventId] = {
+		source: built.xg.source,
+		asaRetryAfter: built.asaRetryAfter,
+		asaRetried: asaRetried || prevIx?.asaRetried || undefined,
+		heat: built.heatStatus,
+		heatRetryAfter: built.heatStatus === "ok" ? undefined : now + HEAT_RETRY_MS,
+		builtAt: now,
+	};
+	const ok = await contentPut(env, ctx, [
+		{ key: analyticsMatchKey(eventId), value: JSON.stringify(built) },
+		{ key: analyticsTeamKey(homeId, year), value: JSON.stringify(home) },
+		{ key: analyticsTeamKey(awayId, year), value: JSON.stringify(away) },
+		{ key: analyticsIndexKey(year), value: JSON.stringify(index) },
+	]);
+	emitDiag(env, ctx, ok ? "matchAnalyticsBuilt" : "matchAnalyticsBuildFail", `${eventId}: ${built.shots.length} shots · xG ${built.xg.source} · heat ${built.heatStatus}${ok ? "" : " — STORE WRITE FAILED"}`);
+	return jsonResponse({ event: eventId, shots: built.shots.length, xg: built.xg, heat: built.heatStatus, stored: ok }, ok ? 200 : 500);
+}
+
+/** `GET /match-analytics?event=<id>` — the saved copy (never fetches ESPN or ASA). Missing → 404 "pending". */
+async function handleMatchAnalyticsGet(url: URL, env: Env, ctx: ExecutionContext): Promise<Response> {
+	const eventId = (url.searchParams.get("event") ?? "").replace(/[^0-9]/g, "");
+	if (!eventId) return new Response("missing ?event", { status: 400 });
+	const cache = caches.default;
+	const cacheKey = new Request(url.toString(), { method: "GET" });
+	const hit = await cache.match(cacheKey);
+	if (hit) return withCacheStatus(hit, "HIT");
+	const m = await contentGetJSON<MatchAnalytics>(env, ctx, analyticsMatchKey(eventId));
+	const headers = new Headers({ "Content-Type": "application/json" });
+	if (!m) {
+		headers.set("Cache-Control", "public, max-age=600");
+		const r = new Response(JSON.stringify({ event: eventId, status: "pending" }), { status: 404, headers });
+		ctx.waitUntil(cache.put(cacheKey, r.clone()));
+		return r;
+	}
+	// Complete (ASA xG + heat) never changes again → long; otherwise it may still upgrade → 1h.
+	headers.set("Cache-Control", `public, max-age=${m.xg.source === "asa" && m.heatStatus === "ok" ? 7 * 86_400 : 3600}`);
+	const { rosterTeams: _rt, ...out } = m;
+	const r = new Response(JSON.stringify(out), { status: 200, headers });
+	ctx.waitUntil(cache.put(cacheKey, r.clone()));
+	return withCacheStatus(r, "MISS");
+}
+
+/** `GET /team-analytics?team=<espnTeamId>[&year=]` — a club's season: shot maps for/against, xG, per-player
+ *  totals, season heat. The per-match contributions stay server-side. */
+async function handleTeamAnalyticsGet(url: URL, env: Env, ctx: ExecutionContext): Promise<Response> {
+	const teamId = (url.searchParams.get("team") ?? "").replace(/[^0-9]/g, "");
+	if (!teamId) return new Response("missing ?team", { status: 400 });
+	const year = Number(url.searchParams.get("year")) || new Date().getUTCFullYear();
+	const cache = caches.default;
+	const cacheKey = new Request(url.toString(), { method: "GET" });
+	const hit = await cache.match(cacheKey);
+	if (hit) return withCacheStatus(hit, "HIT");
+	const s = await contentGetJSON<TeamSeasonAnalytics>(env, ctx, analyticsTeamKey(teamId, year));
+	const headers = new Headers({ "Content-Type": "application/json", "Cache-Control": "public, max-age=3600" });
+	if (!s) return new Response(JSON.stringify({ team: teamId, year, status: "pending" }), { status: 404, headers });
+	const out = {
+		team: teamId, year, matches: s.matches, xgFor: s.xgFor, xgAgainst: s.xgAgainst, xgSources: s.xgSources,
+		players: s.players, heat: s.heat, heatMatches: s.heatMatches,
+		shotsFor: s.contributions.flatMap((c) => c.shotsFor.map((sh) => ({ ...sh, eventId: c.eventId }))),
+		shotsAgainst: s.contributions.flatMap((c) => c.shotsAgainst.map((sh) => ({ ...sh, eventId: c.eventId }))),
+		updatedAt: new Date(s.updatedAt).toISOString(),
+	};
+	const r = new Response(JSON.stringify(out), { status: 200, headers });
+	ctx.waitUntil(cache.put(cacheKey, r.clone()));
+	return withCacheStatus(r, "MISS");
+}
+
+/** Status: what the analytics pipeline has built (no upstream calls). */
+async function statusCheckAnalytics(env: Env): Promise<StatusSection> {
+	const now = Date.now();
+	const year = new Date(now).getUTCFullYear();
+	const ctx = { waitUntil() {}, passThroughOnException() {} } as unknown as ExecutionContext;
+	const index = (await contentGetJSON<AnalyticsIndex>(env, ctx, analyticsIndexKey(year))) ?? {};
+	const rows = Object.values(index);
+	const checks: StatusCheck[] = [];
+	if (!rows.length) checks.push({ label: "Matches built", status: "warn", detail: "none yet — builds start ~2h after each settled match (+ the 2026 backfill, ≤8/hour)" });
+	else {
+		const newest = Math.max(...rows.map((r) => r.builtAt));
+		checks.push({ label: "Matches built", status: "ok", detail: `${rows.length} matches · last build ${ageLabel(now - newest)}` });
+		const asa = rows.filter((r) => r.source === "asa").length;
+		checks.push({ label: "xG source", status: asa === rows.length ? "ok" : "info", detail: `American Soccer Analysis ${asa} · our estimate ${rows.length - asa}${rows.length - asa ? " (retried once ~22h later)" : ""}` });
+		const heatOk = rows.filter((r) => r.heat === "ok").length;
+		checks.push({ label: "Heat maps", status: heatOk ? "ok" : "info", detail: `${heatOk}/${rows.length} matches${heatOk < rows.length ? " — the rest wait for ESPN's event stream (Core) to accept us; retried daily" : ""}` });
+	}
+	return { title: "Match analytics (shot maps · xG · heat maps)", note: "Built once per settled match and saved permanently. Shots: ESPN match summary (already downloaded). xG: American Soccer Analysis, our location estimate as the backup. Heat: ESPN event stream.", checks };
 }
 
 /** Save the nightly NWSL stats BACKUP copies (roster-truth hands them over) in ONE store call. */
