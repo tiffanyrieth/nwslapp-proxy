@@ -44,11 +44,15 @@
 		"bindings": [
 			{ "name": "ESPN_FETCHER", "class_name": "EspnFetcher" },
 			{ "name": "CONTENT_STORE", "class_name": "ContentStore" },
+			// 2026-10-20: image moderation runs here — a DO request gets 30 s CPU (the Worker gets 10 ms, and the
+			// pass kept being killed with exceededCpu). src/moderation-runner.ts.
+			{ "name": "MODERATION_RUNNER", "class_name": "ModerationRunner" },
 		],
 	},
 	"migrations": [
 		{ "tag": "v1", "new_sqlite_classes": ["EspnFetcher"] },
 		{ "tag": "v2", "new_sqlite_classes": ["ContentStore"] },
+		{ "tag": "v3", "new_sqlite_classes": ["ModerationRunner"] },
 	],
 	"ai": {
 		"binding": "AI",
