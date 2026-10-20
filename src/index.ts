@@ -35,15 +35,20 @@ import { moderateSnapshotBatch, carryForwardVerdicts, IMGMOD_MODEL, IMGMOD_BATCH
 import {
 	APIFY_ITEM_FIELDS,
 	IMAGE_COPY_BATCH,
+	IMAGE_COPY_CONCURRENCY,
+	IMAGE_COPY_DEADLINE_MS,
 	IMAGE_COPY_MAX_BATCHES,
+	IMAGE_COPY_PARALLEL_BATCHES,
 	acceptableImage,
 	apifyWebhooksParam,
 	applyImageCopies,
 	chunk,
 	isRetrySlot,
+	mapLimit,
 	nextPool,
 	parseApifyWebhook,
 	planImageCopies,
+	resizedSource,
 	retryPlan,
 	stampAt,
 	type Pool,
@@ -6531,29 +6536,34 @@ async function copyNewImages(env: Env, ctx: ExecutionContext, fresh: unknown[], 
 		emitDiag(env, ctx, "igImageCopyFail", `not configured (SELF ${e.SELF ? "ok" : "missing"}, key ${e.BRACKET_ADMIN_KEY ? "ok" : "missing"})`);
 		return "unconfigured";
 	}
-	const batches = chunk(jobs, IMAGE_COPY_BATCH);
-	const run = batches.slice(0, IMAGE_COPY_MAX_BATCHES);
+	const batches = chunk(jobs, IMAGE_COPY_BATCH).slice(0, IMAGE_COPY_MAX_BATCHES);
 	const copied = new Set<string>();
-	await Promise.all(run.map(async (batch) => {
+	const reasons = new Map<string, number>();
+	const tally = (why: string, n = 1) => reasons.set(why, (reasons.get(why) ?? 0) + n);
+	const started = Date.now();
+	await mapLimit(batches, IMAGE_COPY_PARALLEL_BATCHES, async (batch) => {
+		// Past the deadline, don't START another batch — answer Apify in time; these keep their (fresh) IG links.
+		if (Date.now() - started > IMAGE_COPY_DEADLINE_MS) { tally("deadline", batch.length); return; }
 		try {
 			const r = await e.SELF!.fetch(new Request(`${PROXY_PUBLIC_ORIGIN}/internal/ig-images`, {
 				method: "POST",
 				headers: { "x-admin-key": e.BRACKET_ADMIN_KEY!, "Content-Type": "application/json" },
 				body: JSON.stringify(batch.map(({ key, src }) => ({ key, src }))),
 			}));
-			if (!r.ok) return;
-			const out = (await r.json().catch(() => null)) as { copied?: string[] } | null;
+			if (!r.ok) { tally(`batch-${r.status}`, batch.length); return; }
+			const out = (await r.json().catch(() => null)) as { copied?: string[]; reasons?: Record<string, number> } | null;
 			for (const k of out?.copied ?? []) copied.add(k);
+			for (const [why, n] of Object.entries(out?.reasons ?? {})) tally(why, n);
 		} catch {
-			/* counted as not copied below */
+			tally("batch-threw", batch.length);
 		}
-	}));
+	});
 	applyImageCopies(fresh, copied);
-	const skipped = jobs.length - run.reduce((n, b) => n + b.length, 0);
-	if (copied.size < jobs.length) {
-		emitDiag(env, ctx, "igImageCopyFail", `${copied.size}/${jobs.length} copied${skipped ? `, ${skipped} over the batch cap` : ""}`);
-	}
-	return `${copied.size}/${jobs.length} copied`;
+	const overCap = jobs.length - batches.reduce((n, b) => n + b.length, 0);
+	if (overCap > 0) tally("over-cap", overCap);
+	const why = [...reasons].map(([k, n]) => `${k}:${n}`).join(" ");
+	if (copied.size < jobs.length) emitDiag(env, ctx, "igImageCopyFail", `${copied.size}/${jobs.length} copied ${why}`);
+	return `${copied.size}/${jobs.length} copied${why ? ` (${why})` : ""} in ${Math.round((Date.now() - started) / 100) / 10}s`;
 }
 
 const IG_IMAGE_HOST_RE = /^https:\/\/[a-z0-9.-]+\.(cdninstagram\.com|fbcdn\.net)\//i;
@@ -6569,24 +6579,36 @@ export async function handleIgImageCopy(request: Request, env: Env): Promise<Res
 	const body = (await request.json().catch(() => null)) as { key?: unknown; src?: unknown }[] | null;
 	if (!Array.isArray(body) || body.length > IMAGE_COPY_BATCH) return new Response("bad batch", { status: 400 });
 	const copied: string[] = [];
-	let failed = 0;
-	await Promise.all(body.map(async (job) => {
-		const key = typeof job?.key === "string" ? job.key : "";
-		const src = typeof job?.src === "string" ? job.src : "";
-		if (!IG_IMAGE_KEY_RE.test(key) || !IG_IMAGE_HOST_RE.test(src)) { failed++; return; }
+	const reasons: Record<string, number> = {};
+	const fail = (why: string) => { reasons[why] = (reasons[why] ?? 0) + 1; };
+	// One image: the RESIZED copy first (small + fast), the original only if that fails. `fetchBounded`'s
+	// timeout starts here, when the download actually starts — mapLimit keeps the rest out of the queue.
+	const fetchImage = async (url: string): Promise<{ buf: ArrayBuffer; type: string | null } | string> => {
 		try {
-			const r = await fetchBounded(src, { headers: { Accept: "image/*" } });
-			if (!r.ok) { failed++; return; }
+			const r = await fetchBounded(url, { headers: { Accept: "image/*" } });
+			if (!r.ok) return `http-${r.status}`;
 			const buf = await r.arrayBuffer();
 			const type = r.headers.get("content-type");
-			if (!acceptableImage(type, buf.byteLength)) { failed++; return; }
-			await env.IMAGES!.put(key, buf, { httpMetadata: { contentType: type ?? "image/jpeg", cacheControl: "public, max-age=31536000, immutable" } });
+			return acceptableImage(type, buf.byteLength) ? { buf, type } : "not-image";
+		} catch (e) {
+			return isTimeout(e) ? "timeout" : "fetch-threw";
+		}
+	};
+	await mapLimit(body, IMAGE_COPY_CONCURRENCY, async (job) => {
+		const key = typeof job?.key === "string" ? job.key : "";
+		const src = typeof job?.src === "string" ? job.src : "";
+		if (!IG_IMAGE_KEY_RE.test(key) || !IG_IMAGE_HOST_RE.test(src)) { fail("rejected"); return; }
+		let got = await fetchImage(resizedSource(src));
+		if (typeof got === "string") got = await fetchImage(src);
+		if (typeof got === "string") { fail(got); return; }
+		try {
+			await env.IMAGES!.put(key, got.buf, { httpMetadata: { contentType: got.type ?? "image/jpeg", cacheControl: "public, max-age=31536000, immutable" } });
 			copied.push(key);
 		} catch {
-			failed++;
+			fail("put-threw");
 		}
-	}));
-	return jsonResponse({ copied, failed }, 200);
+	});
+	return jsonResponse({ copied, failed: Object.values(reasons).reduce((a, b) => a + b, 0), reasons }, 200);
 }
 
 /** The one-shot 15:00 UTC retry (scrape days only — isRetrySlot). Reads the three snapshots' fresh-write

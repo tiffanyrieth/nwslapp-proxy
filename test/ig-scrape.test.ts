@@ -19,6 +19,8 @@ import {
 	planImageCopies,
 	retryPlan,
 	acceptableImage,
+	mapLimit,
+	resizedSource,
 } from "../src/ig-scrape.ts";
 import { handleApifyWebhook, handleIgImageCopy } from "../src/index.ts";
 
@@ -128,6 +130,26 @@ test("only real images of a sane size are stored", () => {
 	assert.equal(acceptableImage("text/plain", 21), false); // Instagram's "URL signature expired" body
 	assert.equal(acceptableImage("image/jpeg", 0), false);
 	assert.equal(acceptableImage(null, 100), false);
+});
+
+test("mapLimit never has more than `limit` in flight (the 10/20 46/312 lesson) and keeps order", async () => {
+	let inFlight = 0, peak = 0;
+	const out = await mapLimit([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12], 5, async (n) => {
+		inFlight++; peak = Math.max(peak, inFlight);
+		await new Promise((r) => setTimeout(r, 5));
+		inFlight--;
+		return n * 2;
+	});
+	assert.equal(peak, 5);
+	assert.deepEqual(out, [2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 22, 24]);
+});
+
+test("copies are fetched resized (1080 wide, no enlargement) through the resize CDN", () => {
+	const u = new URL(resizedSource("https://scontent-x.cdninstagram.com/v/a.jpg?oe=1&x=2"));
+	assert.equal(u.host, "images.weserv.nl");
+	assert.equal(u.searchParams.get("url"), "https://scontent-x.cdninstagram.com/v/a.jpg?oe=1&x=2");
+	assert.equal(u.searchParams.get("w"), "1080");
+	assert.ok(u.searchParams.has("we"));
 });
 
 // ── webhook end to end (stub KV / fetch / SELF) ───────────────────────────────────────────────
@@ -281,9 +303,10 @@ test("image copy route: admin-only, Instagram CDN sources only, stores real imag
 			{ key: "ig/EVIL", src: "https://evil.example/good.jpg" },
 			{ key: "../x", src: "https://scontent-x.cdninstagram.com/good.jpg" },
 		]), env);
-		const out = (await r.json()) as { copied: string[]; failed: number };
+		const out = (await r.json()) as { copied: string[]; failed: number; reasons: Record<string, number> };
 		assert.deepEqual(out.copied, ["ig/GOOD"]);
 		assert.equal(out.failed, 3);
+		assert.deepEqual(out.reasons, { "http-403": 1, rejected: 2 }); // resized AND original both 403 → one reason
 		assert.deepEqual(puts.map((p) => p.key), ["ig/GOOD"]);
 		assert.match(JSON.stringify(puts[0].opts), /immutable/);
 	} finally {
