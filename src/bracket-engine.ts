@@ -415,12 +415,26 @@ async function fetchAthleteStats(id: string, year: number): Promise<Record<strin
   return out;
 }
 
+/** BACKOFF for ESPN's per-athlete stats API (2026-10-20): ESPN's WAF answers 403 to every Cloudflare-egress
+ *  request there (same URL + headers are 200 from a residential IP). Polling a blocked upstream escalates the
+ *  block (the 2026-09-15 lesson, docs/backend.md), so once a whole batch is refused with 403/429 this isolate
+ *  stops asking for STATS_BLOCK_BACKOFF_MS — one probe per isolate per window instead of ~28 per request. */
+export const STATS_BLOCK_BACKOFF_MS = 30 * 60 * 1000;
+let statsBlockedUntil = 0;
+export function resetStatsBackoff(): void { statsBlockedUntil = 0; }
+export const STATS_BACKOFF_PREFIX = "ESPN stats backoff";
+
 /** Fetch many athletes' stats in small concurrent batches, with a failure report: how many requests failed
- *  and a histogram of why (HTTP status / thrown message). */
+ *  and a histogram of why (HTTP status / thrown message). Inside the backoff window nothing is fetched and
+ *  every id counts as failed with the backoff reason. */
 export async function fetchStatsReport(ids: string[], year: number): Promise<{ stats: Map<string, Record<string, number>>; failed: number; reasons: Record<string, number> }> {
   const stats = new Map<string, Record<string, number>>();
   const reasons: Record<string, number> = {};
   let failed = 0;
+  if (ids.length > 0 && Date.now() < statsBlockedUntil) {
+    const mins = Math.ceil((statsBlockedUntil - Date.now()) / 60000);
+    return { stats, failed: ids.length, reasons: { [`${STATS_BACKOFF_PREFIX} ${mins}m`]: ids.length } };
+  }
   const CONC = 8;
   for (let i = 0; i < ids.length; i += CONC) {
     const batch = ids.slice(i, i + CONC);
@@ -430,6 +444,13 @@ export async function fetchStatsReport(ids: string[], year: number): Promise<{ s
     for (const [id, s, why] of res) {
       if (s) stats.set(id, s);
       else { failed++; reasons[why ?? "?"] = (reasons[why ?? "?"] ?? 0) + 1; }
+    }
+    // A fully refused FIRST batch = a block, not flaky players: stop here and back off (don't send the rest).
+    if (i === 0 && stats.size === 0 && Object.keys(reasons).every((k) => k === "HTTP 403" || k === "HTTP 429")) {
+      statsBlockedUntil = Date.now() + STATS_BLOCK_BACKOFF_MS;
+      const rest = ids.length - batch.length;
+      if (rest > 0) { failed += rest; reasons[`${STATS_BACKOFF_PREFIX} (not sent)`] = rest; }
+      break;
     }
   }
   return { stats, failed, reasons };
