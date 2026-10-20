@@ -72,6 +72,10 @@ test("without ASA (down / not posted yet): our estimate fills in, labelled, with
 	assert.ok(a.xg.home > 0.5 && a.xg.home < 2.5, `est ${a.xg.home}`);
 	assert.ok(a.asaRetryAfter! > 1000);
 	assert.ok(a.players.every((p) => p.source === "estimate"));
+	// xA (est.): 13 of the 18 shots name the passer who set them up → credited to her.
+	const kp = a.players.reduce((n, p) => n + (p.keyPasses ?? 0), 0);
+	assert.equal(kp, 13);
+	assert.ok(a.players.some((p) => p.shots === 0 && (p.xa ?? 0) > 0), "a creator who never shot still gets a line");
 	assert.equal(a.heatStatus, "pending");
 });
 

@@ -280,7 +280,7 @@ export function buildMatchAnalytics(args: {
 			const a = nm ? asaByTeamName.get(`${teamId}|${normalizeName(nm.name)}`) : undefined;
 			l = a
 				? { athleteId, teamId, shots: a.shots ?? 0, shotsOnTarget: a.shots_on_target ?? 0, goals: a.goals ?? 0, xg: round2(a.xgoals ?? 0), xa: round2(a.xassists ?? 0), keyPasses: a.key_passes ?? 0, source: "asa" }
-				: { athleteId, teamId, shots: 0, shotsOnTarget: 0, goals: 0, xg: 0, xa: null, keyPasses: null, source: "estimate" };
+				: { athleteId, teamId, shots: 0, shotsOnTarget: 0, goals: 0, xg: 0, xa: 0, keyPasses: 0, source: "estimate" };
 			lines.set(athleteId, l);
 		}
 		return l;
@@ -293,6 +293,12 @@ export function buildMatchAnalytics(args: {
 			if (s.outcome === "goal" || s.outcome === "onTarget") l.shotsOnTarget += 1;
 			if (s.outcome === "goal") l.goals += 1;
 			l.xg = round2(l.xg + s.xgEst);
+		}
+		// xA (est.): the passer ESPN names on a shot is credited that shot's estimated xG (+ a key pass) —
+		// ASA's definition, computed from our own estimate when ASA has no row for the match.
+		if (s.assistAthleteId) {
+			const a = line(s.assistAthleteId, s.teamId);
+			if (a.source === "estimate") { a.xa = round2((a.xa ?? 0) + s.xgEst); a.keyPasses = (a.keyPasses ?? 0) + 1; }
 		}
 	}
 	// ASA players who created chances but never shot (key passes / xA) still get a line.
