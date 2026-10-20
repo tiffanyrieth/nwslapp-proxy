@@ -43,24 +43,39 @@ async function checkClub(abbr) {
 	}
 }
 
+// Clubs whose official site blocks the proxy's datacenter IP: the PHONE fetches them (Phase 2b device-IP
+// fallback, `deviceFallback: true` in /club-news/sources — dynamic, so read it rather than hardcode). An empty
+// proxy result for these is by design, so they WARN instead of failing (2026-10-20: CHI/POR failed every
+// deploy because this check predated the fallback). A source-list read failure fails the check (no silence).
+let DEVICE_FALLBACK = new Set();
+try {
+	const r = await fetch(`${BASE}/club-news/sources`);
+	if (!r.ok) throw new Error(`HTTP ${r.status}`);
+	DEVICE_FALLBACK = new Set((await r.json()).filter((s) => s?.deviceFallback).map((s) => s.abbr));
+} catch (e) {
+	console.error(`❌ FAIL — couldn't read /club-news/sources: ${e.message}`);
+	process.exit(1);
+}
+
 const results = await Promise.all(CLUBS.map(checkClub));
 const empty = results.filter((r) => !r.ok);
-const hardFail = empty.filter((r) => !EXPECTED_THIN.has(r.abbr));
-const warnThin = empty.filter((r) => EXPECTED_THIN.has(r.abbr));
+const expected = (abbr) => EXPECTED_THIN.has(abbr) || DEVICE_FALLBACK.has(abbr);
+const hardFail = empty.filter((r) => !expected(r.abbr));
+const warnThin = empty.filter((r) => expected(r.abbr));
 
 console.log(`\nClub-news health check — ${BASE}\n`);
 for (const r of results) {
-	const icon = r.ok ? "✅" : EXPECTED_THIN.has(r.abbr) ? "⚠️ " : "❌";
+	const icon = r.ok ? "✅" : expected(r.abbr) ? "⚠️ " : "❌";
 	console.log(`  ${icon} ${r.abbr.padEnd(4)} ${String(r.count).padStart(2)}  ${r.note}`);
 }
 console.log(`\n${results.length - empty.length}/${results.length} clubs returned article-news.`);
 
 if (warnThin.length > 0) {
-	console.log(`⚠️  Known-thin (expected, not a failure): ${warnThin.map((r) => r.abbr).join(", ")} — brand-new club(s) with no news yet.`);
+	console.log(`⚠️  Expected empty from the proxy (not a failure): ${warnThin.map((r) => `${r.abbr}${DEVICE_FALLBACK.has(r.abbr) ? " (phone-fetched)" : " (no news yet)"}`).join(", ")}.`);
 }
 if (hardFail.length > 0) {
 	console.error(`\n❌ FAIL — ${hardFail.length} club(s) unexpectedly empty: ${hardFail.map((r) => r.abbr).join(", ")}`);
 	console.error("   Check the CLUB_NEWS config (src/index.ts) + GET /telemetry/recent for clubNewsEmpty events.");
 	process.exit(1);
 }
-console.log("✅ PASS — every club has article-news (known-thin clubs excepted).\n");
+console.log("✅ PASS — every club has article-news (phone-fetched and known-thin clubs excepted).\n");

@@ -17,6 +17,7 @@ import {
   fetchTeamAbbrs,
   fetchRosterResilient,
   fetchStatsForMany,
+  fetchStatsForManyStrict,
   type BracketEnv,
 } from "./bracket-engine.ts";
 import { adminGate, type AdminAuthEnv } from "./admin-auth.ts";
@@ -320,7 +321,8 @@ export async function computeEligiblePlayers(
   // exactly how Orlando vanished from 2026-W31, and how Portland would have vanished on 07-30.
   const roster = await fetchRosterResilient(env as unknown as BracketEnv, team.id, team.abbr);
   const ids = roster.map((p) => p.id).filter((id) => !excludeIds.has(id));
-  const stats = await fetchStatsForMany(ids, year);
+  // Strict: zero reachable stats is an ERROR (never "0 eligible" — that read as an exhausted season on 10/17).
+  const stats = await fetchStatsForManyStrict(ids, year);
 
   const players: EligiblePlayer[] = roster.map((p) => {
     const s = stats.get(p.id);

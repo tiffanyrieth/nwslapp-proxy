@@ -23,19 +23,19 @@
 //   node scripts/health_check_predict_community.mjs http://localhost:8787 # against wrangler dev
 
 const BASE = (process.argv[2] || process.env.PROXY_BASE || "https://nwslapp-proxy.tiffany-rieth.workers.dev").replace(/\/$/, "");
-// ⚠️ A DATE RANGE, not the default window. The default scoreboard usually holds only upcoming
-// fixtures, so the post-close REVEAL assertion — the half that proves the gate opens, not just that
-// it shuts — would silently WARN-and-skip on most days. A check whose main positive assertion rarely
-// runs isn't a gate. Look back two weeks so a finished match is essentially always in scope.
+// ⚠️ The LAST TWO WEEKS + upcoming, not the default window. The default scoreboard usually holds only
+// upcoming fixtures, so the post-close REVEAL assertion — the half that proves the gate opens, not just that
+// it shuts — would silently WARN-and-skip on most days. A check whose main positive assertion rarely runs
+// isn't a gate. 2026-10-20: this used ESPN's `dates=A-B` RANGE form, which ESPN has 400'd since 2026-09-16
+// (the check failed every deploy since). Now it reads the FULL SEASON (`dates=YYYY&limit=1000`, the
+// supported shape) from the proxy's own shared /scoreboard cache — no extra ESPN traffic — and windows locally.
 const today = new Date();
-const back = new Date(today.getTime() - 14 * 24 * 3600 * 1000);
-const fmt = (d) => d.toISOString().slice(0, 10).replace(/-/g, "");
-const ESPN_SCOREBOARD =
-	`https://site.api.espn.com/apis/site/v2/sports/soccer/usa.nwsl/scoreboard?limit=500&dates=${fmt(back)}-${fmt(today)}`;
+const WINDOW_BACK_MS = 14 * 24 * 3600 * 1000;
+const SCOREBOARD = `${BASE}/scoreboard?dates=${today.getUTCFullYear()}&limit=1000`;
 const CLOSE_LEAD_MS = 2 * 3600 * 1000;
 
 async function scoreboardEvents() {
-	const r = await fetch(ESPN_SCOREBOARD, { headers: { Accept: "application/json" } });
+	const r = await fetch(SCOREBOARD, { headers: { Accept: "application/json" } });
 	if (!r.ok) throw new Error(`scoreboard HTTP ${r.status}`);
 	const json = await r.json();
 	return (Array.isArray(json?.events) ? json.events : [])
@@ -46,7 +46,7 @@ async function scoreboardEvents() {
 			team: e?.competitions?.[0]?.competitors?.[0]?.team?.abbreviation,
 			label: (e?.competitions?.[0]?.competitors ?? []).map((c) => c?.team?.abbreviation ?? "?").join("–"),
 		}))
-		.filter((e) => e.id && e.team && !Number.isNaN(e.kickoff));
+		.filter((e) => e.id && e.team && !Number.isNaN(e.kickoff) && e.kickoff >= today.getTime() - WINDOW_BACK_MS);
 }
 
 async function ask(fixtures, season = "2026") {

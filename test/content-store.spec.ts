@@ -1,7 +1,7 @@
 // CONTENT STORE (2026-10-08) — non-live content state lives in a Durable Object, never KV.
 // docs/decisions.md "KV writes are reserved for live matches": these pin the store's KV-like semantics, the
-// read-through migration (a KV READ copied into the store, never a KV write), and that a write the store
-// can't take is reported — it must never fall back to KV.
+// (closed) read-through migration — a leftover KV value is ignored while the store is reachable — and that a
+// write the store can't take is reported: it must never fall back to KV.
 import { env, createExecutionContext, waitOnExecutionContext, runInDurableObject } from "cloudflare:test";
 import { describe, it, expect, afterEach } from "vitest";
 import { contentGet, contentGetJSON, contentPut, contentWrittenAt, resetContentMemo } from "../src/index";
@@ -74,15 +74,15 @@ describe("contentGet / contentPut — the only door, and it never writes KV", ()
 		expect((await stub().getMany(["nv3-1"]))["nv3-1"]).toContain('"isNWSL":true');
 	});
 
-	it("read-through migration: a value still in KV is READ and copied into the store — never re-written to KV", async () => {
+	it("store reachable → a leftover KV value is NOT read (the 10/08 read-through window closed 10/17) and KV is never written", async () => {
 		await env.FEED_TAGS.put("sv3-legacy", '{"id":"legacy","isNWSL":true,"teams":["WAS"],"leagueNews":false}');
 		const spy = kvSpy();
 		const ctx = createExecutionContext();
 		const v = await contentGetJSON<{ teams: string[] }>(spy.env, ctx, "sv3-legacy");
 		await waitOnExecutionContext(ctx);
-		expect(v?.teams).toEqual(["WAS"]);
+		expect(v).toBeNull();
 		expect(spy.kvPuts).toEqual([]);
-		expect((await stub().getMany(["sv3-legacy"]))["sv3-legacy"]).toContain('"WAS"');
+		expect((await stub().getMany(["sv3-legacy"]))["sv3-legacy"]).toBeNull();
 		await env.FEED_TAGS.delete("sv3-legacy");
 	});
 
