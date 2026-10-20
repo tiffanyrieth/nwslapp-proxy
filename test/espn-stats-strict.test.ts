@@ -4,7 +4,7 @@
 // variant team stats + KHG eligibility use); partial failure still passes.
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { fetchStatsForMany, fetchStatsForManyStrict, fetchStatsReport } from "../src/bracket-engine.ts";
+import { fetchStatsForMany, fetchStatsForManyStrict, fetchStatsReport, resetStatsBackoff } from "../src/bracket-engine.ts";
 
 const statsBody = JSON.stringify({ splits: { categories: [{ name: "general", stats: [{ name: "starts", value: 9 }] }] } });
 
@@ -24,13 +24,16 @@ test("a 404 'No stats found' is an empty stat line, not a failure", async () => 
 });
 
 test("every request failing → strict THROWS with the reason; lenient returns an empty map", async () => {
-	await withFetch(() => new Response("<html>blocked</html>", { status: 403 }), async () => {
-		await assert.rejects(fetchStatsForManyStrict(["1", "2", "3"], 2026), /unreachable 0\/3 \(HTTP 403×3\)/);
+	resetStatsBackoff();
+	await withFetch(() => new Response("<html>blocked</html>", { status: 500 }), async () => {
+		await assert.rejects(fetchStatsForManyStrict(["1", "2", "3"], 2026), /unreachable 0\/3 \(HTTP 500×3\)/);
 		assert.equal((await fetchStatsForMany(["1", "2", "3"], 2026)).size, 0);
 	});
+	resetStatsBackoff();
 });
 
 test("a partial failure still passes strict — those players just lack stats", async () => {
+	resetStatsBackoff();
 	await withFetch((u) => (u.includes("/athletes/3/") ? new Response("x", { status: 429 }) : new Response(statsBody)), async () => {
 		const s = await fetchStatsForManyStrict(["1", "2", "3"], 2026);
 		assert.equal(s.size, 2);
@@ -39,4 +42,18 @@ test("a partial failure still passes strict — those players just lack stats", 
 
 test("no ids → nothing to fetch, no throw", async () => {
 	assert.equal((await fetchStatsForManyStrict([], 2026)).size, 0);
+});
+
+test("a fully refused first batch backs off: the rest isn't sent, and the next call fetches nothing", async () => {
+	const { resetStatsBackoff } = await import("../src/bracket-engine.ts");
+	resetStatsBackoff();
+	let calls = 0;
+	await withFetch(() => { calls++; return new Response("blocked", { status: 403 }); }, async () => {
+		const ids = Array.from({ length: 28 }, (_, i) => String(i + 1));
+		await assert.rejects(fetchStatsForManyStrict(ids, 2026), /HTTP 403×8 .*backoff \(not sent\)×20/);
+		assert.equal(calls, 8); // one batch of 8 probes, not 28
+		await assert.rejects(fetchStatsForManyStrict(ids, 2026), /backoff \d+m×28/);
+		assert.equal(calls, 8); // nothing sent inside the window
+	});
+	resetStatsBackoff();
 });

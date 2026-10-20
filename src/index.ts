@@ -28,6 +28,7 @@ import {
 	fetchTeamAbbrs,
 	fetchRosterResilient,
 	mapEspnRosterAthletes,
+	STATS_BACKOFF_PREFIX,
 	type BracketEnv,
 } from "./bracket-engine.ts";
 import { buildHeadshotMap, handleHeadshots, normalizeName } from "./headshots.ts";
@@ -2054,6 +2055,22 @@ async function withFetcherTimeout<T>(p: Promise<T>, ms: number): Promise<T> {
 function splitShared(r: SharedJsonResult | null): { shared: SharedJsonResult | null; sharedErr: string | null } {
 	if (r && !r.ok) return { shared: null, sharedErr: r.error ?? "shared fetcher error" };
 	return { shared: r, sharedErr: null };
+}
+
+/** The shared fetcher failed because ESPN refused the stats (block/backoff) — computing directly would hit the
+ *  same block from the edge, so don't (never poll a blocked upstream). Only a fetcher-side failure retries. */
+function isEspnStatsRefusal(err: string | null): boolean {
+	return !!err && (err.includes("ESPN stats unreachable") || err.includes(STATS_BACKOFF_PREFIX));
+}
+
+/** An upstream-error response the edge caches for a few minutes, so a blocked ESPN isn't re-asked on every
+ *  team-page open in every data center. The app falls back to its own per-athlete path on any non-2xx. */
+const AGGREGATE_ERROR_EDGE_TTL = 10 * 60;
+function cacheableUpstreamError(ctx: ExecutionContext, cacheKey: Request, res: Response): Response {
+	const out = new Response(res.body, res);
+	out.headers.set("Cache-Control", `public, max-age=${AGGREGATE_ERROR_EDGE_TTL}`);
+	ctx.waitUntil(caches.default.put(cacheKey, out.clone()));
+	return out;
 }
 
 /** Stamp which path served an aggregate (`X-Espn-Fetcher`: memory/stored/fresh | bypass | error-direct) and,
@@ -8167,7 +8184,8 @@ async function handleKnowHerEligible(url: URL, env: Env, ctx: ExecutionContext):
 	let players;
 	let featuredCount = 0;
 	const { shared, sharedErr } = splitShared(await sharedAggregate(url, env, ctx, (stub) => stub.knowherEligible(team, year) as Promise<SharedJsonResult>));
-	if (sharedErr) emitDiag(env, ctx, "knowherEligibleError", `team=${team}: shared: ${sharedErr.slice(0, 60)} → computing directly`);
+	if (sharedErr) emitDiag(env, ctx, "knowherEligibleError", `team=${team}: shared: ${sharedErr.slice(0, 60)}`);
+	if (isEspnStatsRefusal(sharedErr)) return withFetcherHeaders(upstreamError(), null, sharedErr);
 	try {
 		if (shared?.json) {
 			// One shared copy per team (2026-10-08) — also serves /knowher/todo.
@@ -8217,7 +8235,8 @@ async function handleTeamStats(url: URL, env: Env, ctx: ExecutionContext): Promi
 	let edgeTtl = TEAM_STATS_TTL;
 	// A shared-fetcher ERROR now falls back to computing here (the pre-10/08 path) instead of failing the route,
 	// and says so in X-Espn-Fetcher(-Error) — 2026-10-20, when every shared stats computation came back empty.
-	if (sharedErr) emitDiag(env, ctx, "teamStatsError", `${id}: shared: ${sharedErr.slice(0, 60)} → computing directly`);
+	if (sharedErr) emitDiag(env, ctx, "teamStatsError", `${id}: shared: ${sharedErr.slice(0, 60)}`);
+	if (isEspnStatsRefusal(sharedErr)) return cacheableUpstreamError(ctx, cacheKey, withFetcherHeaders(upstreamError(), null, sharedErr));
 	if (shared?.json) {
 		players = JSON.parse(shared.json) as typeof players;
 		edgeTtl = edgeTtlFor(TEAM_STATS_TTL, shared.fetchedAt, shared.ttlSec || 1, Date.now());
@@ -8226,7 +8245,7 @@ async function handleTeamStats(url: URL, env: Env, ctx: ExecutionContext): Promi
 			players = await fetchTeamSeasonStats(env as unknown as BracketEnv, id, year);
 		} catch (e) {
 			emitDiag(env, ctx, "teamStatsError", `${id}: ${(e as Error).message.slice(0, 60)}`);
-			return withFetcherHeaders(upstreamError(), shared, sharedErr, (e as Error).message);
+			return cacheableUpstreamError(ctx, cacheKey, withFetcherHeaders(upstreamError(), shared, sharedErr, (e as Error).message));
 		}
 	}
 	if (players.length === 0) {
@@ -8259,7 +8278,8 @@ async function handleKnowHerTodo(url: URL, env: Env, ctx: ExecutionContext): Pro
 
 	let player;
 	const { shared, sharedErr } = splitShared(await sharedAggregate(url, env, ctx, (stub) => stub.knowherEligible(team, year) as Promise<SharedJsonResult>));
-	if (sharedErr) emitDiag(env, ctx, "knowherTodoError", `team=${team}: shared: ${sharedErr.slice(0, 60)} → computing directly`);
+	if (sharedErr) emitDiag(env, ctx, "knowherTodoError", `team=${team}: shared: ${sharedErr.slice(0, 60)}`);
+	if (isEspnStatsRefusal(sharedErr)) return withFetcherHeaders(upstreamError(), null, sharedErr);
 	try {
 		let eligible: Awaited<ReturnType<typeof computeEligiblePlayers>>;
 		if (shared?.json) {
