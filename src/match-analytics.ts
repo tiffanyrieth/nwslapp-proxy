@@ -295,7 +295,6 @@ export function buildMatchAnalytics(args: {
 	const teams = matchTeams(args.summary);
 	if (!teams) return null;
 	let shots = shotsFromSummary(args.summary);
-	if (args.asaDepth?.shots?.length) shots = joinAsaShots(shots, args.asaDepth.shots);
 	if (args.core?.shots?.length) shots = joinCoreShots(shots, args.core.shots);
 	const sum = (tid: string) => round2(shots.filter((s) => s.teamId === tid).reduce((n, s) => n + s.xgEst, 0));
 
@@ -359,6 +358,9 @@ export function buildMatchAnalytics(args: {
 			if (!(l.keyPasses || l.xa || l.shots)) lines.delete(athleteId);
 		}
 	}
+	// Phase 2: ASA's own per-shot values, joined with the club mapping (so a home and an away shot at the same spot
+	// can't swap) — the copy's `shots` below carry them.
+	if (asaGame && args.asaDepth?.shots?.length) shots = joinAsaShots(shots, args.asaDepth.shots, asaTeamToEspn);
 	// Phase 2: ASA ids → ESPN athletes by normalized name within the club (the same join as the xG lines).
 	const espnByTeamName = new Map<string, string>();
 	for (const [id, nm] of names) espnByTeamName.set(`${nm.teamId}|${normalizeName(nm.name)}`, id);
@@ -409,7 +411,7 @@ export function rosterNames(summary: SummaryLike): Map<string, { teamId: string;
 // conceded = goals prevented (Berger +0.14). g+ / xPass are ASA's own models — no second source (saved forever).
 
 export interface AsaShot {
-	game_id: string; team_id: string; shooter_player_id?: string; expanded_minute?: number;
+	game_id: string; team_id: string; shooter_player_id?: string; expanded_minute?: number; game_minute?: number; period_id?: number;
 	shot_location_x: number; shot_location_y: number; shot_xg: number; shot_psxg?: number;
 	goal?: number; own_goal?: number; head?: number; pattern_of_play?: string; assist_cross?: number; assist_through_ball?: number;
 }
@@ -463,12 +465,35 @@ export interface DefAction { kind: DefKind; x: number; y: number; minute: string
 const r3 = (n: number) => Math.round(n * 1000) / 1000;
 const locKey = (x: number, y: number) => `${Math.round(x * 10)}|${Math.round(y * 10)}`;
 
-/** Join ASA's per-shot rows onto our shots by location (identical Opta coordinates). Unmatched → unchanged. */
-export function joinAsaShots(shots: Shot[], asa: AsaShot[]): Shot[] {
-	const byLoc = new Map<string, AsaShot>();
-	for (const a of asa) byLoc.set(locKey(a.shot_location_x, a.shot_location_y), a);
-	return shots.map((s) => {
-		const a = byLoc.get(locKey(s.x, s.y));
+/** Join ASA's per-shot rows onto our shots. Both come from Opta and usually share exact coordinates, but on some
+ *  matches one side carries a revised spot (1–3 units off — WAS @ CHI 2026-09-20: 24 of 27 missed an exact join).
+ *  So: same team (when `asaTeamToEspn` is given), same half, within 3 minutes, nearest spot within 5 units; each ASA
+ *  row used once, closest pairs first. Unmatched → unchanged (the shot keeps our estimate). */
+export function joinAsaShots(shots: Shot[], asa: AsaShot[], asaTeamToEspn?: Map<string, string>): Shot[] {
+	// "90'+4'" = 94 (ASA counts stoppage time on: its game_minute + 1 = 94 for that shot).
+	const minuteOf = (m: string) => (m.match(/\d+/g) ?? ["0"]).reduce((n, d) => n + Number(d), 0);
+	const pairs: { i: number; j: number; cost: number }[] = [];
+	shots.forEach((s, i) => {
+		asa.forEach((a, j) => {
+			if (asaTeamToEspn && asaTeamToEspn.get(a.team_id) !== s.teamId) return;
+			if (a.period_id && s.period && a.period_id !== s.period) return;
+			const am = a.game_minute != null ? a.game_minute + 1 : a.expanded_minute ?? 0;
+			const dm = Math.abs(am - minuteOf(s.minute));
+			const dist = Math.hypot(a.shot_location_x - s.x, a.shot_location_y - s.y);
+			if (dm > 3 || dist > 5) return;
+			pairs.push({ i, j, cost: dist + dm * 0.5 });
+		});
+	});
+	pairs.sort((p, q) => p.cost - q.cost);
+	const byShot = new Map<number, AsaShot>();
+	const used = new Set<number>();
+	for (const p of pairs) {
+		if (byShot.has(p.i) || used.has(p.j)) continue;
+		byShot.set(p.i, asa[p.j]);
+		used.add(p.j);
+	}
+	return shots.map((s, i) => {
+		const a = byShot.get(i);
 		if (!a) return s;
 		const onTarget = s.outcome === "goal" || s.outcome === "onTarget";
 		return {

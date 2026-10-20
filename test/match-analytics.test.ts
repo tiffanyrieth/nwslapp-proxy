@@ -268,3 +268,20 @@ test("season shots against carry the keeper who faced them", () => {
 	const keeper = was.keepers[0].athleteId;
 	assert.ok(was.contributions[0].shotsAgainst.every((s) => s.keeperId === keeper));
 });
+
+
+test("ASA shot join tolerates revised spots (1–3 units) but never crosses teams or halves", async () => {
+	const { joinAsaShots } = await import("../src/match-analytics.ts");
+	const base = shotsFromSummary(summary);
+	const asaRows = asa.gameShots.Oa5wPGp9q1.map((a: { shot_location_x: number; shot_location_y: number }, k: number) =>
+		({ ...a, shot_location_x: a.shot_location_x + (k % 3) - 1, shot_location_y: a.shot_location_y + ((k % 2) ? 1.8 : -1.5) }));
+	const teamMap = new Map([["aDQ0lzvQEv", "15365"], ["raMyrr25d2", "15364"]]);
+	const joined = joinAsaShots(base, asaRows, teamMap);
+	assert.equal(joined.filter((s) => s.xgAsa != null).length, 18);
+	const sum = (tid: string) => Math.round(joined.filter((s) => s.teamId === tid).reduce((n, s) => n + (s.xgAsa ?? 0), 0) * 100) / 100;
+	assert.equal(sum("15365"), 1.12);
+	assert.equal(sum("15364"), 0.41);
+	// the wrong club's map → nothing joins
+	const crossed = joinAsaShots(base, asaRows, new Map([["aDQ0lzvQEv", "15364"], ["raMyrr25d2", "15365"]]));
+	assert.equal(crossed.filter((s) => s.xgAsa != null).length, 0);
+});
