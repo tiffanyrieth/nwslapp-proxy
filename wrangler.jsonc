@@ -20,6 +20,12 @@
 	"services": [
 		{ "binding": "SELF", "service": "nwslapp-proxy" },
 	],
+	// R2 (2026-10-20): durable copies of player Instagram images, written once per post by /apify-webhook and
+	// served from the bucket's custom domain img.crestside.app (Cloudflare CDN, no Worker request). Age rule
+	// `expire-ig-45d` deletes `ig/` objects after 45 days. docs: NWSLApp docs/social-tuning.md §1a.
+	"r2_buckets": [
+		{ "binding": "IMAGES", "bucket_name": "nwslapp-images" },
+	],
 	// Workers AI — backs the Social feed's IMAGE-MODERATION backstop. DECOUPLED from the scrape
 	// (FREE tier = 50 subrequests / 10ms CPU per run can't classify a ~300-image scrape at once):
 	// a small batch runs on the 5-min cron (gated ~30 min, moderateSnapshotTick), reading the CACHED
