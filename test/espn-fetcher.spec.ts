@@ -11,6 +11,7 @@ import {
 } from "cloudflare:test";
 import { describe, it, expect, beforeAll, afterEach } from "vitest";
 import worker, { resetEspnFetcherSwitchMemo } from "../src/index";
+import { writeStats, type TeamStatsCopy } from "../src/team-stats-store";
 import {
 	fetcherKey,
 	isFresh,
@@ -236,61 +237,93 @@ describe("shared fetcher — through the worker", () => {
 	});
 });
 
-// ── Phase 2: shared COMPUTED aggregates (team stats + Know Her Game eligible) ─────────────────────────
-// Each is ~(1 teams + 1 roster + N athlete stats) ESPN calls. fetchMock's exact `.times(…)` counts prove the
-// aggregate is computed ONCE for two data centers (any extra ESPN call would hit disableNetConnect and fail).
+// PLAYER STATS (2026-10-20): the hourly per-team aggregates are GONE. Readers serve the club's SAVED copy
+// (src/team-stats-store.ts) and must never call ESPN's stats API — `disableNetConnect` turns any unexpected
+// ESPN call into a failure, so these prove "zero stats calls on read".
 const SITE = "/apis/site/v2/sports/soccer/usa.nwsl";
-const CORE_HOST = "https://sports.core.api.espn.com";
-const SQUAD = 16; // ROSTER_GOOD_MIN — a plausible squad, so no KV last-good fallback path
+const SQUAD = 16;
 
-function mockTeamComputation(teamId: string, abbr: string): void {
-	fetchMock.get(ESPN).intercept({ path: `${SITE}/teams` })
-		.reply(200, JSON.stringify({ sports: [{ leagues: [{ teams: [{ team: { id: teamId, abbreviation: abbr } }] }] }] }), JSON_HEADERS);
-	fetchMock.get(ESPN).intercept({ path: `${SITE}/teams/${teamId}/roster` })
-		.reply(200, JSON.stringify({
-			athletes: Array.from({ length: SQUAD }, (_, i) => ({
-				id: `${teamId}${i}`, displayName: `Player ${i}`, jersey: String(i + 1), position: { abbreviation: i === 0 ? "G" : "F" },
-			})),
-		}), JSON_HEADERS);
-	fetchMock.get(CORE_HOST).intercept({ path: (p) => p.includes("/athletes/") && p.endsWith("/statistics") })
-		.reply(200, JSON.stringify({
-			splits: { categories: [{ name: "general", stats: [{ name: "starts", value: 5 }, { name: "minutes", value: 450 }, { name: "appearances", value: 6 }] }] },
-		}), JSON_HEADERS)
-		.times(SQUAD);
+function copyFor(teamId: string, abbr: string, source: "espn" | "nwsl", apps: number): TeamStatsCopy {
+	const players = Array.from({ length: SQUAD }, (_, i) => ({
+		athleteId: `${teamId}${i}`, name: `Player ${i}`, jersey: i + 1, position: i === 0 ? "Goalkeeper" : "Forward",
+		stats: { "general.starts": i % 3 === 0 ? 0 : 5, "general.minutes": i === 15 ? 40 : 450, "general.appearances": apps },
+	}));
+	return { source, teamId, teamAbbr: abbr, year: 2026, fetchedAt: Date.now(), basedOnEventId: source === "espn" ? "1" : null, appearancesTotal: apps * SQUAD, players };
 }
 
-describe("shared fetcher — computed aggregates", () => {
-	it("/team-stats is computed ONCE for two data centers", async () => {
-		mockTeamComputation("9101", "TSA");
+function mockTeams(teamId: string, abbr: string, times = 1): void {
+	fetchMock.get(ESPN).intercept({ path: `${SITE}/teams` })
+		.reply(200, JSON.stringify({ sports: [{ leagues: [{ teams: [{ team: { id: teamId, abbreviation: abbr } }] }] }] }), JSON_HEADERS)
+		.times(times);
+}
+
+describe("player stats — served from the saved copy, never ESPN on request", () => {
+	it("/team-stats returns the saved copy for two data centers with ZERO ESPN calls", async () => {
+		await writeStats(env, [copyFor("9101", "TSA", "espn", 6)]);
 		const a = await get("https://dc-a.test/team-stats?team=9101&year=2026");
 		const b = await get("https://dc-b.test/team-stats?team=9101&year=2026");
 		expect(a.status).toBe(200);
 		expect(b.status).toBe(200);
-		expect(a.headers.get("X-Espn-Fetcher")).toBe("fresh");
-		expect(b.headers.get("X-Espn-Fetcher")).toBe("memory");
-		const players = ((await b.json()) as { players: unknown[] }).players;
-		expect(players.length).toBe(SQUAD);
+		const body = (await b.json()) as { players: { athleteId: string; stats: Record<string, number> }[]; source: string };
+		expect(body.players.length).toBe(SQUAD);
+		expect(body.source).toBe("espn");
+		expect(body.players[1].stats["general.minutes"]).toBe(450);
 	});
 
-	it("/knowher/eligible and /knowher/todo share ONE per-team computation", async () => {
-		mockTeamComputation("9102", "TSB");
+	it("the NWSL backup serves when there's no ESPN copy, and wins when it holds more appearances", async () => {
+		await writeStats(env, [copyFor("9104", "TSD", "nwsl", 7)]);
+		const r = await get("https://dc-a.test/team-stats?team=9104&year=2026");
+		expect(((await r.json()) as { source: string }).source).toBe("nwsl");
+		await writeStats(env, [copyFor("9105", "TSE", "espn", 6), copyFor("9105", "TSE", "nwsl", 7)]);
+		const r2 = await get("https://dc-a.test/team-stats?team=9105&year=2026");
+		expect(((await r2.json()) as { source: string }).source).toBe("nwsl"); // ESPN hadn't posted the match yet
+	});
+
+	it("no saved copy → an error (the app falls back to its phone path) and still no ESPN call", async () => {
+		const r = await get("https://dc-a.test/team-stats?team=9103&year=2026");
+		expect(r.ok).toBe(false);
+	});
+
+	it("/knowher/eligible and /knowher/todo build from the saved copy (only the team-id lookup touches ESPN)", async () => {
+		await writeStats(env, [copyFor("9102", "TSB", "espn", 6)]);
+		mockTeams("9102", "TSB", 2);
 		const elig = await get("https://dc-a.test/knowher/eligible?team=TSB&year=2026");
 		const todo = await get("https://dc-b.test/knowher/todo?team=TSB&year=2026");
 		expect(elig.status).toBe(200);
 		expect(todo.status).toBe(200);
-		expect(elig.headers.get("X-Espn-Fetcher")).toBe("fresh");
-		expect(todo.headers.get("X-Espn-Fetcher")).toBe("memory");
-		expect(((await elig.json()) as { count: number }).count).toBe(SQUAD);
+		// Gate: starts ≥ 1 OR minutes ≥ 100 → the 0-start players with 450 minutes stay eligible; #15 has 0
+		// starts AND 40 minutes, so it's out → 15 eligible. The pick is the most-started, then most-minutes.
+		expect(((await elig.json()) as { count: number }).count).toBe(SQUAD - 1);
+		const pick = ((await todo.json()) as { player: { starts: number } | null }).player;
+		expect(pick?.starts).toBe(5);
 	});
 
-	it("a failed computation is never shared — the next request computes again", async () => {
-		// /teams fails 3× (espnJSON retries) → the computation throws → error, nothing cached.
-		fetchMock.get(ESPN).intercept({ path: `${SITE}/teams` }).reply(503, "down").times(3);
-		const bad = await get("https://dc-a.test/team-stats?team=9103&year=2026");
-		expect(bad.ok).toBe(false);
-		mockTeamComputation("9103", "TSC");
-		const good = await get("https://dc-b.test/team-stats?team=9103&year=2026");
-		expect(good.status).toBe(200);
-		expect(good.headers.get("X-Espn-Fetcher")).toBe("fresh");
+	it("/knowher/todo with no saved copy is an ERROR (a routine GAP), never a silent 'no eligible pick'", async () => {
+		mockTeams("9106", "TSF");
+		const todo = await get("https://dc-a.test/knowher/todo?team=TSF&year=2026");
+		expect(todo.ok).toBe(false);
+	});
+});
+
+describe("recentFinals — which matches just finished, from the shared schedule copy", () => {
+	it("reads settled regular-season matches out of the stored season copy without re-fetching it", async () => {
+		const season = JSON.stringify({
+			events: [
+				{ id: "501", date: "2026-10-17T16:30Z", season: { slug: "regular-season" }, status: { type: { state: "post", completed: true, name: "STATUS_FULL_TIME" } },
+					competitions: [{ competitors: [{ team: { id: "15365" } }, { team: { id: "15364" } }] }] },
+				{ id: "502", date: "2026-10-18T16:30Z", season: { slug: "regular-season" }, status: { type: { state: "post", completed: false, name: "STATUS_SUSPENDED" } },
+					competitions: [{ competitors: [{ team: { id: "1" } }, { team: { id: "2" } }] }] },
+				{ id: "503", date: "2026-11-08T16:30Z", season: { slug: "playoffs---quarterfinals" }, status: { type: { state: "post", completed: true } },
+					competitions: [{ competitors: [{ team: { id: "3" } }, { team: { id: "4" } }] }] },
+			],
+		});
+		fetchMock.get(ESPN).intercept({ path: (p) => p.startsWith(SB_PATH) && p.includes("dates=2026") }).reply(200, season, JSON_HEADERS);
+		const stub = env.ESPN_FETCHER!.get(env.ESPN_FETCHER!.idFromName("espn"));
+		const first = (await stub.recentFinals(2026, 12 * 3600 * 1000)) as { finals: { eventId: string }[]; refreshed: boolean };
+		expect(first.refreshed).toBe(true); // nothing stored yet → ONE schedule fetch
+		expect(first.finals.map((f) => f.eventId)).toEqual(["501"]); // suspended + playoff excluded
+		const second = (await stub.recentFinals(2026, 12 * 3600 * 1000)) as { finals: { eventId: string }[]; refreshed: boolean };
+		expect(second.refreshed).toBe(false); // served from the copy — no second fetch (disableNetConnect)
+		expect(second.finals.length).toBe(1);
 	});
 });

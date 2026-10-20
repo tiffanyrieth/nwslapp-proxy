@@ -41,6 +41,7 @@ import {
 } from "./headshots.ts";
 import { POSITION_GROUP, mapEspnRosterAthletes, type RosterPlayer } from "./bracket-engine.ts";
 import { ESPN_HEADERS } from "./espn-ua.ts";
+import { appearancesTotal, sdpStatsToEspn, type StatsPlayer, type TeamStatsCopy } from "./team-stats-store.ts";
 
 const ESPN_SITE = "https://site.api.espn.com/apis/site/v2/sports/soccer/usa.nwsl";
 
@@ -172,6 +173,9 @@ export interface SdpSquadPlayer {
 	role: Group | null;
 	minutes: number;
 	games: number;
+	/** Season totals mapped to ESPN key names (sdpStatsToEspn) — feeds the NWSL stats BACKUP copy
+	 *  (2026-10-20). In-memory only: stripped before the `sdp-squads-v1` KV snapshot is written. */
+	espnStats?: Record<string, number>;
 }
 
 export interface SdpSquad {
@@ -891,6 +895,79 @@ export function pairNameVariances(
 	};
 }
 
+/** ESPN athlete id → the SAME person in the league feed, by the rules `diffPlayers` already trusts: any
+ *  name form (full / short / shirt), an ambiguous name (two different league players) skipped rather than
+ *  guessed, then leftovers paired by shirt number (`pairNameVariances`). Feeds the NWSL stats backup, so a
+ *  wrong join would put one player's numbers on another — unmatched players are left out instead. */
+export function pairEspnToSdp(espn: EspnTeamRoster, sdp: SdpSquad): Map<string, SdpSquadPlayer> {
+	const byKey = new Map<string, SdpSquadPlayer | null>();
+	const put = (k: string, p: SdpSquadPlayer) => {
+		if (!k) return;
+		const cur = byKey.get(k);
+		if (cur === undefined) byKey.set(k, p);
+		else if (cur && cur.guid !== p.guid) byKey.set(k, null);
+	};
+	for (const p of sdp.players) {
+		put(p.name, p);
+		put(p.short, p);
+		put(p.shirt, p);
+	}
+	const out = new Map<string, SdpSquadPlayer>();
+	const used = new Set<string>();
+	const leftovers: PlayerDiffs["espnOnly"] = [];
+	for (const e of espn.players) {
+		const m = byKey.get(e.name);
+		if (m && !used.has(m.guid)) {
+			out.set(e.id, m);
+			used.add(m.guid);
+		} else if (m === undefined) {
+			leftovers.push({ espnAthleteId: e.id, name: e.display, jersey: e.jersey });
+		}
+	}
+	const unmatched = sdp.players.filter((p) => !used.has(p.guid));
+	const byGuid = new Map(unmatched.map((p) => [p.guid, p]));
+	const bySdpName = new Map(unmatched.map((p) => [p.display, p]));
+	for (const v of pairNameVariances(leftovers, unmatched).variances) {
+		const hit = bySdpName.get(v.sdpName);
+		if (hit && byGuid.has(hit.guid)) out.set(v.espnAthleteId, hit);
+	}
+	return out;
+}
+
+/** The nightly NWSL stats BACKUP copy for one club: every ESPN-rostered player the league feed can be
+ *  paired with, carrying the league's season totals under ESPN key names. Unpaired players are counted,
+ *  not guessed. */
+export function nwslStatsCopy(args: {
+	teamId: string;
+	teamAbbr: string;
+	year: number;
+	roster: RosterPlayer[];
+	espn: EspnTeamRoster;
+	squad: SdpSquad;
+	now: number;
+}): { copy: TeamStatsCopy; unmatched: number } {
+	const pairs = pairEspnToSdp(args.espn, args.squad);
+	const players: StatsPlayer[] = [];
+	for (const r of args.roster) {
+		const m = pairs.get(r.id);
+		if (!m?.espnStats) continue;
+		players.push({ athleteId: r.id, name: r.name, jersey: r.jersey, position: r.position, age: r.age ?? null, country: r.country ?? null, stats: m.espnStats });
+	}
+	return {
+		copy: {
+			source: "nwsl",
+			teamId: args.teamId,
+			teamAbbr: args.teamAbbr,
+			year: args.year,
+			fetchedAt: args.now,
+			basedOnEventId: null,
+			appearancesTotal: appearancesTotal(players),
+			players,
+		},
+		unmatched: args.roster.length - players.length,
+	};
+}
+
 export function assembleReport(args: {
 	ranAt: string;
 	seasonId: string;
@@ -964,6 +1041,7 @@ function toSdpSquad(
 			role: roleLabelToGroup(p.roleLabel as string),
 			minutes: stat(p as never, "minutes-played"),
 			games: stat(p as never, "games-played"),
+			espnStats: sdpStatsToEspn(p.stats as never),
 		});
 	}
 	return { teamAbbr, teamGuid, teamName, players };
@@ -1000,7 +1078,14 @@ interface RosterTruthEnv {
  *      cadence and the admin re-run are the retry.
  *    • ONE batched diag write, never one per finding.
  */
-export async function runRosterTruth(env: RosterTruthEnv, emit: EmitBatch): Promise<RosterTruthReport> {
+export async function runRosterTruth(
+	env: RosterTruthEnv,
+	emit: EmitBatch,
+	/** Receives the nightly NWSL stats backup copies (one per paired club) — the caller saves them in ONE
+	 *  ContentStore call (this function has no ContentStore access, and the run's 50-subrequest budget has
+	 *  room for exactly one more). Best-effort: a throw here never fails the verification run. */
+	onStatsBackup?: (copies: TeamStatsCopy[], unmatched: number) => Promise<void>,
+): Promise<RosterTruthReport> {
 	const ranAt = new Date().toISOString();
 
 	// Season id — cached, because resolving it costs two fetches we'd rather spend on clubs.
@@ -1036,6 +1121,9 @@ export async function runRosterTruth(env: RosterTruthEnv, emit: EmitBatch): Prom
 	const clubs: ClubReport[] = [];
 	const namesByClub: Record<string, string[]> = {};
 	const verdictClubs: VerdictMap["clubs"] = {};
+	const statsCopies: TeamStatsCopy[] = [];
+	let statsUnmatched = 0;
+	const statsYear = new Date(ranAt).getUTCFullYear();
 
 	await Promise.all(
 		espnTeams.map(async (t) => {
@@ -1064,9 +1152,15 @@ export async function runRosterTruth(env: RosterTruthEnv, emit: EmitBatch): Prom
 				return;
 			}
 
-			const espn = toEspnRoster(mapEspnRosterAthletes(espnRaw, t.abbr), t.abbr, t.id);
+			const rosterPlayers = mapEspnRosterAthletes(espnRaw, t.abbr);
+			const espn = toEspnRoster(rosterPlayers, t.abbr, t.id);
 			const squad = sdpTeam ? toSdpSquad(sdpRaw, t.abbr, sdpTeam.guid, t.abbr) : null;
 			if (squad) squads.push(squad);
+			if (squad && squad.players.length > 0) {
+				const b = nwslStatsCopy({ teamId: t.id, teamAbbr: t.abbr, year: statsYear, roster: rosterPlayers, espn, squad, now: Date.parse(ranAt) });
+				if (b.copy.players.length > 0) statsCopies.push(b.copy);
+				statsUnmatched += b.unmatched;
+			}
 			namesByClub[t.abbr] = espn.players.map((p) => p.name);
 
 			const gateB = gateShape(espn);
@@ -1091,7 +1185,8 @@ export async function runRosterTruth(env: RosterTruthEnv, emit: EmitBatch): Prom
 	await Promise.all([
 		env.FEED_TAGS.put(
 			SDP_SQUADS_KEY,
-			JSON.stringify({ builtAt: ranAt, seasonId, teams: squads }),
+			// espnStats stays out of the KV snapshot (unchanged shape; the stats go to the ContentStore backup).
+			JSON.stringify({ builtAt: ranAt, seasonId, teams: squads.map((s) => ({ ...s, players: s.players.map(({ espnStats: _s, ...p }) => p) })) }),
 			{ expirationTtl: SDP_SQUADS_TTL },
 		),
 		env.FEED_TAGS.put(REPORT_KEY, JSON.stringify(report), { expirationTtl: REPORT_TTL }),
@@ -1101,6 +1196,14 @@ export async function runRosterTruth(env: RosterTruthEnv, emit: EmitBatch): Prom
 			{ expirationTtl: VERDICTS_TTL },
 		),
 	]);
+
+	if (onStatsBackup && statsCopies.length > 0) {
+		try {
+			await onStatsBackup(statsCopies, statsUnmatched);
+		} catch {
+			/* best-effort — the caller emits its own diag; verification already written */
+		}
+	}
 
 	// Answer what recent teamsheets can, BEFORE the weekly routine ever sees it. Best-effort by
 	// construction: a failure here must never fail the verification run, which has already been
