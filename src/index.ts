@@ -33,6 +33,23 @@ import {
 import { buildHeadshotMap, handleHeadshots, normalizeName } from "./headshots.ts";
 import { moderateSnapshotBatch, carryForwardVerdicts, IMGMOD_MODEL, IMGMOD_BATCH } from "./social-moderation.ts";
 import {
+	APIFY_ITEM_FIELDS,
+	IMAGE_COPY_BATCH,
+	IMAGE_COPY_MAX_BATCHES,
+	acceptableImage,
+	apifyWebhooksParam,
+	applyImageCopies,
+	chunk,
+	isRetrySlot,
+	nextPool,
+	parseApifyWebhook,
+	planImageCopies,
+	retryPlan,
+	stampAt,
+	type Pool,
+	type SnapshotStamp,
+} from "./ig-scrape.ts";
+import {
 	BEAT_SEED,
 	NEWS_FEED_SEED,
 	MAX_BEAT_PER_CLUB,
@@ -543,6 +560,7 @@ const OG_FAIL_TTL = 24 * 3600; // a failed article-page OG fetch is retried at m
 // of app traffic. The app's staleness filter (Home 72h / Feed 7d) drops old posts
 // client-side, so a mixed-age snapshot is fine to display.
 const APIFY_API = "https://api.apify.com/v2/acts";
+const APIFY_DATASETS_API = "https://api.apify.com/v2/datasets";
 const APIFY_IG_ACTOR = "sones~instagram-posts-scraper-lowcost";
 const APIFY_TIKTOK_ACTOR = "clockworks~tiktok-scraper"; // deferred; kept ready for re-enable
 const SOCIAL_POSTS_PER_PROFILE = 4; // requested of Apify (ignored by the cheap actor — see above)
@@ -1274,6 +1292,19 @@ that needs more users) until you bring it back.</p>
 			return handleBrightDataWebhook(request, env, ctx);
 		}
 
+		// POST Apify webhook: the player-IG run's completion notice (2026-10-20 — the cron no longer waits
+		// on Apify inside its own invocation). Self-authenticates against APIFY_WEBHOOK_SECRET.
+		if (url.pathname === "/apify-webhook") {
+			return handleApifyWebhook(request, env, ctx);
+		}
+
+		// POST one batch of player-image copies into R2 — called only by handleApifyWebhook through the
+		// SELF binding, so each batch gets its OWN 50-subrequest budget. Admin-key gated like the other
+		// SELF-invoked jobs.
+		if (url.pathname === "/internal/ig-images") {
+			return handleIgImageCopy(request, env);
+		}
+
 		// Admin-only: refresh the IG social snapshot on demand (the every-2-day cron does
 		// this automatically; this forces an immediate pull after a token swap or an aborted
 		// run). Same BRACKET_ADMIN_KEY gate as /headshots/run.
@@ -1295,16 +1326,17 @@ that needs more users) until you bring it back.</p>
 					});
 				}
 				if (side === "players") {
-						// PLAYERS ONLY (Apify) — never touches Club News (Bright Data). `pool=A|B` forces a
-						// specific pool so both pools can be refreshed deterministically (call once per pool).
-						const pParam = url.searchParams.get("pool");
-						const poolArg = pParam === "A" || pParam === "B" ? pParam : undefined;
-						const playersSummary = await refreshSocialCache(env, ctx, { playersOnly: true, pool: poolArg });
-						return new Response(`${JSON.stringify(playersSummary)}\n`, {
-							headers: { "Content-Type": "application/json" },
-						});
-					}
-					const summary = await refreshSocialCache(env, ctx);
+					// PLAYERS ONLY (Apify) — never touches Club News (Bright Data). `pool=A|B` forces a
+					// specific pool so both pools can be refreshed deterministically (call once per pool).
+					// ASYNC since 2026-10-20: returns once Apify accepts the run; /apify-webhook saves it.
+					const pParam = url.searchParams.get("pool");
+					const poolArg = pParam === "A" || pParam === "B" ? pParam : undefined;
+					const playersSummary = await startSocialScrape(env, ctx, { playersOnly: true, pool: poolArg });
+					return new Response(`${JSON.stringify(playersSummary)}\n`, {
+						headers: { "Content-Type": "application/json" },
+					});
+				}
+				const summary = await startSocialScrape(env, ctx);
 				return new Response(`${JSON.stringify(summary)}\n`, {
 					headers: { "Content-Type": "application/json" },
 				});
@@ -1617,11 +1649,11 @@ that needs more users) until you bring it back.</p>
 		);
 	},
 
-	// B3b — once-daily cron: scrape IG via Apify and refresh the social-card
-	// snapshot in KV. Decoupled from user requests so a slow ~50-account scrape never
-	// blocks the app and Apify spend is pinned to ~1 run/day (see wrangler.jsonc crons).
-	// Await (not waitUntil) — a cron should keep its invocation alive until the work is
-	// done; best-effort, a failed refresh leaves the last good snapshot in place.
+	// B3b — every-other-day cron (`0 12 */2 * *`): START the IG scrapes (Bright Data clubs first, then the
+	// async Apify player run) and return; results land at /brightdata-webhook + /apify-webhook in their own
+	// invocations (2026-10-20 — waiting on Apify here 524'd on 10/17 and died on 10/19, src/ig-scrape.ts).
+	// Decoupled from user requests so Apify spend is pinned to ~1 run per cron (see wrangler.jsonc crons);
+	// a failed scrape leaves the last good snapshot serving, and the 15:00 UTC check retries it once.
 	async scheduled(controller, env, ctx): Promise<void> {
 		// The every-5-min cron drives the Bracket Battle engine (manual-action pickup / auto
 		// tally + advance / rotate). The every-other-day cron refreshes the Instagram social
@@ -1652,6 +1684,14 @@ that needs more users) until you bring it back.</p>
 				if (hc) await fetchBounded(hc);
 			} catch {
 				/* best-effort; a missed ping just delays a dead-cron alert by one tick */
+			}
+			// One-shot IG scrape retry (2026-10-20): ONLY the 15:00 UTC tick on a scrape day does anything
+			// (a pure time check otherwise — no KV read). Early in the tick so a later pass's CPU kill can't
+			// skip it; the re-run itself is two small API calls (the work lands in the webhooks).
+			try {
+				await maybeRetrySocialScrape(env, ctx, controller.scheduledTime);
+			} catch (e) {
+				emitDiag(env, ctx, "socialScrapeRetryFail", String((e as Error)?.message ?? e).slice(0, 80));
 			}
 			// Scheduled synthetic checks (A4) + client crash/feature aggregate (A5), each internally gated
 			// to ~30 min so they ride the shared tick without a new cron trigger, and isolated so an
@@ -1754,10 +1794,12 @@ that needs more users) until you bring it back.</p>
 			}
 			return;
 		}
+		// Every-other-day IG scrape: starts Bright Data (clubs) then the async Apify run (players), and
+		// returns — the results land at the two webhooks. A throw here used to be swallowed silently.
 		try {
-			await refreshSocialCache(env, ctx);
-		} catch {
-			/* swallow — next run retries; the stale snapshot stays serving */
+			await startSocialScrape(env, ctx);
+		} catch (e) {
+			emitDiag(env, ctx, "socialScrapeStartFail", String((e as Error)?.message ?? e).slice(0, 80));
 		}
 	},
 } satisfies ExportedHandler<Env>;
@@ -6040,20 +6082,6 @@ function numOrUndef(v: unknown): number | undefined {
 /** Run an Apify actor synchronously and return its dataset items (cron-only —
  *  a sync run is slow). Throws on non-2xx so the caller can isolate one platform's
  *  failure from the other. */
-async function apifyRunSync(actor: string, input: unknown, token: string): Promise<unknown[]> {
-	const r = await fetch(`${APIFY_API}/${actor}/run-sync-get-dataset-items?token=${token}`, {
-		method: "POST",
-		headers: { "Content-Type": "application/json" },
-		body: JSON.stringify(input),
-	});
-	if (!r.ok) {
-		const body = await r.text().catch(() => "");
-		throw new Error(`apify ${actor} ${r.status} ${body.slice(0, 300)}`);
-	}
-	const json = await r.json();
-	return Array.isArray(json) ? json : [];
-}
-
 /** One Apify Instagram post → a `socialVideo` ContentCard, or null if unusable.
  *  Field names are the sones/instagram-posts-scraper-lowcost output (snake_case,
  *  verified live): `code` (shortcode), `taken_at` (unix s), `caption.text`,
@@ -6222,60 +6250,26 @@ export async function handleBrightDataWebhook(request: Request, env: Env, ctx: E
 	});
 }
 
-/** Scrape the given IG handles via Apify and map to cards (defaults to ALL IG handles —
- *  the pre-split behavior, still used while BRIGHTDATA_TOKEN is unset). Cron-only.
- *  After the 2026-08-14 swap, the normal-path call is PLAYER handles only (clubs → BD).
- *
- *  TikTok is DEFERRED (owner: IG-only for now), so only Instagram is scraped — which
- *  also means a single actor runs, sidestepping the Apify FREE plan's 8192MB TOTAL
- *  concurrent-actor cap (running two at once trips `actor-memory-limit-exceeded`/402).
- *  To re-enable TikTok: add a SEQUENTIAL second pass (after IG, to stay under that cap)
- *  scraping APIFY_TIKTOK_ACTOR over the CLUB_SOCIAL.tiktok handles → mapApifyTikTok.
- *  IG empty (or no APIFY_TOKEN) → caller keeps the last good snapshot (→ seed fallback). */
-async function buildSocialCards(env: Env, handles: SocialHandle[], ctx?: ExecutionContext): Promise<{ instagram: unknown[]; tiktok: unknown[] }> {
-	const token = env.APIFY_TOKEN;
-	if (!token) return { instagram: [], tiktok: [] };
-
+/** Apify Instagram dataset items → cards. Matches each item to a handle by the account the actor scraped
+ *  (`scraped_username`; older actor names as fallbacks) and maps it with mapApifyInstagram. Returns the
+ *  cards plus the handles that delivered nothing (a renamed/deleted/private handle yields zero cards
+ *  silently otherwise). Used by the Apify webhook; the actor itself runs async (startApifyRun).
+ *  TikTok stays DEFERRED (owner: IG-only) — re-enable = a second actor run + mapApifyTikTok. */
+export function mapApifyItems(items: unknown[], handles: SocialHandle[]): { cards: unknown[]; missing: SocialHandle[] } {
 	const igHandles = handles.filter((h) => h.platform === "instagram");
 	const igByUser = new Map(igHandles.map((h) => [h.handle.toLowerCase(), h]));
-
-	let instagram: unknown[] = [];
-	try {
-		const items = await apifyRunSync(
-			APIFY_IG_ACTOR,
-			{ usernames: igHandles.map((h) => h.handle), postsPerProfile: SOCIAL_POSTS_PER_PROFILE },
-			token,
-		);
-		const seen = new Set<string>();
-		instagram = items
-			.map((it) => {
-				// sones output keys the scraped account on `scraped_username`.
-				const rec = it as { scraped_username?: string; ownerUsername?: string; user?: { username?: string } };
-				const user = String(rec.scraped_username ?? rec.user?.username ?? rec.ownerUsername ?? "").toLowerCase();
-				const h = igByUser.get(user);
-				if (!h) return null;
-				seen.add(user);
-				return mapApifyInstagram(it, h);
-			})
-			.filter(Boolean) as unknown[];
-
-		// Post-swap the player IG path lost the club webhook's dead-handle detection: a renamed/
-		// deleted/private handle just yields zero cards silently. Flag the gap (same shape + total-
-		// failure guard as the BD `bdHandleEmpty` diag) so a dead player handle can't drain the
-		// free quota run after run unnoticed.
-		if (ctx) {
-			const missing = igHandles.filter((h) => !seen.has(h.handle.toLowerCase()));
-			if (missing.length > 0 && instagram.length > 0) {
-				emitDiag(env, ctx, "apifyHandleEmpty", `${missing.length}: ${missing.map((h) => h.handle).slice(0, 5).join(",")}`);
-			}
-		}
-	} catch (e) {
-		// IG failed this run — caller keeps the last good IG snapshot. Fail LOUD to the engineer so a
-		// persistent Apify outage/402 is visible rather than looking like a quiet "no new posts".
-		if (ctx) emitDiag(env, ctx, "apifyRunFail", String((e as Error)?.message ?? e).slice(0, 80));
-	}
-
-	return { instagram, tiktok: [] };
+	const seen = new Set<string>();
+	const cards = items
+		.map((it) => {
+			const rec = it as { scraped_username?: string; ownerUsername?: string; user?: { username?: string } };
+			const user = String(rec.scraped_username ?? rec.user?.username ?? rec.ownerUsername ?? "").toLowerCase();
+			const h = igByUser.get(user);
+			if (!h) return null;
+			seen.add(user);
+			return mapApifyInstagram(it, h);
+		})
+		.filter(Boolean) as unknown[];
+	return { cards, missing: igHandles.filter((h) => !seen.has(h.handle.toLowerCase())) };
 }
 
 // ── Social feed IMAGE MODERATION wiring ────────────────────────────────────────────────
@@ -6341,14 +6335,18 @@ async function moderateSnapshotTick(env: Env, ctx: ExecutionContext): Promise<vo
 	let approved: Set<string> | null = null;
 	for (const pool of ["A", "B"] as const) {
 		const key = poolKey(pool);
-		const raw = (await env.FEED_TAGS.get(key, "json")) as unknown[] | null;
+		// Re-puts keep the scrape's write stamp (metadata) — otherwise a moderation pass would erase it and
+		// the 15:00 retry check would re-scrape a pool that landed fine.
+		const got = await env.FEED_TAGS.getWithMetadata<SnapshotStamp>(key, "json");
+		const raw = got.value as unknown[] | null;
+		const meta = got.metadata ?? undefined;
 		if (!raw || raw.length === 0) continue;
 		// Trim to the serve-relevant freshest few per handle (sort newest-first, then cap).
 		const trimmed = capPerHandle([...raw].sort(byTimestampDesc), MODERATE_KEEP_PER_HANDLE);
 		let changed = trimmed.length !== raw.length;
 		const anyUnjudged = trimmed.some((c) => { const x = c as { thumbnailURL?: string; mod?: string }; return !!x.thumbnailURL && x.mod !== "ok"; });
 		if (!anyUnjudged) { // pool fully judged — persist a trim if we made one, then try the other pool
-			if (changed) await env.FEED_TAGS.put(key, JSON.stringify(trimmed), { expirationTtl: POOL_SNAPSHOT_TTL });
+			if (changed) await env.FEED_TAGS.put(key, JSON.stringify(trimmed), { expirationTtl: POOL_SNAPSHOT_TTL, metadata: meta });
 			continue;
 		}
 		if (!approved) approved = await loadModApproved(env);
@@ -6358,7 +6356,7 @@ async function moderateSnapshotTick(env: Env, ctx: ExecutionContext): Promise<vo
 			diag: (kind, detail) => emitDiag(env, ctx, kind, detail),
 			onDrop: (rec) => recordModerationDrop(env, ctx, { ...rec, pool }),
 		});
-		if (res.changed || changed) await env.FEED_TAGS.put(key, JSON.stringify(res.cards), { expirationTtl: POOL_SNAPSHOT_TTL });
+		if (res.changed || changed) await env.FEED_TAGS.put(key, JSON.stringify(res.cards), { expirationTtl: POOL_SNAPSHOT_TTL, metadata: meta });
 		return; // one pool per tick — the next tick (≤5 min) picks up the other / the remainder
 	}
 }
@@ -6384,12 +6382,21 @@ function recordModerationDrop(env: Env, ctx: ExecutionContext, rec: { postId: st
 	})());
 }
 
-/** Cron/manual-refresh entry: rebuild the social snapshot → the SPLIT KV keys.
- *  PLAYER side: scraped via Apify inline (sync run) and written here. CLUB side: when
- *  Bright Data is configured, an ASYNC scrape is triggered and /brightdata-webhook writes
- *  the club key minutes later; until then clubs ride the same Apify run (pre-split
- *  fallback — the split deploys without a flag day). Returns a summary for /refresh-social. */
-async function refreshSocialCache(env: Env, ctx?: ExecutionContext, opts?: { playersOnly?: boolean; pool?: "A" | "B" }): Promise<{ playerCards: number; pool: string; clubs: string }> {
+/** Cron/manual-refresh entry (ASYNC since 2026-10-20 — src/ig-scrape.ts header has the incident).
+ *  (1) Bright Data's club scrape is triggered FIRST, so Home's club posts never depend on the player side;
+ *  (2) the Apify player run for one pool is STARTED with a completion webhook, and this returns. The
+ *  results land at /brightdata-webhook and /apify-webhook in their own invocations. The pool marker moves
+ *  only when /apify-webhook SAVES the pool, so a dead run is retried (15:00 check) instead of skipped. */
+async function startSocialScrape(env: Env, ctx?: ExecutionContext, opts?: { playersOnly?: boolean; pool?: Pool }): Promise<{ pool: string; players: string; clubs: string }> {
+	const bdConfigured = !!(env.BRIGHTDATA_TOKEN && env.BD_WEBHOOK_SECRET);
+	let clubs: string;
+	if (opts?.playersOnly) clubs = "skipped (players-only)"; // a manual player refresh must NEVER touch Club News
+	else if (bdConfigured) clubs = await triggerBrightDataClubs(env, ctx);
+	else {
+		clubs = "apify-fallback (rides the player run)";
+		if (ctx) emitDiag(env, ctx, "bdUnconfigured", "clubs via apify fallback");
+	}
+
 	const playerList = await loadPlayerSocial(env);
 	// Pool hygiene: any entry without a pool (pre-rotation data, or a write that skipped
 	// assignment) gets the lighter pool NOW and the list is persisted — never scrape-skipped.
@@ -6402,50 +6409,206 @@ async function refreshSocialCache(env: Env, ctx?: ExecutionContext, opts?: { pla
 	}
 	if (assigned) await env.FEED_TAGS.put(PLAYER_LIST_KEY, JSON.stringify(playerList));
 
-	// Alternate pools: scrape the one NOT scraped last run — or a caller-forced pool, for a
-	// deterministic manual refresh of a specific pool.
-	const last = await env.FEED_TAGS.get(POOL_MARKER_KEY);
-	const thisPool: "A" | "B" = opts?.pool ?? (last === "A" ? "B" : "A");
-	await env.FEED_TAGS.put(POOL_MARKER_KEY, thisPool);
+	// The pool NOT saved last (the marker names the last SAVED pool) — or a caller-forced pool.
+	const thisPool: Pool = opts?.pool ?? nextPool(await env.FEED_TAGS.get(POOL_MARKER_KEY));
 	const poolPlayers = playerList.filter((p) => p.pool === thisPool);
-
-	const igHandles = [...CLUB_HANDLES, ...playerIgHandles(poolPlayers)];
-	const bdConfigured = !!(env.BRIGHTDATA_TOKEN && env.BD_WEBHOOK_SECRET);
-
 	if (poolPlayers.length > MAX_POOL_HANDLES && ctx) {
 		emitDiag(env, ctx, "playerCapExceeded", `pool ${thisPool}: ${poolPlayers.length}/${MAX_POOL_HANDLES}`);
 	}
+	const handles = bdConfigured || opts?.playersOnly
+		? playerIgHandles(poolPlayers)
+		: [...CLUB_HANDLES, ...playerIgHandles(poolPlayers)];
+	const players = await startApifyRun(env, ctx, handles, thisPool);
+	return { pool: thisPool, players, clubs };
+}
 
-	const apifyHandles = (bdConfigured || opts?.playersOnly) ? igHandles.filter((h) => h.kind === "player") : igHandles;
-	const { instagram } = await buildSocialCards(env, apifyHandles, ctx);
-	const players = instagram.filter((c) => (c as { placement?: string }).placement === "feed");
-	// Image-safety backstop: classification is DECOUPLED to the 5-min tick (moderateSnapshotTick) — the
-	// FREE Workers tier (50 subrequests / 10ms CPU per run) can't fetch+classify a ~300-image scrape in
-	// one invocation, and re-scraping to catch up would waste Apify. Here we only CARRY FORWARD verdicts
-	// from the prior snapshot (+ the approve allowlist) so a re-scrape never re-checks a post already
-	// judged; genuinely-new posts stay unjudged (`no mod`) for the cron to chew through a few at a time.
-	const [priorPool, approvedSet] = await Promise.all([
-		env.FEED_TAGS.get(poolKey(thisPool), "json") as Promise<unknown[] | null>,
-		loadModApproved(env),
-	]);
+/** Start the Apify IG run (returns in ~1s) with an ad-hoc webhook for its terminal states. */
+async function startApifyRun(env: Env, ctx: ExecutionContext | undefined, handles: SocialHandle[], pool: Pool): Promise<string> {
+	const token = env.APIFY_TOKEN;
+	const secret = env.APIFY_WEBHOOK_SECRET;
+	if (!token || !secret) {
+		if (ctx) emitDiag(env, ctx, "apifyRunFail", `not configured (token ${token ? "ok" : "missing"}, webhook secret ${secret ? "ok" : "missing"})`);
+		return "apify-unconfigured";
+	}
+	const ig = handles.filter((h) => h.platform === "instagram");
+	const hooks = apifyWebhooksParam(PROXY_PUBLIC_ORIGIN, pool, secret);
+	try {
+		const r = await fetchBounded(`${APIFY_API}/${APIFY_IG_ACTOR}/runs?token=${token}&webhooks=${encodeURIComponent(hooks)}`, {
+			method: "POST",
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify({ usernames: ig.map((h) => h.handle), postsPerProfile: SOCIAL_POSTS_PER_PROFILE }),
+		});
+		if (!r.ok) {
+			const body = await r.text().catch(() => "");
+			if (ctx) emitDiag(env, ctx, "apifyRunFail", `start ${r.status} ${body.slice(0, 50)}`);
+			return `apify-start-failed:${r.status}`;
+		}
+		const json = (await r.json().catch(() => null)) as { data?: { id?: string } } | null;
+		return `apify-started:${json?.data?.id ?? "?"}:pool-${pool}:${ig.length}-handles`;
+	} catch (e) {
+		if (ctx) emitDiag(env, ctx, "apifyRunFail", `start threw ${String((e as Error)?.message ?? e).slice(0, 50)}`);
+		return "apify-start-failed:throw";
+	}
+}
+
+/** POST /apify-webhook?pool=A|B — Apify's completion notice for a player run. Auth: our secret, echoed by
+ *  Apify in the Authorization header (headersTemplate). On SUCCEEDED: read the dataset (only the fields the
+ *  mapper needs), map → trim → carry moderation verdicts → copy new images to R2 → save the pool → move the
+ *  marker. Any other terminal state → `apifyRunFail` diag (the 15:00 check re-runs it). A non-2xx makes
+ *  Apify retry the delivery, so a transient dataset-read failure gets another go; reprocessing is safe. */
+export async function handleApifyWebhook(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
+	const secret = env.APIFY_WEBHOOK_SECRET;
+	if (request.method !== "POST" || !secret || request.headers.get("Authorization") !== secret) {
+		emitDiag(env, ctx, "apifyWebhookAuth", `rejected ${request.method}`);
+		return new Response("forbidden", { status: 403 });
+	}
+	const poolParam = new URL(request.url).searchParams.get("pool");
+	if (poolParam !== "A" && poolParam !== "B") return new Response("bad pool", { status: 400 });
+	const pool: Pool = poolParam;
+	const hook = parseApifyWebhook(await request.json().catch(() => null));
+	if (!hook) {
+		emitDiag(env, ctx, "apifyWebhookBadBody", "unrecognized payload");
+		return new Response("bad body", { status: 400 });
+	}
+	if (hook.eventType !== "ACTOR.RUN.SUCCEEDED" || !hook.datasetId) {
+		emitDiag(env, ctx, "apifyRunFail", `${hook.eventType} ${hook.status} run ${hook.runId} pool ${pool}`);
+		return jsonResponse({ ignored: hook.eventType }, 200);
+	}
+	const token = env.APIFY_TOKEN;
+	if (!token) {
+		emitDiag(env, ctx, "apifyRunFail", "webhook: APIFY_TOKEN unset");
+		return new Response("unconfigured", { status: 500 });
+	}
+	let items: unknown[];
+	try {
+		const r = await fetchBounded(`${APIFY_DATASETS_API}/${hook.datasetId}/items?token=${token}&clean=1&format=json&fields=${APIFY_ITEM_FIELDS.join(",")}`);
+		if (!r.ok) throw new Error(`dataset ${r.status}`);
+		const json = (await r.json()) as unknown;
+		items = Array.isArray(json) ? json : [];
+	} catch (e) {
+		emitDiag(env, ctx, "apifyRunFail", `dataset read: ${String((e as Error)?.message ?? e).slice(0, 50)}`);
+		return new Response("dataset read failed", { status: 502 }); // Apify retries the delivery
+	}
+
+	const bdConfigured = !!(env.BRIGHTDATA_TOKEN && env.BD_WEBHOOK_SECRET);
+	const playerList = await loadPlayerSocial(env);
+	const poolHandles = playerIgHandles(playerList.filter((p) => p.pool === pool));
+	const { cards, missing } = mapApifyItems(items, bdConfigured ? poolHandles : [...CLUB_HANDLES, ...poolHandles]);
+	if (missing.length > 0 && cards.length > 0) {
+		emitDiag(env, ctx, "apifyHandleEmpty", `${missing.length}: ${missing.map((h) => h.handle).slice(0, 5).join(",")}`);
+	}
+	const players = cards.filter((c) => (c as { placement?: string }).placement === "feed");
 	// Trim to the freshest few per player before storing (the Feed serves ≤3/handle; storing/moderating
 	// the actor's ~12/handle is pure waste — this keeps the snapshot + the moderation universe small).
-	const trimmedPlayers = capPerHandle([...players].sort(byTimestampDesc), MODERATE_KEEP_PER_HANDLE);
-	carryForwardVerdicts(trimmedPlayers, priorPool ?? [], approvedSet);
-	const playerCards = await writeSideOrKeepLastGood(env, ctx, poolKey(thisPool), trimmedPlayers, "player", POOL_SNAPSHOT_TTL);
-
-	let clubs: string;
-	if (opts?.playersOnly) {
-		clubs = "skipped (players-only)"; // a manual player refresh must NEVER touch Club News (Bright Data)
-	} else if (bdConfigured) {
-		clubs = await triggerBrightDataClubs(env, ctx);
-	} else {
-		const fresh = instagram.filter((c) => (c as { placement?: string }).placement === "home");
-		const kept = await writeSideOrKeepLastGood(env, ctx, SOCIAL_CLUB_KEY, fresh, "club");
-		clubs = `apify-fallback:${kept}`;
-		if (ctx) emitDiag(env, ctx, "bdUnconfigured", "clubs via apify fallback");
+	const trimmed = capPerHandle([...players].sort(byTimestampDesc), MODERATE_KEEP_PER_HANDLE);
+	const [prior, approvedSet] = await Promise.all([
+		env.FEED_TAGS.get(poolKey(pool), "json") as Promise<unknown[] | null>,
+		loadModApproved(env),
+	]);
+	// Image-safety verdicts carry forward by post URL; classification stays on the 5-min tick.
+	carryForwardVerdicts(trimmed, prior ?? [], approvedSet);
+	const images = await copyNewImages(env, ctx, trimmed, prior ?? []);
+	const saved = await writeSideOrKeepLastGood(env, ctx, poolKey(pool), trimmed, "player", POOL_SNAPSHOT_TTL);
+	// The marker names the last SAVED pool — moved only on fresh cards, so an empty/dead run is retried.
+	if (trimmed.length > 0) await env.FEED_TAGS.put(POOL_MARKER_KEY, pool);
+	if (!bdConfigured) {
+		const clubCards = cards.filter((c) => (c as { placement?: string }).placement === "home");
+		await writeSideOrKeepLastGood(env, ctx, SOCIAL_CLUB_KEY, clubCards, "club");
 	}
-	return { playerCards, pool: thisPool, clubs };
+	return jsonResponse({ pool, received: items.length, cards: trimmed.length, saved, images }, 200);
+}
+
+/** Copy every not-yet-copied player image into R2 while its Instagram link is fresh, then point those cards
+ *  at img.crestside.app (no expiring signature). Fans the work out in batches through SELF so each batch
+ *  gets its own subrequest budget. Skips quietly only when the bucket isn't bound yet (pre-setup); every
+ *  other gap is a diag, and a failed copy just keeps the (fresh) Instagram link this run. */
+async function copyNewImages(env: Env, ctx: ExecutionContext, fresh: unknown[], prior: unknown[]): Promise<string> {
+	const e = env as unknown as { SELF?: Fetcher; BRACKET_ADMIN_KEY?: string };
+	const jobs = planImageCopies(fresh, prior);
+	if (!env.IMAGES) return `bucket-unbound (${jobs.length} not copied)`;
+	if (jobs.length === 0) return "0 new";
+	if (!e.SELF || !e.BRACKET_ADMIN_KEY) {
+		emitDiag(env, ctx, "igImageCopyFail", `not configured (SELF ${e.SELF ? "ok" : "missing"}, key ${e.BRACKET_ADMIN_KEY ? "ok" : "missing"})`);
+		return "unconfigured";
+	}
+	const batches = chunk(jobs, IMAGE_COPY_BATCH);
+	const run = batches.slice(0, IMAGE_COPY_MAX_BATCHES);
+	const copied = new Set<string>();
+	await Promise.all(run.map(async (batch) => {
+		try {
+			const r = await e.SELF!.fetch(new Request(`${PROXY_PUBLIC_ORIGIN}/internal/ig-images`, {
+				method: "POST",
+				headers: { "x-admin-key": e.BRACKET_ADMIN_KEY!, "Content-Type": "application/json" },
+				body: JSON.stringify(batch.map(({ key, src }) => ({ key, src }))),
+			}));
+			if (!r.ok) return;
+			const out = (await r.json().catch(() => null)) as { copied?: string[] } | null;
+			for (const k of out?.copied ?? []) copied.add(k);
+		} catch {
+			/* counted as not copied below */
+		}
+	}));
+	applyImageCopies(fresh, copied);
+	const skipped = jobs.length - run.reduce((n, b) => n + b.length, 0);
+	if (copied.size < jobs.length) {
+		emitDiag(env, ctx, "igImageCopyFail", `${copied.size}/${jobs.length} copied${skipped ? `, ${skipped} over the batch cap` : ""}`);
+	}
+	return `${copied.size}/${jobs.length} copied`;
+}
+
+const IG_IMAGE_HOST_RE = /^https:\/\/[a-z0-9.-]+\.(cdninstagram\.com|fbcdn\.net)\//i;
+const IG_IMAGE_KEY_RE = /^ig\/[A-Za-z0-9_-]{1,64}$/;
+
+/** POST /internal/ig-images — one copy batch (≤ IMAGE_COPY_BATCH). Fetches each Instagram image and stores
+ *  it in R2 with a year-long immutable cache header (one object per post; nothing ever refreshes it).
+ *  Only Instagram CDN sources and `ig/<id>` keys are accepted, so this can never host arbitrary content. */
+export async function handleIgImageCopy(request: Request, env: Env): Promise<Response> {
+	const adminKey = (env as unknown as { BRACKET_ADMIN_KEY?: string }).BRACKET_ADMIN_KEY;
+	if (request.method !== "POST" || !adminAuthed(request, adminKey)) return new Response("forbidden", { status: 403 });
+	if (!env.IMAGES) return new Response("bucket unbound", { status: 503 });
+	const body = (await request.json().catch(() => null)) as { key?: unknown; src?: unknown }[] | null;
+	if (!Array.isArray(body) || body.length > IMAGE_COPY_BATCH) return new Response("bad batch", { status: 400 });
+	const copied: string[] = [];
+	let failed = 0;
+	await Promise.all(body.map(async (job) => {
+		const key = typeof job?.key === "string" ? job.key : "";
+		const src = typeof job?.src === "string" ? job.src : "";
+		if (!IG_IMAGE_KEY_RE.test(key) || !IG_IMAGE_HOST_RE.test(src)) { failed++; return; }
+		try {
+			const r = await fetchBounded(src, { headers: { Accept: "image/*" } });
+			if (!r.ok) { failed++; return; }
+			const buf = await r.arrayBuffer();
+			const type = r.headers.get("content-type");
+			if (!acceptableImage(type, buf.byteLength)) { failed++; return; }
+			await env.IMAGES!.put(key, buf, { httpMetadata: { contentType: type ?? "image/jpeg", cacheControl: "public, max-age=31536000, immutable" } });
+			copied.push(key);
+		} catch {
+			failed++;
+		}
+	}));
+	return jsonResponse({ copied, failed }, 200);
+}
+
+/** The one-shot 15:00 UTC retry (scrape days only — isRetrySlot). Reads the three snapshots' fresh-write
+ *  stamps in ONE KV list op (no values), and re-starts whichever side didn't land since 12:00. Writes
+ *  nothing itself; the re-run's webhooks write the same keys the missed run would have. */
+async function maybeRetrySocialScrape(env: Env, ctx: ExecutionContext, scheduledTime: number): Promise<void> {
+	if (!isRetrySlot(scheduledTime)) return;
+	const listed = await env.FEED_TAGS.list({ prefix: "social-cards-" });
+	const at = (name: string) => stampAt(listed.keys.find((k) => k.name === name)?.metadata);
+	const plan = retryPlan({
+		now: scheduledTime,
+		marker: await env.FEED_TAGS.get(POOL_MARKER_KEY),
+		poolAAt: at(poolKey("A")),
+		poolBAt: at(poolKey("B")),
+		clubAt: at(SOCIAL_CLUB_KEY),
+		bdConfigured: !!(env.BRIGHTDATA_TOKEN && env.BD_WEBHOOK_SECRET),
+	});
+	if (!plan.players && !plan.clubs) return;
+	const results: string[] = [];
+	if (plan.clubs) results.push(`clubs ${await triggerBrightDataClubs(env, ctx)}`);
+	if (plan.players) results.push(`players ${(await startSocialScrape(env, ctx, { playersOnly: true, pool: plan.players })).players}`);
+	emitDiag(env, ctx, "socialScrapeRetry", results.join(" · "));
 }
 
 // ── Social self-tuning · Stage 1b: national-team eligibility ledger ───────────────
@@ -7136,17 +7299,21 @@ async function writeSideOrKeepLastGood(
 	ttl: number = SOCIAL_CACHE_TTL,
 ): Promise<number> {
 	let cards = fresh;
+	// Fresh cards are stamped with the write time (read back by the 15:00 retry check via KV list); a
+	// keep-last-good re-put carries the OLD stamp, so an empty scrape still reads as "not refreshed today".
+	let stamp: SnapshotStamp = { at: Date.now() };
 	if (cards.length === 0) {
 		const placement = side === "club" ? "home" : "feed";
 		const [own, legacy] = await Promise.all([
-			env.FEED_TAGS.get(key, "json") as Promise<unknown[] | null>,
+			env.FEED_TAGS.getWithMetadata<SnapshotStamp>(key, "json") as Promise<{ value: unknown[] | null; metadata: SnapshotStamp | null }>,
 			env.FEED_TAGS.get(SOCIAL_CACHE_KEY, "json") as Promise<Array<{ placement?: string }> | null>,
 		]);
-		cards = own ?? (legacy ?? []).filter((c) => c.placement === placement);
+		cards = own.value ?? (legacy ?? []).filter((c) => c.placement === placement);
+		stamp = { at: stampAt(own.metadata) };
 		if (ctx) emitDiag(env, ctx, "socialScrapeEmpty", `${side}: kept last-good ${cards.length}`);
 	}
 	if (cards.length === 0) return 0; // nothing now, nothing before — keep KV as-is
-	await env.FEED_TAGS.put(key, JSON.stringify(cards), { expirationTtl: ttl });
+	await env.FEED_TAGS.put(key, JSON.stringify(cards), { expirationTtl: ttl, metadata: stamp });
 	return cards.length;
 }
 

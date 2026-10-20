@@ -76,6 +76,10 @@ function stubEnv(secret: string | undefined, seed: Record<string, string> = {}) 
 				const v = store.get(key);
 				return v ? JSON.parse(v) : null;
 			},
+			getWithMetadata: async (key: string, _type?: string) => {
+				const v = store.get(key);
+				return { value: v ? JSON.parse(v) : null, metadata: null };
+			},
 			put: async (key: string, value: string) => {
 				store.set(key, value);
 			},
