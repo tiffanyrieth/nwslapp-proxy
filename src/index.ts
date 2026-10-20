@@ -64,6 +64,16 @@ import {
 	type AsaPlayer,
 	type AsaPlayerXg,
 	type AsaTeam,
+	type AsaDepth,
+	type AsaFlowPoint,
+	type AsaGkXg,
+	type AsaGplusRow,
+	type AsaShot,
+	type AsaXpass,
+	type DefAction,
+	asaGameFor,
+	joinCoreShots,
+	matchTeams,
 	type AnalyticsIndex,
 	planAnalyticsBuilds,
 	type MatchAnalytics,
@@ -8524,6 +8534,8 @@ const analyticsIndexKey = (year: number) => `analytics:index:${year}`;
 /** Builds per 30-min check — paces the one-time 2026 backfill to ≤8/hour (polite to ESPN's site API + ASA). */
 const ANALYTICS_BUILDS_PER_CHECK = 4;
 const HEAT_RETRY_MS = 24 * 3600_000;
+/** Bump with the saved copy's format (MatchAnalytics.v) so edge caches of the old format are never served. */
+const ANALYTICS_FORMAT = 2;
 const ASA_API = "https://app.americansocceranalysis.com/api/v1/nwsl";
 
 /** Which settled matches need a build: never built · ASA's real xG due (one retry) · heat due (Core reachable). */
@@ -8546,7 +8558,7 @@ async function scheduleMatchAnalytics(env: Env, ctx: ExecutionContext, finals: S
 /** ASA data for the match day, cached in the ContentStore so every match that day (and the next-day retry)
  *  shares one fetch: the day's games + team xG + per-player rows (6h), the team list (30d), the player list (7d).
  *  Any failure → null (the build uses our estimate, labelled) + a diag. */
-async function loadAsaForKickoff(env: Env, ctx: ExecutionContext, kickoffIso: string): Promise<{ teams: AsaTeam[]; games: AsaGame[]; gameXg: AsaGameXg[]; playerXg: AsaPlayerXg[]; players: AsaPlayer[] } | null> {
+async function loadAsaForKickoff(env: Env, ctx: ExecutionContext, kickoffIso: string): Promise<{ teams: AsaTeam[]; games: AsaGame[]; gameXg: AsaGameXg[]; playerXg: AsaPlayerXg[]; players: AsaPlayer[]; depth: AsaDepth } | null> {
 	const day = kickoffIso.slice(0, 10);
 	const d0 = new Date(Date.parse(`${day}T00:00:00Z`) - 86_400_000).toISOString().slice(0, 10);
 	const d1 = new Date(Date.parse(`${day}T00:00:00Z`) + 86_400_000).toISOString().slice(0, 10);
@@ -8568,11 +8580,47 @@ async function loadAsaForKickoff(env: Env, ctx: ExecutionContext, kickoffIso: st
 			get<AsaGameXg[]>(`asa:gamexg:${day}`, `${ASA_API}/games/xgoals?${range}`, 6 * 3600),
 			get<AsaPlayerXg[]>(`asa:playerxg:${day}`, `${ASA_API}/players/xgoals?split_by_games=true&${range}`, 6 * 3600),
 		]);
-		return { teams, players, games, gameXg, playerXg };
+		// Phase 2 (keepers · g+ · xPass): one call each per match DAY. Each is optional — a failure here
+		// never costs the xG above (the section just waits for the next build).
+		const opt = <T>(p: Promise<T>, what: string): Promise<T | undefined> =>
+			p.catch((e) => { emitDiag(env, ctx, "asaFetchFail", `${what}: ${String((e as Error)?.message ?? e).slice(0, 60)}`); return undefined; });
+		const split = `split_by_games=true&${range}`;
+		const [gkXg, playerGplus, gkGplus, xpass] = await Promise.all([
+			opt(get<AsaGkXg[]>(`asa:gkxg:${day}`, `${ASA_API}/goalkeepers/xgoals?${split}`, 6 * 3600), "gk xg"),
+			opt(get<AsaGplusRow[]>(`asa:gplus:${day}`, `${ASA_API}/players/goals-added?${split}`, 6 * 3600), "g+"),
+			opt(get<AsaGplusRow[]>(`asa:gkgplus:${day}`, `${ASA_API}/goalkeepers/goals-added?${split}`, 6 * 3600), "gk g+"),
+			opt(get<AsaXpass[]>(`asa:xpass:${day}`, `${ASA_API}/players/xpass?${split}`, 6 * 3600), "xpass"),
+		]);
+		return { teams, players, games, gameXg, playerXg, depth: { gkXg, playerGplus, gkGplus, xpass } };
 	} catch (err) {
 		emitDiag(env, ctx, "asaFetchFail", String((err as Error)?.message ?? err).slice(0, 80));
 		return null;
 	}
+}
+
+/** ASA's per-match rows (every shot with ASA xG / post-shot xG / situation, and the game-flow series) for ONE
+ *  game. A match's rows never change once posted → kept 30 days; an EMPTY answer (not posted yet) only 6h. */
+async function loadAsaGameDepth(env: Env, ctx: ExecutionContext, gameId: string): Promise<Pick<AsaDepth, "shots" | "flow">> {
+	const one = async <T>(key: string, url: string): Promise<T[] | undefined> => {
+		const cached = await contentGetJSON<T[]>(env, ctx, key);
+		if (cached) return cached;
+		try {
+			const r = await fetchBounded(url, { headers: { "User-Agent": PROXY_UA, Accept: "application/json" } });
+			if (!r.ok) throw new Error(`HTTP ${r.status}`);
+			const body = (await r.json()) as T[];
+			await contentPut(env, ctx, [{ key, value: JSON.stringify(body), ttlSec: body.length ? 30 * 86_400 : 6 * 3600 }]);
+			return body;
+		} catch (e) {
+			emitDiag(env, ctx, "asaFetchFail", `${key}: ${String((e as Error)?.message ?? e).slice(0, 60)}`);
+			return undefined;
+		}
+	};
+	const id = encodeURIComponent(gameId);
+	const [shots, flow] = await Promise.all([
+		one<AsaShot>(`asa:shots:${gameId}`, `${ASA_API}/games/shots?game_id=${id}`),
+		one<AsaFlowPoint>(`asa:flow:${gameId}`, `${ASA_API}/games/game-flow?game_id=${id}`),
+	]);
+	return { shots, flow };
 }
 
 /** `POST /internal/match-analytics/build?event=<id>` (SELF, admin key) — build/refresh ONE match's saved copy,
@@ -8605,16 +8653,29 @@ async function handleMatchAnalyticsBuild(request: Request, url: URL, env: Env, c
 	const prev = parse<MatchAnalytics>(got.get(analyticsMatchKey(eventId)));
 	const prevIx = index[eventId];
 
-	// ASA: needed on a first build or a due retry; a match that already has ASA xG reuses its copy's numbers.
-	const asa = prev?.xg.source === "asa" ? null : await loadAsaForKickoff(env, ctx, kickoff);
+	// ASA: needed on a first build, a due retry, or the one-time v1 → v2 upgrade (keepers / g+ / per-shot xG); a
+	// v2 copy that already has ASA's numbers reuses them (a heat-only rebuild).
+	const prevComplete = prev?.xg.source === "asa" && (prev.v ?? 1) >= 2;
+	const asa = prevComplete ? null : await loadAsaForKickoff(env, ctx, kickoff);
+	let asaDepth: AsaDepth | null = null;
+	if (asa) {
+		const mt = matchTeams(summary);
+		const g = mt ? asaGameFor(mt, asa.games, asa.teams) : null;
+		if (g) asaDepth = { ...asa.depth, ...(await loadAsaGameDepth(env, ctx, g.game_id)) };
+	}
 
 	// Heat: reuse a saved one; otherwise ask Core once (never while paused / breaker open / Core refusing us).
 	let heat: Record<string, number[]> | null = prev?.heatStatus === "ok" ? prev.heat : null;
 	let heatStatus: MatchAnalytics["heatStatus"] = heat ? "ok" : "unavailable";
-	if (!heat && env.ESPN_FETCHER && !(await isEspnManuallyPaused(env)) && !(await isEspnBreakerOpen(env)) && now >= (await readNumber(env, STATS_ESPN_BLOCK_KEY))) {
+	// Phase 2 Core extras ride the SAME pages as heat: defensive actions + ESPN's own per-shot xG / xGOT / height.
+	let core: { shots?: { x: number; y: number; xg?: number; xgot?: number; goalZ?: number }[]; defense?: Record<string, DefAction[]> } | null =
+		prev?.heatStatus === "ok" && prev.defense ? { defense: prev.defense } : null;
+	// Ask Core when there's no heat yet, or when a v1 copy has heat but predates the Core extras (once; a refusal
+	// keeps the saved heat — nothing is lost).
+	if ((!heat || !core) && env.ESPN_FETCHER && !(await isEspnManuallyPaused(env)) && !(await isEspnBreakerOpen(env)) && now >= (await readNumber(env, STATS_ESPN_BLOCK_KEY))) {
 		try {
-			const h = (await espnFetcherStub(env).matchHeat(eventId)) as { status: string; grids?: Record<string, number[]>; detail?: string };
-			if (h.status === "ok" && h.grids) { heat = h.grids; heatStatus = "ok"; }
+			const h = (await espnFetcherStub(env).matchHeat(eventId)) as { status: string; grids?: Record<string, number[]>; defense?: Record<string, DefAction[]>; shots?: { x: number; y: number; xg?: number; xgot?: number; goalZ?: number }[]; detail?: string };
+			if (h.status === "ok" && h.grids) { heat = h.grids; heatStatus = "ok"; core = { defense: h.defense, shots: h.shots }; }
 			else if (h.status === "blocked") await writeStats(env, [], [{ key: STATS_ESPN_BLOCK_KEY, value: String(now + STATS_ESPN_BLOCK_MS) }]);
 			if (h.status !== "ok") emitDiag(env, ctx, "matchHeatUnavailable", `${eventId}: ${h.status} ${h.detail ?? ""}`.trim());
 		} catch (err) {
@@ -8622,10 +8683,14 @@ async function handleMatchAnalyticsBuild(request: Request, url: URL, env: Env, c
 		}
 	}
 
-	let built = buildMatchAnalytics({ summary, asa, heat, heatStatus, now });
+	let built = buildMatchAnalytics({ summary, asa, asaDepth, heat, heatStatus, core, now });
 	if (!built) return new Response("could not build", { status: 422 });
 	// Keep ASA's real numbers once we have them (a heat-only rebuild skips the ASA fetch).
-	if (prev?.xg.source === "asa") built = { ...built, xg: prev.xg, players: prev.players, asaRetryAfter: null };
+	if (prevComplete && prev) {
+		built = { ...built, xg: prev.xg, players: prev.players, asaRetryAfter: null,
+			shots: core?.shots?.length ? joinCoreShots(prev.shots, core.shots) : prev.shots,
+			keepers: prev.keepers, gplus: prev.gplus, xpass: prev.xpass, flow: prev.flow, flowSource: prev.flowSource };
+	}
 	const asaRetried = !!prevIx && prevIx.source === "estimate" && built.xg.source === "estimate" && prevIx.asaRetryAfter !== null && now >= prevIx.asaRetryAfter;
 	const home = foldMatchIntoSeason(parse<TeamSeasonAnalytics>(got.get(analyticsTeamKey(homeId, year))) ?? emptySeason(homeId, year), built, now);
 	const away = foldMatchIntoSeason(parse<TeamSeasonAnalytics>(got.get(analyticsTeamKey(awayId, year))) ?? emptySeason(awayId, year), built, now);
@@ -8636,6 +8701,8 @@ async function handleMatchAnalyticsBuild(request: Request, url: URL, env: Env, c
 		heat: built.heatStatus,
 		heatRetryAfter: built.heatStatus === "ok" ? undefined : now + HEAT_RETRY_MS,
 		builtAt: now,
+		v: 2,
+		depth: (built.gplus?.length ?? 0) > 0 || undefined,
 	};
 	const ok = await contentPut(env, ctx, [
 		{ key: analyticsMatchKey(eventId), value: JSON.stringify(built) },
@@ -8643,7 +8710,7 @@ async function handleMatchAnalyticsBuild(request: Request, url: URL, env: Env, c
 		{ key: analyticsTeamKey(awayId, year), value: JSON.stringify(away) },
 		{ key: analyticsIndexKey(year), value: JSON.stringify(index) },
 	]);
-	emitDiag(env, ctx, ok ? "matchAnalyticsBuilt" : "matchAnalyticsBuildFail", `${eventId}: ${built.shots.length} shots · xG ${built.xg.source} · heat ${built.heatStatus}${ok ? "" : " — STORE WRITE FAILED"}`);
+	emitDiag(env, ctx, ok ? "matchAnalyticsBuilt" : "matchAnalyticsBuildFail", `${eventId}: ${built.shots.length} shots · xG ${built.xg.source} · g+ ${built.gplus?.length ?? 0} · keepers ${built.keepers?.length ?? 0} · heat ${built.heatStatus}${ok ? "" : " — STORE WRITE FAILED"}`);
 	return jsonResponse({ event: eventId, shots: built.shots.length, xg: built.xg, heat: built.heatStatus, stored: ok }, ok ? 200 : 500);
 }
 
@@ -8652,7 +8719,8 @@ async function handleMatchAnalyticsGet(url: URL, env: Env, ctx: ExecutionContext
 	const eventId = (url.searchParams.get("event") ?? "").replace(/[^0-9]/g, "");
 	if (!eventId) return new Response("missing ?event", { status: 400 });
 	const cache = caches.default;
-	const cacheKey = new Request(url.toString(), { method: "GET" });
+	// Copy-format version in the cache key: a format upgrade (v1 → v2) must not hide behind a 7-day edge copy.
+	const cacheKey = new Request(`${url.toString()}&_fmt=${ANALYTICS_FORMAT}`, { method: "GET" });
 	const hit = await cache.match(cacheKey);
 	if (hit) return withCacheStatus(hit, "HIT");
 	const m = await contentGetJSON<MatchAnalytics>(env, ctx, analyticsMatchKey(eventId));
@@ -8682,7 +8750,8 @@ async function handleTeamAnalyticsGet(url: URL, env: Env, ctx: ExecutionContext)
 	if (!teamId) return new Response("missing ?team", { status: 400 });
 	const year = Number(url.searchParams.get("year")) || new Date().getUTCFullYear();
 	const cache = caches.default;
-	const cacheKey = new Request(url.toString(), { method: "GET" });
+	// Copy-format version in the cache key: a format upgrade (v1 → v2) must not hide behind a 7-day edge copy.
+	const cacheKey = new Request(`${url.toString()}&_fmt=${ANALYTICS_FORMAT}`, { method: "GET" });
 	const hit = await cache.match(cacheKey);
 	if (hit) return withCacheStatus(hit, "HIT");
 	const s = await contentGetJSON<TeamSeasonAnalytics>(env, ctx, analyticsTeamKey(teamId, year));
@@ -8691,6 +8760,8 @@ async function handleTeamAnalyticsGet(url: URL, env: Env, ctx: ExecutionContext)
 	const out = {
 		team: teamId, year, matches: s.matches, xgFor: s.xgFor, xgAgainst: s.xgAgainst, xgSources: s.xgSources,
 		players: s.players, heat: s.heat, heatMatches: s.heatMatches,
+		keepers: s.keepers ?? [], gplus: s.gplus ?? [], teamGplus: s.teamGplus ?? 0, gplusMatches: s.gplusMatches ?? 0,
+		xpass: s.xpass ?? [], defense: s.defense ?? {}, defenseMatches: s.defenseMatches ?? 0,
 		shotsFor: s.contributions.flatMap((c) => c.shotsFor.map((sh) => ({ ...sh, eventId: c.eventId }))),
 		shotsAgainst: s.contributions.flatMap((c) => c.shotsAgainst.map((sh) => ({ ...sh, eventId: c.eventId }))),
 		updatedAt: new Date(s.updatedAt).toISOString(),
@@ -8714,6 +8785,8 @@ async function statusCheckAnalytics(env: Env): Promise<StatusSection> {
 		checks.push({ label: "Matches built", status: "ok", detail: `${rows.length} matches · last build ${ageLabel(now - newest)}` });
 		const asa = rows.filter((r) => r.source === "asa").length;
 		checks.push({ label: "xG source", status: asa === rows.length ? "ok" : "info", detail: `American Soccer Analysis ${asa} · our estimate ${rows.length - asa}${rows.length - asa ? " (retried once ~22h later)" : ""}` });
+		const depth = rows.filter((r) => r.depth).length;
+		checks.push({ label: "Keepers · g+ · passing", status: depth === rows.length ? "ok" : "info", detail: `${depth}/${rows.length} matches have American Soccer Analysis depth${depth < rows.length ? " (the rest upgrade on their next build, ≤8/hour)" : ""}` });
 		const heatOk = rows.filter((r) => r.heat === "ok").length;
 		checks.push({ label: "Heat maps", status: heatOk ? "ok" : "info", detail: `${heatOk}/${rows.length} matches${heatOk < rows.length ? " — the rest wait for ESPN's event stream (Core) to accept us; retried daily" : ""}` });
 	}

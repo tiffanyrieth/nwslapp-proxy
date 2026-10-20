@@ -27,7 +27,7 @@ import { DurableObject } from "cloudflare:workers";
 import { ESPN_UA } from "./espn-ua.ts";
 import { chooseScoreboardTTL, chooseSummaryTTL } from "./index.ts";
 import { settledMatches, type SettledMatch } from "./team-stats-store.ts";
-import { heatGrids } from "./match-analytics.ts";
+import { coreShots, defenseFromCore, heatGrids, type DefAction } from "./match-analytics.ts";
 import { ESPN_HEADERS } from "./espn-ua.ts";
 
 /** The NWSL full-season scoreboard the app reads (`dates=YYYY`) — the source of "which matches just
@@ -146,7 +146,7 @@ export class EspnFetcher extends DurableObject<Env> {
 	 *  analytics phase 4). Parsed HERE — ~1,400 events / ~630 KB would blow a Worker's 10 ms CPU. ~4 requests,
 	 *  once per match ever (the result is saved permanently by the caller). A 403/429 → `blocked` (the caller
 	 *  sets the durable Core-blocked marker and stops asking). */
-	async matchHeat(eventId: string): Promise<{ status: "ok" | "blocked" | "error"; grids?: Record<string, number[]>; detail?: string }> {
+	async matchHeat(eventId: string): Promise<{ status: "ok" | "blocked" | "error"; grids?: Record<string, number[]>; defense?: Record<string, DefAction[]>; shots?: ReturnType<typeof coreShots>; detail?: string }> {
 		const base = `https://sports.core.api.espn.com/v2/sports/soccer/leagues/usa.nwsl/events/${eventId}/competitions/${eventId}/plays?limit=400`;
 		const items: unknown[] = [];
 		for (let page = 1; page <= 8; page++) {
@@ -157,7 +157,13 @@ export class EspnFetcher extends DurableObject<Env> {
 			items.push(...(j.items ?? []));
 			if (!j.pageCount || page >= j.pageCount) break;
 		}
-		return { status: "ok", grids: heatGrids(items as Parameters<typeof heatGrids>[0]) };
+		// Same pages, two more readings (2026-10-20 phase 2): defensive actions + ESPN's per-shot xG / xGOT / height.
+		return {
+			status: "ok",
+			grids: heatGrids(items as Parameters<typeof heatGrids>[0]),
+			defense: defenseFromCore(items as Parameters<typeof defenseFromCore>[0]),
+			shots: coreShots(items as Parameters<typeof coreShots>[0]),
+		};
 	}
 
 	/** Settled regular-season NWSL matches, read from the SHARED full-season scoreboard copy this object

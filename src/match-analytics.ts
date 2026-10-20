@@ -34,6 +34,19 @@ export interface Shot {
 	bodyPart: BodyPart;
 	/** Our location-based estimate — always present, used when ASA has no number for the match. */
 	xgEst: number;
+	// ── Phase 2 (2026-10-20): joined in by location when a source has the shot ──
+	/** ASA's per-shot xG (`games/shots`). Present → the shot's own number is no longer an estimate. */
+	xgAsa?: number;
+	/** ASA post-shot xG: how hard an ON-TARGET shot was to save (null when off target / blocked). */
+	psxg?: number | null;
+	/** How the chance came about (ASA `pattern_of_play`). */
+	situation?: Situation;
+	assistType?: "cross" | "throughBall" | null;
+	/** ESPN's own per-shot xG / xGOT + shot height (Core event stream; dormant while Core refuses Cloudflare). */
+	xgEspn?: number;
+	xgotEspn?: number;
+	/** Height where it crossed the goal line, 0–100 of the crossbar height (Core `goalPositionZ`). */
+	goalZ?: number;
 }
 
 /** ESPN play type → outcome. Goals come in several types ("Goal", "Goal - Header", "Goal - Volley", …);
@@ -213,7 +226,7 @@ export interface PlayerMatchLine {
 }
 
 export interface MatchAnalytics {
-	v: 1;
+	v: 1 | 2;
 	eventId: string;
 	kickoff: string;
 	home: { id: string; abbr: string };
@@ -229,6 +242,18 @@ export interface MatchAnalytics {
 	builtAt: number;
 	/** ASA hadn't posted the match yet → one retry after this (ms). */
 	asaRetryAfter: number | null;
+	// ── v2 (2026-10-20): every position ──
+	/** Keepers: shots faced, saves, goals prevented (+ keeper g+). Empty until ASA has the match. */
+	keepers?: KeeperLine[];
+	/** Goals added (g+) for every outfield player, by action. Empty until ASA has the match. */
+	gplus?: GplusLine[];
+	/** Passing vs expected. Empty until ASA has the match. */
+	xpass?: XpassLine[];
+	/** Per-minute attacking threat, home vs away. ASA's game flow, else our shots. */
+	flow?: FlowPoint[];
+	flowSource?: "asa" | "estimate";
+	/** Defensive actions by location per player (ESPN Core; null while Core refuses Cloudflare). */
+	defense?: Record<string, DefAction[]> | null;
 }
 
 const round2 = (n: number) => Math.round(n * 100) / 100;
@@ -241,12 +266,18 @@ export function buildMatchAnalytics(args: {
 	espnRosterNames?: Map<string, { teamId: string; name: string }>;
 	heat?: Record<string, number[]> | null;
 	heatStatus?: MatchAnalytics["heatStatus"];
+	/** Phase 2: ASA's per-shot rows, keepers, g+, xPass and game flow for THIS match (any piece may be missing). */
+	asaDepth?: AsaDepth | null;
+	/** Phase 2: ESPN Core extras from the heat step's pages (null while Core refuses Cloudflare). */
+	core?: { shots?: { x: number; y: number; xg?: number; xgot?: number; goalZ?: number }[]; defense?: Record<string, DefAction[]> } | null;
 	now: number;
 	asaRetryMs?: number;
 }): MatchAnalytics | null {
 	const teams = matchTeams(args.summary);
 	if (!teams) return null;
-	const shots = shotsFromSummary(args.summary);
+	let shots = shotsFromSummary(args.summary);
+	if (args.asaDepth?.shots?.length) shots = joinAsaShots(shots, args.asaDepth.shots);
+	if (args.core?.shots?.length) shots = joinCoreShots(shots, args.core.shots);
 	const sum = (tid: string) => round2(shots.filter((s) => s.teamId === tid).reduce((n, s) => n + s.xgEst, 0));
 
 	// ASA, when it has this match.
@@ -309,14 +340,32 @@ export function buildMatchAnalytics(args: {
 			if (!(l.keyPasses || l.xa || l.shots)) lines.delete(athleteId);
 		}
 	}
+	// Phase 2: ASA ids → ESPN athletes by normalized name within the club (the same join as the xG lines).
+	const espnByTeamName = new Map<string, string>();
+	for (const [id, nm] of names) espnByTeamName.set(`${nm.teamId}|${normalizeName(nm.name)}`, id);
+	const mapAsa: AsaAthleteMapper = (asaPlayerId, asaTeamId) => {
+		const teamId = asaTeamToEspn.get(asaTeamId);
+		const nm = asaNameById.get(asaPlayerId);
+		const athleteId = teamId && nm ? espnByTeamName.get(`${teamId}|${nm}`) : undefined;
+		return teamId && athleteId ? { athleteId, teamId } : null;
+	};
+	const d = asaGame ? args.asaDepth : null;
+	const flow = d?.flow?.length
+		? { flow: flowSeries(d.flow, true), flowSource: "asa" as const }   // asaGameFor matched ASA home = ESPN home
+		: shots.length ? { flow: flowFromShots(shots, teams.home.id), flowSource: "estimate" as const } : {};
 	return {
-		v: 1,
+		v: 2,
 		eventId: teams.eventId,
 		kickoff: teams.kickoff,
 		home: { id: teams.home.id, abbr: teams.home.abbr },
 		away: { id: teams.away.id, abbr: teams.away.abbr },
 		shots,
 		xg,
+		keepers: d?.gkXg ? keeperLines(d.gkXg.filter((k) => k.game_id === asaGame!.game_id), (d.gkGplus ?? []).filter((k) => k.game_id === asaGame!.game_id), mapAsa) : [],
+		gplus: d?.playerGplus ? gplusLines(d.playerGplus.filter((r) => r.game_id === asaGame!.game_id), mapAsa) : [],
+		xpass: d?.xpass ? xpassLines(d.xpass.filter((r) => r.game_id === asaGame!.game_id), mapAsa) : [],
+		...flow,
+		defense: args.core?.defense ?? null,
 		players: [...lines.values()].sort((a, b) => b.xg - a.xg),
 		heat: args.heat ?? null,
 		heatStatus: args.heatStatus ?? (args.heat ? "ok" : "pending"),
@@ -336,6 +385,193 @@ export function rosterNames(summary: SummaryLike): Map<string, { teamId: string;
 	return out;
 }
 
+// ── Phase 2: every position (ASA depth + ESPN Core extras, 2026-10-20) ─────────────────────────────
+// Verified on GFC @ WAS (ASA game Oa5wPGp9q1): ASA's per-shot rows carry the SAME coordinates as ESPN's
+// (18/18 join by location) and their xG sums to ASA's team totals; keeper post-shot xG faced minus goals
+// conceded = goals prevented (Berger +0.14). g+ / xPass are ASA's own models — no second source (saved forever).
+
+export interface AsaShot {
+	game_id: string; team_id: string; shooter_player_id?: string; expanded_minute?: number;
+	shot_location_x: number; shot_location_y: number; shot_xg: number; shot_psxg?: number;
+	goal?: number; own_goal?: number; head?: number; pattern_of_play?: string; assist_cross?: number; assist_through_ball?: number;
+}
+export interface AsaGkXg {
+	player_id: string; game_id: string; team_id: string; minutes_played?: number; shots_faced?: number;
+	goals_conceded?: number; saves?: number; xgoals_gk_faced?: number; goals_minus_xgoals_gk?: number;
+}
+export interface AsaGplusRow {
+	player_id: string; game_id: string; team_id: string; general_position?: string; minutes_played?: number;
+	data?: { action_type: string; goals_added_raw?: number; goals_added_above_avg?: number; count_actions?: number }[];
+}
+export interface AsaXpass {
+	player_id: string; game_id: string; team_id: string; attempted_passes?: number; pass_completion_percentage?: number;
+	xpass_completion_percentage?: number; passes_completed_over_expected?: number;
+}
+export interface AsaFlowPoint { period_id: number; expanded_minute: number; home_team_value: number; away_team_value: number }
+/** Everything ASA has for ONE match beyond team/player xG. Each piece optional (ASA can lag or fail per call). */
+export interface AsaDepth { shots?: AsaShot[]; flow?: AsaFlowPoint[]; gkXg?: AsaGkXg[]; playerGplus?: AsaGplusRow[]; gkGplus?: AsaGplusRow[]; xpass?: AsaXpass[] }
+
+export type Situation = "regular" | "corner" | "freeKick" | "setPiece" | "penalty" | "fastBreak" | "throwIn" | "other";
+export function situationOf(pattern: string | undefined): Situation {
+	const p = (pattern ?? "").toLowerCase().replace(/[^a-z]/g, "");
+	switch (p) {
+		case "regular": return "regular";
+		case "corner": return "corner";
+		case "freekick": return "freeKick";
+		case "setpiece": return "setPiece";
+		case "penalty": return "penalty";
+		case "fastbreak": return "fastBreak";
+		case "throwin": return "throwIn";
+		default: return "other";
+	}
+}
+
+export type GplusActions = Record<string, { raw: number; aboveAvg: number; count: number }>;
+export interface GplusLine { athleteId: string; teamId: string; position: string | null; minutes: number; raw: number; aboveAvg: number; actions: GplusActions }
+export interface KeeperLine {
+	athleteId: string; teamId: string; minutes: number; shotsFaced: number; saves: number; goalsConceded: number;
+	/** Post-shot xG of the on-target shots she faced. */
+	xgotFaced: number;
+	/** xgotFaced − goals conceded (positive = she kept out more than an average keeper would). */
+	goalsPrevented: number;
+	gplus: GplusActions | null;
+}
+export interface XpassLine { athleteId: string; teamId: string; attempted: number; completionPct: number; xCompletionPct: number; overExpected: number }
+export interface FlowPoint { minute: number; period: number; home: number; away: number }
+export type DefKind = "tackle" | "tackleLost" | "interception" | "clearance" | "block" | "recovery";
+/** One defensive action, oriented like shots (her team attacks x = 100). */
+export interface DefAction { kind: DefKind; x: number; y: number; minute: string }
+
+const r3 = (n: number) => Math.round(n * 1000) / 1000;
+const locKey = (x: number, y: number) => `${Math.round(x * 10)}|${Math.round(y * 10)}`;
+
+/** Join ASA's per-shot rows onto our shots by location (identical Opta coordinates). Unmatched → unchanged. */
+export function joinAsaShots(shots: Shot[], asa: AsaShot[]): Shot[] {
+	const byLoc = new Map<string, AsaShot>();
+	for (const a of asa) byLoc.set(locKey(a.shot_location_x, a.shot_location_y), a);
+	return shots.map((s) => {
+		const a = byLoc.get(locKey(s.x, s.y));
+		if (!a) return s;
+		const onTarget = s.outcome === "goal" || s.outcome === "onTarget";
+		return {
+			...s,
+			xgAsa: r3(a.shot_xg),
+			psxg: onTarget && a.shot_psxg != null ? r3(a.shot_psxg) : null,
+			situation: situationOf(a.pattern_of_play),
+			assistType: a.assist_cross ? "cross" : a.assist_through_ball ? "throughBall" : null,
+		};
+	});
+}
+
+/** Join ESPN Core's per-shot xG / xGOT / height onto our shots by location (dormant while Core is blocked). */
+export function joinCoreShots(shots: Shot[], core: { x: number; y: number; xg?: number; xgot?: number; goalZ?: number }[]): Shot[] {
+	const byLoc = new Map(core.map((c) => [locKey(c.x, c.y), c]));
+	return shots.map((s) => {
+		const c = byLoc.get(locKey(s.x, s.y));
+		if (!c) return s;
+		return { ...s, ...(c.xg != null ? { xgEspn: r3(c.xg) } : {}), ...(c.xgot != null ? { xgotEspn: r3(c.xgot) } : {}), ...(c.goalZ != null ? { goalZ: c.goalZ } : {}) };
+	});
+}
+
+function gplusActions(row: AsaGplusRow | undefined): GplusActions | null {
+	if (!row?.data?.length) return null;
+	const out: GplusActions = {};
+	for (const d of row.data) out[d.action_type] = { raw: r3(d.goals_added_raw ?? 0), aboveAvg: r3(d.goals_added_above_avg ?? 0), count: d.count_actions ?? 0 };
+	return out;
+}
+
+/** ASA player id (+ ASA team) → ESPN athlete id, by normalized name within the club. */
+export type AsaAthleteMapper = (asaPlayerId: string, asaTeamId: string) => { athleteId: string; teamId: string } | null;
+
+export function keeperLines(gk: AsaGkXg[], gkGplus: AsaGplusRow[], map: AsaAthleteMapper): KeeperLine[] {
+	const out: KeeperLine[] = [];
+	for (const k of gk) {
+		const who = map(k.player_id, k.team_id);
+		if (!who) continue;
+		const faced = k.xgoals_gk_faced ?? 0, conceded = k.goals_conceded ?? 0;
+		out.push({
+			...who, minutes: k.minutes_played ?? 0, shotsFaced: k.shots_faced ?? 0, saves: k.saves ?? 0, goalsConceded: conceded,
+			xgotFaced: r3(faced), goalsPrevented: r3(faced - conceded),
+			gplus: gplusActions(gkGplus.find((g) => g.player_id === k.player_id)),
+		});
+	}
+	return out;
+}
+
+export function gplusLines(rows: AsaGplusRow[], map: AsaAthleteMapper): GplusLine[] {
+	const out: GplusLine[] = [];
+	for (const r of rows) {
+		const who = map(r.player_id, r.team_id);
+		const actions = gplusActions(r);
+		if (!who || !actions) continue;
+		const vals = Object.values(actions);
+		out.push({ ...who, position: r.general_position ?? null, minutes: r.minutes_played ?? 0,
+			raw: r3(vals.reduce((n, a) => n + a.raw, 0)), aboveAvg: r3(vals.reduce((n, a) => n + a.aboveAvg, 0)), actions });
+	}
+	return out.sort((a, b) => b.raw - a.raw);
+}
+
+export function xpassLines(rows: AsaXpass[], map: AsaAthleteMapper): XpassLine[] {
+	const out: XpassLine[] = [];
+	for (const r of rows) {
+		const who = map(r.player_id, r.team_id);
+		if (!who || !r.attempted_passes) continue;
+		out.push({ ...who, attempted: r.attempted_passes, completionPct: r3(r.pass_completion_percentage ?? 0),
+			xCompletionPct: r3(r.xpass_completion_percentage ?? 0), overExpected: r3(r.passes_completed_over_expected ?? 0) });
+	}
+	return out;
+}
+
+/** ASA's per-minute threat, oriented to the ESPN home/away of the match. */
+export function flowSeries(flow: AsaFlowPoint[], asaHomeIsEspnHome: boolean): FlowPoint[] {
+	return flow.map((p) => ({
+		minute: p.expanded_minute, period: p.period_id,
+		home: r3(asaHomeIsEspnHome ? p.home_team_value : p.away_team_value),
+		away: r3(asaHomeIsEspnHome ? p.away_team_value : p.home_team_value),
+	}));
+}
+
+/** Second source for the flow chart: our estimated xG per minute, from the shots. */
+export function flowFromShots(shots: Shot[], homeId: string): FlowPoint[] {
+	const byMinute = new Map<number, FlowPoint>();
+	let last = 90;
+	for (const s of shots) {
+		const m = Number((s.minute.match(/\d+/g) ?? ["0"]).map(Number).reduce((a, b) => a + b, 0));
+		last = Math.max(last, m);
+		const p = byMinute.get(m) ?? { minute: m, period: s.period || (m > 45 ? 2 : 1), home: 0, away: 0 };
+		if (s.teamId === homeId) p.home = r3(p.home + (s.xgAsa ?? s.xgEst)); else p.away = r3(p.away + (s.xgAsa ?? s.xgEst));
+		byMinute.set(m, p);
+	}
+	const out: FlowPoint[] = [];
+	for (let m = 0; m <= last; m++) out.push(byMinute.get(m) ?? { minute: m, period: m > 45 ? 2 : 1, home: 0, away: 0 });
+	return out;
+}
+
+/** ESPN Core event stream → each player's defensive actions (same pages the heat step reads). */
+export const DEF_KINDS: Record<string, DefKind> = {
+	"tackle": "tackle", "attempted-tackle": "tackleLost", "interception": "interception", "clear": "clearance",
+	"blocked-pass": "block", "ball-recovery": "recovery",
+};
+export function defenseFromCore(events: { type?: { type?: string }; fieldPositionX?: number | null; fieldPositionY?: number | null; clock?: { displayValue?: string }; participants?: { athlete?: { $ref?: string } }[] }[]): Record<string, DefAction[]> {
+	const out: Record<string, DefAction[]> = {};
+	for (const e of events) {
+		const kind = DEF_KINDS[e.type?.type ?? ""];
+		const x = e.fieldPositionX, y = e.fieldPositionY;
+		if (!kind || x == null || y == null) continue;
+		const id = athleteIdFromRef(e.participants?.[0]?.athlete?.$ref);
+		if (!id) continue;
+		(out[id] ??= []).push({ kind, x, y, minute: e.clock?.displayValue ?? "" });
+	}
+	return out;
+}
+
+/** Core shots (with ESPN's own xG / xGOT / height) for `joinCoreShots`. */
+export function coreShots(events: { type?: { type?: string }; fieldPositionX?: number | null; fieldPositionY?: number | null; expectedGoals?: number; expectedGoalsOnTarget?: number; goalPositionZ?: number }[]): { x: number; y: number; xg?: number; xgot?: number; goalZ?: number }[] {
+	return events
+		.filter((e) => e.expectedGoals != null && e.fieldPositionX != null && e.fieldPositionY != null && /shot|goal/.test(e.type?.type ?? "") && e.type?.type !== "goal-kick")
+		.map((e) => ({ x: e.fieldPositionX as number, y: e.fieldPositionY as number, xg: e.expectedGoals, xgot: e.expectedGoalsOnTarget, goalZ: e.goalPositionZ }));
+}
+
 // ── Season rollup per club ───────────────────────────────────────────────────────────────────────
 // Stored as one CONTRIBUTION per match; every total is recomputed from them, so re-folding a match (e.g. ASA's
 // real xG replacing our estimate a day later) replaces its contribution and can never double-count.
@@ -352,7 +588,15 @@ export interface SeasonContribution {
 	players: PlayerMatchLine[];
 	/** This club's players' touch grids from that match (heat maps), when the match has them. */
 	heat?: Record<string, number[]>;
+	// Phase 2 — this club's rows from the match:
+	keepers?: KeeperLine[];
+	gplus?: GplusLine[];
+	xpass?: XpassLine[];
+	defense?: Record<string, DefAction[]>;
 }
+export interface SeasonKeeperLine { athleteId: string; matches: number; minutes: number; shotsFaced: number; saves: number; goalsConceded: number; xgotFaced: number; goalsPrevented: number; gplus: GplusActions | null }
+export interface SeasonGplusLine { athleteId: string; matches: number; minutes: number; raw: number; aboveAvg: number; actions: GplusActions }
+export interface SeasonXpassLine { athleteId: string; matches: number; attempted: number; completionPct: number; xCompletionPct: number; overExpected: number }
 export interface TeamSeasonAnalytics {
 	v: 1;
 	teamId: string;
@@ -367,11 +611,21 @@ export interface TeamSeasonAnalytics {
 	/** Season touch grids per player (sum of the matches that have heat), and how many matches fed them. */
 	heat: Record<string, number[]>;
 	heatMatches: number;
+	// Phase 2 (derived):
+	keepers: SeasonKeeperLine[];
+	gplus: SeasonGplusLine[];
+	/** The club's total g+ (sum of every player's, raw) and how many matches had ASA g+. */
+	teamGplus: number;
+	gplusMatches: number;
+	xpass: SeasonXpassLine[];
+	defense: Record<string, DefAction[]>;
+	defenseMatches: number;
 	updatedAt: number;
 }
 
 export function emptySeason(teamId: string, year: number): TeamSeasonAnalytics {
-	return { v: 1, teamId, year, contributions: [], matches: 0, xgFor: 0, xgAgainst: 0, xgSources: { asa: 0, estimate: 0 }, players: [], heat: {}, heatMatches: 0, updatedAt: 0 };
+	return { v: 1, teamId, year, contributions: [], matches: 0, xgFor: 0, xgAgainst: 0, xgSources: { asa: 0, estimate: 0 }, players: [], heat: {}, heatMatches: 0,
+		keepers: [], gplus: [], teamGplus: 0, gplusMatches: 0, xpass: [], defense: {}, defenseMatches: 0, updatedAt: 0 };
 }
 
 /** Fold one match into a club's season (idempotent per eventId). Not this club's match → unchanged. */
@@ -389,6 +643,10 @@ export function foldMatchIntoSeason(prev: TeamSeasonAnalytics, m: MatchAnalytics
 		shotsAgainst: m.shots.filter((s) => s.teamId !== tid),
 		players: m.players.filter((p) => p.teamId === tid),
 		heat: m.heat ? Object.fromEntries(Object.entries(m.heat).filter(([id]) => m.players.some((p) => p.athleteId === id && p.teamId === tid) || teamOfHeat(m, id) === tid)) : undefined,
+		keepers: (m.keepers ?? []).filter((k) => k.teamId === tid),
+		gplus: (m.gplus ?? []).filter((g) => g.teamId === tid),
+		xpass: (m.xpass ?? []).filter((x) => x.teamId === tid),
+		defense: m.defense ? Object.fromEntries(Object.entries(m.defense).filter(([id]) => teamOfHeat(m, id) === tid)) : undefined,
 	};
 	const contributions = [...prev.contributions.filter((c) => c.eventId !== m.eventId), contribution]
 		.sort((a, b) => a.kickoff.localeCompare(b.kickoff));
@@ -401,7 +659,39 @@ function recompute(s: TeamSeasonAnalytics, now: number): TeamSeasonAnalytics {
 	const xgSources = { asa: 0, estimate: 0 };
 	const heat: Record<string, number[]> = {};
 	let heatMatches = 0;
+	const keepers = new Map<string, SeasonKeeperLine>();
+	const gplus = new Map<string, SeasonGplusLine>();
+	const xpass = new Map<string, SeasonXpassLine & { completed: number; expected: number }>();
+	const defense: Record<string, DefAction[]> = {};
+	let gplusMatches = 0, defenseMatches = 0;
+	const addActions = (into: GplusActions, from: GplusActions | null) => {
+		for (const [k, a] of Object.entries(from ?? {})) {
+			const t = (into[k] ??= { raw: 0, aboveAvg: 0, count: 0 });
+			t.raw += a.raw; t.aboveAvg += a.aboveAvg; t.count += a.count;
+		}
+	};
 	for (const c of s.contributions) {
+		for (const k of c.keepers ?? []) {
+			const t = keepers.get(k.athleteId) ?? { athleteId: k.athleteId, matches: 0, minutes: 0, shotsFaced: 0, saves: 0, goalsConceded: 0, xgotFaced: 0, goalsPrevented: 0, gplus: {} };
+			t.matches += 1; t.minutes += k.minutes; t.shotsFaced += k.shotsFaced; t.saves += k.saves; t.goalsConceded += k.goalsConceded;
+			t.xgotFaced += k.xgotFaced; t.goalsPrevented += k.goalsPrevented; addActions(t.gplus ?? {}, k.gplus);
+			keepers.set(k.athleteId, t);
+		}
+		if (c.gplus?.length) gplusMatches += 1;
+		for (const g of c.gplus ?? []) {
+			const t = gplus.get(g.athleteId) ?? { athleteId: g.athleteId, matches: 0, minutes: 0, raw: 0, aboveAvg: 0, actions: {} };
+			t.matches += 1; t.minutes += g.minutes; t.raw += g.raw; t.aboveAvg += g.aboveAvg; addActions(t.actions, g.actions);
+			gplus.set(g.athleteId, t);
+		}
+		for (const x of c.xpass ?? []) {
+			const t = xpass.get(x.athleteId) ?? { athleteId: x.athleteId, matches: 0, attempted: 0, completionPct: 0, xCompletionPct: 0, overExpected: 0, completed: 0, expected: 0 };
+			t.matches += 1; t.attempted += x.attempted; t.completed += x.attempted * x.completionPct; t.expected += x.attempted * x.xCompletionPct; t.overExpected += x.overExpected;
+			xpass.set(x.athleteId, t);
+		}
+		if (c.defense && Object.keys(c.defense).length) {
+			defenseMatches += 1;
+			for (const [id, list] of Object.entries(c.defense)) (defense[id] ??= []).push(...list);
+		}
 		xgFor += c.xgFor; xgAgainst += c.xgAgainst; xgSources[c.source] += 1;
 		if (c.heat && Object.keys(c.heat).length) {
 			heatMatches += 1;
@@ -426,8 +716,20 @@ function recompute(s: TeamSeasonAnalytics, now: number): TeamSeasonAnalytics {
 		players: [...players.values()].map((p) => ({ ...p, xg: round2(p.xg), xa: round2(p.xa) })).sort((a, b) => b.xg - a.xg),
 		heat,
 		heatMatches,
+		keepers: [...keepers.values()].map((k) => ({ ...k, xgotFaced: r3(k.xgotFaced), goalsPrevented: r3(k.goalsPrevented), gplus: roundActions(k.gplus) })),
+		gplus: [...gplus.values()].map((g) => ({ ...g, raw: r3(g.raw), aboveAvg: r3(g.aboveAvg), actions: roundActions(g.actions) ?? {} })).sort((a, b) => b.raw - a.raw),
+		teamGplus: r3([...gplus.values()].reduce((n, g) => n + g.raw, 0)),
+		gplusMatches,
+		xpass: [...xpass.values()].map(({ completed, expected, ...x }) => ({ ...x, completionPct: x.attempted ? r3(completed / x.attempted) : 0, xCompletionPct: x.attempted ? r3(expected / x.attempted) : 0, overExpected: r3(x.overExpected) })),
+		defense,
+		defenseMatches,
 		updatedAt: now,
 	};
+}
+
+function roundActions(a: GplusActions | null): GplusActions | null {
+	if (!a || !Object.keys(a).length) return null;
+	return Object.fromEntries(Object.entries(a).map(([k, v]) => [k, { raw: r3(v.raw), aboveAvg: r3(v.aboveAvg), count: v.count }]));
 }
 
 /** Which club a heat-grid athlete played for in this match (shots/lines first, else the match's roster map). */
@@ -464,7 +766,11 @@ export function heatGrids(events: { fieldPositionX?: number | null; fieldPositio
 
 // ── Scheduling builds ────────────────────────────────────────────────────────────────────────────
 
-export interface AnalyticsIndexEntry { source: "asa" | "estimate"; asaRetryAfter: number | null; asaRetried?: boolean; heat: MatchAnalytics["heatStatus"]; heatRetryAfter?: number; builtAt: number }
+export interface AnalyticsIndexEntry { source: "asa" | "estimate"; asaRetryAfter: number | null; asaRetried?: boolean; heat: MatchAnalytics["heatStatus"]; heatRetryAfter?: number; builtAt: number;
+	/** Copy version — a v1 copy (no keepers / g+ / per-shot ASA xG) is rebuilt ONCE to v2. */
+	v?: number;
+	/** ASA depth present (keepers / g+ / xPass) — the status page counts these. */
+	depth?: boolean }
 export type AnalyticsIndex = Record<string, AnalyticsIndexEntry>;
 
 /** Which settled matches to build now (newest first, capped): never built · ASA's real xG due (ONE retry) ·
@@ -483,6 +789,7 @@ export function planAnalyticsBuilds(args: {
 			if (args.now < f.kickoffMs + args.afterKickoffMs) return false;
 			const ix = args.index[f.eventId];
 			if (!ix) return true;
+			if ((ix.v ?? 1) < 2) return true; // phase-2 upgrade, once (paced by `max` like the backfill)
 			if (ix.source === "estimate" && !ix.asaRetried && ix.asaRetryAfter !== null && args.now >= ix.asaRetryAfter) return true;
 			return ix.heat !== "ok" && !args.coreBlocked && args.now >= (ix.heatRetryAfter ?? 0);
 		})

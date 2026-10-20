@@ -136,12 +136,110 @@ test("scheduling: new matches first (newest first, capped), ONE ASA retry, heat 
 		{ eventId: "heatDue", kickoffMs: now - 40 * H },
 	];
 	const index = {
-		asaDue: { source: "estimate" as const, asaRetryAfter: now - 1, heat: "ok" as const, builtAt: 0 },
-		asaRetried: { source: "estimate" as const, asaRetryAfter: now - 1, asaRetried: true, heat: "ok" as const, builtAt: 0 },
-		heatDue: { source: "asa" as const, asaRetryAfter: null, heat: "unavailable" as const, heatRetryAfter: now - 1, builtAt: 0 },
+		asaDue: { source: "estimate" as const, asaRetryAfter: now - 1, heat: "ok" as const, builtAt: 0, v: 2 },
+		asaRetried: { source: "estimate" as const, asaRetryAfter: now - 1, asaRetried: true, heat: "ok" as const, builtAt: 0, v: 2 },
+		heatDue: { source: "asa" as const, asaRetryAfter: null, heat: "unavailable" as const, heatRetryAfter: now - 1, builtAt: 0, v: 2 },
 	};
 	const plan = (coreBlocked: boolean, max = 10) => planAnalyticsBuilds({ finals, index, now, coreBlocked, afterKickoffMs: 4 * H, max });
 	assert.deepEqual(plan(false), ["new", "asaDue", "heatDue", "old"]);
 	assert.deepEqual(plan(true), ["new", "asaDue", "old"]); // Core refusing → no heat-only rebuilds
 	assert.deepEqual(plan(false, 2), ["new", "asaDue"]);
+});
+
+
+// ── Phase 2: every position (ASA depth + ESPN Core extras) ────────────────────────────────────────
+const core = JSON.parse(readFileSync(new URL("./fixtures/core-plays-401854021-trim.json", import.meta.url), "utf8"));
+const depth = () => ({
+	shots: asa.gameShots.Oa5wPGp9q1, flow: asa.gameFlow.Oa5wPGp9q1,
+	gkXg: asa.gkXg, playerGplus: asa.playerGplus, gkGplus: asa.gkGplus, xpass: asa.playerXpass,
+});
+const nameOf = (id: string) => (summary.rosters as { roster: { athlete: { id: string; displayName: string } }[] }[])
+	.flatMap((r) => r.roster).find((p) => p.athlete.id === id)?.athlete.displayName;
+
+test("ASA per-shot rows join ours by location: 18/18, and their xG sums to ASA's team totals", async () => {
+	const { joinAsaShots } = await import("../src/match-analytics.ts");
+	const joined = joinAsaShots(shotsFromSummary(summary), asa.gameShots.Oa5wPGp9q1);
+	assert.equal(joined.filter((s) => s.xgAsa != null).length, 18);
+	const sum = (tid: string) => Math.round(joined.filter((s) => s.teamId === tid).reduce((n, s) => n + (s.xgAsa ?? 0), 0) * 100) / 100;
+	assert.equal(sum("15365"), 1.12);
+	assert.equal(sum("15364"), 0.41);
+	// post-shot xG only on target; situation from ASA's pattern of play
+	assert.ok(joined.every((s) => (s.outcome === "goal" || s.outcome === "onTarget") ? s.psxg != null : s.psxg === null));
+	assert.equal(joined.filter((s) => s.situation === "corner").length, 2);
+});
+
+test("keepers: shots faced, saves and goals prevented per match (Berger +0.14)", () => {
+	const m = buildMatchAnalytics({ summary, asa, asaDepth: depth(), now: 1 })!;
+	assert.equal(m.v, 2);
+	assert.equal(m.keepers!.length, 2);
+	const berger = m.keepers!.find((k) => nameOf(k.athleteId) === "Ann-Katrin Berger")!;
+	assert.equal(berger.teamId, "15364");
+	assert.equal(berger.saves, 5);
+	assert.equal(berger.goalsConceded, 1);
+	assert.equal(berger.goalsPrevented, 0.141);
+	assert.ok(berger.gplus?.Shotstopping);
+});
+
+test("goals added (g+) for every outfield player, six actions each; passing vs expected", () => {
+	const m = buildMatchAnalytics({ summary, asa, asaDepth: depth(), now: 1 })!;
+	assert.ok(m.gplus!.length >= 25, `${m.gplus!.length} g+ lines`);
+	assert.ok(m.gplus!.every((g) => Object.keys(g.actions).length === 6 && ["15365", "15364"].includes(g.teamId)));
+	assert.ok(m.gplus!.some((g) => (g.actions.Interrupting?.count ?? 0) > 0), "defenders' tackles/clearances counted");
+	assert.ok(m.xpass!.length >= 25);
+	assert.ok(m.xpass!.every((x) => x.attempted > 0 && x.completionPct <= 1));
+});
+
+test("game flow: ASA's per-minute series when posted, our shots otherwise", async () => {
+	const { flowFromShots } = await import("../src/match-analytics.ts");
+	const m = buildMatchAnalytics({ summary, asa, asaDepth: depth(), now: 1 })!;
+	assert.equal(m.flowSource, "asa");
+	assert.equal(m.flow!.length, 97);
+	const est = buildMatchAnalytics({ summary, asa: null, now: 1 })!;
+	assert.equal(est.flowSource, "estimate");
+	const fallback = flowFromShots(shotsFromSummary(summary), "15365");
+	assert.ok(fallback.length >= 91);
+	assert.equal(Math.round(fallback.reduce((n, p) => n + p.home, 0) * 100) / 100, 1.28); // = our WAS estimate
+});
+
+test("ESPN Core extras (dormant while blocked): defensive actions per player + ESPN's per-shot xG / xGOT / height", async () => {
+	const { defenseFromCore, coreShots, joinCoreShots } = await import("../src/match-analytics.ts");
+	const def = defenseFromCore(core.items);
+	const all = Object.values(def).flat();
+	const n = (k: string) => all.filter((a) => a.kind === k).length;
+	assert.deepEqual([n("tackle"), n("tackleLost"), n("interception"), n("clearance"), n("block")], [35, 27, 21, 44, 20]);
+	const cs = coreShots(core.items);
+	const joined = joinCoreShots(shotsFromSummary(summary), cs);
+	const first = joined[0]; // Luvanga 4', missed left
+	assert.equal(first.xgEspn, 0.078);
+	assert.equal(first.xgotEspn, 0);
+	assert.equal(first.goalZ, 22.2);
+	assert.ok(joined.filter((s) => s.xgEspn != null).length >= 17);
+});
+
+test("season: keepers, g+ (+ team total), passing and defense roll up and stay idempotent", async () => {
+	const { defenseFromCore } = await import("../src/match-analytics.ts");
+	const m = buildMatchAnalytics({ summary, asa, asaDepth: depth(), core: { defense: defenseFromCore(core.items) }, now: 1 })!;
+	let gfc = foldMatchIntoSeason(emptySeason("15364", 2026), m, 1);
+	gfc = foldMatchIntoSeason(gfc, m, 2);
+	assert.equal(gfc.matches, 1);
+	assert.equal(gfc.keepers.length, 1);
+	assert.equal(gfc.keepers[0].goalsPrevented, 0.141);
+	assert.ok(gfc.gplus.length >= 12 && gfc.gplusMatches === 1);
+	assert.equal(gfc.teamGplus, Math.round(gfc.gplus.reduce((n, g) => n + g.raw, 0) * 1000) / 1000);
+	assert.ok(gfc.xpass.length >= 12);
+	assert.ok(Object.keys(gfc.defense).length >= 10 && gfc.defenseMatches === 1);
+	// defense split per club: no WAS player in GFC's season
+	const wasIds = new Set((summary.rosters as { team: { id: string }; roster: { athlete: { id: string } }[] }[]).find((r) => r.team.id === "15365")!.roster.map((p) => p.athlete.id));
+	assert.ok(Object.keys(gfc.defense).every((id) => !wasIds.has(id)));
+});
+
+test("planner: a v1 copy is rebuilt once to v2 (keepers / g+ / per-shot ASA xG)", async () => {
+	const { planAnalyticsBuilds } = await import("../src/match-analytics.ts");
+	const H = 3600_000, now = 1_000 * H;
+	const finals = [{ eventId: "old", kickoffMs: now - 50 * H }, { eventId: "done", kickoffMs: now - 60 * H }];
+	const index = {
+		old: { source: "asa" as const, asaRetryAfter: null, heat: "ok" as const, builtAt: 0 },
+		done: { source: "asa" as const, asaRetryAfter: null, heat: "ok" as const, builtAt: 0, v: 2 },
+	};
+	assert.deepEqual(planAnalyticsBuilds({ finals, index, now, coreBlocked: true, afterKickoffMs: 4 * H, max: 10 }), ["old"]);
 });
