@@ -1361,6 +1361,14 @@ that needs more users) until you bring it back.</p>
 			return handleTeamStatsRefresh(request, url, env, ctx);
 		}
 
+		// POST one image-moderation pass — SELF-only (admin key), from triggerModerationTick on the 5-min tick.
+		if (url.pathname === "/internal/moderate-tick") {
+			const adminKey = (env as unknown as { BRACKET_ADMIN_KEY?: string }).BRACKET_ADMIN_KEY;
+			if (request.method !== "POST" || !adminAuthed(request, adminKey)) return new Response("forbidden", { status: 403 });
+			await moderateSnapshotTick(env, ctx);
+			return new Response(null, { status: 204 });
+		}
+
 		// Admin-only: refresh the IG social snapshot on demand (the every-2-day cron does
 		// this automatically; this forces an immediate pull after a token swap or an aborted
 		// run). Same BRACKET_ADMIN_KEY gate as /headshots/run.
@@ -1814,8 +1822,12 @@ that needs more users) until you bring it back.</p>
 			// keep steady-state catch well under an hour. Runs LAST so a FREE-tier CPU/subrequest kill can
 			// never affect the bracket engine or alerting above (their KV writes are already done). Drops →
 			// the Supabase moderation log. Starts on the FIRST tick after deploy (≤5 min = effectively now).
+			// 2026-10-20: the pass now runs in its OWN invocation via SELF (own 10ms CPU budget). Run inline as the
+			// LAST pass it got only what the bracket + alerting passes left, and most window ticks were killed with
+			// exceededCpu (13:15–13:50 UTC on 10/20, 12:05/12:10 on 10/19) — no verdicts saved on those ticks. The
+			// window check stays here (a clock check, no KV), so outside 12–14 UTC this costs nothing.
 			try {
-				await moderateSnapshotTick(env, ctx);
+				await triggerModerationTick(env, ctx);
 			} catch {
 				/* swallow — best-effort; the next tick retries the remaining unjudged images */
 			}
@@ -6441,6 +6453,20 @@ async function moderateSnapshotTick(env: Env, ctx: ExecutionContext): Promise<vo
 		if (res.changed || changed) await env.FEED_TAGS.put(key, JSON.stringify(res.cards), { expirationTtl: POOL_SNAPSHOT_TTL, metadata: meta });
 		return; // one pool per tick — the next tick (≤5 min) picks up the other / the remainder
 	}
+}
+
+/** Kick one moderation pass in its OWN invocation (SELF, admin key) during the post-scrape window. */
+async function triggerModerationTick(env: Env, ctx: ExecutionContext): Promise<void> {
+	if (!env.AI) return;
+	const hourUTC = new Date().getUTCHours();
+	if (hourUTC < MOD_WINDOW_START_UTC_HOUR || hourUTC >= MOD_WINDOW_START_UTC_HOUR + MOD_WINDOW_HOURS) return;
+	const e = env as unknown as { SELF?: Fetcher; BRACKET_ADMIN_KEY?: string };
+	if (!e.SELF || !e.BRACKET_ADMIN_KEY) {
+		await moderateSnapshotTick(env, ctx); // unconfigured → the old inline path
+		return;
+	}
+	const r = await e.SELF.fetch(new Request(`${PROXY_PUBLIC_ORIGIN}/internal/moderate-tick`, { method: "POST", headers: { "x-admin-key": e.BRACKET_ADMIN_KEY } }));
+	if (!r.ok) emitDiag(env, ctx, "moderationTickFail", `HTTP ${r.status}`);
 }
 
 /** Write one reviewable moderation-drop row to Supabase (fire-and-forget, via ctx.waitUntil). Uses the
