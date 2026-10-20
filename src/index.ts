@@ -464,6 +464,8 @@ import { edgeTtlFor, type FetcherKind, type FetcherResult } from "./espn-fetcher
 export { EspnFetcher } from "./espn-fetcher.ts";
 // Non-live content state (Social snapshots, verdicts, previews, club news) — DO SQLite, never KV.
 export { ContentStore } from "./content-store.ts";
+// Image moderation runs inside its own Durable Object (30 s CPU, not the Worker's 10 ms) — 2026-10-20.
+export { ModerationRunner } from "./moderation-runner.ts";
 import type { ContentPut } from "./content-store.ts";
 import {
 	isPausedMonday as isKHGPausedMonday, loadKnowHerCalendar, mondayStart as khgMondayStart,
@@ -1359,14 +1361,6 @@ that needs more users) until you bring it back.</p>
 		// maybeScheduleStatsRefresh on the 5-min tick; its own invocation = its own subrequest budget.
 		if (url.pathname === "/internal/team-stats/refresh") {
 			return handleTeamStatsRefresh(request, url, env, ctx);
-		}
-
-		// POST one image-moderation pass — SELF-only (admin key), from triggerModerationTick on the 5-min tick.
-		if (url.pathname === "/internal/moderate-tick") {
-			const adminKey = (env as unknown as { BRACKET_ADMIN_KEY?: string }).BRACKET_ADMIN_KEY;
-			if (request.method !== "POST" || !adminAuthed(request, adminKey)) return new Response("forbidden", { status: 403 });
-			await moderateSnapshotTick(env, ctx);
-			return new Response(null, { status: 204 });
 		}
 
 		// Admin-only: refresh the IG social snapshot on demand (the every-2-day cron does
@@ -6421,7 +6415,7 @@ const MOD_WINDOW_HOURS = 2;
  *  freshest MODERATE_KEEP_PER_HANDLE/player, (2) classifies up to IMGMOD_BATCH not-yet-judged images, and
  *  (3) writes the snapshot back once if anything changed. Fully-judged pools cost just a read (idle-skip).
  *  No scrape → no Apify. Drops → Supabase log. */
-async function moderateSnapshotTick(env: Env, ctx: ExecutionContext): Promise<void> {
+export async function moderateSnapshotTick(env: Env, ctx: ExecutionContext): Promise<void> {
 	if (!env.AI) return; // no binding → nothing to classify
 	// Only run in the ~2h window after the scrape; outside it, return BEFORE any KV read (idle = ~free).
 	const hourUTC = new Date().getUTCHours();
@@ -6455,18 +6449,23 @@ async function moderateSnapshotTick(env: Env, ctx: ExecutionContext): Promise<vo
 	}
 }
 
-/** Kick one moderation pass in its OWN invocation (SELF, admin key) during the post-scrape window. */
+/** Kick one moderation pass in the ModerationRunner Durable Object during the post-scrape window — one fast
+ *  RPC that only arms the DO's alarm, so the pass gets the DO's 30 s CPU and the tick never waits on it
+ *  (src/moderation-runner.ts). No binding → the old inline path. */
 async function triggerModerationTick(env: Env, ctx: ExecutionContext): Promise<void> {
 	if (!env.AI) return;
 	const hourUTC = new Date().getUTCHours();
 	if (hourUTC < MOD_WINDOW_START_UTC_HOUR || hourUTC >= MOD_WINDOW_START_UTC_HOUR + MOD_WINDOW_HOURS) return;
-	const e = env as unknown as { SELF?: Fetcher; BRACKET_ADMIN_KEY?: string };
-	if (!e.SELF || !e.BRACKET_ADMIN_KEY) {
-		await moderateSnapshotTick(env, ctx); // unconfigured → the old inline path
+	await kickModeration(env, ctx);
+}
+
+async function kickModeration(env: Env, ctx: ExecutionContext): Promise<void> {
+	const ns = env.MODERATION_RUNNER;
+	if (!ns) {
+		await moderateSnapshotTick(env, ctx);
 		return;
 	}
-	const r = await e.SELF.fetch(new Request(`${PROXY_PUBLIC_ORIGIN}/internal/moderate-tick`, { method: "POST", headers: { "x-admin-key": e.BRACKET_ADMIN_KEY } }));
-	if (!r.ok) emitDiag(env, ctx, "moderationTickFail", `HTTP ${r.status}`);
+	await (ns.get(ns.idFromName("moderation")) as unknown as { kick(): Promise<{ armed: boolean }> }).kick();
 }
 
 /** Write one reviewable moderation-drop row to Supabase (fire-and-forget, via ctx.waitUntil). Uses the
@@ -9190,8 +9189,8 @@ async function handleAlertSelfTest(request: Request, env: Env, ctx: ExecutionCon
 			// immediately after a deploy without waiting for the next tick. Hit it repeatedly to blast
 			// through faster; each pass does one pool's batch. Reports counts via the diag it emits.
 			if (!env.AI) return json({ do: "moderate", ok: false, note: "AI binding unset" });
-			await moderateSnapshotTick(env, ctx);
-			return json({ do: "moderate", ok: true, note: "ran one moderation pass now — see imageModerationRun in /telemetry/recent; hit again to process the next batch, or just let the 5-min tick finish it" });
+			await kickModeration(env, ctx); // in the ModerationRunner DO (30 s CPU) since 2026-10-20
+			return json({ do: "moderate", ok: true, note: "kicked one moderation pass (ModerationRunner DO) — see imageModerationRun in /telemetry/recent; hit again to process the next batch, or just let the 5-min tick finish it" });
 		}
 		default:
 			return json({ error: "unknown ?do=", allowed: ["email", "synthetic", "aggregate", "digest", "heartbeat", "imgmod", "moderate"] });

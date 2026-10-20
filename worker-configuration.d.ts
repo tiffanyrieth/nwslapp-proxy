@@ -78,6 +78,10 @@ interface Env {
 	// worker runs before the bucket exists — copying just skips ("bucket-unbound").
 	IMAGES?: R2Bucket;
 
+	// Durable Object (2026-10-20): the player-image moderation pass, run with a DO's 30 s CPU budget instead of
+	// the Worker's 10 ms (src/moderation-runner.ts). Optional so the inline fallback works without it.
+	MODERATION_RUNNER?: DurableObjectNamespace;
+
 	// Sign in with Apple (SIWA) revocation — secrets set via `wrangler secret put`.
 	// Back POST /auth/apple-token-exchange + the account-delete revoke step: the .p8
 	// signs an ES256 client_secret JWT used against Apple's /auth/token + /auth/revoke.
