@@ -131,6 +131,8 @@ export interface SettledMatch {
 	eventId: string;
 	teamIds: string[];
 	kickoffMs: number;
+	/** A playoff match — match analytics include these; the regular-season stats refresh skips them. */
+	playoff?: boolean;
 }
 
 /** Each club's most recent settled regular-season match. */
@@ -203,6 +205,11 @@ export const NON_FINAL_STATUS = new Set([
 	"STATUS_SUSPENDED", "STATUS_POSTPONED", "STATUS_DELAYED", "STATUS_CANCELED", "STATUS_CANCELLED", "STATUS_ABANDONED",
 ]);
 export function settledRegularSeasonMatches(scoreboard: unknown): SettledMatch[] {
+	return settledMatches(scoreboard).filter((m) => !m.playoff);
+}
+
+/** Every settled regular-season AND playoff match (playoffs flagged); preseason excluded. */
+export function settledMatches(scoreboard: unknown): SettledMatch[] {
 	const events = ((scoreboard as { events?: unknown[] } | null)?.events ?? []) as {
 		id?: string;
 		date?: string;
@@ -213,13 +220,13 @@ export function settledRegularSeasonMatches(scoreboard: unknown): SettledMatch[]
 	const out: SettledMatch[] = [];
 	for (const e of events) {
 		const slug = (e.season?.slug ?? "").toLowerCase();
-		if (slug.startsWith("preseason") || slug.startsWith("playoffs")) continue;
+		if (slug.startsWith("preseason")) continue;
 		const st = e.status?.type ?? e.competitions?.[0]?.status?.type;
 		if (st?.state !== "post" || st.completed === false || (st.name && NON_FINAL_STATUS.has(st.name))) continue;
 		const kickoffMs = Date.parse(e.date ?? "");
 		const teamIds = (e.competitions?.[0]?.competitors ?? []).map((c) => String(c.team?.id ?? "")).filter(Boolean);
 		if (!e.id || Number.isNaN(kickoffMs) || teamIds.length !== 2) continue;
-		out.push({ eventId: String(e.id), teamIds, kickoffMs });
+		out.push({ eventId: String(e.id), teamIds, kickoffMs, ...(slug.startsWith("playoffs") ? { playoff: true } : {}) });
 	}
 	return out;
 }

@@ -306,7 +306,7 @@ describe("player stats — served from the saved copy, never ESPN on request", (
 });
 
 describe("recentFinals — which matches just finished, from the shared schedule copy", () => {
-	it("reads settled regular-season matches out of the stored season copy without re-fetching it", async () => {
+	it("reads settled matches (playoffs flagged) out of the stored season copy without re-fetching it", async () => {
 		const season = JSON.stringify({
 			events: [
 				{ id: "501", date: "2026-10-17T16:30Z", season: { slug: "regular-season" }, status: { type: { state: "post", completed: true, name: "STATUS_FULL_TIME" } },
@@ -319,11 +319,12 @@ describe("recentFinals — which matches just finished, from the shared schedule
 		});
 		fetchMock.get(ESPN).intercept({ path: (p) => p.startsWith(SB_PATH) && p.includes("dates=2026") }).reply(200, season, JSON_HEADERS);
 		const stub = env.ESPN_FETCHER!.get(env.ESPN_FETCHER!.idFromName("espn"));
-		const first = (await stub.recentFinals(2026, 12 * 3600 * 1000)) as { finals: { eventId: string }[]; refreshed: boolean };
+		const first = (await stub.recentFinals(2026, 12 * 3600 * 1000)) as { finals: { eventId: string; playoff?: boolean }[]; refreshed: boolean };
 		expect(first.refreshed).toBe(true); // nothing stored yet → ONE schedule fetch
-		expect(first.finals.map((f) => f.eventId)).toEqual(["501"]); // suspended + playoff excluded
+		expect(first.finals.map((f) => f.eventId)).toEqual(["501", "503"]); // suspended excluded
+		expect(first.finals[1].playoff).toBe(true); // the stats refresh filters these out; analytics keep them
 		const second = (await stub.recentFinals(2026, 12 * 3600 * 1000)) as { finals: { eventId: string }[]; refreshed: boolean };
 		expect(second.refreshed).toBe(false); // served from the copy — no second fetch (disableNetConnect)
-		expect(second.finals.length).toBe(1);
+		expect(second.finals.length).toBe(2);
 	});
 });

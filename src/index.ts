@@ -8451,17 +8451,18 @@ async function maybeScheduleStatsRefresh(env: Env, ctx: ExecutionContext, schedu
 	// The ESPN kill switch + circuit breaker gate at the EDGE, before the shared fetcher — this path skips the
 	// edge, so it checks them itself (never poll a paused or failing ESPN).
 	if ((await isEspnManuallyPaused(env)) || (await isEspnBreakerOpen(env))) return;
-	const { finals } = (await espnFetcherStub(env).recentFinals(year, 12 * 3600 * 1000)) as { finals: SettledMatch[] };
-	if (finals.length === 0) return;
+	const { finals: allFinals } = (await espnFetcherStub(env).recentFinals(year, 12 * 3600 * 1000)) as { finals: SettledMatch[] };
+	if (allFinals.length === 0) return;
 	// Match analytics (shots from the summary = ESPN's SITE service, not the blocked Core stats API) — planned
 	// before the stats block check below so a Core refusal never stops shot maps.
 	try {
-		await scheduleMatchAnalytics(env, ctx, finals, now, year);
+		await scheduleMatchAnalytics(env, ctx, allFinals, now, year);
 	} catch (e) {
 		emitDiag(env, ctx, "matchAnalyticsScheduleFail", String((e as Error)?.message ?? e).slice(0, 80));
 	}
 	const blockedUntil = await readNumber(env, STATS_ESPN_BLOCK_KEY);
 	if (now < blockedUntil) return; // ESPN refusing Cloudflare — the NWSL backup serves meanwhile
+	const finals = allFinals.filter((f) => !f.playoff); // player stats = regular season
 	const teamIds = [...new Set(finals.flatMap((f) => f.teamIds))];
 	const copies = await readTeamStatsCopies(env, teamIds, year);
 	const espnCopies = new Map([...copies].map(([t, c]) => [t, c.espn]));
@@ -8655,17 +8656,21 @@ async function handleMatchAnalyticsGet(url: URL, env: Env, ctx: ExecutionContext
 	const hit = await cache.match(cacheKey);
 	if (hit) return withCacheStatus(hit, "HIT");
 	const m = await contentGetJSON<MatchAnalytics>(env, ctx, analyticsMatchKey(eventId));
+	// Does ANY match have a heat map yet? The app hides the heat section everywhere until one does (owner 2026-10-20).
+	const year = Number((m?.kickoff ?? "").slice(0, 4)) || new Date().getUTCFullYear();
+	const index = (await contentGetJSON<AnalyticsIndex>(env, ctx, analyticsIndexKey(year))) ?? {};
+	const heatAnywhere = Object.values(index).some((r) => r.heat === "ok");
 	const headers = new Headers({ "Content-Type": "application/json" });
 	if (!m) {
 		headers.set("Cache-Control", "public, max-age=600");
-		const r = new Response(JSON.stringify({ event: eventId, status: "pending" }), { status: 404, headers });
+		const r = new Response(JSON.stringify({ event: eventId, status: "pending", heatAnywhere }), { status: 404, headers });
 		ctx.waitUntil(cache.put(cacheKey, r.clone()));
 		return r;
 	}
 	// Complete (ASA xG + heat) never changes again → long; otherwise it may still upgrade → 1h.
 	headers.set("Cache-Control", `public, max-age=${m.xg.source === "asa" && m.heatStatus === "ok" ? 7 * 86_400 : 3600}`);
-	const { rosterTeams: _rt, ...out } = m;
-	const r = new Response(JSON.stringify(out), { status: 200, headers });
+	const { rosterTeams: _rt, ...rest } = m;
+	const r = new Response(JSON.stringify({ ...rest, heatAnywhere }), { status: 200, headers });
 	ctx.waitUntil(cache.put(cacheKey, r.clone()));
 	return withCacheStatus(r, "MISS");
 }

@@ -26,7 +26,7 @@
 import { DurableObject } from "cloudflare:workers";
 import { ESPN_UA } from "./espn-ua.ts";
 import { chooseScoreboardTTL, chooseSummaryTTL } from "./index.ts";
-import { settledRegularSeasonMatches, type SettledMatch } from "./team-stats-store.ts";
+import { settledMatches, type SettledMatch } from "./team-stats-store.ts";
 import { heatGrids } from "./match-analytics.ts";
 import { ESPN_HEADERS } from "./espn-ua.ts";
 
@@ -193,7 +193,8 @@ export class EspnFetcher extends DurableObject<Env> {
 		} catch {
 			return { finals: [], copyAgeMs: now - best.fetchedAt, refreshed };
 		}
-		return { finals: settledRegularSeasonMatches(parsed), copyAgeMs: now - best.fetchedAt, refreshed };
+		// Regular season + playoffs (flagged): analytics build both; the stats refresh filters playoffs out.
+		return { finals: settledMatches(parsed), copyAgeMs: now - best.fetchedAt, refreshed };
 	}
 
 	private hit(e: Entry, source: FetcherSource): FetcherResult {
