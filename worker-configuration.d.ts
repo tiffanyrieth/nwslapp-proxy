@@ -68,6 +68,16 @@ interface Env {
 	BRIGHTDATA_TOKEN?: string;
 	BD_WEBHOOK_SECRET?: string;
 
+	// Secret (2026-10-20): opaque string Apify echoes in the Authorization header of the player run's
+	// completion webhook (POST /apify-webhook, set per run via the `webhooks` headersTemplate). Unset → the
+	// scrape isn't started (apifyRunFail "not configured") rather than started with an unauthenticated hook.
+	APIFY_WEBHOOK_SECRET?: string;
+
+	// R2 bucket `nwslapp-images` (2026-10-20): durable copies of player Instagram images, served from
+	// img.crestside.app (custom domain) so a card never shows an expired Instagram link. Optional so the
+	// worker runs before the bucket exists — copying just skips ("bucket-unbound").
+	IMAGES?: R2Bucket;
+
 	// Sign in with Apple (SIWA) revocation — secrets set via `wrangler secret put`.
 	// Back POST /auth/apple-token-exchange + the account-delete revoke step: the .p8
 	// signs an ES256 client_secret JWT used against Apple's /auth/token + /auth/revoke.
