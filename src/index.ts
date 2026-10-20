@@ -56,6 +56,19 @@ import {
 	type SnapshotStamp,
 } from "./ig-scrape.ts";
 import {
+	FEED_REFRESH_MS,
+	FeedHttpError,
+	conditionalHeaders,
+	healthAfterFailure,
+	healthAfterSuccess,
+	isDeadFeed,
+	isFeedDue,
+	parseRetryAfter,
+	validatorsOf,
+	type FeedHealth,
+	type FeedValidators,
+} from "./feed-polite.ts";
+import {
 	STATS_ESPN_BLOCK_KEY,
 	STATS_ESPN_BLOCK_MS,
 	nextEspnCopy,
@@ -808,7 +821,10 @@ const SOCIAL_KEEP_DAYS = 21;
 const SOCIAL_KEEP_MS = SOCIAL_KEEP_DAYS * 24 * 60 * 60 * 1000;
 /** Curated-Bluesky flood guard: max posts per account, per UTC day, per club (owner 2026-10-08). */
 const CURATED_POSTS_PER_DAY_PER_CLUB = 4;
-const SOCIAL_SOURCES_REFRESH_MS = 60 * 60 * 1000;
+// Every 4h (owner 2026-10-20, replacing the 2026-10-05 hourly ruling): articles don't need minute-level
+// freshness, an unchanged feed now answers a tiny 304 (src/feed-polite.ts), and small publishers (Substack hosts
+// 4 of our feeds; one 429'd every hourly run) see a quarter of the traffic.
+const SOCIAL_SOURCES_REFRESH_MS = FEED_REFRESH_MS;
 /** External fetches one refresh run may spend on SOURCE fetches (the rest of the 50 covers mixed-
  *  source Haiku, a capped OG fill and the KV write). Past it, the stalest sources go first and the
  *  remainder carry forward to the next run — so the list can grow without ever breaching the cap. */
@@ -817,7 +833,7 @@ const REFRESH_OG_CAP = 5; // OG fills per sources-refresh run (news keepers + Cl
 const NEWS_ITEMS_PER_OUTLET = 15; // newest items carried per outlet (pre-Haiku) — bounds snapshot size
 /** One source's slot in the snapshot. Beat items are FINAL cards (stamped to the club); news items
  *  are pre-Haiku NewsCards (relevance + team tag still run per /feed build). */
-interface SourceSlot {
+interface SourceSlot extends FeedHealth {
 	fetchedAt: number;
 	ok: boolean;
 	error?: string;
@@ -893,26 +909,43 @@ async function describeHttpFailure(r: Response): Promise<string> {
 /** Fetch + parse one article-type source (RSS/Atom, beehiiv archive, WP REST) → decoded items.
  *  Throws on transport/HTTP failure (caller decides the diag); an empty parse is `[]`. */
 async function fetchSourceItems(kind: "rss" | "beehiiv" | "wpjson", url: string): Promise<RawItem[]> {
+	const r = await fetchSourceItemsIfChanged(kind, url, undefined);
+	return "notModified" in r ? [] : r.items;
+}
+
+/** One feed fetch, POLITE (2026-10-20, src/feed-polite.ts): sends the stored validators so an unchanged feed
+ *  answers a tiny 304 (`{notModified:true}`), and a non-2xx throws FeedHttpError with the status + the site's
+ *  Retry-After so the caller can back off instead of retrying every run. */
+async function fetchSourceItemsIfChanged(
+	kind: "rss" | "beehiiv" | "wpjson",
+	url: string,
+	cond: FeedValidators | undefined,
+): Promise<{ notModified: true } | { items: RawItem[]; validators: FeedValidators }> {
 	const accept =
 		kind === "rss" ? "application/rss+xml, application/atom+xml, application/xml, text/xml" : kind === "wpjson" ? "application/json" : "text/html";
 	// WP REST is a JSON API — it has no SSR'd page to unlock, so it gets the honest PROXY_UA rather than a
 	// spoofed browser UA (a Chrome UA on a non-Chrome TLS fingerprint is a classic bot-score signal; a
 	// Tribune paper's bot wall began 403ing the browser-UA WP fetch ~a day after it went live, 2026-10-01).
 	const ua = kind === "wpjson" ? PROXY_UA : BROWSER_UA;
-	const r = await fetchBounded(url, { headers: { "User-Agent": ua, Accept: accept } });
-	if (!r.ok) throw new Error(await describeHttpFailure(r));
+	const r = await fetchBounded(url, { headers: { "User-Agent": ua, Accept: accept, ...conditionalHeaders(cond) } });
+	if (r.status === 304) return { notModified: true };
+	if (!r.ok) throw new FeedHttpError(await describeHttpFailure(r), r.status, parseRetryAfter(r.headers.get("retry-after"), Date.now()));
+	const validators = validatorsOf(r.headers);
 	let items: RawItem[];
 	if (kind === "rss") items = parseOutletRSS(await r.text());
 	else if (kind === "beehiiv") items = parseBeehiivArchive(await r.text(), new URL(url).origin);
 	else items = parseWpJsonPosts(await r.json());
 	// Normalize to plain display text (RSS is already decoded by parseOutletRSS; beehiiv/WP carry
 	// entities / HTML in title + excerpt).
-	return items.map((it) => ({
-		...it,
-		title: decodeEntities(it.title).trim(),
-		description: it.description ? stripHtml(it.description).slice(0, 240) || undefined : undefined,
-		image: httpsImage(it.image),
-	}));
+	return {
+		validators,
+		items: items.map((it) => ({
+			...it,
+			title: decodeEntities(it.title).trim(),
+			description: it.description ? stripHtml(it.description).slice(0, 240) || undefined : undefined,
+			image: httpsImage(it.image),
+		})),
+	};
 }
 
 // ---------------------------------------------------------------------------
@@ -1753,8 +1786,8 @@ that needs more users) until you bring it back.</p>
 			} catch {
 				/* swallow — best-effort; the next gated tick retries */
 			}
-			// Social sources snapshot refresh (Club Beat + News outlets), gated to ~60 min (owner 2026-10-05:
-			// hourly is plenty for articles; gentler on publishers). ONE subrequest here: the work runs in its OWN invocation
+			// Social sources snapshot refresh (Club Beat + News outlets), gated to every 4h (owner 2026-10-20, was
+			// hourly per 2026-10-05; gentler on publishers — src/feed-polite.ts). ONE subrequest here: the work runs in its OWN invocation
 			// via the SELF service binding, so it never competes with this tick's alerting budget.
 			try {
 				await triggerSocialSourcesRefresh(env, ctx);
@@ -4090,7 +4123,7 @@ async function statusCheckBeats(env: Env): Promise<StatusSection> {
 	if (uncovered.length) checks.push({ label: "Clubs with no Club Beat source", status: "info", detail: uncovered.join(", ") });
 	return {
 		title: `Club Beat sources (${list.length}) — club-dedicated coverage, routed to that club's fans only`,
-		note: "Read from the social sources snapshot (refreshed hourly off the request path). Tiers on the newest item: 🟢 <14d · 🟡 14–30d · 🔴 >30d, or the last refresh FAILED (red = unreachable from the Worker). GET /social/beat-audit re-fetches every source live.",
+		note: "Read from the social sources snapshot (refreshed every 4h off the request path; unchanged feeds answer 304, failing ones back off). Tiers on the newest item: 🟢 <14d · 🟡 14–30d · 🔴 >30d, or the last refresh FAILED (red = unreachable from the Worker). GET /social/beat-audit re-fetches every source live.",
 		checks,
 	};
 }
@@ -4590,8 +4623,12 @@ type NewsCard = {
 
 /** One outlet's items -> pre-Haiku News cards (title filter + datable items only, newest first). */
 async function fetchOutletCards(feed: NewsFeedSource): Promise<NewsCard[]> {
+	return outletCardsFrom(feed, await fetchSourceItems(feed.kind ?? "rss", feed.url));
+}
+
+function outletCardsFrom(feed: NewsFeedSource, rawItems: RawItem[]): NewsCard[] {
 	const cards: NewsCard[] = [];
-	for (const it of await fetchSourceItems(feed.kind ?? "rss", feed.url)) {
+	for (const it of rawItems) {
 		if (!titlePasses(it.title, feed.titleMatch)) continue;
 		// `timestamp` is required app-side; skip an undatable item rather
 		// than fake a time (would mis-sort it to "now").
@@ -4730,7 +4767,8 @@ async function buildOneBeatSource(
 	env: Env,
 	ctx: ExecutionContext,
 	og: { left: number },
-): Promise<{ items: unknown[]; newestRaw: number | null }> {
+	cond?: FeedValidators,
+): Promise<{ notModified: true } | { items: unknown[]; newestRaw: number | null; validators?: FeedValidators }> {
 	if (src.kind === "bluesky" && src.handle) {
 		// A `mixed` writer's newest few posts are often about another team they also cover (e.g. a
 		// KC Star writer on Sporting KC) — sample deeper so the club's posts surface. 20 = ONE Haiku batch.
@@ -4751,7 +4789,9 @@ async function buildOneBeatSource(
 		return { items: cards.map((c) => ({ ...c, teamAbbreviation: src.abbr, isLeague: false })), newestRaw };
 	}
 	if (!src.url || src.kind === "bluesky") return { items: [], newestRaw: null };
-	const all = await fetchSourceItems(src.kind, src.url);
+	const got = await fetchSourceItemsIfChanged(src.kind, src.url, cond);
+	if ("notModified" in got) return got;
+	const all = got.items;
 	const rawTimes = all.map((it) => Date.parse(it.pubDate ?? "")).filter((t) => !Number.isNaN(t));
 	const newestRaw = rawTimes.length ? Math.max(...rawTimes) : null;
 	const items = all.filter((it) => titlePasses(it.title, src.titleMatch));
@@ -4787,7 +4827,7 @@ async function buildOneBeatSource(
 		const used = await enrichNewsOG(newest, env, ctx, og.left);
 		og.left -= used.scraped;
 	}
-	return { items: newest, newestRaw };
+	return { items: newest, newestRaw, validators: got.validators };
 }
 
 /** `GET /watch/summaries?e=<event>:<league>[:1],…` — internal-only batch of /summary bodies for the match
@@ -4898,48 +4938,63 @@ async function refreshSocialSources(
 	const prev = await readSourcesSnapshot(env, ctx);
 	const beats = await loadBeatSources(env, ctx);
 	const outlets = await loadNewsFeeds(env, ctx);
-	type Job = { key: string; run: () => Promise<{ items: unknown[]; newestRaw: number | null }> };
+	type RunResult = { notModified: true } | { items: unknown[]; newestRaw: number | null; validators?: FeedValidators };
+	type Job = { key: string; run: (cond: FeedValidators | undefined) => Promise<RunResult> };
 	const og = { left: REFRESH_OG_CAP };
 	const jobs: Job[] = [
 		...outlets.map((f) => ({
 			key: newsSlotKey(f),
-			run: async () => {
-				const items = await fetchOutletCards(f);
+			run: async (cond: FeedValidators | undefined): Promise<RunResult> => {
+				const got = await fetchSourceItemsIfChanged(f.kind ?? "rss", f.url, cond);
+				if ("notModified" in got) return got;
+				const items = outletCardsFrom(f, got.items);
 				const times = items.map((c) => Date.parse(String(c.timestamp ?? ""))).filter((t) => !Number.isNaN(t));
-				return { items: items as unknown[], newestRaw: times.length ? Math.max(...times) : null };
+				return { items: items as unknown[], newestRaw: times.length ? Math.max(...times) : null, validators: got.validators };
 			},
 		})),
-		...beats.map((b) => ({ key: beatSlotKey(b), run: () => buildOneBeatSource(b, env, ctx, og) })),
+		...beats.map((b) => ({ key: beatSlotKey(b), run: (cond: FeedValidators | undefined) => buildOneBeatSource(b, env, ctx, og, cond) })),
 	];
-	// Stalest first (never-fetched = 0), so a budget-bounded run always makes progress.
-	jobs.sort((x, y) => (prev?.sources[x.key]?.fetchedAt ?? 0) - (prev?.sources[y.key]?.fetchedAt ?? 0));
 	const now = Date.now();
+	// A feed inside its backoff window isn't attempted (it used to be retried every run forever — always the
+	// "stalest"); stalest first among the due ones, so a budget-bounded run always makes progress.
+	const dueJobs = jobs.filter((j) => isFeedDue(prev?.sources[j.key], now));
+	dueJobs.sort((x, y) => (prev?.sources[x.key]?.fetchedAt ?? 0) - (prev?.sources[y.key]?.fetchedAt ?? 0));
 	const sources: Record<string, SourceSlot> = {};
 	const failed: string[] = [];
-	const due = jobs.slice(0, REFRESH_SOURCE_BUDGET);
-	const carried = jobs.slice(REFRESH_SOURCE_BUDGET);
+	const due = dueJobs.slice(0, REFRESH_SOURCE_BUDGET);
+	const dueKeys = new Set(due.map((j) => j.key));
+	const carried = jobs.filter((j) => !dueKeys.has(j.key));
+	const dead: string[] = [];
 	await Promise.all(
 		due.map(async (j) => {
+			const old = prev?.sources[j.key];
 			try {
-				const out = await j.run();
+				const out = await j.run(old ? { etag: old.etag, lastModified: old.lastModified } : undefined);
+				if ("notModified" in out) {
+					// 304 — the feed hasn't changed: keep what we have, mark it fresh (a tiny reply, not a re-download).
+					sources[j.key] = { ...(old as SourceSlot), ...healthAfterSuccess(old, null), fetchedAt: now, ok: true, error: undefined, failStreak: undefined, nextAttemptAt: undefined, failingSince: undefined };
+					return;
+				}
 				// ACCUMULATE within the window (2026-10-08): a re-fetch only sees each source's newest items,
 				// so merge with what's stored instead of replacing it. News keeps its newest 15 per source.
 				const isNews = j.key.startsWith("news:");
 				sources[j.key] = {
+					...healthAfterSuccess(old, out.validators ?? null),
 					fetchedAt: now,
 					ok: true,
-					items: mergeSlotItems(prev?.sources[j.key]?.items, out.items, isNews ? NEWS_ITEMS_PER_OUTLET : undefined),
+					items: mergeSlotItems(old?.items, out.items, isNews ? NEWS_ITEMS_PER_OUTLET : undefined),
 					newestRaw: out.newestRaw,
 				};
 			} catch (e) {
 				const msg = String((e as Error)?.message ?? e).slice(0, 80);
 				failed.push(j.key);
-				if (isTimeout(e)) emitDiag(env, ctx, "feedUpstreamTimeout", j.key.slice(0, 70));
+				const health = healthAfterFailure(old, e, now);
+				if (isDeadFeed(health, now)) dead.push(j.key); // reported once a day below, not per run
+				else if (isTimeout(e)) emitDiag(env, ctx, "feedUpstreamTimeout", j.key.slice(0, 70));
 				else if (isSubrequestCap(e)) emitDiag(env, ctx, "subrequestCapHit", j.key.slice(0, 70));
-				else emitDiag(env, ctx, "feedSourceFail", `${j.key.slice(0, 60)}: ${msg}`);
-				// Keep the last good items (a transient blip shouldn't blank a club), flagged not-ok.
-				const old = prev?.sources[j.key];
-				sources[j.key] = { fetchedAt: old?.fetchedAt ?? 0, ok: false, error: msg, items: old?.items ?? [], newestRaw: old?.newestRaw ?? null };
+				else emitDiag(env, ctx, "feedSourceFail", `${j.key.slice(0, 60)}: ${msg} (retry in ${Math.round(((health.nextAttemptAt ?? now) - now) / 3600000)}h)`);
+				// Keep the last good items (a transient blip shouldn't blank a club), flagged not-ok, backed off.
+				sources[j.key] = { ...health, fetchedAt: old?.fetchedAt ?? 0, ok: false, error: msg, items: old?.items ?? [], newestRaw: old?.newestRaw ?? null };
 			}
 		}),
 	);
@@ -4966,7 +5021,10 @@ async function refreshSocialSources(
 	}
 	const snap: SourcesSnapshot = { v: 1, updatedAt: now, at: now, sources };
 	await putSnapshot(env, ctx, SOCIAL_SOURCES_KEY, snap);
-	if (carried.length) emitDiag(env, ctx, "sourcesRefreshCarried", `${carried.length} source(s) past the per-run budget carried forward`);
+	const overBudget = dueJobs.length - due.length;
+	if (overBudget > 0) emitDiag(env, ctx, "sourcesRefreshCarried", `${overBudget} source(s) past the per-run budget carried forward`);
+	// A feed failing for 7+ days — one rolled-up line in the daily digest so the owner can keep or drop it.
+	if (dead.length) emitDiag(env, ctx, "feedSourceDead", `failing 7+ days: ${dead.join(" ").slice(0, 70)}`);
 	return { refreshed: due.length - failed.length, failed, carried: carried.length, total: jobs.length };
 }
 
@@ -5146,9 +5204,10 @@ export function capCuratedPerDayPerClub<T extends Record<string, unknown>>(cards
 // ---------------------------------------------------------------------------
 const PODCAST_LIST_KEY = "social:podcast-list";
 const SOCIAL_PODCASTS_KEY = "social:podcasts-snapshot";
-const SOCIAL_PODCASTS_REFRESH_MS = 60 * 60 * 1000; // hourly — weekly shows don't need the 30-min cadence
+// Every 4h (owner 2026-10-20, replacing hourly): weekly shows; an unchanged feed answers a tiny 304.
+const SOCIAL_PODCASTS_REFRESH_MS = FEED_REFRESH_MS;
 
-interface PodcastSlot {
+interface PodcastSlot extends FeedHealth {
 	meta: PodcastShow;
 	artwork?: string;
 	author?: string;
@@ -5219,9 +5278,11 @@ async function loadRosterNameMap(env: Env): Promise<Map<string, string>> {
 
 /** Build one show's snapshot slot (uncached refresh path). Fetches the feed, parses episodes,
  *  routes league shows (club shows inherit their scope), caps to MAX_EPISODES_PER_SHOW. */
-async function buildPodcastSlot(show: PodcastShow, roster: Map<string, string>): Promise<PodcastSlot> {
-	const r = await fetchBounded(show.rss, { headers: { "User-Agent": BROWSER_UA, Accept: "application/rss+xml, application/xml, text/xml" } });
-	if (!r.ok) throw new Error(`HTTP ${r.status}`);
+async function buildPodcastSlot(show: PodcastShow, roster: Map<string, string>, cond?: FeedValidators): Promise<PodcastSlot | "notModified"> {
+	const r = await fetchBounded(show.rss, { headers: { "User-Agent": BROWSER_UA, Accept: "application/rss+xml, application/xml, text/xml", ...conditionalHeaders(cond) } });
+	if (r.status === 304) return "notModified";
+	if (!r.ok) throw new FeedHttpError(`HTTP ${r.status}`, r.status, parseRetryAfter(r.headers.get("retry-after"), Date.now()));
+	const validators = validatorsOf(r.headers);
 	const parsed = parsePodcastRSS(await r.text());
 	const episodes: PodcastEpisode[] = [];
 	const clubCounts: Record<string, number> = {};
@@ -5252,7 +5313,7 @@ async function buildPodcastSlot(show: PodcastShow, roster: Map<string, string>):
 		});
 		if (episodes.length >= MAX_EPISODES_PER_SHOW) break;
 	}
-	return { meta: show, artwork: httpsImage(parsed.artwork), author: parsed.author, blocked: parsed.blocked, lastEpisodeAt, ok: true, clubCounts, episodes };
+	return { ...validators, meta: show, artwork: httpsImage(parsed.artwork), author: parsed.author, blocked: parsed.blocked, lastEpisodeAt, ok: true, clubCounts, episodes };
 }
 
 /** REFRESH the podcasts snapshot (own invocation via SELF — see SOCIAL_PODCASTS_KEY). Per-show
@@ -5264,23 +5325,38 @@ async function refreshPodcastsSnapshot(env: Env, ctx: ExecutionContext): Promise
 	const now = Date.now();
 	const out: Record<string, PodcastSlot> = {};
 	const failed: string[] = [];
+	const dead: string[] = [];
 	await Promise.all(
 		shows.map(async (show) => {
+			const old = prev?.shows[show.id];
+			// Inside its backoff window → keep the previous slot untouched, don't ask the host (2026-10-20).
+			if (old && !isFeedDue(old, now)) {
+				out[show.id] = { ...old, meta: show };
+				return;
+			}
 			try {
-				out[show.id] = await buildPodcastSlot(show, roster);
+				const got = await buildPodcastSlot(show, roster, old ? { etag: old.etag, lastModified: old.lastModified } : undefined);
+				// 304 → the feed hasn't changed: keep the previous slot, healthy again.
+				out[show.id] = got === "notModified" && old
+					? { ...old, ...healthAfterSuccess(old, null), meta: show, ok: true, error: undefined, failStreak: undefined, nextAttemptAt: undefined, failingSince: undefined }
+					: got === "notModified"
+						? { meta: show, lastEpisodeAt: null, ok: true, clubCounts: {}, episodes: [] }
+						: got;
 			} catch (e) {
 				const msg = String((e as Error)?.message ?? e).slice(0, 80);
 				failed.push(show.id);
-				if (isTimeout(e)) emitDiag(env, ctx, "feedUpstreamTimeout", `pod:${show.id}`);
+				const health = healthAfterFailure(old, e, now);
+				if (isDeadFeed(health, now)) dead.push(`pod:${show.id}`);
+				else if (isTimeout(e)) emitDiag(env, ctx, "feedUpstreamTimeout", `pod:${show.id}`);
 				else if (isSubrequestCap(e)) emitDiag(env, ctx, "subrequestCapHit", `pod:${show.id}`);
-				else emitDiag(env, ctx, "podcastFeedFail", `${show.id}: ${msg}`);
-				const old = prev?.shows[show.id];
+				else emitDiag(env, ctx, "podcastFeedFail", `${show.id}: ${msg} (retry in ${Math.round(((health.nextAttemptAt ?? now) - now) / 3600000)}h)`);
 				out[show.id] = old
-					? { ...old, ok: false, error: msg, meta: show }
-					: { meta: show, lastEpisodeAt: null, ok: false, error: msg, clubCounts: {}, episodes: [] };
+					? { ...old, ...health, ok: false, error: msg, meta: show }
+					: { ...health, meta: show, lastEpisodeAt: null, ok: false, error: msg, clubCounts: {}, episodes: [] };
 			}
 		}),
 	);
+	if (dead.length) emitDiag(env, ctx, "feedSourceDead", `failing 7+ days: ${dead.join(" ").slice(0, 70)}`);
 	const snap: PodcastsSnapshot = { v: 1, updatedAt: now, at: now, shows: out };
 	await putSnapshot(env, ctx, SOCIAL_PODCASTS_KEY, snap);
 	return { refreshed: shows.length - failed.length, failed, total: shows.length };
@@ -5738,7 +5814,7 @@ async function handleFeed(url: URL, env: Env, ctx: ExecutionContext): Promise<Re
 		// "time out" from queueing alone. News + the KV snapshot go FIRST (fast, small); the
 		// Bluesky wave follows with its hang bound, so a Bluesky incident degrades ONLY the
 		// Bluesky sources and the rest of the feed always arrives.
-		// Social sources snapshot (Club Beat + News outlets): ONE KV read, refreshed off-path ~hourly.
+		// Social sources snapshot (Club Beat + News outlets): ONE read, refreshed off-path every 4h.
 		// Podcasts snapshot only when the client is podcast-capable (build 43 sends no caps).
 		const sourcesSnap = await readSourcesSnapshot(env, ctx);
 		const podcastsSnap = caps.has("podcast") ? await readPodcastsSnapshot(env, ctx) : null;
