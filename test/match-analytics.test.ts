@@ -59,7 +59,7 @@ test("with ASA: team xG is ASA's (WAS 1.12 – GFC 0.41) and player lines carry 
 	assert.equal(a.xg.source, "asa");
 	assert.equal(a.xg.home, 1.12);
 	assert.equal(a.xg.away, 0.41);
-	assert.equal(a.asaRetryAfter, null);
+	assert.ok(a.asaRetryAfter, "xG without the g+ depth → ASA is asked again");
 	const asaLines = a.players.filter((p) => p.source === "asa");
 	assert.ok(asaLines.length >= 10, `${asaLines.length} ASA-matched players`);
 	assert.ok(asaLines.some((p) => (p.keyPasses ?? 0) > 0));
@@ -137,7 +137,7 @@ test("scheduling: new matches first (newest first, capped), ONE ASA retry, heat 
 	];
 	const index = {
 		asaDue: { source: "estimate" as const, asaRetryAfter: now - 1, heat: "ok" as const, builtAt: 0, v: 2 },
-		asaRetried: { source: "estimate" as const, asaRetryAfter: now - 1, asaRetried: true, heat: "ok" as const, builtAt: 0, v: 2 },
+		asaRetried: { source: "estimate" as const, asaRetryAfter: now - 1, asaRetries: 2, heat: "ok" as const, builtAt: 0, v: 2 },
 		heatDue: { source: "asa" as const, asaRetryAfter: null, heat: "unavailable" as const, heatRetryAfter: now - 1, builtAt: 0, v: 2 },
 	};
 	const plan = (coreBlocked: boolean, max = 10) => planAnalyticsBuilds({ finals, index, now, coreBlocked, afterKickoffMs: 4 * H, max });
@@ -150,7 +150,7 @@ test("scheduling: new matches first (newest first, capped), ONE ASA retry, heat 
 // ── Phase 2: every position (ASA depth + ESPN Core extras) ────────────────────────────────────────
 const core = JSON.parse(readFileSync(new URL("./fixtures/core-plays-401854021-trim.json", import.meta.url), "utf8"));
 const depth = () => ({
-	shots: asa.gameShots.Oa5wPGp9q1, flow: asa.gameFlow.Oa5wPGp9q1,
+	shots: asa.gameShots.Oa5wPGp9q1,
 	gkXg: asa.gkXg, playerGplus: asa.playerGplus, gkGplus: asa.gkGplus, xpass: asa.playerXpass,
 });
 const nameOf = (id: string) => (summary.rosters as { roster: { athlete: { id: string; displayName: string } }[] }[])
@@ -187,18 +187,6 @@ test("goals added (g+) for every outfield player, six actions each; passing vs e
 	assert.ok(m.gplus!.some((g) => (g.actions.Interrupting?.count ?? 0) > 0), "defenders' tackles/clearances counted");
 	assert.ok(m.xpass!.length >= 25);
 	assert.ok(m.xpass!.every((x) => x.attempted > 0 && x.completionPct <= 1));
-});
-
-test("game flow: ASA's per-minute series when posted, our shots otherwise", async () => {
-	const { flowFromShots } = await import("../src/match-analytics.ts");
-	const m = buildMatchAnalytics({ summary, asa, asaDepth: depth(), now: 1 })!;
-	assert.equal(m.flowSource, "asa");
-	assert.equal(m.flow!.length, 97);
-	const est = buildMatchAnalytics({ summary, asa: null, now: 1 })!;
-	assert.equal(est.flowSource, "estimate");
-	const fallback = flowFromShots(shotsFromSummary(summary), "15365");
-	assert.ok(fallback.length >= 91);
-	assert.equal(Math.round(fallback.reduce((n, p) => n + p.home, 0) * 100) / 100, 1.28); // = our WAS estimate
 });
 
 test("ESPN Core extras (dormant while blocked): defensive actions per player + ESPN's per-shot xG / xGOT / height", async () => {
@@ -242,4 +230,41 @@ test("planner: a v1 copy is rebuilt once to v2 (keepers / g+ / per-shot ASA xG)"
 		done: { source: "asa" as const, asaRetryAfter: null, heat: "ok" as const, builtAt: 0, v: 2 },
 	};
 	assert.deepEqual(planAnalyticsBuilds({ finals, index, now, coreBlocked: true, afterKickoffMs: 4 * H, max: 10 }), ["old"]);
+});
+
+
+test("ASA retries: up to twice (2h–33h lag measured), then stop; a complete copy schedules none", async () => {
+	const { planAnalyticsBuilds, MAX_ASA_RETRIES } = await import("../src/match-analytics.ts");
+	assert.equal(MAX_ASA_RETRIES, 2);
+	const H = 3600_000, now = 1_000 * H;
+	const finals = [{ eventId: "a", kickoffMs: now - 30 * H }, { eventId: "b", kickoffMs: now - 60 * H }, { eventId: "c", kickoffMs: now - 70 * H }];
+	const ix = (asaRetries: number | undefined, legacy?: boolean) => ({ source: "asa" as const, asaRetryAfter: now - 1, heat: "ok" as const, builtAt: 0, v: 2, asaRetries, ...(legacy ? { asaRetried: true } : {}) });
+	const index = { a: ix(undefined), b: ix(1, true), c: ix(2) };
+	assert.deepEqual(planAnalyticsBuilds({ finals, index, now, coreBlocked: true, afterKickoffMs: 4 * H, max: 10 }), ["a", "b"]);
+	const complete = buildMatchAnalytics({ summary, asa, asaDepth: depth(), now: 1 })!;
+	assert.equal(complete.asaRetryAfter, null);
+});
+
+test("height band: ESPN's own words for shots on target, exact Core height when present", async () => {
+	const { heightBandFromText, heightBandFromZ, joinCoreShots, coreShots } = await import("../src/match-analytics.ts");
+	assert.equal(heightBandFromText("Attempt saved. X right footed shot is saved in the top centre of the goal."), "high");
+	assert.equal(heightBandFromText("Goal! ... left footed shot from the centre of the box to the bottom right corner."), "low");
+	assert.equal(heightBandFromText("Attempt saved. ... is saved in the centre of the goal."), "middle");
+	assert.equal(heightBandFromText("Attempt missed. ... misses to the left."), null);
+	const shots = shotsFromSummary(summary);
+	const onTarget = shots.filter((s) => s.outcome === "goal" || s.outcome === "onTarget");
+	assert.ok(onTarget.every((s) => s.heightBand), "every on-target shot gets a band from ESPN's text");
+	assert.ok(shots.filter((s) => s.outcome !== "goal" && s.outcome !== "onTarget").every((s) => !s.heightBand));
+	assert.equal(shots.find((s) => s.outcome === "goal")!.heightBand, "low"); // "to the bottom right corner"
+	assert.equal(heightBandFromZ(39.9 - 10), "high");
+	const joined = joinCoreShots(shots, coreShots(core.items));
+	assert.equal(joined[1].goalZ, 25.3);
+	assert.equal(joined[1].heightBand, "middle"); // Core 25.3 = just under the top third (text said "top centre")
+});
+
+test("season shots against carry the keeper who faced them", () => {
+	const m = buildMatchAnalytics({ summary, asa, asaDepth: depth(), now: 1 })!;
+	const was = foldMatchIntoSeason(emptySeason("15365", 2026), m, 1);
+	const keeper = was.keepers[0].athleteId;
+	assert.ok(was.contributions[0].shotsAgainst.every((s) => s.keeperId === keeper));
 });

@@ -65,7 +65,6 @@ import {
 	type AsaPlayerXg,
 	type AsaTeam,
 	type AsaDepth,
-	type AsaFlowPoint,
 	type AsaGkXg,
 	type AsaGplusRow,
 	type AsaShot,
@@ -8598,9 +8597,9 @@ async function loadAsaForKickoff(env: Env, ctx: ExecutionContext, kickoffIso: st
 	}
 }
 
-/** ASA's per-match rows (every shot with ASA xG / post-shot xG / situation, and the game-flow series) for ONE
- *  game. A match's rows never change once posted → kept 30 days; an EMPTY answer (not posted yet) only 6h. */
-async function loadAsaGameDepth(env: Env, ctx: ExecutionContext, gameId: string): Promise<Pick<AsaDepth, "shots" | "flow">> {
+/** ASA's per-shot rows (ASA xG / post-shot xG / situation) for ONE game. A match's rows never change once posted
+ *  → kept 30 days; an EMPTY answer (not posted yet) only 6h. */
+async function loadAsaGameDepth(env: Env, ctx: ExecutionContext, gameId: string): Promise<Pick<AsaDepth, "shots">> {
 	const one = async <T>(key: string, url: string): Promise<T[] | undefined> => {
 		const cached = await contentGetJSON<T[]>(env, ctx, key);
 		if (cached) return cached;
@@ -8616,11 +8615,7 @@ async function loadAsaGameDepth(env: Env, ctx: ExecutionContext, gameId: string)
 		}
 	};
 	const id = encodeURIComponent(gameId);
-	const [shots, flow] = await Promise.all([
-		one<AsaShot>(`asa:shots:${gameId}`, `${ASA_API}/games/shots?game_id=${id}`),
-		one<AsaFlowPoint>(`asa:flow:${gameId}`, `${ASA_API}/games/game-flow?game_id=${id}`),
-	]);
-	return { shots, flow };
+	return { shots: await one<AsaShot>(`asa:shots:${gameId}`, `${ASA_API}/games/shots?game_id=${id}`) };
 }
 
 /** `POST /internal/match-analytics/build?event=<id>` (SELF, admin key) — build/refresh ONE match's saved copy,
@@ -8655,7 +8650,7 @@ async function handleMatchAnalyticsBuild(request: Request, url: URL, env: Env, c
 
 	// ASA: needed on a first build, a due retry, or the one-time v1 → v2 upgrade (keepers / g+ / per-shot xG); a
 	// v2 copy that already has ASA's numbers reuses them (a heat-only rebuild).
-	const prevComplete = prev?.xg.source === "asa" && (prev.v ?? 1) >= 2;
+	const prevComplete = prev?.xg.source === "asa" && (prev.v ?? 1) >= 2 && (prev.gplus?.length ?? 0) > 0;
 	const asa = prevComplete ? null : await loadAsaForKickoff(env, ctx, kickoff);
 	let asaDepth: AsaDepth | null = null;
 	if (asa) {
@@ -8689,15 +8684,16 @@ async function handleMatchAnalyticsBuild(request: Request, url: URL, env: Env, c
 	if (prevComplete && prev) {
 		built = { ...built, xg: prev.xg, players: prev.players, asaRetryAfter: null,
 			shots: core?.shots?.length ? joinCoreShots(prev.shots, core.shots) : prev.shots,
-			keepers: prev.keepers, gplus: prev.gplus, xpass: prev.xpass, flow: prev.flow, flowSource: prev.flowSource };
+			keepers: prev.keepers, gplus: prev.gplus, xpass: prev.xpass };
 	}
-	const asaRetried = !!prevIx && prevIx.source === "estimate" && built.xg.source === "estimate" && prevIx.asaRetryAfter !== null && now >= prevIx.asaRetryAfter;
+	const wasAsaRetry = !!prevIx && prevIx.asaRetryAfter !== null && now >= prevIx.asaRetryAfter;
+	const asaRetries = (prevIx?.asaRetries ?? (prevIx?.asaRetried ? 1 : 0)) + (wasAsaRetry ? 1 : 0);
 	const home = foldMatchIntoSeason(parse<TeamSeasonAnalytics>(got.get(analyticsTeamKey(homeId, year))) ?? emptySeason(homeId, year), built, now);
 	const away = foldMatchIntoSeason(parse<TeamSeasonAnalytics>(got.get(analyticsTeamKey(awayId, year))) ?? emptySeason(awayId, year), built, now);
 	index[eventId] = {
 		source: built.xg.source,
 		asaRetryAfter: built.asaRetryAfter,
-		asaRetried: asaRetried || prevIx?.asaRetried || undefined,
+		asaRetries: asaRetries || undefined,
 		heat: built.heatStatus,
 		heatRetryAfter: built.heatStatus === "ok" ? undefined : now + HEAT_RETRY_MS,
 		builtAt: now,
@@ -8784,7 +8780,7 @@ async function statusCheckAnalytics(env: Env): Promise<StatusSection> {
 		const newest = Math.max(...rows.map((r) => r.builtAt));
 		checks.push({ label: "Matches built", status: "ok", detail: `${rows.length} matches · last build ${ageLabel(now - newest)}` });
 		const asa = rows.filter((r) => r.source === "asa").length;
-		checks.push({ label: "xG source", status: asa === rows.length ? "ok" : "info", detail: `American Soccer Analysis ${asa} · our estimate ${rows.length - asa}${rows.length - asa ? " (retried once ~22h later)" : ""}` });
+		checks.push({ label: "xG source", status: asa === rows.length ? "ok" : "info", detail: `American Soccer Analysis ${asa} · our estimate ${rows.length - asa}${rows.length - asa ? " (ASA re-asked up to twice, ~22h apart)" : ""}` });
 		const depth = rows.filter((r) => r.depth).length;
 		checks.push({ label: "Keepers · g+ · passing", status: depth === rows.length ? "ok" : "info", detail: `${depth}/${rows.length} matches have American Soccer Analysis depth${depth < rows.length ? " (the rest upgrade on their next build, ≤8/hour)" : ""}` });
 		const heatOk = rows.filter((r) => r.heat === "ok").length;

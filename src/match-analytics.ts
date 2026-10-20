@@ -45,8 +45,28 @@ export interface Shot {
 	/** ESPN's own per-shot xG / xGOT + shot height (Core event stream; dormant while Core refuses Cloudflare). */
 	xgEspn?: number;
 	xgotEspn?: number;
-	/** Height where it crossed the goal line, 0–100 of the crossbar height (Core `goalPositionZ`). */
+	/** Height where it crossed the goal line (Core `goalPositionZ`, 0–100 scale; the crossbar is ≈ 38). */
 	goalZ?: number;
+	/** High / middle / low third of the goal for a shot ON TARGET: ESPN's own words ("top centre", "bottom left
+	 *  corner", "centre of the goal") — exact Core height overrides when present. */
+	heightBand?: HeightBand;
+	/** Season "shots against" only: the keeper who faced it (that match's keeper with the most minutes). */
+	keeperId?: string;
+}
+
+export type HeightBand = "high" | "middle" | "low";
+/** ESPN text → band. Calibrated on GFC @ WAS against Core heights: "top …" Z 25–32, "centre of the goal" 4–15,
+ *  "bottom …" 2–4 (crossbar ≈ 38, "hits the bar" = 39.9). */
+export function heightBandFromText(text: string): HeightBand | null {
+	const t = text.toLowerCase();
+	if (/\b(top|high) (left|right|centre|center)\b|\btop corner\b|\bhigh centre\b/.test(t)) return "high";
+	if (/\b(bottom|low) (left|right|centre|center)\b|\bbottom corner\b/.test(t)) return "low";
+	if (/\b(centre|center) of the goal\b/.test(t)) return "middle";
+	return null;
+}
+/** Core height → band: thirds of the crossbar height (Design's 0.8 m / 1.6 m of 2.44 m). */
+export function heightBandFromZ(z: number): HeightBand {
+	return z > 25.3 ? "high" : z < 12.7 ? "low" : "middle";
 }
 
 /** ESPN play type → outcome. Goals come in several types ("Goal", "Goal - Header", "Goal - Volley", …);
@@ -159,6 +179,7 @@ export function shotsFromSummary(summary: SummaryLike): Shot[] {
 		const bodyPart = bodyPartOf(type, text);
 		const [shooter, assister] = p.participants ?? [];
 		const base = { x: p.fieldPositionX, y: p.fieldPositionY, penalty, bodyPart };
+		const band = outcome === "goal" || outcome === "onTarget" ? heightBandFromText(text) : null;
 		shots.push({
 			minute: p.clock?.displayValue ?? "",
 			period: p.period?.number ?? 0,
@@ -174,6 +195,7 @@ export function shotsFromSummary(summary: SummaryLike): Shot[] {
 			penalty,
 			bodyPart,
 			xgEst: estimateXg(base),
+			...(band ? { heightBand: band } : {}),
 		});
 	}
 	return shots;
@@ -249,9 +271,6 @@ export interface MatchAnalytics {
 	gplus?: GplusLine[];
 	/** Passing vs expected. Empty until ASA has the match. */
 	xpass?: XpassLine[];
-	/** Per-minute attacking threat, home vs away. ASA's game flow, else our shots. */
-	flow?: FlowPoint[];
-	flowSource?: "asa" | "estimate";
 	/** Defensive actions by location per player (ESPN Core; null while Core refuses Cloudflare). */
 	defense?: Record<string, DefAction[]> | null;
 }
@@ -266,7 +285,7 @@ export function buildMatchAnalytics(args: {
 	espnRosterNames?: Map<string, { teamId: string; name: string }>;
 	heat?: Record<string, number[]> | null;
 	heatStatus?: MatchAnalytics["heatStatus"];
-	/** Phase 2: ASA's per-shot rows, keepers, g+, xPass and game flow for THIS match (any piece may be missing). */
+	/** Phase 2: ASA's per-shot rows, keepers, g+ and xPass for THIS match (any piece may be missing). */
 	asaDepth?: AsaDepth | null;
 	/** Phase 2: ESPN Core extras from the heat step's pages (null while Core refuses Cloudflare). */
 	core?: { shots?: { x: number; y: number; xg?: number; xgot?: number; goalZ?: number }[]; defense?: Record<string, DefAction[]> } | null;
@@ -350,9 +369,7 @@ export function buildMatchAnalytics(args: {
 		return teamId && athleteId ? { athleteId, teamId } : null;
 	};
 	const d = asaGame ? args.asaDepth : null;
-	const flow = d?.flow?.length
-		? { flow: flowSeries(d.flow, true), flowSource: "asa" as const }   // asaGameFor matched ASA home = ESPN home
-		: shots.length ? { flow: flowFromShots(shots, teams.home.id), flowSource: "estimate" as const } : {};
+	const gplusOut = d?.playerGplus ? gplusLines(d.playerGplus.filter((r) => r.game_id === asaGame!.game_id), mapAsa) : [];
 	return {
 		v: 2,
 		eventId: teams.eventId,
@@ -362,16 +379,17 @@ export function buildMatchAnalytics(args: {
 		shots,
 		xg,
 		keepers: d?.gkXg ? keeperLines(d.gkXg.filter((k) => k.game_id === asaGame!.game_id), (d.gkGplus ?? []).filter((k) => k.game_id === asaGame!.game_id), mapAsa) : [],
-		gplus: d?.playerGplus ? gplusLines(d.playerGplus.filter((r) => r.game_id === asaGame!.game_id), mapAsa) : [],
+		gplus: gplusOut,
 		xpass: d?.xpass ? xpassLines(d.xpass.filter((r) => r.game_id === asaGame!.game_id), mapAsa) : [],
-		...flow,
 		defense: args.core?.defense ?? null,
 		players: [...lines.values()].sort((a, b) => b.xg - a.xg),
 		heat: args.heat ?? null,
 		heatStatus: args.heatStatus ?? (args.heat ? "ok" : "pending"),
 		rosterTeams: Object.fromEntries([...names].map(([id, v]) => [id, v.teamId])),
 		builtAt: args.now,
-		asaRetryAfter: xg.source === "estimate" ? args.now + (args.asaRetryMs ?? 22 * 3600_000) : null,
+		// ASA lags 2h–33h after kickoff (measured on the 10/17 matches) → retry while xG or the g+ depth is missing
+		// (at most MAX_ASA_RETRIES times, see planAnalyticsBuilds).
+		asaRetryAfter: xg.source === "estimate" || !gplusOut.length ? args.now + (args.asaRetryMs ?? 22 * 3600_000) : null,
 	};
 }
 
@@ -407,9 +425,10 @@ export interface AsaXpass {
 	player_id: string; game_id: string; team_id: string; attempted_passes?: number; pass_completion_percentage?: number;
 	xpass_completion_percentage?: number; passes_completed_over_expected?: number;
 }
-export interface AsaFlowPoint { period_id: number; expanded_minute: number; home_team_value: number; away_team_value: number }
 /** Everything ASA has for ONE match beyond team/player xG. Each piece optional (ASA can lag or fail per call). */
-export interface AsaDepth { shots?: AsaShot[]; flow?: AsaFlowPoint[]; gkXg?: AsaGkXg[]; playerGplus?: AsaGplusRow[]; gkGplus?: AsaGplusRow[]; xpass?: AsaXpass[] }
+// (No game-flow: the app's chart is the RUNNING xG of these shots — ASA's `games/game-flow` is a per-minute threat
+// value, not xG, so it was dropped 2026-10-20 to save a call per match.)
+export interface AsaDepth { shots?: AsaShot[]; gkXg?: AsaGkXg[]; playerGplus?: AsaGplusRow[]; gkGplus?: AsaGplusRow[]; xpass?: AsaXpass[] }
 
 export type Situation = "regular" | "corner" | "freeKick" | "setPiece" | "penalty" | "fastBreak" | "throwIn" | "other";
 export function situationOf(pattern: string | undefined): Situation {
@@ -437,7 +456,6 @@ export interface KeeperLine {
 	gplus: GplusActions | null;
 }
 export interface XpassLine { athleteId: string; teamId: string; attempted: number; completionPct: number; xCompletionPct: number; overExpected: number }
-export interface FlowPoint { minute: number; period: number; home: number; away: number }
 export type DefKind = "tackle" | "tackleLost" | "interception" | "clearance" | "block" | "recovery";
 /** One defensive action, oriented like shots (her team attacks x = 100). */
 export interface DefAction { kind: DefKind; x: number; y: number; minute: string }
@@ -469,7 +487,9 @@ export function joinCoreShots(shots: Shot[], core: { x: number; y: number; xg?: 
 	return shots.map((s) => {
 		const c = byLoc.get(locKey(s.x, s.y));
 		if (!c) return s;
-		return { ...s, ...(c.xg != null ? { xgEspn: r3(c.xg) } : {}), ...(c.xgot != null ? { xgotEspn: r3(c.xgot) } : {}), ...(c.goalZ != null ? { goalZ: c.goalZ } : {}) };
+		const onTarget = s.outcome === "goal" || s.outcome === "onTarget";
+		return { ...s, ...(c.xg != null ? { xgEspn: r3(c.xg) } : {}), ...(c.xgot != null ? { xgotEspn: r3(c.xgot) } : {}),
+			...(c.goalZ != null ? { goalZ: c.goalZ, ...(onTarget ? { heightBand: heightBandFromZ(c.goalZ) } : {}) } : {}) };
 	});
 }
 
@@ -519,31 +539,6 @@ export function xpassLines(rows: AsaXpass[], map: AsaAthleteMapper): XpassLine[]
 		out.push({ ...who, attempted: r.attempted_passes, completionPct: r3(r.pass_completion_percentage ?? 0),
 			xCompletionPct: r3(r.xpass_completion_percentage ?? 0), overExpected: r3(r.passes_completed_over_expected ?? 0) });
 	}
-	return out;
-}
-
-/** ASA's per-minute threat, oriented to the ESPN home/away of the match. */
-export function flowSeries(flow: AsaFlowPoint[], asaHomeIsEspnHome: boolean): FlowPoint[] {
-	return flow.map((p) => ({
-		minute: p.expanded_minute, period: p.period_id,
-		home: r3(asaHomeIsEspnHome ? p.home_team_value : p.away_team_value),
-		away: r3(asaHomeIsEspnHome ? p.away_team_value : p.home_team_value),
-	}));
-}
-
-/** Second source for the flow chart: our estimated xG per minute, from the shots. */
-export function flowFromShots(shots: Shot[], homeId: string): FlowPoint[] {
-	const byMinute = new Map<number, FlowPoint>();
-	let last = 90;
-	for (const s of shots) {
-		const m = Number((s.minute.match(/\d+/g) ?? ["0"]).map(Number).reduce((a, b) => a + b, 0));
-		last = Math.max(last, m);
-		const p = byMinute.get(m) ?? { minute: m, period: s.period || (m > 45 ? 2 : 1), home: 0, away: 0 };
-		if (s.teamId === homeId) p.home = r3(p.home + (s.xgAsa ?? s.xgEst)); else p.away = r3(p.away + (s.xgAsa ?? s.xgEst));
-		byMinute.set(m, p);
-	}
-	const out: FlowPoint[] = [];
-	for (let m = 0; m <= last; m++) out.push(byMinute.get(m) ?? { minute: m, period: m > 45 ? 2 : 1, home: 0, away: 0 });
 	return out;
 }
 
@@ -640,7 +635,11 @@ export function foldMatchIntoSeason(prev: TeamSeasonAnalytics, m: MatchAnalytics
 		xgAgainst: isHome ? m.xg.away : m.xg.home,
 		source: m.xg.source,
 		shotsFor: m.shots.filter((s) => s.teamId === tid),
-		shotsAgainst: m.shots.filter((s) => s.teamId !== tid),
+		// Each shot against carries the keeper who faced it (most minutes that match) → a keeper's season goal face.
+		shotsAgainst: m.shots.filter((s) => s.teamId !== tid).map((s) => {
+			const k = [...(m.keepers ?? [])].filter((x) => x.teamId === tid).sort((a, b) => b.minutes - a.minutes)[0];
+			return k ? { ...s, keeperId: k.athleteId } : s;
+		}),
 		players: m.players.filter((p) => p.teamId === tid),
 		heat: m.heat ? Object.fromEntries(Object.entries(m.heat).filter(([id]) => m.players.some((p) => p.athleteId === id && p.teamId === tid) || teamOfHeat(m, id) === tid)) : undefined,
 		keepers: (m.keepers ?? []).filter((k) => k.teamId === tid),
@@ -766,7 +765,11 @@ export function heatGrids(events: { fieldPositionX?: number | null; fieldPositio
 
 // ── Scheduling builds ────────────────────────────────────────────────────────────────────────────
 
-export interface AnalyticsIndexEntry { source: "asa" | "estimate"; asaRetryAfter: number | null; asaRetried?: boolean; heat: MatchAnalytics["heatStatus"]; heatRetryAfter?: number; builtAt: number;
+/** ASA is re-asked at most this many times after the first build (+22h, +44h) for missing xG / g+ depth. */
+export const MAX_ASA_RETRIES = 2;
+export interface AnalyticsIndexEntry { source: "asa" | "estimate"; asaRetryAfter: number | null; asaRetried?: boolean;
+	/** How many ASA retries have run (`asaRetried` = the older one-retry flag, read as 1). */
+	asaRetries?: number; heat: MatchAnalytics["heatStatus"]; heatRetryAfter?: number; builtAt: number;
 	/** Copy version — a v1 copy (no keepers / g+ / per-shot ASA xG) is rebuilt ONCE to v2. */
 	v?: number;
 	/** ASA depth present (keepers / g+ / xPass) — the status page counts these. */
@@ -790,7 +793,8 @@ export function planAnalyticsBuilds(args: {
 			const ix = args.index[f.eventId];
 			if (!ix) return true;
 			if ((ix.v ?? 1) < 2) return true; // phase-2 upgrade, once (paced by `max` like the backfill)
-			if (ix.source === "estimate" && !ix.asaRetried && ix.asaRetryAfter !== null && args.now >= ix.asaRetryAfter) return true;
+			const retries = ix.asaRetries ?? (ix.asaRetried ? 1 : 0);
+			if (ix.asaRetryAfter !== null && args.now >= ix.asaRetryAfter && retries < MAX_ASA_RETRIES) return true;
 			return ix.heat !== "ok" && !args.coreBlocked && args.now >= (ix.heatRetryAfter ?? 0);
 		})
 		.slice(0, args.max)
