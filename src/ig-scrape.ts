@@ -19,11 +19,43 @@
 export const IMAGE_PUBLIC_ORIGIN = "https://img.crestside.app";
 
 /** Images per copy batch. Each batch runs in its OWN invocation (SELF binding) so its image fetches get a
- *  fresh 50-subrequest budget; 40 leaves headroom for the diag flush. */
-export const IMAGE_COPY_BATCH = 40;
-/** Max batches one webhook fans out (each is 1 subrequest of the webhook's 50). 10 × 40 = 400 images,
- *  above a whole pool's ~310-card first run; anything beyond keeps its Instagram link this run. */
-export const IMAGE_COPY_MAX_BATCHES = 10;
+ *  fresh 50-subrequest budget (≤ 2 fetches per image: resized, then the original as a fallback).
+ *  2026-10-20 first live run: 40-image batches copied only 46/312 — workerd allows ~6 open connections per
+ *  invocation and each fetch's 8s timeout started while it was still QUEUED, so with 0.3–2MB originals at
+ *  1–3s each only the first wave finished. Now 15 per batch, run 5 at a time (`mapLimit`), so a timeout only
+ *  ever counts a download that has actually started. */
+export const IMAGE_COPY_BATCH = 15;
+/** Batches run at once by the webhook, and the most it fans out (each is 1 subrequest of its 50).
+ *  24 × 15 = 360 images, above a whole pool's ~310-card first run; anything beyond keeps its Instagram link. */
+export const IMAGE_COPY_PARALLEL_BATCHES = 6;
+export const IMAGE_COPY_MAX_BATCHES = 24;
+/** Downloads in flight inside one batch (under workerd's ~6 open connections). */
+export const IMAGE_COPY_CONCURRENCY = 5;
+/** Stop STARTING new batches after this long, so the webhook answers inside Apify's delivery window. */
+export const IMAGE_COPY_DEADLINE_MS = 20_000;
+
+/** Stored width. Cards render ≤ ~370pt wide (≤ 1110px at 3x); Instagram originals are 1080–1440px and
+ *  0.3–2MB. The copy is fetched RESIZED through images.weserv.nl (the free resize CDN image moderation already
+ *  uses) → ~5x smaller: faster to copy, cheaper to store, faster on a phone. If weserv fails, the original is
+ *  stored instead (the copy still works, just bigger). */
+export const IMAGE_COPY_WIDTH = 1080;
+export function resizedSource(src: string): string {
+	return `https://images.weserv.nl/?url=${encodeURIComponent(src)}&w=${IMAGE_COPY_WIDTH}&we&output=jpg&q=82`;
+}
+
+/** Map with at most `limit` in flight, results in input order. */
+export async function mapLimit<T, R>(items: readonly T[], limit: number, fn: (item: T, index: number) => Promise<R>): Promise<R[]> {
+	const out = new Array<R>(items.length);
+	let next = 0;
+	const worker = async () => {
+		while (next < items.length) {
+			const i = next++;
+			out[i] = await fn(items[i], i);
+		}
+	};
+	await Promise.all(Array.from({ length: Math.min(limit, items.length) }, worker));
+	return out;
+}
 
 /** The fields the Apify dataset read asks for — exactly what `mapApifyInstagram` + the handle match read.
  *  Asking for these only (the actor's 1.7.x items also carry carousel/usertags/owner blobs) keeps the
