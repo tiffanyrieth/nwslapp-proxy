@@ -376,7 +376,9 @@ type ClubNewsSource =
 const CLUB_NEWS: Record<string, ClubNewsSource> = {
 	// ── Official RSS/Atom (dated, structured) ──
 	BAY: { kind: "rss", url: "https://bayfc.com/feed/" },
-	LOU: { kind: "rss", url: "https://racingloufc.com/feed/" },
+	// /news/feed/ (2026-10-20): the site-wide /feed/ (301 → www) stopped carrying news — newest item June 2024,
+	// so every item aged out and LOU's Club News went empty. The club's News Archive has its own current feed.
+	LOU: { kind: "rss", url: "https://www.racingloufc.com/news/feed/" },
 	SD: { kind: "rss", url: "https://sandiegowavefc.com/feed/" },
 	WAS: { kind: "rss", url: "https://washingtonspirit.com/feed/" },
 	// Angel City runs on HubSpot — its blog RSS lives under the /acfc-post blog path
@@ -1902,11 +1904,8 @@ const ESPN_FETCHER_COMPUTE_TIMEOUT_MS = 25_000;
 // read/write goes through these helpers. A write that can't reach the store emits a diag and returns false —
 // it NEVER falls back to KV. A read that can't reach it falls back to a KV READ (reads don't touch the cap).
 const CONTENT_STORE_TIMEOUT_MS = 8_000;
-/** TEMP (2026-10-08): read-through migration. A key the store doesn't have yet is read from its old KV home
- *  (a READ, never a write) and copied into the store, so existing verdicts/previews carry over with no Haiku
- *  re-spend. The old KV keys all expire by ~10-15 (7-day TTLs); remove this window + the KV read after
- *  CONTENT_KV_READTHROUGH_UNTIL. */
-const CONTENT_KV_READTHROUGH_UNTIL = Date.parse("2026-10-17T00:00:00Z");
+// (The 2026-10-08 KV→store read-through migration window closed 2026-10-17 and was removed 2026-10-20; the old
+// KV copies had all expired. A KV READ now happens only when the store itself is unreachable.)
 /** Per-isolate memo for the three Social snapshots, so each /feed build doesn't cost a store request. */
 const CONTENT_MEMO_MS = 60_000;
 const contentMemo = new Map<string, { value: string | null; at: number }>();
@@ -1957,19 +1956,14 @@ export async function contentGet(
 	}
 
 	const kvReadAll = fromStore === null; // store unreachable → KV READ fallback for everything
-	const toCopy: ContentPut[] = [];
 	await Promise.all(
 		remaining.map(async (k) => {
 			let v = fromStore?.[k] ?? null;
-			if (v === null && (kvReadAll || now < CONTENT_KV_READTHROUGH_UNTIL)) {
-				v = await env.FEED_TAGS.get(k).catch(() => null);
-				if (v !== null && !kvReadAll && ctx) toCopy.push({ key: k, value: v, ttlSec: readThroughTtl(k, v) });
-			}
+			if (v === null && kvReadAll) v = await env.FEED_TAGS.get(k).catch(() => null);
 			out.set(k, v);
 			if (opts.memo) contentMemo.set(k, { value: v, at: now });
 		}),
 	);
-	if (toCopy.length && ctx) ctx.waitUntil(contentPut(env, ctx, toCopy).then(() => undefined));
 	return out;
 }
 
@@ -2040,14 +2034,6 @@ export async function contentWrittenAt(env: Env, ctx: ExecutionContext, key: str
 	}
 }
 
-/** The TTL a read-through copy keeps (its old KV TTL family; snapshots none). */
-function readThroughTtl(key: string, value: string): number | undefined {
-	if (key.startsWith("ogn-") && value === "{}") return OG_FAIL_TTL; // a remembered failure keeps its 1-day retry
-	if (key.startsWith("sv3-") || key.startsWith("nv3-") || key.startsWith("ogn-")) return TAG_TTL;
-	if (key.startsWith("clubnews-")) return CLUBNEWS_TTL;
-	return undefined;
-}
-
 async function withFetcherTimeout<T>(p: Promise<T>, ms: number): Promise<T> {
 	let timer: ReturnType<typeof setTimeout> | undefined;
 	try {
@@ -2064,6 +2050,22 @@ async function withFetcherTimeout<T>(p: Promise<T>, ms: number): Promise<T> {
 
 /** Ask the shared fetcher for a computed aggregate. Returns null when sharing is off/unavailable (the
  *  caller computes directly, as before); emits `espnFetcherFallback` when the fetcher failed to answer. */
+/** Split a shared-aggregate answer into the usable result vs the shared fetcher's error (null when off). */
+function splitShared(r: SharedJsonResult | null): { shared: SharedJsonResult | null; sharedErr: string | null } {
+	if (r && !r.ok) return { shared: null, sharedErr: r.error ?? "shared fetcher error" };
+	return { shared: r, sharedErr: null };
+}
+
+/** Stamp which path served an aggregate (`X-Espn-Fetcher`: memory/stored/fresh | bypass | error-direct) and,
+ *  when something failed, the short reason (`X-Espn-Fetcher-Error`) — readable without log access. */
+function withFetcherHeaders(res: Response, shared: SharedJsonResult | null, sharedErr: string | null, directErr?: string): Response {
+	const out = new Response(res.body, res);
+	out.headers.set("X-Espn-Fetcher", shared ? shared.source : sharedErr ? "error-direct" : "bypass");
+	const why = [sharedErr && `shared: ${sharedErr}`, directErr && `direct: ${directErr}`].filter(Boolean).join(" | ");
+	if (why) out.headers.set("X-Espn-Fetcher-Error", why.slice(0, 200));
+	return out;
+}
+
 async function sharedAggregate(
 	url: URL,
 	env: Env,
@@ -8164,10 +8166,10 @@ async function handleKnowHerEligible(url: URL, env: Env, ctx: ExecutionContext):
 
 	let players;
 	let featuredCount = 0;
-	const shared = await sharedAggregate(url, env, ctx, (stub) => stub.knowherEligible(team, year) as Promise<SharedJsonResult>);
+	const { shared, sharedErr } = splitShared(await sharedAggregate(url, env, ctx, (stub) => stub.knowherEligible(team, year) as Promise<SharedJsonResult>));
+	if (sharedErr) emitDiag(env, ctx, "knowherEligibleError", `team=${team}: shared: ${sharedErr.slice(0, 60)} → computing directly`);
 	try {
-		if (shared && !shared.ok) throw new Error(shared.error ?? "shared fetcher error");
-		if (shared?.ok && shared.json) {
+		if (shared?.json) {
 			// One shared copy per team (2026-10-08) — also serves /knowher/todo.
 			({ players, featuredCount } = JSON.parse(shared.json) as { players: Awaited<ReturnType<typeof computeEligiblePlayers>>; featuredCount: number });
 		} else {
@@ -8179,19 +8181,17 @@ async function handleKnowHerEligible(url: URL, env: Env, ctx: ExecutionContext):
 		// NO SILENT FAILURES: this route's bare upstreamError() emitted nothing, so an ESPN/roster
 		// failure behind /knowher/eligible was invisible to the pager (the same class as the KHG-todo bug).
 		emitDiag(env, ctx, "knowherEligibleError", `team=${team}: ${e instanceof Error ? e.message : String(e)}`);
-		return upstreamError();
+		return withFetcherHeaders(upstreamError(), shared, sharedErr, e instanceof Error ? e.message : String(e));
 	}
 	const headers = new Headers();
 	headers.set("Content-Type", "application/json");
-	headers.set("Cache-Control", `public, max-age=${shared?.ok ? edgeTtlFor(KNOWHER_ELIGIBLE_TTL, shared.fetchedAt, shared.ttlSec || 1, Date.now()) : KNOWHER_ELIGIBLE_TTL}`);
+	headers.set("Cache-Control", `public, max-age=${shared ? edgeTtlFor(KNOWHER_ELIGIBLE_TTL, shared.fetchedAt, shared.ttlSec || 1, Date.now()) : KNOWHER_ELIGIBLE_TTL}`);
 	const body = new Response(JSON.stringify({ team, year, count: players.length, featuredThisSeason: featuredCount, players }), { status: 200, headers });
 	if (players.length > 0) {
 		// Note: no ctx here (admin/debug endpoint) — cache synchronously via the returned clone.
 		await cache.put(cacheKey, body.clone());
 	}
-	const out = withCacheStatus(body, "MISS");
-	out.headers.set("X-Espn-Fetcher", shared ? shared.source : "bypass");
-	return out;
+	return withFetcherHeaders(withCacheStatus(body, "MISS"), shared, sharedErr);
 }
 
 /** `GET /team-stats?team={id}` — every rostered athlete of a club with their FULL flattened season stats
@@ -8212,21 +8212,21 @@ async function handleTeamStats(url: URL, env: Env, ctx: ExecutionContext): Promi
 	let players: Awaited<ReturnType<typeof fetchTeamSeasonStats>>;
 	// Shared fetcher (2026-10-08): ONE computation per team per TEAM_STATS_TTL for every data center (was
 	// ~29 ESPN calls per data center per hour). Off/unavailable → computed here exactly as before.
-	const shared = await sharedAggregate(url, env, ctx, (stub) => stub.teamStats(id, year) as Promise<SharedJsonResult>);
+	const sharedRes = await sharedAggregate(url, env, ctx, (stub) => stub.teamStats(id, year) as Promise<SharedJsonResult>);
+	const { shared, sharedErr } = splitShared(sharedRes);
 	let edgeTtl = TEAM_STATS_TTL;
-	if (shared && !shared.ok) {
-		emitDiag(env, ctx, "teamStatsError", `${id}: ${(shared.error ?? "shared fetcher error").slice(0, 50)}`);
-		return upstreamError();
-	}
-	if (shared?.ok && shared.json) {
+	// A shared-fetcher ERROR now falls back to computing here (the pre-10/08 path) instead of failing the route,
+	// and says so in X-Espn-Fetcher(-Error) — 2026-10-20, when every shared stats computation came back empty.
+	if (sharedErr) emitDiag(env, ctx, "teamStatsError", `${id}: shared: ${sharedErr.slice(0, 60)} → computing directly`);
+	if (shared?.json) {
 		players = JSON.parse(shared.json) as typeof players;
 		edgeTtl = edgeTtlFor(TEAM_STATS_TTL, shared.fetchedAt, shared.ttlSec || 1, Date.now());
 	} else {
 		try {
 			players = await fetchTeamSeasonStats(env as unknown as BracketEnv, id, year);
 		} catch (e) {
-			emitDiag(env, ctx, "teamStatsError", `${id}: ${(e as Error).message.slice(0, 50)}`);
-			return upstreamError();
+			emitDiag(env, ctx, "teamStatsError", `${id}: ${(e as Error).message.slice(0, 60)}`);
+			return withFetcherHeaders(upstreamError(), shared, sharedErr, (e as Error).message);
 		}
 	}
 	if (players.length === 0) {
@@ -8240,9 +8240,7 @@ async function handleTeamStats(url: URL, env: Env, ctx: ExecutionContext): Promi
 	headers.set("Cache-Control", `public, max-age=${edgeTtl}`);
 	const body = new Response(JSON.stringify({ team: id, year, players }), { status: 200, headers });
 	ctx.waitUntil(cache.put(cacheKey, body.clone()));
-	const out = withCacheStatus(body, "MISS");
-	out.headers.set("X-Espn-Fetcher", shared ? shared.source : "bypass");
-	return out;
+	return withFetcherHeaders(withCacheStatus(body, "MISS"), shared, sharedErr);
 }
 
 /** `GET /knowher/todo?team=WAS` — the weekly generation feed (docs §5b): THIS week's featured pick for one
@@ -8260,11 +8258,11 @@ async function handleKnowHerTodo(url: URL, env: Env, ctx: ExecutionContext): Pro
 	if (hit) return withCacheStatus(hit, "HIT");
 
 	let player;
-	const shared = await sharedAggregate(url, env, ctx, (stub) => stub.knowherEligible(team, year) as Promise<SharedJsonResult>);
+	const { shared, sharedErr } = splitShared(await sharedAggregate(url, env, ctx, (stub) => stub.knowherEligible(team, year) as Promise<SharedJsonResult>));
+	if (sharedErr) emitDiag(env, ctx, "knowherTodoError", `team=${team}: shared: ${sharedErr.slice(0, 60)} → computing directly`);
 	try {
-		if (shared && !shared.ok) throw new Error(shared.error ?? "shared fetcher error");
 		let eligible: Awaited<ReturnType<typeof computeEligiblePlayers>>;
-		if (shared?.ok && shared.json) {
+		if (shared?.json) {
 			// The SAME shared per-team copy /knowher/eligible uses (2026-10-08) — no second ESPN pass.
 			eligible = (JSON.parse(shared.json) as { players: typeof eligible }).players;
 		} else {
@@ -8277,7 +8275,7 @@ async function handleKnowHerTodo(url: URL, env: Env, ctx: ExecutionContext): Pro
 		// "ESPN down" for two days and sent the KHG cloud routine chasing a non-existent ESPN outage.
 		// Record the REAL error so the next incident is diagnosable from server_diagnostics, not guessed.
 		emitDiag(env, ctx, "knowherTodoError", `team=${team}: ${e instanceof Error ? e.message : String(e)}`);
-		return upstreamError();
+		return withFetcherHeaders(upstreamError(), shared, sharedErr, e instanceof Error ? e.message : String(e));
 	}
 	// No one left to feature. In-season (Mar–Nov) that's worth a loud signal; offseason it's expected.
 	if (!player) {
@@ -8287,12 +8285,10 @@ async function handleKnowHerTodo(url: URL, env: Env, ctx: ExecutionContext): Pro
 	const headers = new Headers();
 	headers.set("Content-Type", "application/json");
 	headers.set("Cache-Control", `public, max-age=${KNOWHER_ELIGIBLE_TTL}`);
-	if (shared?.ok) headers.set("Cache-Control", `public, max-age=${edgeTtlFor(KNOWHER_ELIGIBLE_TTL, shared.fetchedAt, shared.ttlSec || 1, Date.now())}`);
+	if (shared) headers.set("Cache-Control", `public, max-age=${edgeTtlFor(KNOWHER_ELIGIBLE_TTL, shared.fetchedAt, shared.ttlSec || 1, Date.now())}`);
 	const body = new Response(JSON.stringify({ team, year, season: year, player }), { status: 200, headers });
 	if (player) ctx.waitUntil(cache.put(cacheKey, body.clone()));
-	const out = withCacheStatus(body, "MISS");
-	out.headers.set("X-Espn-Fetcher", shared ? shared.source : "bypass");
-	return out;
+	return withFetcherHeaders(withCacheStatus(body, "MISS"), shared, sharedErr);
 }
 
 const CREST_TTL = 30 * 24 * 3600; // 30d edge cache — team crests effectively never change
@@ -8623,13 +8619,10 @@ async function dueByMarker(env: Env, key: string, intervalMs: number): Promise<b
  *  (never run, or `at` older than intervalMs). Read-only, so a due pass still writes exactly its one
  *  `:last`. Nothing reads the old `:due` markers, so dropping them is invisible. (2026-08-30 KV
  *  write-budget pass, docs/stress-testing.md §7 — cuts the alerting bookkeeping floor 192→96/day.) */
-/** `dueBySnapshot` for a ContentStore snapshot: due when never written or older than intervalMs. During the
- *  read-through window a snapshot the store hasn't seen yet takes its age from the old KV copy, so the move
- *  doesn't cost an extra off-schedule pull of unofficial sources (hourly-max policy). */
+/** `dueBySnapshot` for a ContentStore snapshot: due when never written or older than intervalMs. */
 async function dueByContent(env: Env, ctx: ExecutionContext, key: string, intervalMs: number): Promise<boolean> {
 	const at = await contentWrittenAt(env, ctx, key);
 	if (at !== null) return Date.now() - at >= intervalMs;
-	if (Date.now() < CONTENT_KV_READTHROUGH_UNTIL) return dueBySnapshot(env, key, intervalMs);
 	return true;
 }
 

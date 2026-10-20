@@ -400,7 +400,13 @@ async function fetchLeaders(year: number): Promise<Record<string, LeaderLine>> {
 /** One athlete's season stats, flattened to "category.statName" → value. */
 async function fetchAthleteStats(id: string, year: number): Promise<Record<string, number>> {
   const out: Record<string, number> = {};
-  const json = (await (await fetch(`${ESPN_CORE}/seasons/${year}/types/1/athletes/${id}/statistics`, { headers: ESPN_HEADERS })).json()) as {
+  const r = await fetch(`${ESPN_CORE}/seasons/${year}/types/1/athletes/${id}/statistics`, { headers: ESPN_HEADERS });
+  // 404 "No stats found" = a player with no appearances this season — no stats, not a failure.
+  if (r.status === 404) return out;
+  // Anything else non-2xx is a FAILURE with its status (2026-10-20: an un-checked 403/429 page used to throw
+  // inside .json(), get swallowed, and read as "no stats" — every Know Her Game pick vanished silently).
+  if (!r.ok) throw new Error(`HTTP ${r.status}`);
+  const json = (await r.json()) as {
     splits?: { categories?: { name?: string; stats?: { name?: string; value?: number }[] }[] };
   };
   for (const cat of json.splits?.categories ?? []) {
@@ -409,18 +415,41 @@ async function fetchAthleteStats(id: string, year: number): Promise<Record<strin
   return out;
 }
 
-/** Fetch many athletes' stats in small concurrent batches (failures drop to undefined). */
-export async function fetchStatsForMany(ids: string[], year: number): Promise<Map<string, Record<string, number>>> {
-  const out = new Map<string, Record<string, number>>();
+/** Fetch many athletes' stats in small concurrent batches, with a failure report: how many requests failed
+ *  and a histogram of why (HTTP status / thrown message). */
+export async function fetchStatsReport(ids: string[], year: number): Promise<{ stats: Map<string, Record<string, number>>; failed: number; reasons: Record<string, number> }> {
+  const stats = new Map<string, Record<string, number>>();
+  const reasons: Record<string, number> = {};
+  let failed = 0;
   const CONC = 8;
   for (let i = 0; i < ids.length; i += CONC) {
     const batch = ids.slice(i, i + CONC);
     const res = await Promise.all(batch.map(async (id) => {
-      try { return [id, await fetchAthleteStats(id, year)] as const; } catch { return [id, null] as const; }
+      try { return [id, await fetchAthleteStats(id, year), null] as const; } catch (e) { return [id, null, String((e as Error)?.message ?? e).slice(0, 40)] as const; }
     }));
-    for (const [id, stats] of res) if (stats) out.set(id, stats);
+    for (const [id, s, why] of res) {
+      if (s) stats.set(id, s);
+      else { failed++; reasons[why ?? "?"] = (reasons[why ?? "?"] ?? 0) + 1; }
+    }
   }
-  return out;
+  return { stats, failed, reasons };
+}
+
+/** Fetch many athletes' stats (failures drop to undefined). Lenient — for callers with their own fallback. */
+export async function fetchStatsForMany(ids: string[], year: number): Promise<Map<string, Record<string, number>>> {
+  return (await fetchStatsReport(ids, year)).stats;
+}
+
+/** Like fetchStatsForMany, but THROWS when every request failed — an aggregate built on zero reachable stats
+ *  (team stats, the Know Her Game eligible list) must be an ERROR, never a cached/shared "nobody has stats".
+ *  Partial failures still pass (those players just lack stats), exactly as before. */
+export async function fetchStatsForManyStrict(ids: string[], year: number): Promise<Map<string, Record<string, number>>> {
+  const r = await fetchStatsReport(ids, year);
+  if (ids.length > 0 && r.failed === ids.length) {
+    const why = Object.entries(r.reasons).map(([k, n]) => `${k}×${n}`).join(" ");
+    throw new Error(`ESPN stats unreachable 0/${ids.length} (${why})`);
+  }
+  return r.stats;
 }
 
 /** Every rostered athlete of a team with their FULL flattened season stats (`"category.statName" → value`)
@@ -440,7 +469,7 @@ export async function fetchTeamSeasonStats(
   const team = teams.find((t) => String(t.id) === String(teamId));
   const roster = await fetchRosterResilient(env, String(teamId), team?.abbr ?? "");
   const ids = roster.map((p) => p.id).filter(Boolean);
-  const stats = await fetchStatsForMany(ids, year);
+  const stats = await fetchStatsForManyStrict(ids, year);
   return roster.map((p) => ({ athleteId: p.id, stats: stats.get(p.id) ?? {} }));
 }
 
