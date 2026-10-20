@@ -13,13 +13,8 @@
 // writes KV `knowher-pool-v1`. The AUTO weekly generator is deferred (docs/know-her-game.md
 // §5); its pipe (eligibility, mode flag, admin) is built now so nothing gets retrofitted.
 
-import {
-  fetchTeamAbbrs,
-  fetchRosterResilient,
-  fetchStatsForMany,
-  fetchStatsForManyStrict,
-  type BracketEnv,
-} from "./bracket-engine.ts";
+import { fetchTeamAbbrs } from "./bracket-engine.ts";
+import { readResolvedTeamStats, readStatsByAthlete, type StatsPlayer, type StatsStoreEnv } from "./team-stats-store.ts";
 import { adminGate, type AdminAuthEnv } from "./admin-auth.ts";
 import { buildStatQuestionsN, weaveStats, type StatInput } from "./knowher-stats.ts";
 
@@ -316,36 +311,38 @@ export async function computeEligiblePlayers(
   const teams = await fetchTeamAbbrs();
   const team = teams.find((t) => t.abbr === want);
   if (!team) return [];
-  // Resilient (last-known-good KV fallback), not raw: an ESPN roster collapse here yields an
-  // EMPTY eligible pool, which the fail-open assembler ships as a silently short edition —
-  // exactly how Orlando vanished from 2026-W31, and how Portland would have vanished on 07-30.
-  const roster = await fetchRosterResilient(env as unknown as BracketEnv, team.id, team.abbr);
-  const ids = roster.map((p) => p.id).filter((id) => !excludeIds.has(id));
-  // Strict: zero reachable stats is an ERROR (never "0 eligible" — that read as an exhausted season on 10/17).
-  const stats = await fetchStatsForManyStrict(ids, year);
+  // The club's SAVED stats copy (2026-10-20, src/team-stats-store.ts): ESPN refreshed after each of its matches,
+  // NWSL nightly as the backup. No ESPN stats call here — and no copy at all is an ERROR, never "0 eligible"
+  // (10/17: an empty-stats answer read as an exhausted season and stopped the weekend routine).
+  const resolved = await readResolvedTeamStats(env, team.id, year);
+  if (!resolved || resolved.players.length === 0) throw new Error(`no saved stats for ${want} ${year} yet`);
+  return eligibleFromStats(resolved.players, team.abbr, excludeIds);
+}
 
-  const players: EligiblePlayer[] = roster.map((p) => {
-    const s = stats.get(p.id);
+/** Saved stats copy → the ranked eligible pool (pure). Same fields and gate as the old ESPN path. */
+export function eligibleFromStats(players: StatsPlayer[], teamAbbr: string, excludeIds: Set<string> = new Set()): EligiblePlayer[] {
+  const out: EligiblePlayer[] = players.map((p) => {
+    const s = p.stats;
     return {
-      athleteId: p.id,
+      athleteId: p.athleteId,
       name: p.name,
       jersey: p.jersey,
       position: p.position,
-      team: p.team,
+      team: teamAbbr,
       age: p.age ?? null,
       country: p.country ?? null,
-      starts: Math.round(s?.["general.starts"] ?? 0),
-      minutes: Math.round(s?.["general.minutes"] ?? 0),
-      appearances: Math.round(s?.["general.appearances"] ?? 0),
-      goals: Math.round(s?.["offensive.totalGoals"] ?? 0),
-      assists: Math.round(s?.["offensive.goalAssists"] ?? 0),
-      shots: Math.round(s?.["offensive.totalShots"] ?? 0),
-      shotsOnTarget: Math.round(s?.["offensive.shotsOnTarget"] ?? 0),
-      cleanSheets: Math.round(s?.["goalKeeping.cleanSheet"] ?? 0),
-      saves: Math.round(s?.["goalKeeping.saves"] ?? 0),
+      starts: Math.round(s["general.starts"] ?? 0),
+      minutes: Math.round(s["general.minutes"] ?? 0),
+      appearances: Math.round(s["general.appearances"] ?? 0),
+      goals: Math.round(s["offensive.totalGoals"] ?? 0),
+      assists: Math.round(s["offensive.goalAssists"] ?? 0),
+      shots: Math.round(s["offensive.totalShots"] ?? 0),
+      shotsOnTarget: Math.round(s["offensive.shotsOnTarget"] ?? 0),
+      cleanSheets: Math.round(s["goalKeeping.cleanSheet"] ?? 0),
+      saves: Math.round(s["goalKeeping.saves"] ?? 0),
     };
   });
-  return rankEligible(players, excludeIds);
+  return rankEligible(out, excludeIds);
 }
 
 // ── Featured ledger (once-per-season) ───────────────────────────────────────────
@@ -414,7 +411,7 @@ export async function unfeature(env: KnowHerEnv, season: number, athleteId: stri
 // GET /knowher/admin = the page (HTTP Basic gated); POST /knowher/admin/api = key-gated ops.
 // Same BRACKET_ADMIN_KEY secret as the other admin routes. Manual-mode content lives here.
 
-export interface KnowHerEnv {
+export interface KnowHerEnv extends StatsStoreEnv {
   FEED_TAGS: KVNamespace;
   BRACKET_ADMIN_KEY?: string;
   /** Dedicated secret for the automated weekly /knowher/ingest POST — deliberately NOT the master
@@ -733,8 +730,9 @@ export async function publishVerifiedPool(
   if (!pool) return { error: "no verified candidate staged" };
 
   const year = pool.season ?? new Date().getUTCFullYear();
-  const ids = pool.players.map((p) => String(p.espnAthleteId)).filter(Boolean);
-  const stats = await fetchStatsForMany(ids, year);
+  // The SAVED per-club stats copies (2026-10-20) — current as of each club's latest match; no ESPN call.
+  const teamIds = (await fetchTeamAbbrs()).map((t) => t.id);
+  const stats = await readStatsByAthlete(env, teamIds, year);
 
   const lever1: Lever1Flag[] = [];
   const held: string[] = [];
@@ -749,7 +747,7 @@ export async function publishVerifiedPool(
 
     const input = statInputFor(p, stats.get(String(p.espnAthleteId)));
     if (!input) {
-      held.push(`${label}: no ESPN stats available to inject`);
+      held.push(`${label}: no saved stats for this player (ESPN + NWSL copies) to inject`);
       continue;
     }
     let statQs: KnowHerQuestion[] = [];

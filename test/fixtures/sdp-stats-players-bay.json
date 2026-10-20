@@ -1,0 +1,266 @@
+{
+ "players": [
+  {
+   "playerId": "nwsl::Football_Player::300fc21c88214cf191d546d1cf81d8ec",
+   "mediaFirstName": "Hannah",
+   "mediaLastName": "Bebar",
+   "shortName": "H. Bebar",
+   "shirtName": "",
+   "bibNumber": "41",
+   "roleLabel": "Midfielder",
+   "stats": [
+    {
+     "statsId": "games-played",
+     "statsLabel": "Games played",
+     "statsLabelAbbreviation": "GP",
+     "statsValue": 28,
+     "statsUnit": null,
+     "statsUnitAbbreviation": null
+    },
+    {
+     "statsId": "minutes-played",
+     "statsLabel": "Minutes played",
+     "statsLabelAbbreviation": "Mins",
+     "statsValue": 2475,
+     "statsUnit": "minutes",
+     "statsUnitAbbreviation": "'"
+    },
+    {
+     "statsId": "goals",
+     "statsLabel": "Goals",
+     "statsLabelAbbreviation": "G",
+     "statsValue": 1,
+     "statsUnit": null,
+     "statsUnitAbbreviation": null
+    },
+    {
+     "statsId": "assists",
+     "statsLabel": "Assists",
+     "statsLabelAbbreviation": "A",
+     "statsValue": 2,
+     "statsUnit": null,
+     "statsUnitAbbreviation": null
+    },
+    {
+     "statsId": "goals-conceded",
+     "statsLabel": "Goals conceded",
+     "statsLabelAbbreviation": "",
+     "statsValue": 41,
+     "statsUnit": null,
+     "statsUnitAbbreviation": null
+    },
+    {
+     "statsId": "saves",
+     "statsLabel": "Saves",
+     "statsLabelAbbreviation": "Saves",
+     "statsValue": 0,
+     "statsUnit": null,
+     "statsUnitAbbreviation": null
+    },
+    {
+     "statsId": "Appearances",
+     "statsLabel": "Appearances",
+     "statsLabelAbbreviation": null,
+     "statsValue": 28,
+     "statsUnit": null,
+     "statsUnitAbbreviation": null
+    },
+    {
+     "statsId": "Clean Sheets",
+     "statsLabel": "Clean Sheets",
+     "statsLabelAbbreviation": null,
+     "statsValue": 5,
+     "statsUnit": null,
+     "statsUnitAbbreviation": null
+    },
+    {
+     "statsId": "Goal Assists",
+     "statsLabel": "Goal Assists",
+     "statsLabelAbbreviation": null,
+     "statsValue": 2,
+     "statsUnit": null,
+     "statsUnitAbbreviation": null
+    },
+    {
+     "statsId": "Goals",
+     "statsLabel": "Goals",
+     "statsLabelAbbreviation": null,
+     "statsValue": 1,
+     "statsUnit": null,
+     "statsUnitAbbreviation": null
+    },
+    {
+     "statsId": "Goals Conceded",
+     "statsLabel": "Goals Conceded",
+     "statsLabelAbbreviation": null,
+     "statsValue": 41,
+     "statsUnit": null,
+     "statsUnitAbbreviation": null
+    },
+    {
+     "statsId": "Interceptions",
+     "statsLabel": "Interceptions",
+     "statsLabelAbbreviation": null,
+     "statsValue": 53,
+     "statsUnit": null,
+     "statsUnitAbbreviation": null
+    },
+    {
+     "statsId": "Key Passes (Attempt Assists)",
+     "statsLabel": "Key Passes (Attempt Assists)",
+     "statsLabelAbbreviation": null,
+     "statsValue": 32,
+     "statsUnit": null,
+     "statsUnitAbbreviation": null
+    },
+    {
+     "statsId": "Shots On Target ( inc goals )",
+     "statsLabel": "Shots On Target ( inc goals )",
+     "statsLabelAbbreviation": null,
+     "statsValue": 6,
+     "statsUnit": null,
+     "statsUnitAbbreviation": null
+    },
+    {
+     "statsId": "Starts",
+     "statsLabel": "Starts",
+     "statsLabelAbbreviation": null,
+     "statsValue": 28,
+     "statsUnit": null,
+     "statsUnitAbbreviation": null
+    },
+    {
+     "statsId": "Tackles Won",
+     "statsLabel": "Tackles Won",
+     "statsLabelAbbreviation": null,
+     "statsValue": 46,
+     "statsUnit": null,
+     "statsUnitAbbreviation": null
+    },
+    {
+     "statsId": "Total Shots",
+     "statsLabel": "Total Shots",
+     "statsLabelAbbreviation": null,
+     "statsValue": 20,
+     "statsUnit": null,
+     "statsUnitAbbreviation": null
+    },
+    {
+     "statsId": "Total Tackles",
+     "statsLabel": "Total Tackles",
+     "statsLabelAbbreviation": null,
+     "statsValue": 84,
+     "statsUnit": null,
+     "statsUnitAbbreviation": null
+    }
+   ]
+  },
+  {
+   "playerId": "nwsl::Football_Player::3a05f90ee4774e9e9cc460fef290f3c4",
+   "mediaFirstName": "Jordan",
+   "mediaLastName": "Silkowitz",
+   "shortName": "J. Silkowitz",
+   "shirtName": "",
+   "bibNumber": "29",
+   "roleLabel": "Goalkeeper",
+   "stats": [
+    {
+     "statsId": "games-played",
+     "statsLabel": "Games played",
+     "statsLabelAbbreviation": "GP",
+     "statsValue": 27,
+     "statsUnit": null,
+     "statsUnitAbbreviation": null
+    },
+    {
+     "statsId": "minutes-played",
+     "statsLabel": "Minutes played",
+     "statsLabelAbbreviation": "Mins",
+     "statsValue": 2403,
+     "statsUnit": "minutes",
+     "statsUnitAbbreviation": "'"
+    },
+    {
+     "statsId": "goals",
+     "statsLabel": "Goals",
+     "statsLabelAbbreviation": "G",
+     "statsValue": 0,
+     "statsUnit": null,
+     "statsUnitAbbreviation": null
+    },
+    {
+     "statsId": "assists",
+     "statsLabel": "Assists",
+     "statsLabelAbbreviation": "A",
+     "statsValue": 0,
+     "statsUnit": null,
+     "statsUnitAbbreviation": null
+    },
+    {
+     "statsId": "goals-conceded",
+     "statsLabel": "Goals conceded",
+     "statsLabelAbbreviation": "",
+     "statsValue": 40,
+     "statsUnit": null,
+     "statsUnitAbbreviation": null
+    },
+    {
+     "statsId": "saves",
+     "statsLabel": "Saves",
+     "statsLabelAbbreviation": "Saves",
+     "statsValue": 108,
+     "statsUnit": null,
+     "statsUnitAbbreviation": null
+    },
+    {
+     "statsId": "Appearances",
+     "statsLabel": "Appearances",
+     "statsLabelAbbreviation": null,
+     "statsValue": 27,
+     "statsUnit": null,
+     "statsUnitAbbreviation": null
+    },
+    {
+     "statsId": "Clean Sheets",
+     "statsLabel": "Clean Sheets",
+     "statsLabelAbbreviation": null,
+     "statsValue": 7,
+     "statsUnit": null,
+     "statsUnitAbbreviation": null
+    },
+    {
+     "statsId": "Goals Conceded",
+     "statsLabel": "Goals Conceded",
+     "statsLabelAbbreviation": null,
+     "statsValue": 40,
+     "statsUnit": null,
+     "statsUnitAbbreviation": null
+    },
+    {
+     "statsId": "Key Passes (Attempt Assists)",
+     "statsLabel": "Key Passes (Attempt Assists)",
+     "statsLabelAbbreviation": null,
+     "statsValue": 1,
+     "statsUnit": null,
+     "statsUnitAbbreviation": null
+    },
+    {
+     "statsId": "Saves Made",
+     "statsLabel": "Saves Made",
+     "statsLabelAbbreviation": null,
+     "statsValue": 108,
+     "statsUnit": null,
+     "statsUnitAbbreviation": null
+    },
+    {
+     "statsId": "Starts",
+     "statsLabel": "Starts",
+     "statsLabelAbbreviation": null,
+     "statsValue": 27,
+     "statsUnit": null,
+     "statsUnitAbbreviation": null
+    }
+   ]
+  }
+ ]
+}

@@ -39,10 +39,11 @@ import {
   type MatchupVotes,
 } from "./bracket.ts";
 import { ESPN_HEADERS } from "./espn-ua.ts";
+import { readStatsByAthlete, type StatsStoreEnv } from "./team-stats-store.ts";
 import { ADMIN_PAGE_HTML } from "./bracket-admin-page.ts";
 import { adminGate, adminRealm, type AdminAuthEnv } from "./admin-auth.ts";
 
-export interface BracketEnv {
+export interface BracketEnv extends StatsStoreEnv {
   SUPABASE_URL: string;
   SUPABASE_SERVICE_ROLE_KEY: string;
   // Optional KV (the full Worker Env carries it) — only the bracket scoring marker uses it now
@@ -372,30 +373,6 @@ function idFromRef(ref?: string): string | null {
 
 interface LeaderLine { goals: number; assists: number; saves: number }
 
-/** League leaders (1 call): athleteId → {goals, assists, saves} for the season. */
-async function fetchLeaders(year: number): Promise<Record<string, LeaderLine>> {
-  const map: Record<string, LeaderLine> = {};
-  try {
-    const json = (await (await fetch(`${ESPN_CORE}/seasons/${year}/types/1/leaders`, { headers: ESPN_HEADERS })).json()) as {
-      categories?: { name?: string; leaders?: { value?: number; athlete?: { $ref?: string } }[] }[];
-    };
-    const want: Record<string, keyof LeaderLine> = {
-      goals: "goals", goalsLeaders: "goals", assists: "assists", assistsLeaders: "assists", saves: "saves", savesLeaders: "saves",
-    };
-    for (const cat of json.categories ?? []) {
-      const key = want[cat.name ?? ""];
-      if (!key) continue;
-      for (const l of cat.leaders ?? []) {
-        const id = idFromRef(l.athlete?.$ref);
-        if (!id) continue;
-        const e = map[id] ?? { goals: 0, assists: 0, saves: 0 };
-        e[key] = l.value ?? 0;
-        map[id] = e;
-      }
-    }
-  } catch { /* leaders unavailable → callers fall to roster-depth */ }
-  return map;
-}
 
 /** One athlete's season stats, flattened to "category.statName" → value. */
 async function fetchAthleteStats(id: string, year: number): Promise<Record<string, number>> {
@@ -473,26 +450,6 @@ export async function fetchStatsForManyStrict(ids: string[], year: number): Prom
   return r.stats;
 }
 
-/** Every rostered athlete of a team with their FULL flattened season stats (`"category.statName" → value`)
- *  — powers the app's `GET /team-stats?team={id}` route, which bundles the ~27 per-athlete ESPN calls the
- *  device used to fire on every team-page open into ONE edge-cached call (docs: the team-page stats burst).
- *  Unlike `computeEligiblePlayers` this does NOT gate/rank — it returns every rostered player (stats or an
- *  empty map when ESPN had none), because the team page shows the whole squad. One invocation: teams (1) +
- *  roster (1) + ~27 stat calls ≈ 29 ESPN subrequests, under the free 50/invocation cap (same profile as
- *  `/knowher/todo`). The roster comes through `fetchRosterResilient`, so a live ESPN blip falls back to the
- *  same `roster:{id}` last-known-good that `/roster` serves. */
-export async function fetchTeamSeasonStats(
-  env: BracketEnv,
-  teamId: string,
-  year: number,
-): Promise<Array<{ athleteId: string; stats: Record<string, number> }>> {
-  const teams = await fetchTeamAbbrs();
-  const team = teams.find((t) => String(t.id) === String(teamId));
-  const roster = await fetchRosterResilient(env, String(teamId), team?.abbr ?? "");
-  const ids = roster.map((p) => p.id).filter(Boolean);
-  const stats = await fetchStatsForManyStrict(ids, year);
-  return roster.map((p) => ({ athleteId: p.id, stats: stats.get(p.id) ?? {} }));
-}
 
 /** A comparable seeding score from the edition's stat, or null when the data's absent
  *  (→ the player falls to roster-depth order). save% is computed (the ESPN field is buggy). */
@@ -538,17 +495,25 @@ async function seedPool(
   if (candidates.length === 0) return [];
 
   const score = new Map<string, number>();
-  let attempted = candidates.length;
-  if (seedingStat === "goals_assists") {
-    const leaders = await fetchLeaders(year);
-    for (const c of candidates) { const s = statScore(seedingStat, leaders[c.id], undefined); if (s != null) score.set(c.id, s); }
-  } else {
-    const budget = Math.max(0, config.statFetchBudget);
-    const ids = candidates.slice(0, budget).map((c) => c.id);
-    attempted = ids.length;
-    const stats = await fetchStatsForMany(ids, year);
-    for (const c of candidates) { const s = statScore(seedingStat, undefined, stats.get(c.id)); if (s != null) score.set(c.id, s); }
+  const attempted = candidates.length;
+  // The SAVED per-club stats copies (2026-10-20, src/team-stats-store.ts) — every candidate, no ESPN call
+  // (this used to spend up to `statFetchBudget` per-athlete ESPN calls, or one leaders call, per edition).
+  // An unreachable store → no stat seeding this edition (roster-depth order + the heuristic diag below).
+  let stats = new Map<string, Record<string, number>>();
+  try {
+    stats = await readStatsByAthlete(env, (await fetchTeamAbbrs()).map((t) => t.id), year);
+  } catch (e) {
+    await emitDiag(env, "bracketStatsStoreFail", String((e as Error)?.message ?? e).slice(0, 80));
   }
+  for (const c of candidates) {
+    const s = stats.get(c.id);
+    const leader: LeaderLine | undefined = s
+      ? { goals: s["offensive.totalGoals"] ?? 0, assists: s["offensive.goalAssists"] ?? 0, saves: s["goalKeeping.saves"] ?? 0 }
+      : undefined;
+    const v = seedingStat === "goals_assists" ? statScore(seedingStat, leader, undefined) : statScore(seedingStat, undefined, s);
+    if (v != null) score.set(c.id, v);
+  }
+  void config;
 
   // Real-stat scores rank first (desc); everyone else keeps roster-depth order behind them.
   const scored = candidates.filter((c) => score.has(c.id)).sort((a, b) => score.get(b.id)! - score.get(a.id)!);

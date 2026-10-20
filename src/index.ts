@@ -24,7 +24,7 @@ import {
 	forceCloseActiveRound,
 	handleBracketAdmin,
 	ROSTER_GOOD_MIN,
-	fetchTeamSeasonStats,
+	fetchStatsReport,
 	fetchTeamAbbrs,
 	fetchRosterResilient,
 	mapEspnRosterAthletes,
@@ -55,6 +55,18 @@ import {
 	type Pool,
 	type SnapshotStamp,
 } from "./ig-scrape.ts";
+import {
+	STATS_ESPN_BLOCK_KEY,
+	STATS_ESPN_BLOCK_MS,
+	nextEspnCopy,
+	planStatsRefresh,
+	readNumber,
+	readResolvedTeamStats,
+	readTeamStatsCopies,
+	writeStats,
+	type SettledMatch,
+	type TeamStatsCopy,
+} from "./team-stats-store.ts";
 import {
 	BEAT_SEED,
 	NEWS_FEED_SEED,
@@ -310,9 +322,6 @@ const TEAM_VIDEOS_TTL = 7200; // 2hr (read-load pass 2026-09-02: raised 1h→2h 
 // CLUBNEWS_TTL below — club news is already 2h-bounded so this adds ZERO club-news staleness, only ~2h vs ~1h
 // YouTube-upload freshness; ~2× fewer /team-videos hits. NOT higher: club news is demand-refreshed at 2h with
 // no cron to align a longer TTL to, so >2h would stale breaking club news across the shared cache key.)
-export const TEAM_STATS_TTL = 3600; // 1hr — a squad's season stat totals only move after a match (a few times/week);
-// 1h keeps the shared cache warm so the team page's ~27-athlete stat bundle is one edge-cached call, not 27
-// per-device ESPN calls. Not a live surface — the live match card is elsewhere.
 
 const YT_API = "https://www.googleapis.com/youtube/v3";
 const UPLOADS_PER_TEAM = 15; // recent uploads per club (official API: same 1-unit quota at any size); the app applies the window (owner 2026-10-08; was 5)
@@ -436,7 +445,7 @@ const BROWSER_UA =
 // 2026-08-04) — the constant + full story live in espn-ua.ts so no module can miss it again.
 import { ESPN_UA, ESPN_HEADERS, PROXY_UA } from "./espn-ua.ts";
 import { buildWatchSummariesEnvelope, parseWatchSummaryEntries, summaryUrlFor, WATCH_INTERNAL_HOST, type WatchSummaryResult } from "./watch-summaries.ts";
-import { edgeTtlFor, type FetcherKind, type FetcherResult, type SharedJsonResult } from "./espn-fetcher.ts";
+import { edgeTtlFor, type FetcherKind, type FetcherResult } from "./espn-fetcher.ts";
 // The ESPN shared fetcher Durable Object (Option A, 2026-10-08) — exported from the main module so the
 // runtime can instantiate it (wrangler.jsonc `durable_objects` binds ESPN_FETCHER to this class).
 export { EspnFetcher } from "./espn-fetcher.ts";
@@ -1313,6 +1322,12 @@ that needs more users) until you bring it back.</p>
 			return handleIgImageCopy(request, env);
 		}
 
+		// POST one club's after-match ESPN stats refresh — SELF-only (admin key), scheduled by
+		// maybeScheduleStatsRefresh on the 5-min tick; its own invocation = its own subrequest budget.
+		if (url.pathname === "/internal/team-stats/refresh") {
+			return handleTeamStatsRefresh(request, url, env, ctx);
+		}
+
 		// Admin-only: refresh the IG social snapshot on demand (the every-2-day cron does
 		// this automatically; this forces an immediate pull after a token swap or an aborted
 		// run). Same BRACKET_ADMIN_KEY gate as /headshots/run.
@@ -1701,6 +1716,13 @@ that needs more users) until you bring it back.</p>
 			} catch (e) {
 				emitDiag(env, ctx, "socialScrapeRetryFail", String((e as Error)?.message ?? e).slice(0, 80));
 			}
+			// After-match player-stats refresh (2026-10-20): the :00/:30 ticks only; zero ESPN calls to decide,
+			// each due club refreshes in its own SELF invocation. Early so a later pass's CPU kill can't skip it.
+			try {
+				await maybeScheduleStatsRefresh(env, ctx, controller.scheduledTime);
+			} catch (e) {
+				emitDiag(env, ctx, "teamStatsScheduleFail", String((e as Error)?.message ?? e).slice(0, 80));
+			}
 			// Scheduled synthetic checks (A4) + client crash/feature aggregate (A5), each internally gated
 			// to ~30 min so they ride the shared tick without a new cron trigger, and isolated so an
 			// alerting bug can never affect the bracket engine.
@@ -1796,7 +1818,7 @@ that needs more users) until you bring it back.</p>
 				return;
 			}
 			try {
-				await runRosterTruth(env, (events) => emitDiagBatch(env, ctx, events));
+				await runRosterTruth(env, (events) => emitDiagBatch(env, ctx, events), (copies, unmatched) => saveNwslStatsBackup(env, ctx, copies, unmatched));
 			} catch (e) {
 				emitDiag(env, ctx, "rosterTruthRunFail", (e as Error).message.slice(0, 80));
 			}
@@ -2051,18 +2073,6 @@ async function withFetcherTimeout<T>(p: Promise<T>, ms: number): Promise<T> {
 
 /** Ask the shared fetcher for a computed aggregate. Returns null when sharing is off/unavailable (the
  *  caller computes directly, as before); emits `espnFetcherFallback` when the fetcher failed to answer. */
-/** Split a shared-aggregate answer into the usable result vs the shared fetcher's error (null when off). */
-function splitShared(r: SharedJsonResult | null): { shared: SharedJsonResult | null; sharedErr: string | null } {
-	if (r && !r.ok) return { shared: null, sharedErr: r.error ?? "shared fetcher error" };
-	return { shared: r, sharedErr: null };
-}
-
-/** The shared fetcher failed because ESPN refused the stats (block/backoff) — computing directly would hit the
- *  same block from the edge, so don't (never poll a blocked upstream). Only a fetcher-side failure retries. */
-function isEspnStatsRefusal(err: string | null): boolean {
-	return !!err && (err.includes("ESPN stats unreachable") || err.includes(STATS_BACKOFF_PREFIX));
-}
-
 /** An upstream-error response the edge caches for a few minutes, so a blocked ESPN isn't re-asked on every
  *  team-page open in every data center. The app falls back to its own per-athlete path on any non-2xx. */
 const AGGREGATE_ERROR_EDGE_TTL = 10 * 60;
@@ -2071,34 +2081,6 @@ function cacheableUpstreamError(ctx: ExecutionContext, cacheKey: Request, res: R
 	out.headers.set("Cache-Control", `public, max-age=${AGGREGATE_ERROR_EDGE_TTL}`);
 	ctx.waitUntil(caches.default.put(cacheKey, out.clone()));
 	return out;
-}
-
-/** Stamp which path served an aggregate (`X-Espn-Fetcher`: memory/stored/fresh | bypass | error-direct) and,
- *  when something failed, the short reason (`X-Espn-Fetcher-Error`) — readable without log access. */
-function withFetcherHeaders(res: Response, shared: SharedJsonResult | null, sharedErr: string | null, directErr?: string): Response {
-	const out = new Response(res.body, res);
-	out.headers.set("X-Espn-Fetcher", shared ? shared.source : sharedErr ? "error-direct" : "bypass");
-	const why = [sharedErr && `shared: ${sharedErr}`, directErr && `direct: ${directErr}`].filter(Boolean).join(" | ");
-	if (why) out.headers.set("X-Espn-Fetcher-Error", why.slice(0, 200));
-	return out;
-}
-
-async function sharedAggregate(
-	url: URL,
-	env: Env,
-	ctx: ExecutionContext,
-	call: (stub: ReturnType<typeof espnFetcherStub>) => Promise<SharedJsonResult>,
-): Promise<SharedJsonResult | null> {
-	if (!(await useSharedFetcher(url, env))) return null;
-	try {
-		const r = await withFetcherTimeout(call(espnFetcherStub(env)), ESPN_FETCHER_COMPUTE_TIMEOUT_MS);
-		for (const n of r.notes) emitDiagCoalesced(env, ctx, n.kind, n.detail, url.pathname);
-		return r;
-	} catch (e) {
-		emitDiagCoalesced(env, ctx, "espnFetcherFallback",
-			`${url.pathname} — shared fetcher unavailable (${String((e as Error)?.message ?? e).slice(0, 80)}), computing directly`, url.pathname);
-		return null;
-	}
 }
 
 const ESPN_BREAKER_THRESHOLD = 3; // consecutive upstream failures before opening
@@ -4321,7 +4303,7 @@ async function handleAdminPortal(request: Request, env: Env, ctx: ExecutionConte
 		if (op === "state") return await respond();
 
 		if (op === "run") {
-			await runRosterTruth(env, (events) => emitDiagBatch(env, ctx, events));
+			await runRosterTruth(env, (events) => emitDiagBatch(env, ctx, events), (copies, unmatched) => saveNwslStatsBackup(env, ctx, copies, unmatched));
 			return await respond();
 		}
 
@@ -7842,7 +7824,6 @@ async function handleTriviaLegacyFlat(url: URL, env: Env, ctx: ExecutionContext)
 
 const KNOWHER_TTL = 5 * 60; // 5 min — SHORT so owner content edits (iteration + the weekly swap) go live
 // near-instantly, not after 6h. The pool is tiny, so a 5-min edge/client cache still sheds ~all load.
-export const KNOWHER_ELIGIBLE_TTL = 3600; // 1h — roster stats move a few times/day
 
 /** Know Her Game's weekly pool, filtered to the requested `teams` (docs §3/§4): the app
  *  fetches `?teams=WAS,POR` and gets only those followed teams' featured players. Returns an
@@ -8170,54 +8151,36 @@ async function handleKnowHerPublishVerified(request: Request, env: Env, ctx: Exe
 }
 
 /** Roster-learning eligibility for one team (docs §4): `?team=WAS` → the players who started
- *  ≥ 1 match this season, ranked core-starters-first. Powers the admin's "who's pickable" view
- *  and the deferred auto generator's weekly selection. */
+ *  ≥ 1 match this season, ranked core-starters-first. Powers the admin's "who's pickable" view and the
+ *  weekend routine. Built from the club's SAVED stats copy (2026-10-20) — zero ESPN stats calls. */
 async function handleKnowHerEligible(url: URL, env: Env, ctx: ExecutionContext): Promise<Response> {
 	const team = (url.searchParams.get("team") ?? "").toUpperCase();
 	if (!team) return new Response(`Missing ?team=`, { status: 400 });
 	const year = Number(url.searchParams.get("year")) || new Date().getUTCFullYear();
-	const cache = caches.default;
-	const cacheKey = new Request(url.toString(), { method: "GET" });
-	const hit = await cache.match(cacheKey);
-	if (hit) return withCacheStatus(hit, "HIT");
-
 	let players;
 	let featuredCount = 0;
-	const { shared, sharedErr } = splitShared(await sharedAggregate(url, env, ctx, (stub) => stub.knowherEligible(team, year) as Promise<SharedJsonResult>));
-	if (sharedErr) emitDiag(env, ctx, "knowherEligibleError", `team=${team}: shared: ${sharedErr.slice(0, 60)}`);
-	if (isEspnStatsRefusal(sharedErr)) return withFetcherHeaders(upstreamError(), null, sharedErr);
 	try {
-		if (shared?.json) {
-			// One shared copy per team (2026-10-08) — also serves /knowher/todo.
-			({ players, featuredCount } = JSON.parse(shared.json) as { players: Awaited<ReturnType<typeof computeEligiblePlayers>>; featuredCount: number });
-		} else {
-			const featured = await readFeaturedIds(env as unknown as KnowHerEnv, year);
-			featuredCount = featured.size;
-			players = await computeEligiblePlayers(env as unknown as KnowHerEnv, team, year, featured);
-		}
+		const featured = await readFeaturedIds(env as unknown as KnowHerEnv, year);
+		featuredCount = featured.size;
+		players = await computeEligiblePlayers(env as unknown as KnowHerEnv, team, year, featured);
 	} catch (e) {
-		// NO SILENT FAILURES: this route's bare upstreamError() emitted nothing, so an ESPN/roster
-		// failure behind /knowher/eligible was invisible to the pager (the same class as the KHG-todo bug).
+		// NO SILENT FAILURES: no saved copy (or an unreachable store) is an ERROR, never "0 eligible".
 		emitDiag(env, ctx, "knowherEligibleError", `team=${team}: ${e instanceof Error ? e.message : String(e)}`);
-		return withFetcherHeaders(upstreamError(), shared, sharedErr, e instanceof Error ? e.message : String(e));
+		return upstreamError();
 	}
-	const headers = new Headers();
-	headers.set("Content-Type", "application/json");
-	headers.set("Cache-Control", `public, max-age=${shared ? edgeTtlFor(KNOWHER_ELIGIBLE_TTL, shared.fetchedAt, shared.ttlSec || 1, Date.now()) : KNOWHER_ELIGIBLE_TTL}`);
-	const body = new Response(JSON.stringify({ team, year, count: players.length, featuredThisSeason: featuredCount, players }), { status: 200, headers });
-	if (players.length > 0) {
-		// Note: no ctx here (admin/debug endpoint) — cache synchronously via the returned clone.
-		await cache.put(cacheKey, body.clone());
-	}
-	return withFetcherHeaders(withCacheStatus(body, "MISS"), shared, sharedErr);
+	// Not edge-cached: a store read is cheap (no ESPN), and the featured ledger moves at publish.
+	return jsonResponse({ team, year, count: players.length, featuredThisSeason: featuredCount, players }, 200);
 }
 
+/** Edge TTL for /team-stats. The copy only changes after a club plays (event-driven refresh), so the edge
+ *  cache only saves ContentStore reads — never ESPN calls. 1h keeps a just-refreshed copy visible quickly. */
+const TEAM_STATS_EDGE_TTL = 3600;
+
 /** `GET /team-stats?team={id}` — every rostered athlete of a club with their FULL flattened season stats
- *  (`"category.statName" → value`, the exact shape the app's PlayerSeasonStats.all consumes), in ONE
- *  edge-cached call. Replaces the app's old ~27-per-athlete device→ESPN burst on every team-page open
- *  (docs/stress-testing.md §6). Reuses `fetchTeamSeasonStats` (resilient roster + batched stat fetch,
- *  ~29 subrequests, under the free 50/invocation cap). On any failure the app falls back to its own
- *  per-athlete fetch, so a proxy miss DEGRADES (per-device fan-out), never blanks. */
+ *  (`"category.statName" → value`, the exact shape the app's PlayerSeasonStats.all consumes), in ONE call.
+ *  Served from the club's SAVED stats copy (2026-10-20, src/team-stats-store.ts): ESPN refreshed after each
+ *  of its matches, the NWSL league feed nightly as the backup. NEVER fetches ESPN on request. No copy →
+ *  an error, and the app falls back to its own per-athlete phone fetch (degrades, never blanks). */
 async function handleTeamStats(url: URL, env: Env, ctx: ExecutionContext): Promise<Response> {
 	const id = (url.searchParams.get("team") ?? "").replace(/[^0-9]/g, "");
 	if (!id) return new Response("missing ?team", { status: 400 });
@@ -8226,89 +8189,122 @@ async function handleTeamStats(url: URL, env: Env, ctx: ExecutionContext): Promi
 	const cacheKey = new Request(url.toString(), { method: "GET" });
 	const hit = await cache.match(cacheKey);
 	if (hit) return withCacheStatus(hit, "HIT");
-
-	let players: Awaited<ReturnType<typeof fetchTeamSeasonStats>>;
-	// Shared fetcher (2026-10-08): ONE computation per team per TEAM_STATS_TTL for every data center (was
-	// ~29 ESPN calls per data center per hour). Off/unavailable → computed here exactly as before.
-	const sharedRes = await sharedAggregate(url, env, ctx, (stub) => stub.teamStats(id, year) as Promise<SharedJsonResult>);
-	const { shared, sharedErr } = splitShared(sharedRes);
-	let edgeTtl = TEAM_STATS_TTL;
-	// A shared-fetcher ERROR now falls back to computing here (the pre-10/08 path) instead of failing the route,
-	// and says so in X-Espn-Fetcher(-Error) — 2026-10-20, when every shared stats computation came back empty.
-	if (sharedErr) emitDiag(env, ctx, "teamStatsError", `${id}: shared: ${sharedErr.slice(0, 60)}`);
-	if (isEspnStatsRefusal(sharedErr)) return cacheableUpstreamError(ctx, cacheKey, withFetcherHeaders(upstreamError(), null, sharedErr));
-	if (shared?.json) {
-		players = JSON.parse(shared.json) as typeof players;
-		edgeTtl = edgeTtlFor(TEAM_STATS_TTL, shared.fetchedAt, shared.ttlSec || 1, Date.now());
-	} else {
-		try {
-			players = await fetchTeamSeasonStats(env as unknown as BracketEnv, id, year);
-		} catch (e) {
-			emitDiag(env, ctx, "teamStatsError", `${id}: ${(e as Error).message.slice(0, 60)}`);
-			return cacheableUpstreamError(ctx, cacheKey, withFetcherHeaders(upstreamError(), shared, sharedErr, (e as Error).message));
-		}
-	}
-	if (players.length === 0) {
-		// No roster resolved (bad id, or an ESPN roster outage with no last-known-good). Don't cache an
-		// empty — return an error so the app falls back to its per-athlete path. Loud (no silent empty).
-		emitDiag(env, ctx, "teamStatsEmpty", `${id}: 0 players`);
+	let resolved;
+	try {
+		resolved = await readResolvedTeamStats(env, id, year);
+	} catch (e) {
+		emitDiag(env, ctx, "teamStatsError", `${id}: ${(e as Error).message.slice(0, 60)}`);
 		return upstreamError();
 	}
+	if (!resolved || resolved.players.length === 0) {
+		emitDiag(env, ctx, "teamStatsEmpty", `${id}: no saved stats copy yet`);
+		return cacheableUpstreamError(ctx, cacheKey, upstreamError());
+	}
+	const players = resolved.players.map((p) => ({ athleteId: p.athleteId, stats: p.stats }));
 	const headers = new Headers();
 	headers.set("Content-Type", "application/json");
-	headers.set("Cache-Control", `public, max-age=${edgeTtl}`);
-	const body = new Response(JSON.stringify({ team: id, year, players }), { status: 200, headers });
+	headers.set("Cache-Control", `public, max-age=${TEAM_STATS_EDGE_TTL}`);
+	const body = new Response(JSON.stringify({ team: id, year, players, source: resolved.source, asOf: new Date(resolved.asOf).toISOString() }), { status: 200, headers });
 	ctx.waitUntil(cache.put(cacheKey, body.clone()));
-	return withFetcherHeaders(withCacheStatus(body, "MISS"), shared, sharedErr);
+	return withCacheStatus(body, "MISS");
 }
 
 /** `GET /knowher/todo?team=WAS` — the weekly generation feed (docs §5b): THIS week's featured pick for one
- *  team, WITH verified ESPN stats attached, so the (later-automated) Claude routine never fetches stats —
- *  only fun facts. Per-team by design: one team ≈ 28 ESPN subrequests (safe under the free 50/invocation
- *  cap); the routine loops 16 quick calls. Excludes already-featured players (once-per-season ledger); a
- *  null player in-season is a loud diag (nobody left to feature = a real signal, not a silent empty). */
+ *  team WITH its stats attached, so the Claude routine never fetches stats. Built from the club's SAVED
+ *  stats copy (zero ESPN calls). Excludes already-featured players (once-per-season ledger); a null player
+ *  in-season is a loud diag; no saved copy is an ERROR (a GAP the routine reports), never a silent empty. */
 async function handleKnowHerTodo(url: URL, env: Env, ctx: ExecutionContext): Promise<Response> {
 	const team = (url.searchParams.get("team") ?? "").toUpperCase();
 	if (!team) return new Response(`Missing ?team=`, { status: 400 });
 	const year = Number(url.searchParams.get("year")) || new Date().getUTCFullYear();
-	const cache = caches.default;
-	const cacheKey = new Request(url.toString(), { method: "GET" });
-	const hit = await cache.match(cacheKey);
-	if (hit) return withCacheStatus(hit, "HIT");
-
 	let player;
-	const { shared, sharedErr } = splitShared(await sharedAggregate(url, env, ctx, (stub) => stub.knowherEligible(team, year) as Promise<SharedJsonResult>));
-	if (sharedErr) emitDiag(env, ctx, "knowherTodoError", `team=${team}: shared: ${sharedErr.slice(0, 60)}`);
-	if (isEspnStatsRefusal(sharedErr)) return withFetcherHeaders(upstreamError(), null, sharedErr);
 	try {
-		let eligible: Awaited<ReturnType<typeof computeEligiblePlayers>>;
-		if (shared?.json) {
-			// The SAME shared per-team copy /knowher/eligible uses (2026-10-08) — no second ESPN pass.
-			eligible = (JSON.parse(shared.json) as { players: typeof eligible }).players;
-		} else {
-			const featured = await readFeaturedIds(env as unknown as KnowHerEnv, year);
-			eligible = await computeEligiblePlayers(env as unknown as KnowHerEnv, team, year, featured);
-		}
-		player = pickWeeklyFeatured(eligible);
+		const featured = await readFeaturedIds(env as unknown as KnowHerEnv, year);
+		player = pickWeeklyFeatured(await computeEligiblePlayers(env as unknown as KnowHerEnv, team, year, featured));
 	} catch (e) {
-		// NO SILENT FAILURES: a bare upstreamError() here mislabeled a UA/403 bug in fetchTeamAbbrs as
-		// "ESPN down" for two days and sent the KHG cloud routine chasing a non-existent ESPN outage.
-		// Record the REAL error so the next incident is diagnosable from server_diagnostics, not guessed.
 		emitDiag(env, ctx, "knowherTodoError", `team=${team}: ${e instanceof Error ? e.message : String(e)}`);
-		return withFetcherHeaders(upstreamError(), shared, sharedErr, e instanceof Error ? e.message : String(e));
+		return upstreamError();
 	}
-	// No one left to feature. In-season (Mar–Nov) that's worth a loud signal; offseason it's expected.
 	if (!player) {
 		const month = new Date().getUTCMonth() + 1;
 		if (month >= 3 && month <= 11) emitDiag(env, ctx, "knowherTodoEmpty", `team=${team} season=${year}`);
 	}
-	const headers = new Headers();
-	headers.set("Content-Type", "application/json");
-	headers.set("Cache-Control", `public, max-age=${KNOWHER_ELIGIBLE_TTL}`);
-	if (shared) headers.set("Cache-Control", `public, max-age=${edgeTtlFor(KNOWHER_ELIGIBLE_TTL, shared.fetchedAt, shared.ttlSec || 1, Date.now())}`);
-	const body = new Response(JSON.stringify({ team, year, season: year, player }), { status: 200, headers });
-	if (player) ctx.waitUntil(cache.put(cacheKey, body.clone()));
-	return withFetcherHeaders(withCacheStatus(body, "MISS"), shared, sharedErr);
+	return jsonResponse({ team, year, season: year, player }, 200);
+}
+
+// ── After-match player-stats refresh (2026-10-20, src/team-stats-store.ts) ───────────────────────────────
+// No timer: each club's ESPN copy refreshes ONCE ~2h after each of its settled regular-season matches (plus
+// one lag retry). The check below runs every 30 min on the 5-min tick and costs ZERO ESPN calls (finals come
+// from the shared scoreboard copy, read inside the EspnFetcher DO); each due club refreshes in its OWN
+// invocation via SELF (~29 ESPN calls — the only place the proxy calls ESPN's stats API now).
+async function maybeScheduleStatsRefresh(env: Env, ctx: ExecutionContext, scheduledTime: number): Promise<void> {
+	if (new Date(scheduledTime).getUTCMinutes() % 30 >= 5) return; // :00 and :30 ticks only
+	const e = env as unknown as { SELF?: Fetcher; BRACKET_ADMIN_KEY?: string };
+	if (!e.SELF || !e.BRACKET_ADMIN_KEY || !env.CONTENT_STORE || !env.ESPN_FETCHER) return;
+	const now = Date.now();
+	const year = new Date(now).getUTCFullYear();
+	// The ESPN kill switch + circuit breaker gate at the EDGE, before the shared fetcher — this path skips the
+	// edge, so it checks them itself (never poll a paused or failing ESPN).
+	if ((await isEspnManuallyPaused(env)) || (await isEspnBreakerOpen(env))) return;
+	const blockedUntil = await readNumber(env, STATS_ESPN_BLOCK_KEY);
+	if (now < blockedUntil) return; // ESPN refusing Cloudflare — the NWSL backup serves meanwhile
+	const { finals } = (await espnFetcherStub(env).recentFinals(year, 12 * 3600 * 1000)) as { finals: SettledMatch[] };
+	if (finals.length === 0) return;
+	const teamIds = [...new Set(finals.flatMap((f) => f.teamIds))];
+	const copies = await readTeamStatsCopies(env, teamIds, year);
+	const espnCopies = new Map([...copies].map(([t, c]) => [t, c.espn]));
+	const due = planStatsRefresh({ finals, espnCopies, now, blockedUntil });
+	for (const d of due) {
+		const r = await e.SELF.fetch(new Request(`${PROXY_PUBLIC_ORIGIN}/internal/team-stats/refresh?team=${d.teamId}&event=${d.eventId}`, {
+			method: "POST",
+			headers: { "x-admin-key": e.BRACKET_ADMIN_KEY },
+		}));
+		if (r.status === 503) break; // ESPN refused → the job wrote the block marker; stop this check
+	}
+}
+
+/** `POST /internal/team-stats/refresh?team=<espnTeamId>&event=<eventId>` (SELF, admin key) — refresh ONE
+ *  club's ESPN stats copy for the settled match `event`. Stores a copy only when most stats came back; a
+ *  refusal (403/429) writes the durable block marker (6h) and answers 503. */
+async function handleTeamStatsRefresh(request: Request, url: URL, env: Env, ctx: ExecutionContext): Promise<Response> {
+	const adminKey = (env as unknown as { BRACKET_ADMIN_KEY?: string }).BRACKET_ADMIN_KEY;
+	if (request.method !== "POST" || !adminAuthed(request, adminKey)) return new Response("forbidden", { status: 403 });
+	const teamId = (url.searchParams.get("team") ?? "").replace(/[^0-9]/g, "");
+	const eventId = (url.searchParams.get("event") ?? "").replace(/[^0-9]/g, "");
+	if (!teamId || !eventId) return new Response("team + event required", { status: 400 });
+	if (await isEspnManuallyPaused(env)) return new Response("ESPN paused", { status: 503 });
+	const now = Date.now();
+	const year = new Date(now).getUTCFullYear();
+	const teams = await fetchTeamAbbrs();
+	const abbr = teams.find((t) => String(t.id) === teamId)?.abbr ?? "";
+	const roster = await fetchRosterResilient(env as unknown as BracketEnv, teamId, abbr);
+	if (roster.length === 0) {
+		emitDiag(env, ctx, "teamStatsRefreshFail", `${abbr || teamId}: no roster`);
+		return new Response("no roster", { status: 502 });
+	}
+	const report = await fetchStatsReport(roster.map((p) => p.id), year);
+	const why = Object.entries(report.reasons).map(([k, n]) => `${k}×${n}`).join(" ");
+	if (report.failed * 2 >= roster.length) {
+		const refused = Object.keys(report.reasons).some((k) => k === "HTTP 403" || k === "HTTP 429" || k.startsWith(STATS_BACKOFF_PREFIX));
+		if (refused) await writeStats(env, [], [{ key: STATS_ESPN_BLOCK_KEY, value: String(now + STATS_ESPN_BLOCK_MS) }]);
+		emitDiag(env, ctx, "teamStatsRefreshFail", `${abbr}: ${report.failed}/${roster.length} failed (${why})${refused ? " → ESPN paused 6h" : ""}`);
+		return new Response("stats unavailable", { status: refused ? 503 : 502 });
+	}
+	const prev = (await readTeamStatsCopies(env, [teamId], year)).get(teamId)?.espn ?? null;
+	const players = roster.map((p) => ({
+		athleteId: p.id, name: p.name, jersey: p.jersey, position: p.position, age: p.age ?? null, country: p.country ?? null,
+		stats: report.stats.get(p.id) ?? {},
+	}));
+	const copy = nextEspnCopy({ prev, teamId, teamAbbr: abbr, year, eventId, players, now });
+	const ok = await writeStats(env, [copy]);
+	emitDiag(env, ctx, "teamStatsRefresh", `${abbr} event ${eventId}: ${roster.length - report.failed}/${roster.length} ok, apps ${copy.appearancesTotal}${copy.retryAfter ? " (ESPN not updated yet — retry in 22h)" : ""}${ok ? "" : " — STORE WRITE FAILED"}`);
+	return jsonResponse({ team: abbr, event: eventId, players: players.length, failed: report.failed, appearancesTotal: copy.appearancesTotal, retryScheduled: !!copy.retryAfter, stored: ok }, 200);
+}
+
+/** Save the nightly NWSL stats BACKUP copies (roster-truth hands them over) in ONE store call. */
+async function saveNwslStatsBackup(env: Env, ctx: ExecutionContext, copies: TeamStatsCopy[], unmatched: number): Promise<void> {
+	const ok = await writeStats(env, copies);
+	emitDiag(env, ctx, ok ? "statsBackup" : "statsBackupFail", `${copies.length} clubs saved, ${unmatched} rostered players unpaired with the league feed${ok ? "" : " — STORE WRITE FAILED"}`);
 }
 
 const CREST_TTL = 30 * 24 * 3600; // 30d edge cache — team crests effectively never change
