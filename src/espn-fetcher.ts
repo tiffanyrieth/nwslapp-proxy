@@ -28,7 +28,7 @@ import { ESPN_UA } from "./espn-ua.ts";
 import { chooseScoreboardTTL, chooseSummaryTTL } from "./index.ts";
 import { settledMatches, type SettledMatch } from "./team-stats-store.ts";
 import { coreShots, defenseFromCore, heatGrids, type DefAction } from "./match-analytics.ts";
-import { ESPN_HEADERS } from "./espn-ua.ts";
+import { coreFetch, type CoreLink, type CoreRelayEnv } from "./espn-core.ts";
 
 /** The NWSL full-season scoreboard the app reads (`dates=YYYY`) — the source of "which matches just
  *  finished" for the after-match stats refresh. */
@@ -146,13 +146,18 @@ export class EspnFetcher extends DurableObject<Env> {
 	 *  analytics phase 4). Parsed HERE — ~1,400 events / ~630 KB would blow a Worker's 10 ms CPU. ~4 requests,
 	 *  once per match ever (the result is saved permanently by the caller). A 403/429 → `blocked` (the caller
 	 *  sets the durable Core-blocked marker and stops asking). */
-	async matchHeat(eventId: string): Promise<{ status: "ok" | "blocked" | "error"; grids?: Record<string, number[]>; defense?: Record<string, DefAction[]>; shots?: ReturnType<typeof coreShots>; detail?: string }> {
+	async matchHeat(eventId: string): Promise<{ status: "ok" | "blocked" | "error"; grids?: Record<string, number[]>; defense?: Record<string, DefAction[]>; shots?: ReturnType<typeof coreShots>; detail?: string; via?: CoreLink; relayFailure?: string }> {
 		const base = `https://sports.core.api.espn.com/v2/sports/soccer/leagues/usa.nwsl/events/${eventId}/competitions/${eventId}/plays?limit=400`;
 		const items: unknown[] = [];
+		// Page 1 is the canary (sent alone; a refusal stops here). Pages go through the Core chain (relay → direct).
+		let via: CoreLink | undefined;
+		let relayFailure: string | undefined;
 		for (let page = 1; page <= 8; page++) {
-			const r = await fetch(`${base}&page=${page}`, { headers: ESPN_HEADERS });
-			if (r.status === 403 || r.status === 429) return { status: "blocked", detail: `HTTP ${r.status}` };
-			if (!r.ok) return { status: "error", detail: `HTTP ${r.status}` };
+			const { res: r, link, relayFailure: rf } = await coreFetch(this.env as unknown as CoreRelayEnv, `${base}&page=${page}`);
+			via = link;
+			relayFailure ??= rf;
+			if (r.status === 403 || r.status === 429) return { status: "blocked", detail: `HTTP ${r.status} via ${link}`, via, relayFailure };
+			if (!r.ok) return { status: "error", detail: `HTTP ${r.status} via ${link}`, via, relayFailure };
 			const j = (await r.json()) as { items?: unknown[]; pageCount?: number };
 			items.push(...(j.items ?? []));
 			if (!j.pageCount || page >= j.pageCount) break;
@@ -163,6 +168,8 @@ export class EspnFetcher extends DurableObject<Env> {
 			grids: heatGrids(items as Parameters<typeof heatGrids>[0]),
 			defense: defenseFromCore(items as Parameters<typeof defenseFromCore>[0]),
 			shots: coreShots(items as Parameters<typeof coreShots>[0]),
+			via,
+			relayFailure,
 		};
 	}
 

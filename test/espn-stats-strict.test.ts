@@ -44,16 +44,24 @@ test("no ids → nothing to fetch, no throw", async () => {
 	assert.equal((await fetchStatsForManyStrict([], 2026)).size, 0);
 });
 
-test("a fully refused first batch backs off: the rest isn't sent, and the next call fetches nothing", async () => {
-	const { resetStatsBackoff } = await import("../src/bracket-engine.ts");
+test("a refused canary backs off: ONE request, the rest isn't sent, and the next call fetches nothing", async () => {
 	resetStatsBackoff();
 	let calls = 0;
 	await withFetch(() => { calls++; return new Response("blocked", { status: 403 }); }, async () => {
 		const ids = Array.from({ length: 28 }, (_, i) => String(i + 1));
-		await assert.rejects(fetchStatsForManyStrict(ids, 2026), /HTTP 403×8 .*backoff \(not sent\)×20/);
-		assert.equal(calls, 8); // one batch of 8 probes, not 28
+		await assert.rejects(fetchStatsForManyStrict(ids, 2026), /HTTP 403×1 .*backoff \(not sent\)×27/);
+		assert.equal(calls, 1); // one probe after a block, never a batch (owner 2026-10-20)
 		await assert.rejects(fetchStatsForManyStrict(ids, 2026), /backoff \d+m×28/);
-		assert.equal(calls, 8); // nothing sent inside the window
+		assert.equal(calls, 1); // nothing sent inside the window
 	});
 	resetStatsBackoff();
+});
+
+test("the canary is reported (link + result) so every probe is on record", async () => {
+	resetStatsBackoff();
+	await withFetch(() => new Response(statsBody), async () => {
+		const r = await fetchStatsReport(["1", "2", "3"], 2026);
+		assert.deepEqual(r.probe, { link: "direct", result: "ok" });
+		assert.deepEqual(r.via, { direct: 3 });
+	});
 });

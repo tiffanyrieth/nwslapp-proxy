@@ -482,6 +482,7 @@ const BROWSER_UA =
 // ⚠️ ESPN bot rule: EVERY ESPN fetch needs the shared UA (ESPN 403s UA-less Worker fetches,
 // 2026-08-04) — the constant + full story live in espn-ua.ts so no module can miss it again.
 import { ESPN_UA, ESPN_HEADERS, PROXY_UA } from "./espn-ua.ts";
+import type { CoreRelayEnv } from "./espn-core.ts";
 import { buildWatchSummariesEnvelope, parseWatchSummaryEntries, summaryUrlFor, WATCH_INTERNAL_HOST, type WatchSummaryResult } from "./watch-summaries.ts";
 import { edgeTtlFor, type FetcherKind, type FetcherResult } from "./espn-fetcher.ts";
 // The ESPN shared fetcher Durable Object (Option A, 2026-10-08) — exported from the main module so the
@@ -8519,8 +8520,12 @@ async function handleTeamStatsRefresh(request: Request, url: URL, env: Env, ctx:
 		emitDiag(env, ctx, "teamStatsRefreshFail", `${abbr || teamId}: no roster`);
 		return new Response("no roster", { status: 502 });
 	}
-	const report = await fetchStatsReport(roster.map((p) => p.id), year);
+	const report = await fetchStatsReport(roster.map((p) => p.id), year, env as unknown as CoreRelayEnv);
 	const why = Object.entries(report.reasons).map(([k, n]) => `${k}×${n}`).join(" ");
+	// Every canary on record (owner 2026-10-20): when, which link, what ESPN said. Plus any relay trouble.
+	if (report.probe) emitDiag(env, ctx, "espnCoreProbe", `stats ${abbr}: ${report.probe.link ?? "?"} → ${report.probe.result}`);
+	const relayWhy = Object.entries(report.relayFailures).map(([k, n]) => `${k}×${n}`).join(" ");
+	if (relayWhy) emitDiag(env, ctx, "espnCoreRelayFail", `stats ${abbr}: ${relayWhy}`);
 	if (report.failed * 2 >= roster.length) {
 		const refused = Object.keys(report.reasons).some((k) => k === "HTTP 403" || k === "HTTP 429" || k.startsWith(STATS_BACKOFF_PREFIX));
 		if (refused) await writeStats(env, [], [{ key: STATS_ESPN_BLOCK_KEY, value: String(now + STATS_ESPN_BLOCK_MS) }]);
@@ -8534,8 +8539,9 @@ async function handleTeamStatsRefresh(request: Request, url: URL, env: Env, ctx:
 	}));
 	const copy = nextEspnCopy({ prev, teamId, teamAbbr: abbr, year, eventId, players, now });
 	const ok = await writeStats(env, [copy]);
-	emitDiag(env, ctx, "teamStatsRefresh", `${abbr} event ${eventId}: ${roster.length - report.failed}/${roster.length} ok, apps ${copy.appearancesTotal}${copy.retryAfter ? " (ESPN not updated yet — retry in 22h)" : ""}${ok ? "" : " — STORE WRITE FAILED"}`);
-	return jsonResponse({ team: abbr, event: eventId, players: players.length, failed: report.failed, appearancesTotal: copy.appearancesTotal, retryScheduled: !!copy.retryAfter, stored: ok }, 200);
+	const viaWhy = Object.entries(report.via).map(([k, n]) => `${k}×${n}`).join(" ");
+	emitDiag(env, ctx, "teamStatsRefresh", `${abbr} event ${eventId}: ${roster.length - report.failed}/${roster.length} ok via ${viaWhy || "-"}, apps ${copy.appearancesTotal}${copy.retryAfter ? " (ESPN not updated yet — retry in 22h)" : ""}${ok ? "" : " — STORE WRITE FAILED"}`);
+	return jsonResponse({ team: abbr, event: eventId, players: players.length, failed: report.failed, via: report.via, appearancesTotal: copy.appearancesTotal, retryScheduled: !!copy.retryAfter, stored: ok }, 200);
 }
 
 // ── Match analytics: shot maps, xG, heat maps (2026-10-20, src/match-analytics.ts) ─────────────────────────────
@@ -8684,7 +8690,9 @@ async function handleMatchAnalyticsBuild(request: Request, url: URL, env: Env, c
 	// keeps the saved heat — nothing is lost).
 	if ((!heat || !core) && env.ESPN_FETCHER && !(await isEspnManuallyPaused(env)) && !(await isEspnBreakerOpen(env)) && now >= (await espnCoreBlockedUntil(env))) {
 		try {
-			const h = (await espnFetcherStub(env).matchHeat(eventId)) as { status: string; grids?: Record<string, number[]>; defense?: Record<string, DefAction[]>; shots?: { x: number; y: number; xg?: number; xgot?: number; goalZ?: number }[]; detail?: string };
+			const h = (await espnFetcherStub(env).matchHeat(eventId)) as { status: string; grids?: Record<string, number[]>; defense?: Record<string, DefAction[]>; shots?: { x: number; y: number; xg?: number; xgot?: number; goalZ?: number }[]; detail?: string; via?: string; relayFailure?: string };
+			emitDiag(env, ctx, "espnCoreProbe", `heat ${eventId}: ${h.via ?? "?"} → ${h.status}${h.detail ? ` ${h.detail}` : ""}`);
+			if (h.relayFailure) emitDiag(env, ctx, "espnCoreRelayFail", `heat ${eventId}: ${h.relayFailure}`);
 			if (h.status === "ok" && h.grids) { heat = h.grids; heatStatus = "ok"; core = { defense: h.defense, shots: h.shots }; }
 			else if (h.status === "blocked") await writeStats(env, [], [{ key: STATS_ESPN_BLOCK_KEY, value: String(now + STATS_ESPN_BLOCK_MS) }]);
 			if (h.status !== "ok") emitDiag(env, ctx, "matchHeatUnavailable", `${eventId}: ${h.status} ${h.detail ?? ""}`.trim());
