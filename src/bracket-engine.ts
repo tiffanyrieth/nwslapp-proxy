@@ -39,6 +39,7 @@ import {
   type MatchupVotes,
 } from "./bracket.ts";
 import { ESPN_HEADERS } from "./espn-ua.ts";
+import { coreFetch, type CoreLink, type CoreRelayEnv } from "./espn-core.ts";
 import { readStatsByAthlete, type StatsStoreEnv } from "./team-stats-store.ts";
 import { ADMIN_PAGE_HTML } from "./bracket-admin-page.ts";
 import { adminGate, adminRealm, type AdminAuthEnv } from "./admin-auth.ts";
@@ -374,63 +375,92 @@ function idFromRef(ref?: string): string | null {
 interface LeaderLine { goals: number; assists: number; saves: number }
 
 
-/** One athlete's season stats, flattened to "category.statName" → value. */
-async function fetchAthleteStats(id: string, year: number): Promise<Record<string, number>> {
+/** One athlete's season stats, flattened to "category.statName" → value. Goes through the Core chain
+ *  (relay → Cloudflare direct, src/espn-core.ts); `env` absent = direct only (unit tests). */
+async function fetchAthleteStats(id: string, year: number, env?: CoreRelayEnv): Promise<{ stats: Record<string, number>; link: CoreLink; relayFailure?: string }> {
   const out: Record<string, number> = {};
-  const r = await fetch(`${ESPN_CORE}/seasons/${year}/types/1/athletes/${id}/statistics`, { headers: ESPN_HEADERS });
+  const { res: r, link, relayFailure } = await coreFetch(env, `${ESPN_CORE}/seasons/${year}/types/1/athletes/${id}/statistics`);
   // 404 "No stats found" = a player with no appearances this season — no stats, not a failure.
-  if (r.status === 404) return out;
+  if (r.status === 404) return { stats: out, link, relayFailure };
   // Anything else non-2xx is a FAILURE with its status (2026-10-20: an un-checked 403/429 page used to throw
   // inside .json(), get swallowed, and read as "no stats" — every Know Her Game pick vanished silently).
-  if (!r.ok) throw new Error(`HTTP ${r.status}`);
+  if (!r.ok) throw Object.assign(new Error(`HTTP ${r.status}`), { link, relayFailure });
   const json = (await r.json()) as {
     splits?: { categories?: { name?: string; stats?: { name?: string; value?: number }[] }[] };
   };
   for (const cat of json.splits?.categories ?? []) {
     for (const s of cat.stats ?? []) out[`${cat.name}.${s.name}`] = s.value ?? 0;
   }
-  return out;
+  return { stats: out, link, relayFailure };
 }
 
 /** BACKOFF for ESPN's per-athlete stats API (2026-10-20): ESPN's WAF answers 403 to every Cloudflare-egress
  *  request there (same URL + headers are 200 from a residential IP). Polling a blocked upstream escalates the
- *  block (the 2026-09-15 lesson, docs/backend.md), so once a whole batch is refused with 403/429 this isolate
- *  stops asking for STATS_BLOCK_BACKOFF_MS — one probe per isolate per window instead of ~28 per request. */
+ *  block (the 2026-09-15 lesson, docs/backend.md), so once the canary is refused with 403/429 this isolate
+ *  stops asking for STATS_BLOCK_BACKOFF_MS. */
 export const STATS_BLOCK_BACKOFF_MS = 30 * 60 * 1000;
 let statsBlockedUntil = 0;
 export function resetStatsBackoff(): void { statsBlockedUntil = 0; }
 export const STATS_BACKOFF_PREFIX = "ESPN stats backoff";
 
-/** Fetch many athletes' stats in small concurrent batches, with a failure report: how many requests failed
- *  and a histogram of why (HTTP status / thrown message). Inside the backoff window nothing is fetched and
- *  every id counts as failed with the backoff reason. */
-export async function fetchStatsReport(ids: string[], year: number): Promise<{ stats: Map<string, Record<string, number>>; failed: number; reasons: Record<string, number> }> {
+export interface StatsReport {
+  stats: Map<string, Record<string, number>>;
+  failed: number;
+  /** Why requests failed: HTTP status / thrown message → count. */
+  reasons: Record<string, number>;
+  /** Which Core link answered each request that got an answer. */
+  via: Partial<Record<CoreLink, number>>;
+  /** Why the relay was skipped over (relay down, ESPN refusing the relay too) → count. */
+  relayFailures: Record<string, number>;
+  /** The canary: the ONE request sent before the rest (owner 2026-10-20 — after a block, probe once, never a
+   *  batch). Callers log it so every probe's time, link and result is on record. */
+  probe: { link: CoreLink | null; result: string } | null;
+}
+
+/** Fetch many athletes' stats with a failure report. ONE canary request goes first; only if ESPN answers it
+ *  do the rest follow, in small concurrent batches. A refused canary (403/429) backs off this isolate and
+ *  sends nothing else. Inside the backoff window nothing is fetched and every id counts as failed. */
+export async function fetchStatsReport(ids: string[], year: number, env?: CoreRelayEnv): Promise<StatsReport> {
   const stats = new Map<string, Record<string, number>>();
   const reasons: Record<string, number> = {};
+  const via: Partial<Record<CoreLink, number>> = {};
+  const relayFailures: Record<string, number> = {};
+  const bump = (m: Record<string, number>, k: string) => { m[k] = (m[k] ?? 0) + 1; };
   let failed = 0;
+  let probe: StatsReport["probe"] = null;
   if (ids.length > 0 && Date.now() < statsBlockedUntil) {
     const mins = Math.ceil((statsBlockedUntil - Date.now()) / 60000);
-    return { stats, failed: ids.length, reasons: { [`${STATS_BACKOFF_PREFIX} ${mins}m`]: ids.length } };
+    return { stats, failed: ids.length, reasons: { [`${STATS_BACKOFF_PREFIX} ${mins}m`]: ids.length }, via, relayFailures, probe };
+  }
+  const one = async (id: string) => {
+    try {
+      const r = await fetchAthleteStats(id, year, env);
+      stats.set(id, r.stats);
+      bump(via, r.link);
+      if (r.relayFailure) bump(relayFailures, r.relayFailure);
+      return { link: r.link as CoreLink | null, result: "ok" };
+    } catch (e) {
+      const why = String((e as Error)?.message ?? e).slice(0, 40);
+      const meta = e as { link?: CoreLink; relayFailure?: string };
+      failed++;
+      bump(reasons, why);
+      if (meta.link) bump(via, meta.link);
+      if (meta.relayFailure) bump(relayFailures, meta.relayFailure);
+      return { link: meta.link ?? null, result: why };
+    }
+  };
+  if (ids.length === 0) return { stats, failed, reasons, via, relayFailures, probe };
+  probe = await one(ids[0]);
+  if (probe.result === "HTTP 403" || probe.result === "HTTP 429") {
+    // A refused canary = a block, not one flaky player: back off and don't send the rest.
+    statsBlockedUntil = Date.now() + STATS_BLOCK_BACKOFF_MS;
+    const rest = ids.length - 1;
+    if (rest > 0) { failed += rest; reasons[`${STATS_BACKOFF_PREFIX} (not sent)`] = rest; }
+    return { stats, failed, reasons, via, relayFailures, probe };
   }
   const CONC = 8;
-  for (let i = 0; i < ids.length; i += CONC) {
-    const batch = ids.slice(i, i + CONC);
-    const res = await Promise.all(batch.map(async (id) => {
-      try { return [id, await fetchAthleteStats(id, year), null] as const; } catch (e) { return [id, null, String((e as Error)?.message ?? e).slice(0, 40)] as const; }
-    }));
-    for (const [id, s, why] of res) {
-      if (s) stats.set(id, s);
-      else { failed++; reasons[why ?? "?"] = (reasons[why ?? "?"] ?? 0) + 1; }
-    }
-    // A fully refused FIRST batch = a block, not flaky players: stop here and back off (don't send the rest).
-    if (i === 0 && stats.size === 0 && Object.keys(reasons).every((k) => k === "HTTP 403" || k === "HTTP 429")) {
-      statsBlockedUntil = Date.now() + STATS_BLOCK_BACKOFF_MS;
-      const rest = ids.length - batch.length;
-      if (rest > 0) { failed += rest; reasons[`${STATS_BACKOFF_PREFIX} (not sent)`] = rest; }
-      break;
-    }
-  }
-  return { stats, failed, reasons };
+  for (let i = 1; i < ids.length; i += CONC) await Promise.all(ids.slice(i, i + CONC).map(one));
+  return { stats, failed, reasons, via, relayFailures, probe };
 }
 
 /** Fetch many athletes' stats (failures drop to undefined). Lenient — for callers with their own fallback. */

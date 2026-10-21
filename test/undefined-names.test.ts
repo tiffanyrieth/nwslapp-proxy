@@ -9,7 +9,7 @@ import { execSync } from "node:child_process";
 
 /** Workers / Web platform globals tsc doesn't know without the runtime types. */
 const RUNTIME = new Set([
-	"AbortController", "atob", "Blob", "btoa", "BufferSource", "Cache", "caches", "clearTimeout", "CompressionStream",
+	"AbortController", "AbortSignal", "atob", "Blob", "btoa", "BufferSource", "Cache", "caches", "clearTimeout", "CompressionStream",
 	"crypto", "CryptoKey", "DecompressionStream", "DurableObjectNamespace", "DurableObjectState", "DurableObjectStub",
 	"ExecutionContext", "ExportedHandler", "fetch", "Fetcher", "Headers", "JsonWebKey", "KVNamespace", "Request",
 	"RequestInit", "Response", "setTimeout", "TextDecoder", "TextEncoder", "URL", "URLSearchParams",
