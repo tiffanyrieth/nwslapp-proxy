@@ -4264,7 +4264,7 @@ async function statusCheckStats(env: Env): Promise<StatusSection> {
 		const row = cadenceCheck("NWSL backup (nightly)", now - oldest, 24 * 3600_000, "nightly 08:00 UTC", 6 * 3600_000);
 		checks.push({ ...row, status: nwsl.length < teams.length && row.status === "ok" ? "warn" : row.status, detail: `${nwsl.length}/${teams.length} clubs · oldest ${row.detail.replace("refreshed ", "")}` });
 	}
-	const blockedUntil = await readNumber(env, STATS_ESPN_BLOCK_KEY).catch(() => 0);
+	const blockedUntil = await espnCoreBlockedUntil(env);
 	if (blockedUntil > now) {
 		checks.push({ label: "ESPN stats API", status: "warn", detail: `refusing Cloudflare — paused until ${new Date(blockedUntil).toISOString().slice(11, 16)} UTC; the NWSL backup is serving` });
 	}
@@ -8452,6 +8452,19 @@ async function handleKnowHerTodo(url: URL, env: Env, ctx: ExecutionContext): Pro
 // one lag retry). The check below runs every 30 min on the 5-min tick and costs ZERO ESPN calls (finals come
 // from the shared scoreboard copy, read inside the EspnFetcher DO); each due club refreshes in its OWN
 // invocation via SELF (~29 ESPN calls — the only place the proxy calls ESPN's stats API now).
+/** When ESPN's Core service (player stats, the event stream behind heat maps) may be asked again: the later of the
+ *  automatic block marker (6h after a refusal) and the owner's manual hold `ESPN_CORE_HOLD_UNTIL` (an ISO time or
+ *  epoch ms, set with `wrangler secret put` — changeable without a deploy). 2026-10-21: Core refuses EVERY
+ *  Cloudflare Worker request (our UA and a browser UA alike, while the same request is 200 from a home IP), so it
+ *  is held while a non-Cloudflare relay is built. Gates the after-match stats refresh, the analytics heat step and
+ *  the stats-refresh route itself. ESPN's main (site) service is NOT affected. */
+async function espnCoreBlockedUntil(env: Env): Promise<number> {
+	const marker = await readNumber(env, STATS_ESPN_BLOCK_KEY).catch(() => 0);
+	const raw = String((env as unknown as { ESPN_CORE_HOLD_UNTIL?: string }).ESPN_CORE_HOLD_UNTIL ?? "").trim();
+	const hold = /^\d+$/.test(raw) ? Number(raw) : Date.parse(raw) || 0;
+	return Math.max(marker, hold);
+}
+
 async function maybeScheduleStatsRefresh(env: Env, ctx: ExecutionContext, scheduledTime: number): Promise<void> {
 	if (new Date(scheduledTime).getUTCMinutes() % 30 >= 5) return; // :00 and :30 ticks only
 	const e = env as unknown as { SELF?: Fetcher; BRACKET_ADMIN_KEY?: string };
@@ -8470,8 +8483,8 @@ async function maybeScheduleStatsRefresh(env: Env, ctx: ExecutionContext, schedu
 	} catch (e) {
 		emitDiag(env, ctx, "matchAnalyticsScheduleFail", String((e as Error)?.message ?? e).slice(0, 80));
 	}
-	const blockedUntil = await readNumber(env, STATS_ESPN_BLOCK_KEY);
-	if (now < blockedUntil) return; // ESPN refusing Cloudflare — the NWSL backup serves meanwhile
+	const blockedUntil = await espnCoreBlockedUntil(env);
+	if (now < blockedUntil) return; // ESPN refusing Cloudflare (or held) — the NWSL backup serves meanwhile
 	const finals = allFinals.filter((f) => !f.playoff); // player stats = regular season
 	const teamIds = [...new Set(finals.flatMap((f) => f.teamIds))];
 	const copies = await readTeamStatsCopies(env, teamIds, year);
@@ -8496,6 +8509,7 @@ async function handleTeamStatsRefresh(request: Request, url: URL, env: Env, ctx:
 	const eventId = (url.searchParams.get("event") ?? "").replace(/[^0-9]/g, "");
 	if (!teamId || !eventId) return new Response("team + event required", { status: 400 });
 	if (await isEspnManuallyPaused(env)) return new Response("ESPN paused", { status: 503 });
+	if (Date.now() < (await espnCoreBlockedUntil(env))) return new Response("ESPN Core held", { status: 503 });
 	const now = Date.now();
 	const year = new Date(now).getUTCFullYear();
 	const teams = await fetchTeamAbbrs();
@@ -8543,7 +8557,7 @@ async function scheduleMatchAnalytics(env: Env, ctx: ExecutionContext, finals: S
 	const e = env as unknown as { SELF?: Fetcher; BRACKET_ADMIN_KEY?: string };
 	if (!e.SELF || !e.BRACKET_ADMIN_KEY) return;
 	const index = (await contentGetJSON<AnalyticsIndex>(env, ctx, analyticsIndexKey(year))) ?? {};
-	const coreBlocked = now < (await readNumber(env, STATS_ESPN_BLOCK_KEY));
+	const coreBlocked = now < (await espnCoreBlockedUntil(env));
 	// Newest first: this weekend's matches beat the backfill.
 	const due = planAnalyticsBuilds({ finals, index, now, coreBlocked, afterKickoffMs: STATS_REFRESH_AFTER_KICKOFF_MS, max: ANALYTICS_BUILDS_PER_CHECK });
 	for (const eventId of due) {
@@ -8668,7 +8682,7 @@ async function handleMatchAnalyticsBuild(request: Request, url: URL, env: Env, c
 		prev?.heatStatus === "ok" && prev.defense ? { defense: prev.defense } : null;
 	// Ask Core when there's no heat yet, or when a v1 copy has heat but predates the Core extras (once; a refusal
 	// keeps the saved heat — nothing is lost).
-	if ((!heat || !core) && env.ESPN_FETCHER && !(await isEspnManuallyPaused(env)) && !(await isEspnBreakerOpen(env)) && now >= (await readNumber(env, STATS_ESPN_BLOCK_KEY))) {
+	if ((!heat || !core) && env.ESPN_FETCHER && !(await isEspnManuallyPaused(env)) && !(await isEspnBreakerOpen(env)) && now >= (await espnCoreBlockedUntil(env))) {
 		try {
 			const h = (await espnFetcherStub(env).matchHeat(eventId)) as { status: string; grids?: Record<string, number[]>; defense?: Record<string, DefAction[]>; shots?: { x: number; y: number; xg?: number; xgot?: number; goalZ?: number }[]; detail?: string };
 			if (h.status === "ok" && h.grids) { heat = h.grids; heatStatus = "ok"; core = { defense: h.defense, shots: h.shots }; }
