@@ -140,7 +140,7 @@ test("scheduling: new matches first (newest first, capped), ONE ASA retry, heat 
 		asaRetried: { source: "estimate" as const, asaRetryAfter: now - 1, asaRetries: 2, heat: "ok" as const, builtAt: 0, v: 2 },
 		heatDue: { source: "asa" as const, asaRetryAfter: null, heat: "unavailable" as const, heatRetryAfter: now - 1, builtAt: 0, v: 2 },
 	};
-	const plan = (coreBlocked: boolean, max = 10) => planAnalyticsBuilds({ finals, index, now, coreBlocked, afterKickoffMs: 4 * H, max });
+	const plan = (coreBlocked: boolean, max = 10) => planAnalyticsBuilds({ finals, index, now, coreBlocked, afterKickoffMs: 4 * H, max, earliestKickoffMs: 0 });
 	assert.deepEqual(plan(false), ["new", "asaDue", "heatDue", "old"]);
 	assert.deepEqual(plan(true), ["new", "asaDue", "old"]); // Core refusing → no heat-only rebuilds
 	assert.deepEqual(plan(false, 2), ["new", "asaDue"]);
@@ -229,7 +229,7 @@ test("planner: a v1 copy is rebuilt once to v2 (keepers / g+ / per-shot ASA xG)"
 		old: { source: "asa" as const, asaRetryAfter: null, heat: "ok" as const, builtAt: 0 },
 		done: { source: "asa" as const, asaRetryAfter: null, heat: "ok" as const, builtAt: 0, v: 2 },
 	};
-	assert.deepEqual(planAnalyticsBuilds({ finals, index, now, coreBlocked: true, afterKickoffMs: 4 * H, max: 10 }), ["old"]);
+	assert.deepEqual(planAnalyticsBuilds({ finals, index, now, coreBlocked: true, afterKickoffMs: 4 * H, max: 10, earliestKickoffMs: 0 }), ["old"]);
 });
 
 
@@ -240,7 +240,7 @@ test("ASA retries: up to twice (2h–33h lag measured), then stop; a complete co
 	const finals = [{ eventId: "a", kickoffMs: now - 30 * H }, { eventId: "b", kickoffMs: now - 60 * H }, { eventId: "c", kickoffMs: now - 70 * H }];
 	const ix = (asaRetries: number | undefined, legacy?: boolean) => ({ source: "asa" as const, asaRetryAfter: now - 1, heat: "ok" as const, builtAt: 0, v: 2, asaRetries, ...(legacy ? { asaRetried: true } : {}) });
 	const index = { a: ix(undefined), b: ix(1, true), c: ix(2) };
-	assert.deepEqual(planAnalyticsBuilds({ finals, index, now, coreBlocked: true, afterKickoffMs: 4 * H, max: 10 }), ["a", "b"]);
+	assert.deepEqual(planAnalyticsBuilds({ finals, index, now, coreBlocked: true, afterKickoffMs: 4 * H, max: 10, earliestKickoffMs: 0 }), ["a", "b"]);
 	const complete = buildMatchAnalytics({ summary, asa, asaDepth: depth(), now: 1 })!;
 	assert.equal(complete.asaRetryAfter, null);
 });
@@ -284,4 +284,18 @@ test("ASA shot join tolerates revised spots (1–3 units) but never crosses team
 	// the wrong club's map → nothing joins
 	const crossed = joinAsaShots(base, asaRows, new Map([["aDQ0lzvQEv", "15364"], ["raMyrr25d2", "15365"]]));
 	assert.equal(crossed.filter((s) => s.xgAsa != null).length, 0);
+});
+
+
+test("no backfill before Oct 12, 2026: only last week's games and every match after (owner 2026-10-20)", async () => {
+	const { planAnalyticsBuilds, ANALYTICS_FIRST_KICKOFF_MS } = await import("../src/match-analytics.ts");
+	const H = 3600_000;
+	const now = Date.parse("2026-10-21T12:00:00Z");
+	const finals = [
+		{ eventId: "oct17", kickoffMs: Date.parse("2026-10-17T16:30:00Z") },
+		{ eventId: "oct11", kickoffMs: Date.parse("2026-10-11T23:00:00Z") },
+		{ eventId: "sep20", kickoffMs: Date.parse("2026-09-20T21:00:00Z") },
+	];
+	assert.equal(new Date(ANALYTICS_FIRST_KICKOFF_MS).toISOString(), "2026-10-12T00:00:00.000Z");
+	assert.deepEqual(planAnalyticsBuilds({ finals, index: {}, now, coreBlocked: true, afterKickoffMs: 4 * H, max: 10 }), ["oct17"]);
 });

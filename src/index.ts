@@ -8775,7 +8775,7 @@ async function statusCheckAnalytics(env: Env): Promise<StatusSection> {
 	const index = (await contentGetJSON<AnalyticsIndex>(env, ctx, analyticsIndexKey(year))) ?? {};
 	const rows = Object.values(index);
 	const checks: StatusCheck[] = [];
-	if (!rows.length) checks.push({ label: "Matches built", status: "warn", detail: "none yet — builds start ~4h after kickoff of each settled match (+ the 2026 backfill, ≤8/hour)" });
+	if (!rows.length) checks.push({ label: "Matches built", status: "warn", detail: "none yet — builds start ~4h after kickoff of each settled match (from Oct 12, 2026; no earlier backfill)" });
 	else {
 		const newest = Math.max(...rows.map((r) => r.builtAt));
 		checks.push({ label: "Matches built", status: "ok", detail: `${rows.length} matches · last build ${ageLabel(now - newest)}` });
