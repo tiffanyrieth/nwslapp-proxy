@@ -103,6 +103,7 @@ import {
 	writeStats,
 	type SettledMatch,
 	type TeamStatsCopy,
+	STATS_REFRESH_AFTER_KICKOFF_MS,
 } from "./team-stats-store.ts";
 import {
 	BEAT_SEED,
