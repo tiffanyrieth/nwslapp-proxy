@@ -10,6 +10,7 @@ import {
 	planStatsRefresh,
 	nextEspnCopy,
 	settledRegularSeasonMatches,
+	settledMatches,
 	latestMatchByTeam,
 	STATS_REFRESH_AFTER_KICKOFF_MS,
 	STATS_LAG_RETRY_MS,
@@ -166,7 +167,7 @@ test("only settled regular-season matches count (suspended / playoff / preseason
 		id, date: "2026-10-17T16:30Z", season: { slug }, status: { type },
 		competitions: [{ competitors: [{ team: { id: "1" } }, { team: { id: "2" } }] }],
 	});
-	const finals = settledRegularSeasonMatches({
+	const board = {
 		events: [
 			ev("ok", "regular-season", { state: "post", completed: true, name: "STATUS_FULL_TIME" }),
 			ev("sparse", "regular-season", { state: "post" }), // fail-open, like chooseSummaryTTL
@@ -176,6 +177,10 @@ test("only settled regular-season matches count (suspended / playoff / preseason
 			ev("po", "playoffs---quarterfinals", { state: "post", completed: true }),
 			ev("pre", "preseason", { state: "post", completed: true }),
 		],
-	});
-	assert.deepEqual(finals.map((f) => f.eventId), ["ok", "sparse"]);
+	};
+	assert.deepEqual(settledRegularSeasonMatches(board).map((f) => f.eventId), ["ok", "sparse"]);
+	// Match analytics also build playoff matches (flagged so the stats refresh can skip them).
+	const all = settledMatches(board);
+	assert.deepEqual(all.map((f) => f.eventId), ["ok", "sparse", "po"]);
+	assert.equal(all.find((f) => f.eventId === "po")?.playoff, true);
 });

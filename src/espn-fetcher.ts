@@ -26,7 +26,9 @@
 import { DurableObject } from "cloudflare:workers";
 import { ESPN_UA } from "./espn-ua.ts";
 import { chooseScoreboardTTL, chooseSummaryTTL } from "./index.ts";
-import { settledRegularSeasonMatches, type SettledMatch } from "./team-stats-store.ts";
+import { settledMatches, type SettledMatch } from "./team-stats-store.ts";
+import { coreShots, defenseFromCore, heatGrids, type DefAction } from "./match-analytics.ts";
+import { ESPN_HEADERS } from "./espn-ua.ts";
 
 /** The NWSL full-season scoreboard the app reads (`dates=YYYY`) — the source of "which matches just
  *  finished" for the after-match stats refresh. */
@@ -140,6 +142,30 @@ export class EspnFetcher extends DurableObject<Env> {
 	// saved copy per club, refreshed only after that club plays (src/team-stats-store.ts). Re-downloading
 	// ~29 ESPN calls per team every hour was 167/168 wasted and ESPN's stats API now refuses Cloudflare.
 
+	/** Per-player touch heat maps for ONE settled match from ESPN's Core event stream (2026-10-20, match
+	 *  analytics phase 4). Parsed HERE — ~1,400 events / ~630 KB would blow a Worker's 10 ms CPU. ~4 requests,
+	 *  once per match ever (the result is saved permanently by the caller). A 403/429 → `blocked` (the caller
+	 *  sets the durable Core-blocked marker and stops asking). */
+	async matchHeat(eventId: string): Promise<{ status: "ok" | "blocked" | "error"; grids?: Record<string, number[]>; defense?: Record<string, DefAction[]>; shots?: ReturnType<typeof coreShots>; detail?: string }> {
+		const base = `https://sports.core.api.espn.com/v2/sports/soccer/leagues/usa.nwsl/events/${eventId}/competitions/${eventId}/plays?limit=400`;
+		const items: unknown[] = [];
+		for (let page = 1; page <= 8; page++) {
+			const r = await fetch(`${base}&page=${page}`, { headers: ESPN_HEADERS });
+			if (r.status === 403 || r.status === 429) return { status: "blocked", detail: `HTTP ${r.status}` };
+			if (!r.ok) return { status: "error", detail: `HTTP ${r.status}` };
+			const j = (await r.json()) as { items?: unknown[]; pageCount?: number };
+			items.push(...(j.items ?? []));
+			if (!j.pageCount || page >= j.pageCount) break;
+		}
+		// Same pages, two more readings (2026-10-20 phase 2): defensive actions + ESPN's per-shot xG / xGOT / height.
+		return {
+			status: "ok",
+			grids: heatGrids(items as Parameters<typeof heatGrids>[0]),
+			defense: defenseFromCore(items as Parameters<typeof defenseFromCore>[0]),
+			shots: coreShots(items as Parameters<typeof coreShots>[0]),
+		};
+	}
+
 	/** Settled regular-season NWSL matches, read from the SHARED full-season scoreboard copy this object
 	 *  already holds for the app — parsed HERE (the 2.6 MB body would blow the 5-min tick's 10ms CPU budget).
 	 *  Only when the newest stored copy is older than `refreshIfOlderMs` (nobody opened the app in a while)
@@ -173,7 +199,8 @@ export class EspnFetcher extends DurableObject<Env> {
 		} catch {
 			return { finals: [], copyAgeMs: now - best.fetchedAt, refreshed };
 		}
-		return { finals: settledRegularSeasonMatches(parsed), copyAgeMs: now - best.fetchedAt, refreshed };
+		// Regular season + playoffs (flagged): analytics build both; the stats refresh filters playoffs out.
+		return { finals: settledMatches(parsed), copyAgeMs: now - best.fetchedAt, refreshed };
 	}
 
 	private hit(e: Entry, source: FetcherSource): FetcherResult {
