@@ -483,6 +483,7 @@ const BROWSER_UA =
 // 2026-08-04) — the constant + full story live in espn-ua.ts so no module can miss it again.
 import { ESPN_UA, ESPN_HEADERS, PROXY_UA } from "./espn-ua.ts";
 import type { CoreRelayEnv } from "./espn-core.ts";
+import { decideNewDeviceAlert, hasActivityCounter, isNewInstall, isoWeekStartDay, NEW_DEVICE_DAILY_CAP, newDeviceAlertEnabled, newDeviceBaseline, osLine, type AnalyticsEvent, type NewDeviceAlertEnv } from "./new-device-alert.ts";
 import { buildWatchSummariesEnvelope, parseWatchSummaryEntries, summaryUrlFor, WATCH_INTERNAL_HOST, type WatchSummaryResult } from "./watch-summaries.ts";
 import { edgeTtlFor, type FetcherKind, type FetcherResult } from "./espn-fetcher.ts";
 // The ESPN shared fetcher Durable Object (Option A, 2026-10-08) — exported from the main module so the
@@ -9059,12 +9060,57 @@ async function handleAnalyticsIngest(request: Request, env: Env, ctx: ExecutionC
 					body: JSON.stringify({ p_events: events }),
 				});
 				if (!r.ok) emitDiag(env, ctx, "analyticsRpcFail", `increment_counters ${r.status}`);
+				// After the counts land, so this week's total already includes this device.
+				else await maybeEmailNewDevice(env, ctx, events, base, key);
 			} catch (err) {
 				emitDiag(env, ctx, "analyticsRpcFail", String(err).slice(0, 80));
 			}
 		})(),
 	);
 	return new Response(null, { status: 204 });
+}
+
+/** New-device email (src/new-device-alert.ts): reads only the anonymous counters already received. Off unless
+ *  the NEW_DEVICE_ALERT secret is on; capped per day in the ContentStore DO (no KV). */
+async function maybeEmailNewDevice(env: Env, ctx: ExecutionContext, events: AnalyticsEvent[], base: string, key: string): Promise<void> {
+	const cfg = env as unknown as NewDeviceAlertEnv;
+	if (!newDeviceAlertEnabled(cfg) || !hasActivityCounter(events)) return;
+	const now = new Date();
+	let weekDevices: number | null = null;
+	if (!isNewInstall(events)) {
+		try {
+			const r = await fetch(
+				`${base}/rest/v1/analytics_counters?event=eq.active_week&day=gte.${isoWeekStartDay(now)}&select=count`,
+				{ headers: { apikey: key, Authorization: `Bearer ${key}` } },
+			);
+			if (!r.ok) throw new Error(`HTTP ${r.status}`);
+			weekDevices = ((await r.json()) as { count: number }[]).reduce((t, row) => t + Number(row.count), 0);
+		} catch (e) {
+			emitDiag(env, ctx, "newDeviceAlertFail", `week count: ${String((e as Error)?.message ?? e).slice(0, 80)}`);
+			return;
+		}
+	}
+	const alert = decideNewDeviceAlert(events, weekDevices, newDeviceBaseline(cfg));
+	if (!alert) return;
+
+	const capKey = `alert:newdevice:${now.toISOString().slice(0, 10)}`;
+	const sent = Number((await contentGet(env, ctx, [capKey])).get(capKey) ?? 0);
+	if (sent >= NEW_DEVICE_DAILY_CAP) {
+		emitDiag(env, ctx, "newDeviceAlertCapped", `${alert.subject} (cap ${NEW_DEVICE_DAILY_CAP}/day reached)`);
+		return;
+	}
+	const when = now.toLocaleString("en-US", { timeZone: "America/New_York", dateStyle: "medium", timeStyle: "short" });
+	const ok = await sendOwnerEmail(env, ctx, alert.subject, [
+		alert.reason,
+		"",
+		`When: ${when} ET`,
+		osLine(events),
+		"",
+		"From the anonymous usage counters only — no device id. Turn off before launch:",
+		"  printf 0 | npx wrangler secret put NEW_DEVICE_ALERT",
+	].join("\n"));
+	if (ok) await contentPut(env, ctx, [{ key: capKey, value: String(sent + 1), ttlSec: 2 * 86400 }]);
+	else emitDiag(env, ctx, "newDeviceAlertFail", `email not sent: ${alert.subject}`);
 }
 
 // ── Error-CLASS diagnostic kinds (2026-07-16; role changed 2026-09-18) ────────────────────────
@@ -9095,6 +9141,8 @@ const ALERT_ERROR_KINDS = new Set([
 	// (posts unjudged → social/beat dropped, news kept league-wide); `beatListInvalid` = a malformed
 	// source-list overlay (seed served instead).
 	"haikuFailure", "beatListInvalid", "subrequestCapHit", "podcastFeedFail",
+	// New-device email (2026-10-21): the week-count read or the send failed.
+	"newDeviceAlertFail",
 ]);
 
 /** The ONE owner-email primitive (Resend). Every alerting path — the scheduled synthetic checks, the
