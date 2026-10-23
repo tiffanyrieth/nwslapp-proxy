@@ -287,15 +287,28 @@ test("ASA shot join tolerates revised spots (1–3 units) but never crosses team
 });
 
 
-test("no backfill before Oct 12, 2026: only last week's games and every match after (owner 2026-10-20)", async () => {
-	const { planAnalyticsBuilds, ANALYTICS_FIRST_KICKOFF_MS } = await import("../src/match-analytics.ts");
+test("season backfill (owner 2026-10-23): whole 2026 season, recent first, ONE old match per check", async () => {
+	const { planAnalyticsBuilds, ANALYTICS_FIRST_KICKOFF_MS, ANALYTICS_BACKFILL_BEFORE_MS } = await import("../src/match-analytics.ts");
 	const H = 3600_000;
 	const now = Date.parse("2026-10-21T12:00:00Z");
 	const finals = [
 		{ eventId: "oct17", kickoffMs: Date.parse("2026-10-17T16:30:00Z") },
 		{ eventId: "oct11", kickoffMs: Date.parse("2026-10-11T23:00:00Z") },
 		{ eventId: "sep20", kickoffMs: Date.parse("2026-09-20T21:00:00Z") },
+		{ eventId: "mar14", kickoffMs: Date.parse("2026-03-14T20:00:00Z") },
 	];
-	assert.equal(new Date(ANALYTICS_FIRST_KICKOFF_MS).toISOString(), "2026-10-12T00:00:00.000Z");
-	assert.deepEqual(planAnalyticsBuilds({ finals, index: {}, now, coreBlocked: true, afterKickoffMs: 4 * H, max: 10 }), ["oct17"]);
+	assert.equal(new Date(ANALYTICS_FIRST_KICKOFF_MS).toISOString(), "2026-01-01T00:00:00.000Z");
+	assert.equal(new Date(ANALYTICS_BACKFILL_BEFORE_MS).toISOString(), "2026-10-12T00:00:00.000Z");
+	const plan = (index: Record<string, unknown>, max = 4) =>
+		planAnalyticsBuilds({ finals, index: index as never, now, coreBlocked: true, afterKickoffMs: 4 * H, max, maxBackfill: 1 });
+	// Recent match + the newest old one only (never a burst of old matches).
+	assert.deepEqual(plan({}), ["oct17", "oct11"]);
+	// A full check of recent work leaves no slot for backfill.
+	assert.deepEqual(plan({}, 1), ["oct17"]);
+	// Once recent is built, still one old match per check, newest first.
+	const built = { source: "asa", asaRetryAfter: null, heat: "unavailable", heatRetryAfter: now + H, builtAt: now, v: 2 };
+	assert.deepEqual(plan({ oct17: built }), ["oct11"]);
+	assert.deepEqual(plan({ oct17: built, oct11: built }), ["sep20"]);
+	// Next season's matches are never "backfill" of this one.
+	assert.deepEqual(planAnalyticsBuilds({ finals: [{ eventId: "x", kickoffMs: Date.parse("2025-11-01T00:00:00Z") }], index: {}, now, coreBlocked: true, afterKickoffMs: 4 * H, max: 4, maxBackfill: 1 }), []);
 });

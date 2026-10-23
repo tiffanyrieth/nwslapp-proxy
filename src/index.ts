@@ -8552,8 +8552,12 @@ async function handleTeamStatsRefresh(request: Request, url: URL, env: Env, ctx:
 const analyticsMatchKey = (eventId: string) => `analytics:match:${eventId}`;
 const analyticsTeamKey = (teamId: string, year: number) => `analytics:team:${teamId}:${year}`;
 const analyticsIndexKey = (year: number) => `analytics:index:${year}`;
-/** Builds per 30-min check — paces the one-time 2026 backfill to ≤8/hour (polite to ESPN's site API + ASA). */
+/** Builds per 30-min check for recent matches (a busy match weekend). */
 const ANALYTICS_BUILDS_PER_CHECK = 4;
+/** One-time season backfill (owner 2026-10-23): ONE old match per check, only in a slot recent matches leave free → ≤2 an
+ *  hour (~1 ESPN /summary + ~4 Core pages + ASA's per-day set, shared by that day's matches). Reads like a fan opening
+ *  old matches, never a scraper; ~170 matches take ~3.5 days. */
+const ANALYTICS_BACKFILL_PER_CHECK = 1;
 const HEAT_RETRY_MS = 24 * 3600_000;
 /** Bump with the saved copy's format (MatchAnalytics.v) so edge caches of the old format are never served. */
 const ANALYTICS_FORMAT = 2;
@@ -8566,7 +8570,7 @@ async function scheduleMatchAnalytics(env: Env, ctx: ExecutionContext, finals: S
 	const index = (await contentGetJSON<AnalyticsIndex>(env, ctx, analyticsIndexKey(year))) ?? {};
 	const coreBlocked = now < (await espnCoreBlockedUntil(env));
 	// Newest first: this weekend's matches beat the backfill.
-	const due = planAnalyticsBuilds({ finals, index, now, coreBlocked, afterKickoffMs: STATS_REFRESH_AFTER_KICKOFF_MS, max: ANALYTICS_BUILDS_PER_CHECK });
+	const due = planAnalyticsBuilds({ finals, index, now, coreBlocked, afterKickoffMs: STATS_REFRESH_AFTER_KICKOFF_MS, max: ANALYTICS_BUILDS_PER_CHECK, maxBackfill: ANALYTICS_BACKFILL_PER_CHECK });
 	for (const eventId of due) {
 		const r = await e.SELF.fetch(new Request(`${PROXY_PUBLIC_ORIGIN}/internal/match-analytics/build?event=${eventId}`, {
 			method: "POST",
@@ -8799,7 +8803,7 @@ async function statusCheckAnalytics(env: Env): Promise<StatusSection> {
 	const index = (await contentGetJSON<AnalyticsIndex>(env, ctx, analyticsIndexKey(year))) ?? {};
 	const rows = Object.values(index);
 	const checks: StatusCheck[] = [];
-	if (!rows.length) checks.push({ label: "Matches built", status: "warn", detail: "none yet — builds start ~4h after kickoff of each settled match (from Oct 12, 2026; no earlier backfill)" });
+	if (!rows.length) checks.push({ label: "Matches built", status: "warn", detail: "none yet — builds start ~4h after kickoff of each settled match (2026 season; older matches backfill ≤2/hour)" });
 	else {
 		const newest = Math.max(...rows.map((r) => r.builtAt));
 		checks.push({ label: "Matches built", status: "ok", detail: `${rows.length} matches · last build ${ageLabel(now - newest)}` });
