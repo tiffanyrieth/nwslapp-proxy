@@ -790,10 +790,14 @@ export function heatGrids(events: { fieldPositionX?: number | null; fieldPositio
 
 // ── Scheduling builds ────────────────────────────────────────────────────────────────────────────
 
-/** No analytics build for a match that kicked off before this (owner 2026-10-20): the feature lands at the end of
- *  2026 and the app won't be in the App Store before the final, so there's no point backfilling the season —
- *  only last week's games (from Mon 2026-10-12) and every match after. Keeps ASA / ESPN calls to what's needed. */
-export const ANALYTICS_FIRST_KICKOFF_MS = Date.parse("2026-10-12T00:00:00Z");
+/** Analytics cover the whole 2026 season. Owner 2026-10-20 first ruled "no backfill before Oct 12"; REVERSED by the
+ *  owner 2026-10-23 once it showed the season cards (player / team "2026 season") only counted matches since Oct 12. */
+export const ANALYTICS_FIRST_KICKOFF_MS = Date.parse("2026-01-01T00:00:00Z");
+
+/** Matches before this are the one-time BACKFILL. They're paced like a fan browsing old matches, never like a scraper
+ *  (owner 2026-10-23: ESPN / ASA must never see bot-like bursts): at most `maxBackfill` per check, in slots recent
+ *  matches leave free — a busy post-match check never grows past `max`. */
+export const ANALYTICS_BACKFILL_BEFORE_MS = Date.parse("2026-10-12T00:00:00Z");
 
 /** ASA is re-asked at most this many times after the first build (+22h, +44h) for missing xG / g+ depth. */
 export const MAX_ASA_RETRIES = 2;
@@ -817,9 +821,14 @@ export function planAnalyticsBuilds(args: {
 	max: number;
 	/** Matches that kicked off earlier are never built (default: `ANALYTICS_FIRST_KICKOFF_MS`). */
 	earliestKickoffMs?: number;
+	/** Matches before this are backfill (default: `ANALYTICS_BACKFILL_BEFORE_MS`). */
+	backfillBeforeMs?: number;
+	/** Backfill builds per check, only when no recent match is due (default: no limit beyond `max`). */
+	maxBackfill?: number;
 }): string[] {
 	const earliest = args.earliestKickoffMs ?? ANALYTICS_FIRST_KICKOFF_MS;
-	return [...args.finals]
+	const backfillBefore = args.backfillBeforeMs ?? ANALYTICS_BACKFILL_BEFORE_MS;
+	const due = [...args.finals]
 		.sort((a, b) => b.kickoffMs - a.kickoffMs)
 		.filter((f) => {
 			if (f.kickoffMs < earliest) return false;
@@ -830,7 +839,10 @@ export function planAnalyticsBuilds(args: {
 			const retries = ix.asaRetries ?? (ix.asaRetried ? 1 : 0);
 			if (ix.asaRetryAfter !== null && args.now >= ix.asaRetryAfter && retries < MAX_ASA_RETRIES) return true;
 			return ix.heat !== "ok" && !args.coreBlocked && args.now >= (ix.heatRetryAfter ?? 0);
-		})
-		.slice(0, args.max)
-		.map((f) => f.eventId);
+		});
+	if (args.maxBackfill === undefined) return due.slice(0, args.max).map((f) => f.eventId);
+	// Recent matches first; backfill only fills slots they leave free, never more than `maxBackfill`.
+	const recent = due.filter((f) => f.kickoffMs >= backfillBefore).slice(0, args.max);
+	const old = due.filter((f) => f.kickoffMs < backfillBefore).slice(0, Math.max(0, Math.min(args.maxBackfill, args.max - recent.length)));
+	return [...recent, ...old].map((f) => f.eventId);
 }
