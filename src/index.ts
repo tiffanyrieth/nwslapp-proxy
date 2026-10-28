@@ -1383,6 +1383,7 @@ that needs more users) until you bring it back.</p>
 		// through the SELF service binding so it runs in its OWN invocation (own 50-subrequest
 		// budget); the owner can also hit it by hand right after a source-list edit.
 		if (url.pathname === "/social/sources/refresh") {
+			return withDiagFlush(env, (async () => {
 			if (!auditAuthed(request, env)) {
 				return new Response("Authentication required.", { status: 401, headers: { "WWW-Authenticate": adminRealm("NWSLApp Admin") } });
 			}
@@ -1399,6 +1400,7 @@ that needs more users) until you bring it back.</p>
 			const summary = await refreshSocialSources(env, ctx);
 			emitDiag(env, ctx, "socialSourcesRefresh", `${summary.refreshed}/${summary.total} ok${summary.failed.length ? `, ${summary.failed.length} failed` : ""}${summary.carried ? `, ${summary.carried} carried` : ""}`);
 			return jsonResponse(summary, 200);
+			})());
 		}
 		// Podcast directory (public, 1h edge) — the Settings directory + Listen toggle source.
 		if (url.pathname === "/podcasts/directory") {
@@ -1442,19 +1444,19 @@ that needs more users) until you bring it back.</p>
 		// SELF binding, so each batch gets its OWN 50-subrequest budget. Admin-key gated like the other
 		// SELF-invoked jobs.
 		if (url.pathname === "/internal/ig-images") {
-			return handleIgImageCopy(request, env);
+			return withDiagFlush(env, handleIgImageCopy(request, env));
 		}
 
 		// POST one club's after-match ESPN stats refresh — SELF-only (admin key), scheduled by
 		// maybeScheduleStatsRefresh on the 5-min tick; its own invocation = its own subrequest budget.
 		if (url.pathname === "/internal/team-stats/refresh") {
-			return handleTeamStatsRefresh(request, url, env, ctx);
+			return withDiagFlush(env, handleTeamStatsRefresh(request, url, env, ctx));
 		}
 
 		// POST one match's analytics build (shots, xG, season rollups, heat) — SELF-only (admin key), scheduled by
 		// scheduleMatchAnalytics on the 5-min tick's :00/:30 check; its own invocation = its own budget.
 		if (url.pathname === "/internal/match-analytics/build") {
-			return handleMatchAnalyticsBuild(request, url, env, ctx);
+			return withDiagFlush(env, handleMatchAnalyticsBuild(request, url, env, ctx));
 		}
 
 		// Admin-only: refresh the IG social snapshot on demand (the every-2-day cron does
@@ -3811,23 +3813,46 @@ function flushDiags(env: Env, ctx: ExecutionContext, force = false): void {
 	// per-kind log throttle (shouldLogDiag) suppressed is still visible at a glance in the observability tail.
 	const rolled = events.filter((e) => e.n > 1).map((e) => `${e.kind}×${e.n}`).join(" ");
 	if (rolled) console.log("telemetry-rollup", rolled);
+	ctx.waitUntil(postDiags(env, events));
+}
+
+async function postDiags(env: Env, events: Array<{ kind: string; n: number; detail: string }>): Promise<void> {
 	const sb = env as unknown as SupabaseAdminEnv;
 	if (!sb.SUPABASE_URL || !sb.SUPABASE_SERVICE_ROLE_KEY) return; // local dev / unconfigured → dropped (no KV, no Supabase)
 	const base = sb.SUPABASE_URL.replace(/\/$/, ""), svcKey = sb.SUPABASE_SERVICE_ROLE_KEY;
-	ctx.waitUntil(
-		(async () => {
-			try {
-				const r = await fetch(`${base}/rest/v1/rpc/record_server_diagnostics`, {
-					method: "POST",
-					headers: { apikey: svcKey, Authorization: `Bearer ${svcKey}`, "Content-Type": "application/json" },
-					body: JSON.stringify({ p_events: events }),
-				});
-				if (!r.ok) console.log(`[sdiag] record_server_diagnostics failed: ${r.status}`);
-			} catch (err) {
-				console.log(`[sdiag] record_server_diagnostics threw: ${String(err).slice(0, 120)}`);
-			}
-		})(),
-	);
+	try {
+		const r = await fetch(`${base}/rest/v1/rpc/record_server_diagnostics`, {
+			method: "POST",
+			headers: { apikey: svcKey, Authorization: `Bearer ${svcKey}`, "Content-Type": "application/json" },
+			body: JSON.stringify({ p_events: events }),
+		});
+		if (!r.ok) console.log(`[sdiag] record_server_diagnostics failed: ${r.status}`);
+	} catch (err) {
+		console.log(`[sdiag] record_server_diagnostics threw: ${String(err).slice(0, 120)}`);
+	}
+}
+
+/** Run a SELF-invoked background job, then send its diagnostics BEFORE answering (2026-10-28). The cron that
+ *  calls these jobs ends right after them, which cancels the job invocation and anything it left in
+ *  waitUntil — so its diags either sat in the accumulator until eviction or were cut off mid-send (seen
+ *  10/21: three of four teamStatsRefresh runs left no record). Awaiting the send costs one Supabase RPC per job. */
+async function withDiagFlush(env: Env, job: Promise<Response>): Promise<Response> {
+	const res = await job;
+	if (serverDiagAccum.size > 0) {
+		const events = [...serverDiagAccum.entries()].map(([kind, e]) => ({ kind, n: e.count, detail: e.lastDetail }));
+		serverDiagAccum.clear();
+		lastDiagFlushAt = Date.now();
+		await postDiags(env, events);
+	}
+	return res;
+}
+
+/** Call a SELF job and read its reply to the end, so the job finishes as a normal request instead of being
+ *  cancelled with an unread body when the calling cron ends. */
+async function selfJob(self: Fetcher, url: string, adminKey: string): Promise<Response> {
+	const r = await self.fetch(new Request(url, { method: "POST", headers: { "x-admin-key": adminKey } }));
+	await r.arrayBuffer().catch(() => undefined);
+	return r;
 }
 
 /** NO SILENT FAILURES (proxy edition): surface one operational event so a proxy-side miss shows up in the
@@ -5073,9 +5098,7 @@ async function triggerSocialSourcesRefresh(env: Env, ctx: ExecutionContext): Pro
 		emitDiag(env, ctx, "sourcesRefreshFail", `not configured (SELF binding ${e.SELF ? "ok" : "missing"}, admin key ${e.BRACKET_ADMIN_KEY ? "ok" : "missing"})`);
 		return;
 	}
-	const r = await e.SELF.fetch(
-		new Request(`${PROXY_PUBLIC_ORIGIN}/social/sources/refresh`, { method: "POST", headers: { "x-admin-key": e.BRACKET_ADMIN_KEY } }),
-	);
+	const r = await selfJob(e.SELF, `${PROXY_PUBLIC_ORIGIN}/social/sources/refresh`, e.BRACKET_ADMIN_KEY);
 	if (!r.ok) emitDiag(env, ctx, "sourcesRefreshFail", `refresh returned HTTP ${r.status}`);
 }
 
@@ -5088,9 +5111,7 @@ async function triggerPodcastsRefresh(env: Env, ctx: ExecutionContext): Promise<
 		emitDiag(env, ctx, "sourcesRefreshFail", `podcasts: not configured (SELF ${e.SELF ? "ok" : "missing"}, key ${e.BRACKET_ADMIN_KEY ? "ok" : "missing"})`);
 		return;
 	}
-	const r = await e.SELF.fetch(
-		new Request(`${PROXY_PUBLIC_ORIGIN}/social/sources/refresh?family=podcasts`, { method: "POST", headers: { "x-admin-key": e.BRACKET_ADMIN_KEY } }),
-	);
+	const r = await selfJob(e.SELF, `${PROXY_PUBLIC_ORIGIN}/social/sources/refresh?family=podcasts`, e.BRACKET_ADMIN_KEY);
 	if (!r.ok) emitDiag(env, ctx, "sourcesRefreshFail", `podcasts refresh returned HTTP ${r.status}`);
 }
 
@@ -5329,9 +5350,7 @@ async function triggerBlueskyRefresh(env: Env, ctx: ExecutionContext, force = fa
 		emitDiag(env, ctx, "sourcesRefreshFail", `bluesky: not configured (SELF ${e.SELF ? "ok" : "missing"}, key ${e.BRACKET_ADMIN_KEY ? "ok" : "missing"})`);
 		return;
 	}
-	const r = await e.SELF.fetch(
-		new Request(`${PROXY_PUBLIC_ORIGIN}/social/sources/refresh?family=bluesky`, { method: "POST", headers: { "x-admin-key": e.BRACKET_ADMIN_KEY } }),
-	);
+	const r = await selfJob(e.SELF, `${PROXY_PUBLIC_ORIGIN}/social/sources/refresh?family=bluesky`, e.BRACKET_ADMIN_KEY);
 	if (!r.ok) emitDiag(env, ctx, "sourcesRefreshFail", `bluesky refresh returned HTTP ${r.status}`);
 }
 
@@ -8554,10 +8573,7 @@ async function maybeScheduleStatsRefresh(env: Env, ctx: ExecutionContext, schedu
 	const espnCopies = new Map([...copies].map(([t, c]) => [t, c.espn]));
 	const due = planStatsRefresh({ finals, espnCopies, now, blockedUntil });
 	for (const d of due) {
-		const r = await e.SELF.fetch(new Request(`${PROXY_PUBLIC_ORIGIN}/internal/team-stats/refresh?team=${d.teamId}&event=${d.eventId}`, {
-			method: "POST",
-			headers: { "x-admin-key": e.BRACKET_ADMIN_KEY },
-		}));
+		const r = await selfJob(e.SELF, `${PROXY_PUBLIC_ORIGIN}/internal/team-stats/refresh?team=${d.teamId}&event=${d.eventId}`, e.BRACKET_ADMIN_KEY);
 		if (r.status === 503) break; // ESPN refused → the job wrote the block marker; stop this check
 	}
 }
@@ -8633,10 +8649,7 @@ async function scheduleMatchAnalytics(env: Env, ctx: ExecutionContext, finals: S
 	// Newest first: this weekend's matches beat the backfill.
 	const due = planAnalyticsBuilds({ finals, index, now, coreBlocked, afterKickoffMs: STATS_REFRESH_AFTER_KICKOFF_MS, max: ANALYTICS_BUILDS_PER_CHECK, maxBackfill: ANALYTICS_BACKFILL_PER_CHECK });
 	for (const eventId of due) {
-		const r = await e.SELF.fetch(new Request(`${PROXY_PUBLIC_ORIGIN}/internal/match-analytics/build?event=${eventId}`, {
-			method: "POST",
-			headers: { "x-admin-key": e.BRACKET_ADMIN_KEY },
-		}));
+		const r = await selfJob(e.SELF, `${PROXY_PUBLIC_ORIGIN}/internal/match-analytics/build?event=${eventId}`, e.BRACKET_ADMIN_KEY);
 		if (!r.ok) emitDiag(env, ctx, "matchAnalyticsBuildFail", `${eventId}: HTTP ${r.status}`);
 	}
 }
