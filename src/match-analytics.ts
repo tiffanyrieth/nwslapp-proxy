@@ -751,6 +751,53 @@ function recompute(s: TeamSeasonAnalytics, now: number): TeamSeasonAnalytics {
 	};
 }
 
+/** One line of a player's match-by-match list on her season page (2026-10-28): which matches she played and the
+ *  headline numbers from each, so the app can list them and open her numbers for that match. Built from the saved
+ *  per-match rows at read time (no extra storage, no upstream calls). */
+export interface PlayerMatchLogEntry {
+	eventId: string;
+	kickoff: string;
+	/** From ASA's g+ / keeper rows; null when only our shot estimate covers the match. */
+	minutes: number | null;
+	goals: number;
+	xg: number;
+	/** Her g+ for the match (a keeper's = the sum of her keeper parts); null before ASA posts. */
+	gplus: number | null;
+	/** Keepers only. */
+	goalsPrevented: number | null;
+	saves: number | null;
+}
+
+/** athleteId → her matches, oldest first. A player appears once she has any row from a match: a g+ line, a keeper
+ *  line, or a shot. */
+export function playerMatchLog(contributions: SeasonContribution[]): Record<string, PlayerMatchLogEntry[]> {
+	const out: Record<string, PlayerMatchLogEntry[]> = {};
+	for (const c of contributions) {
+		const ids = new Set<string>([
+			...(c.gplus ?? []).map((g) => g.athleteId),
+			...(c.keepers ?? []).map((k) => k.athleteId),
+			...c.players.map((p) => p.athleteId),
+		]);
+		for (const id of ids) {
+			const g = c.gplus?.find((x) => x.athleteId === id);
+			const k = c.keepers?.find((x) => x.athleteId === id);
+			const p = c.players.find((x) => x.athleteId === id);
+			const keeperGplus = k?.gplus ? Object.values(k.gplus).reduce((n, a) => n + a.raw, 0) : null;
+			(out[id] ??= []).push({
+				eventId: c.eventId,
+				kickoff: c.kickoff,
+				minutes: k?.minutes ?? g?.minutes ?? null,
+				goals: p?.goals ?? 0,
+				xg: r3(p?.xg ?? 0),
+				gplus: k ? (keeperGplus === null ? null : r3(keeperGplus)) : g ? r3(g.raw) : null,
+				goalsPrevented: k ? r3(k.goalsPrevented) : null,
+				saves: k ? k.saves : null,
+			});
+		}
+	}
+	return out;
+}
+
 function roundActions(a: GplusActions | null): GplusActions | null {
 	if (!a || !Object.keys(a).length) return null;
 	return Object.fromEntries(Object.entries(a).map(([k, v]) => [k, { raw: r3(v.raw), aboveAvg: r3(v.aboveAvg), count: v.count }]));

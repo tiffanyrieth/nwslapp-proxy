@@ -6,7 +6,7 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import {
 	shotsFromSummary, shotOutcome, estimateXg, buildMatchAnalytics, asaTeamIdFor, asaGameFor, matchTeams,
-	emptySeason, foldMatchIntoSeason, heatGrids, HEAT_COLS, HEAT_ROWS, PENALTY_XG,
+	emptySeason, foldMatchIntoSeason, heatGrids, HEAT_COLS, HEAT_ROWS, PENALTY_XG, playerMatchLog,
 } from "../src/match-analytics.ts";
 
 const summary = JSON.parse(readFileSync(new URL("./fixtures/summary-401854021-shots.json", import.meta.url), "utf8"));
@@ -311,4 +311,25 @@ test("season backfill (owner 2026-10-23): whole 2026 season, recent first, ONE o
 	assert.deepEqual(plan({ oct17: built, oct11: built }), ["sep20"]);
 	// Next season's matches are never "backfill" of this one.
 	assert.deepEqual(planAnalyticsBuilds({ finals: [{ eventId: "x", kickoffMs: Date.parse("2025-11-01T00:00:00Z") }], index: {}, now, coreBlocked: true, afterKickoffMs: 4 * H, max: 4, maxBackfill: 1 }), []);
+});
+
+test("match log: one row per match she has any line in, keepers carry saves + goals prevented, oldest first", () => {
+	const base = { xgFor: 1, xgAgainst: 1, source: "asa" as const, shotsFor: [], shotsAgainst: [] };
+	const contributions = [
+		{ ...base, eventId: "1", kickoff: "2026-10-01T00:00Z",
+			players: [{ athleteId: "fw", teamId: "t", shots: 3, shotsOnTarget: 2, goals: 1, xg: 0.4567, xa: 0, keyPasses: 1, source: "asa" as const }],
+			gplus: [{ athleteId: "fw", teamId: "t", position: "ST", minutes: 90, raw: 0.31234, aboveAvg: 0.1, actions: {} },
+				{ athleteId: "cb", teamId: "t", position: "CB", minutes: 64, raw: -0.05, aboveAvg: 0, actions: {} }],
+			keepers: [{ athleteId: "gk", teamId: "t", minutes: 90, shotsFaced: 4, saves: 3, goalsConceded: 1, xgotFaced: 1.2, goalsPrevented: 0.2,
+				gplus: { Shotstopping: { raw: 0.1, aboveAvg: 0, count: 4 }, Passing: { raw: 0.05, aboveAvg: 0, count: 20 } } }] },
+		// Our estimate only (ASA hasn't posted): just the shooter, with no minutes or g+.
+		{ ...base, eventId: "2", kickoff: "2026-10-08T00:00Z", source: "estimate" as const,
+			players: [{ athleteId: "fw", teamId: "t", shots: 1, shotsOnTarget: 0, goals: 0, xg: 0.1, xa: null, keyPasses: null, source: "estimate" as const }] },
+	];
+	const log = playerMatchLog(contributions);
+	assert.deepEqual(log.fw.map((e) => e.eventId), ["1", "2"]);
+	assert.deepEqual(log.fw[0], { eventId: "1", kickoff: "2026-10-01T00:00Z", minutes: 90, goals: 1, xg: 0.457, gplus: 0.312, goalsPrevented: null, saves: null });
+	assert.deepEqual(log.fw[1], { eventId: "2", kickoff: "2026-10-08T00:00Z", minutes: null, goals: 0, xg: 0.1, gplus: null, goalsPrevented: null, saves: null });
+	assert.equal(log.cb.length, 1);
+	assert.deepEqual(log.gk[0], { eventId: "1", kickoff: "2026-10-01T00:00Z", minutes: 90, goals: 0, xg: 0, gplus: 0.15, goalsPrevented: 0.2, saves: 3 });
 });

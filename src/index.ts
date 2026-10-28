@@ -58,7 +58,7 @@ import {
 import {
 	buildMatchAnalytics,
 	emptySeason,
-	foldMatchIntoSeason,
+	foldMatchIntoSeason, playerMatchLog,
 	type AsaGame,
 	type AsaGameXg,
 	type AsaPlayer,
@@ -8860,6 +8860,7 @@ async function handleTeamAnalyticsGet(url: URL, env: Env, ctx: ExecutionContext)
 		players: s.players, heat: s.heat, heatMatches: s.heatMatches,
 		keepers: s.keepers ?? [], gplus: s.gplus ?? [], teamGplus: s.teamGplus ?? 0, gplusMatches: s.gplusMatches ?? 0,
 		xpass: s.xpass ?? [], defense: s.defense ?? {}, defenseMatches: s.defenseMatches ?? 0,
+		matchLog: playerMatchLog(s.contributions),
 		shotsFor: s.contributions.flatMap((c) => c.shotsFor.map((sh) => ({ ...sh, eventId: c.eventId }))),
 		shotsAgainst: s.contributions.flatMap((c) => c.shotsAgainst.map((sh) => ({ ...sh, eventId: c.eventId }))),
 		updatedAt: new Date(s.updatedAt).toISOString(),
