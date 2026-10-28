@@ -137,7 +137,7 @@ import {
 	type PodcastShow,
 	type PodcastEpisode,
 } from "./podcasts.ts";
-import { adminAuthed, adminGate, safeEqual, type AdminAuthEnv } from "./admin-auth.ts";
+import { adminAuthed, adminGate, adminRealm, safeEqual, type AdminAuthEnv } from "./admin-auth.ts";
 import { handleAnalyticsAdmin, computeMetrics } from "./analytics-admin.ts";
 import { ADMIN_PORTAL_HTML } from "./admin-portal.ts";
 import {
@@ -262,6 +262,67 @@ async function fetchKHGCalendarEvents(year: number): Promise<KHGCalendarEvent[]>
 	if (!r.ok) throw new Error(`scoreboard ${year} ${r.status}`);
 	const json = (await r.json()) as { events?: Array<{ date?: string; season?: { slug?: string } }> };
 	return (json.events ?? []).map((ev) => ({ date: ev.date, seasonSlug: ev.season?.slug ?? null }));
+}
+
+/** GET /admin/khg-calendar — the owner's calendar hatch. (Restored 2026-10-28: the 9/15 /spotlight cleanup
+ *  (12fb928) deleted this handler while the route still called it, so the page threw a ReferenceError.) No param = show the derived calendar + overrides;
+ *  ?pause=YYYY-MM-DD / ?live=YYYY-MM-DD add a forced Monday; ?unpause= / ?unlive= remove one; ?anchor= pins
+ *  the Week-1 Monday; ?clear=1 drops every override; ?recompute=1 forces a fresh derivation now. Every
+ *  action is a GET link so the whole lever works from the portal tab, like /admin/fanzone-order. */
+async function handleKHGCalendarAdmin(url: URL, request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
+	const gate = await adminGate(request, env as unknown as AdminAuthEnv, { jwt: true },
+		(kind, detail) => emitDiag(env, ctx, kind, detail));
+	if (gate) return gate;
+	const esc = (s: string) => s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+	const isYMD = (s: string | null): s is string => !!s && /^\d{4}-\d{2}-\d{2}$/.test(s);
+	const p = url.searchParams;
+	const actionKeys = ["pause", "live", "unpause", "unlive", "anchor"];
+	let status = "Know Her Game calendar";
+	let override = await readKHGOverride(env);
+	if (p.get("clear") === "1") {
+		override = {};
+		await writeKHGOverride(env, override);
+		status = "Overrides cleared — the calendar is purely schedule-derived again.";
+		emitDiag(env, ctx, "khgCalendarOverrideSet", "cleared");
+	} else if (actionKeys.some((k) => isYMD(p.get(k)))) {
+		const paused = new Set(override.forcePaused ?? []);
+		const live = new Set(override.forceLive ?? []);
+		const pause = p.get("pause"), forceLive = p.get("live"), unpause = p.get("unpause"), unlive = p.get("unlive"), anchor = p.get("anchor");
+		if (isYMD(pause)) { paused.add(pause); live.delete(pause); }
+		if (isYMD(forceLive)) { live.add(forceLive); paused.delete(forceLive); }
+		if (isYMD(unpause)) paused.delete(unpause);
+		if (isYMD(unlive)) live.delete(unlive);
+		await writeKHGOverride(env, { forcePaused: [...paused], forceLive: [...live], anchor: isYMD(anchor) ? anchor : override.anchor });
+		override = await readKHGOverride(env);
+		status = `Override saved: ${JSON.stringify(override)}`;
+		emitDiag(env, ctx, "khgCalendarOverrideSet", JSON.stringify(override).slice(0, 120));
+	} else if (actionKeys.some((k) => p.has(k))) {
+		status = "Invalid date — use YYYY-MM-DD (a Monday). Nothing changed.";
+	}
+	const force = p.get("recompute") === "1" || p.has("clear") || actionKeys.some((k) => p.has(k));
+	const cal = await loadKnowHerCalendar(env, fetchKHGCalendarEvents, KHG_COMPILED_ANCHOR, new Date(),
+		(kind, detail) => emitDiag(env, ctx, kind, detail), force);
+	const thisMonday = khgYMD(khgMondayStart(new Date()));
+	const rows = cal ? cal.pausedMondays.map((m) => `<li><code>${m}</code> paused · <a href="/admin/khg-calendar?live=${m}">force live</a></li>`).join("") : "";
+	const calBlock = cal
+		? `<p>Anchor (Week-1 Monday, frozen this season): <span class="cur">${esc(cal.anchor)}</span>${cal.anchor !== KHG_COMPILED_ANCHOR ? ` <span class="warn">≠ compiled ${KHG_COMPILED_ANCHOR} — bump the constants</span>` : ""}<br>
+Season end (first KHG drop after the last fixture): <span class="cur">${esc(cal.seasonEnd ?? "unknown — no fixtures loaded")}</span><br>
+This Monday <code>${thisMonday}</code>: <span class="cur">${isKHGPausedMonday(cal, thisMonday) ? "PAUSED" : "live"}</span> · derived ${esc(cal.derivedAt)} · <a href="/admin/khg-calendar?recompute=1">recompute now</a></p>
+<p>Paused drop Mondays (no NWSL fixture in the 14-day round window):</p><ul>${rows || "<li>none in the horizon</li>"}</ul>`
+		: `<p class="warn">Calendar unavailable (derivation failed — see diagnostics). /config omits it; the app derives from its own schedule; the publish pass proceeds.</p>`;
+	const page = `<!doctype html>
+<html><head><meta charset="utf-8"><style>
+body{background:#111;color:#ddd;font:14px -apple-system,sans-serif;padding:18px;max-width:680px}
+a{color:#9ad} code{background:#1c1c1e;padding:1px 5px;border-radius:4px;font-size:12px}
+.cur{color:#fff;font-weight:600} .ok{color:#8c8} .warn{color:#fc6} p,li{line-height:1.5}
+</style></head><body>
+<p class="ok">${esc(status)}</p>
+${calBlock}
+<p>Overrides: <code>${esc(JSON.stringify(override))}</code> · <a href="/admin/khg-calendar?clear=1">clear all</a></p>
+<p>Force: <code>?pause=YYYY-MM-DD</code> · <code>?live=YYYY-MM-DD</code> · remove: <code>?unpause=</code> / <code>?unlive=</code> · pin anchor: <code>?anchor=YYYY-MM-DD</code>.
+A paused Monday publishes nothing (the last edition stays live) and the app schedules no nudge for it. Apps pick changes up on their next launch (config cache ≤5 min).</p>
+</body></html>`;
+	return new Response(page, { headers: { "Content-Type": "text/html; charset=utf-8" } });
 }
 
 // `/scoreboard?league=<slug>` serves any of these ESPN soccer competitions (women's)
