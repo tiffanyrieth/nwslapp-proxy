@@ -15,11 +15,8 @@ const RUNTIME = new Set([
 	"RequestInit", "Response", "setTimeout", "TextDecoder", "TextEncoder", "URL", "URLSearchParams",
 ]);
 
-/** Pre-existing, reported to the owner 2026-10-21 (not part of the analytics work) — remove each once fixed:
- *  `adminRealm` isn't imported into index.ts (since #136, 9/30) → unauthenticated hits on a few admin routes
- *  500 instead of prompting; `handleKHGCalendarAdmin` was deleted 9/15 (12fb928) but /admin/khg-calendar still
- *  calls it. */
-const KNOWN = new Set(["adminRealm", "handleKHGCalendarAdmin"]);
+/** Names tsc can't see but that are deliberately defined at runtime (none today). Add one only with a reason. */
+const KNOWN = new Set<string>([]);
 
 test("no undefined identifiers in src/ (esbuild doesn't type-check)", () => {
 	let out = "";
